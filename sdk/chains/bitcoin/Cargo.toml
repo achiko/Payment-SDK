@@ -1,0 +1,20 @@
+[package]
+name = "chain-bitcoin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bitcoin.workspace = true
+chain-contract = { path = "../contract" }
+indexing = { path = "../../indexing" }
+json-rpc = { path = "../../../packages/json-rpc" }
+signer = { path = "../../signing/contract" }
+transaction-utxo = { path = "../../transactions/utxo" }
+
+[dev-dependencies]
+futures-executor.workspace = true
+signer-local = { path = "../../signing/local" }
+
+[lints]
+workspace = true

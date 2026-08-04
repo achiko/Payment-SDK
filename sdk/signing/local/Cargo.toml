@@ -1,0 +1,19 @@
+[package]
+name = "signer-local"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+alloy-signer.workspace = true
+alloy-signer-local.workspace = true
+k256.workspace = true
+serde-compat.workspace = true
+signer = { path = "../contract" }
+
+[dev-dependencies]
+futures-executor.workspace = true
+
+[lints]
+workspace = true

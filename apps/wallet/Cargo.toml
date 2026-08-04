@@ -1,0 +1,28 @@
+[package]
+name = "wallet-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chain-bitcoin = { path = "../../sdk/chains/bitcoin" }
+chain-contract = { path = "../../sdk/chains/contract" }
+chain-ethereum = { path = "../../sdk/chains/ethereum" }
+signer = { path = "../../sdk/signing/contract" }
+telemetry = { path = "../../packages/telemetry" }
+
+[dev-dependencies]
+alloy-primitives.workspace = true
+alloy-signer.workspace = true
+alloy-signer-local.workspace = true
+futures-executor.workspace = true
+indexing = { path = "../../sdk/indexing" }
+reqwest.workspace = true
+serde_json.workspace = true
+signer-local = { path = "../../sdk/signing/local" }
+tokio.workspace = true
+transaction-utxo = { path = "../../sdk/transactions/utxo" }
+zeroize.workspace = true
+
+[lints]
+workspace = true

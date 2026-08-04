@@ -1,0 +1,10 @@
+[package]
+name = "rpc-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+transport = { path = "../transport", default-features = false }
+
+[lints]
+workspace = true

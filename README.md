@@ -1,0 +1,126 @@
+# Payment SDK contracts and wallet execution core
+
+This workspace combines requirements/contracts for an exchange payment system
+with a concrete stateless Wallet Service execution core. Payment Service,
+Indexer, storage, HTTP, and deployment wiring remain contract-first. The wallet
+path implements ephemeral local secp256k1 provisioning/signing for tests plus
+chain-native Bitcoin and Ethereum adapters over injected RPC backends.
+
+The implemented wallet capabilities are:
+
+- Ethereum EOA generation, balances, EIP-1559 build/sign/broadcast/receipt,
+  native collection, and ERC-20 gas requirements plus one-transfer collection;
+- Bitcoin native SegWit v0 and Taproot address generation, deterministic UTXO
+  funding, chain-native signing, balances, receipts, and batched collection;
+- a generic `wallet_worker::WalletService` facade that shares one injected
+  custody backend between provisioning and signing without owning persistence.
+
+`signer-local` is deliberately ephemeral and not production custody. Concrete
+RPC transports, authentication, durable secrets, databases, and deployment
+configuration are still injected by the application.
+
+The previous experimental workspace is preserved under [`old/`](./old). The
+new scaffold is organized by architectural ownership:
+
+```text
+apps/                             executable composition roots
+sdk/
+├── chains/                       concrete chains, identities, shared capabilities
+├── deposits/                     PS deposits, event mirror, ledger, collection state
+├── transactions/                 reusable UTXO and account construction
+├── signing/                      chain-independent signing
+├── indexing/                     block synchronization and reorg contracts
+└── storage/                      backend-independent atomic storage
+packages/                         non-blockchain HTTP, JSON-RPC, transport, telemetry
+reference/                        ignored shallow upstream research checkouts
+```
+
+The principal documents are:
+
+- [`docs/SYSTEM_REQUIREMENTS.md`](./docs/SYSTEM_REQUIREMENTS.md): canonical consolidated requirements and Mermaid flows;
+- [`ARCHITECTURE.md`](./ARCHITECTURE.md): ownership and dependency rules;
+- [`docs/CONTRACTS.md`](./docs/CONTRACTS.md): how the current traits compose;
+- [`docs/INDEXING.md`](./docs/INDEXING.md): proposed indexing and reorg flow;
+- [`docs/FEATURE_VALIDATION.md`](./docs/FEATURE_VALIDATION.md): original PS/WS/IX feature traceability and corrections;
+- [`docs/RESEARCH.md`](./docs/RESEARCH.md): upstream type and architecture findings;
+- [`docs/REQUIREMENTS.md`](./docs/REQUIREMENTS.md): decisions still required before implementation;
+- [`reference/README.md`](./reference/README.md): local reference repositories and revisions.
+
+Run the structural compile check with:
+
+```bash
+cargo check --workspace --all-targets
+cargo test --workspace
+```
+
+Generate ephemeral test keys and chain-native addresses with:
+
+```bash
+cargo run -p chain-ethereum --example ethereum_test_wallet
+cargo run -p chain-bitcoin --example bitcoin_test_wallet
+```
+
+These examples are offline and print only public information. Their private
+keys remain in process memory and are discarded when each example exits.
+
+Run the complete three-asset Wallet Service composition example with:
+
+```bash
+cargo run --locked -p wallet-worker --example three_asset_wallet_service
+```
+
+The example configures Bitcoin Testnet4, native ETH on Ethereum mainnet, and
+Ethereum-mainnet USDC. It demonstrates Bitcoin collection, an explicit ETH
+build/sign/broadcast flow, and USDC gas-requirement plus collection handling.
+Its deterministic RPC implementations are offline test doubles: replace
+`DemoBitcoinRpc`, `DemoEthereumRpc`, and the ephemeral `LocalSigner` with
+authenticated production adapters before connecting the composition to funds.
+
+The offline tests exercise Bitcoin SegWit/Taproot signing, Ethereum EIP-1559
+signing, balance reads, collection requirements, collection submission, and the
+shared-custody Wallet Service composition.
+
+### Live native-ETH transaction example
+
+[`apps/wallet/examples/live_ethereum_transaction.rs`](./apps/wallet/examples/live_ethereum_transaction.rs)
+is an opt-in executable that builds a real EIP-1559 transfer from live RPC
+state. Start with a funded development/testnet key, keep the key out of shell
+history and source control, and set these environment variables:
+
+- `ETH_RPC_URL`: an authenticated HTTPS Ethereum JSON-RPC endpoint (plain HTTP
+  is accepted only for a loopback development node);
+- `ETH_PRIVATE_KEY`: the sender's 32-byte secp256k1 private key;
+- `ETH_TO`: the `0x`-prefixed recipient address;
+- `ETH_VALUE_WEI`: the base-10 native-ETH amount in wei;
+- `ETH_CHAIN_ID`: the expected chain ID, checked against the RPC before build.
+
+With those variables configured, review the freshly queried nonce, balance,
+gas estimate, fee caps, and maximum debit without signing:
+
+```bash
+cargo run --locked -p wallet-worker --example live_ethereum_transaction
+```
+
+Signing and broadcasting are independent approvals. Sign without broadcasting
+with:
+
+```bash
+ETH_SIGN_TRANSACTION=true \
+  cargo run --locked -p wallet-worker --example live_ethereum_transaction
+```
+
+After reviewing every field, explicitly enable both operations to send it:
+
+```bash
+ETH_SIGN_TRANSACTION=true \
+ETH_BROADCAST_TRANSACTION=I_UNDERSTAND \
+  cargo run --locked -p wallet-worker --example live_ethereum_transaction
+```
+
+The example never prints the private key or raw signed envelope. It verifies
+that the node's returned transaction hash equals the locally computed hash.
+RPC acceptance is not on-chain confirmation, so production code must monitor
+the receipt and serialize builds for each sender to avoid pending-nonce races.
+The environment-backed signer and transaction-only RPC adapter are sample
+wiring; production custody, authenticated transport policy, and durable receipt
+tracking remain deployment responsibilities.

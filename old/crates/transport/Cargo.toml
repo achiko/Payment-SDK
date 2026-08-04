@@ -1,0 +1,14 @@
+[package]
+name = "transport"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["http"]
+http = []
+ws = []
+
+[dependencies]
+
+[lints]
+workspace = true

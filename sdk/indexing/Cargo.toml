@@ -1,0 +1,12 @@
+[package]
+name = "indexing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chain-identity = { path = "../chains/identity" }
+storage = { path = "../storage" }
+
+[lints]
+workspace = true

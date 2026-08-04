@@ -1,0 +1,10 @@
+[package]
+name = "signer-local"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+signer = { path = "../signer" }
+
+[lints]
+workspace = true

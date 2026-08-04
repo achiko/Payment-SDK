@@ -1,0 +1,51 @@
+[workspace]
+members = [
+    "apps/api",
+    "apps/indexer",
+    "apps/wallet",
+    "sdk/chains/identity",
+    "sdk/chains/contract",
+    "sdk/chains/bitcoin",
+    "sdk/chains/ethereum",
+    "sdk/deposits",
+    "sdk/transactions/utxo",
+    "sdk/transactions/account",
+    "sdk/signing/contract",
+    "sdk/signing/local",
+    "sdk/signing/trezor",
+    "sdk/indexing",
+    "sdk/storage",
+    "packages/transport",
+    "packages/json-rpc",
+    "packages/http",
+    "packages/telemetry",
+]
+exclude = ["old", "reference"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+alloy-primitives = { version = "=1.2.1", default-features = false, features = ["std"] }
+alloy-consensus = { version = "=1.0.22", features = ["k256"] }
+alloy-eips = "=1.0.22"
+alloy-signer = "=1.0.22"
+alloy-signer-local = { version = "=1.0.22", default-features = false }
+bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
+futures-executor = "0.3"
+k256 = { version = "=0.13.4", features = ["ecdsa", "schnorr"] }
+reqwest = { version = "=0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+# The Rust-1.85-compatible signer release still targets Serde's compatibility module.
+serde-compat = { package = "serde", version = "=1.0.219", default-features = false }
+serde_json = "=1.0.143"
+tokio = { version = "=1.49.0", features = ["macros", "rt-multi-thread"] }
+zeroize = "=1.8.2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"

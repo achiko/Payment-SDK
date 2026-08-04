@@ -1,0 +1,12 @@
+[package]
+name = "chain-contract"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chain-identity = { path = "../identity" }
+signer = { path = "../../signing/contract" }
+
+[lints]
+workspace = true

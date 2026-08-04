@@ -1,0 +1,15 @@
+[package]
+name = "indexer-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chain-bitcoin = { path = "../../sdk/chains/bitcoin" }
+chain-ethereum = { path = "../../sdk/chains/ethereum" }
+indexing = { path = "../../sdk/indexing" }
+storage = { path = "../../sdk/storage" }
+telemetry = { path = "../../packages/telemetry" }
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "signer-ethereum"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+network = { path = "../network" }
+network-ethereum = { path = "../network-ethereum" }
+primitives = { path = "../primitives" }
+signer = { path = "../signer" }
+
+[dev-dependencies]
+signer-local = { path = "../signer-local" }
+
+[lints]
+workspace = true

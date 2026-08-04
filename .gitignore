@@ -1,0 +1,34 @@
+# Rust build output
+/target/
+/old/target/
+
+# macOS
+.DS_Store
+
+# IDE/editor local files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local env/secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+*.secret
+
+# Logs/runtime files
+*.log
+logs/
+*.db
+*.sqlite
+*.sqlite3
+
+# Reference repositories are local research material. Their exact revisions are
+# recorded in reference/README.md rather than vendored into this repository.
+/reference/*
+!/reference/README.md

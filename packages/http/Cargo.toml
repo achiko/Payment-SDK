@@ -1,0 +1,12 @@
+[package]
+name = "http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+transport = { path = "../transport" }
+
+[lints]
+workspace = true
+

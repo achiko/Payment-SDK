@@ -1,0 +1,13 @@
+[package]
+name = "deposits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chain-identity = { path = "../chains/identity" }
+indexing = { path = "../indexing" }
+signer = { path = "../signing/contract" }
+
+[lints]
+workspace = true

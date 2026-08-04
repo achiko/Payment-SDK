@@ -1,0 +1,15 @@
+[package]
+name = "payment-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chain-identity = { path = "../../sdk/chains/identity" }
+deposits = { path = "../../sdk/deposits" }
+indexing = { path = "../../sdk/indexing" }
+signer = { path = "../../sdk/signing/contract" }
+storage = { path = "../../sdk/storage" }
+
+[lints]
+workspace = true
