@@ -5,8 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bincode = { version = "=2.0.1", default-features = false, features = ["derive", "std"] }
 chain-identity = { path = "../chains/identity" }
 storage = { path = "../storage" }
+
+[dev-dependencies]
+futures-executor.workspace = true
 
 [lints]
 workspace = true

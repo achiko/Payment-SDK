@@ -461,7 +461,7 @@ fn invalid_public_key(message: impl Into<String>) -> ChainError {
 mod tests {
     use super::*;
     use futures_executor::block_on;
-    use indexing::{BlockHeight, BlockRef};
+    use indexing::BlockRef;
     use signer_local::LocalSigner;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -475,31 +475,6 @@ mod tests {
     }
 
     impl EthereumRpc for MockEthereumRpc {
-        fn indexing_capabilities<'a>(
-            &'a self,
-        ) -> crate::BoxFuture<'a, Result<crate::EthereumIndexingCapabilities, SourceError>>
-        {
-            Box::pin(async {
-                Ok(crate::EthereumIndexingCapabilities {
-                    block_transactions: true,
-                    receipts: true,
-                    logs: true,
-                    traces: false,
-                })
-            })
-        }
-
-        fn tip<'a>(&'a self) -> crate::BoxFuture<'a, Result<BlockRef, SourceError>> {
-            Box::pin(async { Err(unused_rpc_error()) })
-        }
-
-        fn block_at<'a>(
-            &'a self,
-            _height: BlockHeight,
-        ) -> crate::BoxFuture<'a, Result<crate::EthereumBlock, SourceError>> {
-            Box::pin(async { Err(unused_rpc_error()) })
-        }
-
         fn balance<'a>(
             &'a self,
             _address: EthereumAddress,
@@ -541,13 +516,6 @@ mod tests {
         ) -> crate::BoxFuture<'a, Result<EthereumTransactionId, SourceError>> {
             self.broadcasts.fetch_add(1, Ordering::Relaxed);
             Box::pin(async move { Ok(transaction.id) })
-        }
-    }
-
-    fn unused_rpc_error() -> SourceError {
-        SourceError {
-            message: "not used by wallet test".to_owned(),
-            retryable: false,
         }
     }
 

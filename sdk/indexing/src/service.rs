@@ -1,9 +1,9 @@
 use crate::{
-    BlockHeight, BlockRef, BoxFuture, ConfirmationPolicy, IndexError, IndexScope,
-    ObservationEventPage, ObservationEventRequest, ObservedTransaction, TransactionPage,
-    TransactionPageRequest, WatchId, WatchReceipt, WatchRequest,
+    AddressWatchRequest, BlockHeight, BlockRef, BoxFuture, ConfirmationPolicy, IndexError,
+    IndexScope, ObservationEventPage, ObservationEventRequest, ObservedTransaction,
+    TransactionPage, TransactionPageRequest, TransactionRequest, UnwatchCommand, UnwatchOutcome,
+    WatchReceipt, WatchRequest,
 };
-use chain_identity::{CanonicalAddress, CanonicalTransactionId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyncRequest {
@@ -14,13 +14,49 @@ pub struct SyncRequest {
     pub max_blocks: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncPhase {
+    Starting,
+    Reconciling,
+    CatchingUp,
+    Ready,
+    Reverting,
+    Replaying,
+    RebuildRequired,
+    Halted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RebuildReason {
+    pub checkpoint: BlockRef,
+    pub oldest_retained: BlockHeight,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyncStatus {
     pub scope: IndexScope,
     pub checkpoint: Option<BlockRef>,
     pub observed_tip: Option<BlockRef>,
     pub confirmation_policy: ConfirmationPolicy,
-    pub running: bool,
+    pub phase: SyncPhase,
+    pub rebuild_reason: Option<RebuildReason>,
+    pub halted_reason: Option<String>,
+}
+
+impl SyncStatus {
+    #[must_use]
+    pub fn starting(scope: IndexScope, confirmation_policy: ConfirmationPolicy) -> Self {
+        Self {
+            scope,
+            checkpoint: None,
+            observed_tip: None,
+            confirmation_policy,
+            phase: SyncPhase::Starting,
+            rebuild_reason: None,
+            halted_reason: None,
+        }
+    }
 }
 
 /// Internal reorg-safe synchronization loop. It is intentionally separate from
@@ -39,13 +75,16 @@ pub trait ObservationRegistry: Send + Sync {
         request: WatchRequest,
     ) -> BoxFuture<'a, Result<WatchReceipt, IndexError>>;
 
-    fn unwatch<'a>(&'a self, watch_id: &'a WatchId) -> BoxFuture<'a, Result<(), IndexError>>;
+    fn unwatch<'a>(
+        &'a self,
+        command: UnwatchCommand,
+    ) -> BoxFuture<'a, Result<UnwatchOutcome, IndexError>>;
 }
 
 pub trait ObservationQuery: Send + Sync {
     fn transaction<'a>(
         &'a self,
-        transaction_id: &'a CanonicalTransactionId,
+        request: TransactionRequest,
     ) -> BoxFuture<'a, Result<Option<ObservedTransaction>, IndexError>>;
 
     fn transactions_by_address<'a>(
@@ -55,7 +94,7 @@ pub trait ObservationQuery: Send + Sync {
 
     fn watches_for_address<'a>(
         &'a self,
-        address: &'a CanonicalAddress,
+        request: AddressWatchRequest,
     ) -> BoxFuture<'a, Result<Vec<WatchReceipt>, IndexError>>;
 }
 

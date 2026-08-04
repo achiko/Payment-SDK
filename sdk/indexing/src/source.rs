@@ -1,5 +1,5 @@
 use crate::{
-    BlockChanges, BlockHash, BlockHeight, BlockRef, BoxFuture, IndexError, IndexedBlock,
+    BlockHash, BlockHeight, BlockRef, BoxFuture, IndexError, IndexedBlock, InterpretedBlock,
     SourceError, WatchTarget,
 };
 
@@ -25,14 +25,13 @@ pub trait BlockSource: Send + Sync {
 pub trait BlockInterpreter: Send + Sync {
     type Block: IndexedBlock;
     type Target: Clone + Send + Sync + 'static;
-    type Event: Clone + Send + Sync + 'static;
     type Undo: Clone + Send + Sync + 'static;
 
     fn inspect(
         &self,
         block: &Self::Block,
         watches: &[WatchTarget<Self::Target>],
-    ) -> Result<BlockChanges<Self::Event, Self::Undo>, IndexError>;
+    ) -> Result<InterpretedBlock<Self::Undo>, IndexError>;
 }
 
 /// Mempool state is non-canonical and is intentionally separate from block sync.

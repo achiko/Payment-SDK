@@ -25,6 +25,7 @@ pub enum DepositState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Deposit {
     pub id: DepositId,
+    pub idempotency_key: IdempotencyKey,
     pub user_id: UserId,
     pub asset: AssetId,
     pub address: CanonicalAddress,

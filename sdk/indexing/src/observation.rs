@@ -1,5 +1,5 @@
-use crate::{BlockHeight, BlockRef, WatchId};
-use chain_identity::{AssetId, AtomicAmount, CanonicalAddress, CanonicalTransactionId, ChainId};
+use crate::{BlockHeight, BlockRef, IndexScope, WatchId};
+use chain_identity::{AssetId, AtomicAmount, CanonicalAddress, CanonicalTransactionId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObservationRevision(pub u64);
@@ -89,7 +89,7 @@ pub enum TransactionStatus {
 /// IX fact only. It deliberately contains no deposit, user, incoming, or sweep label.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservedTransaction {
-    pub chain: ChainId,
+    pub scope: IndexScope,
     pub transaction_id: CanonicalTransactionId,
     pub revision: ObservationRevision,
     pub status: TransactionStatus,
@@ -110,6 +110,32 @@ pub struct ObservationEvent {
     pub transaction: ObservedTransaction,
 }
 
+/// Chain-interpreted state before the repository assigns durable identity.
+///
+/// Revisions, event IDs, cursors, and previous state are deliberately absent:
+/// the repository allocates all four in the same atomic block commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservationDraft {
+    pub scope: IndexScope,
+    pub transaction_id: CanonicalTransactionId,
+    pub status: ObservationDraftStatus,
+    pub movements: Vec<ValueMovement>,
+    pub fee: Option<NetworkFee>,
+    pub watch_ids: Vec<WatchId>,
+    pub first_seen_at: u64,
+    pub observed_at: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObservationDraftStatus {
+    Included,
+    /// A canonical failed receipt. Interpreters must emit no movements for it;
+    /// the network fee may still be present.
+    Failed {
+        reason: Option<String>,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WatchSelector {
     Address(CanonicalAddress),
@@ -118,9 +144,10 @@ pub enum WatchSelector {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WatchRequest {
+    pub scope: IndexScope,
     pub selector: WatchSelector,
-    /// First block that can contain relevant history. `None` means current tip.
-    pub start_height: Option<BlockHeight>,
+    /// First block that can contain relevant history.
+    pub start_height: BlockHeight,
     /// Caller idempotency key, distinct from the IX-assigned watch ID.
     pub idempotency_key: String,
 }
@@ -128,17 +155,58 @@ pub struct WatchRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WatchReceipt {
     pub id: WatchId,
+    pub scope: IndexScope,
     pub selector: WatchSelector,
     pub start_height: BlockHeight,
     pub registered_at: Option<BlockRef>,
+    pub inactive_from: Option<BlockHeight>,
     pub confirmation_policy: ConfirmationPolicy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegisterWatchCommand<T> {
+    pub request: WatchRequest,
+    pub target: T,
+    pub registered_at: Option<BlockRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RegisterWatchOutcome {
+    Registered(WatchReceipt),
+    Existing(WatchReceipt),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnwatchCommand {
+    pub scope: IndexScope,
+    pub watch_id: WatchId,
+    pub inactive_from: BlockHeight,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnwatchOutcome {
+    Deactivated,
+    AlreadyInactive,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransactionRequest {
+    pub scope: IndexScope,
+    pub transaction_id: CanonicalTransactionId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransactionPageRequest {
+    pub scope: IndexScope,
     pub address: CanonicalAddress,
     pub after: Option<CanonicalTransactionId>,
     pub limit: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AddressWatchRequest {
+    pub scope: IndexScope,
+    pub address: CanonicalAddress,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,8 +231,9 @@ pub struct FinalityScanPage {
     pub next: Option<CanonicalTransactionId>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservationEventRequest {
+    pub scope: IndexScope,
     pub after: Option<EventCursor>,
     pub limit: usize,
 }

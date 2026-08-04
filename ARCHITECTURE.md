@@ -65,8 +65,9 @@ indexing, storage, HTTP, and JSON-RPC usable.
 - Do not introduce a `signing_plan` layer. Use builder, unsigned transaction,
   and signed transaction states.
 - Do not put concrete Bitcoin or Ethereum RPC methods in generic JSON-RPC.
-- Do not select PostgreSQL, SQLite, RocksDB, memory, or another storage backend
-  during this contract phase.
+- Do not make a storage backend part of generic chain/signing contracts.
+  Applications may select a backend after its semantics are approved; Ethereum
+  IX v1 selects RocksDB through `storage-rocksdb`.
 - Do not assume all account-oriented chains use Ethereum's nonce/value/gas
   transaction model.
 - Do not name an application `payment-service`; name executables after their
@@ -82,10 +83,11 @@ apps/api
 ├── signer boundary
 └── storage boundary
 
-apps/indexer
-├── chain-bitcoin / chain-ethereum
+apps/indexer                         (Ethereum v1 composition)
+├── chain-ethereum
 ├── indexing
-└── storage
+├── storage-rocksdb
+└── packages/http + telemetry
 
 apps/wallet
 ├── chain-bitcoin / chain-ethereum
@@ -114,3 +116,21 @@ json-rpc      -> transport
 http          -> transport
 packages/*    -> packages/* only
 ```
+
+## Ethereum Indexer v1 selection
+
+[`docs/INDEXER_SERVICE.md`](./docs/INDEXER_SERVICE.md) is the approved concrete
+selection for the first IX vertical slice. It does not weaken the ownership
+rules above:
+
+- `sdk/indexing` owns backend-independent ordered sync and semantic repository
+  commands; the application injects `storage-rocksdb`.
+- `sdk/chains/ethereum` owns Ethereum RPC methods, decoding, and fact drafts.
+- `apps/indexer` selects one Ethereum scope, source, repository, HTTP adapter,
+  telemetry, and worker supervisor.
+- `sdk/deposits` and `apps/api` own the separate PS database, retry window,
+  event mirror, projection cursor, and reconciliation cases.
+- HTTP reconciliation is authoritative; WebSocket `newHeads` messages are
+  wake-up hints only.
+- One RocksDB owner replaces distributed leasing only for v1. It does not
+  authorize multiple independent writers or claim high availability.

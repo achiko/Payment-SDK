@@ -15,6 +15,7 @@ members = [
     "sdk/signing/trezor",
     "sdk/indexing",
     "sdk/storage",
+    "sdk/storage/rocksdb",
     "packages/transport",
     "packages/json-rpc",
     "packages/http",

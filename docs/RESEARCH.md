@@ -211,3 +211,23 @@ transaction associated types.
 9. Treat block inclusion and accounting-grade confirmation as distinct states.
 10. Make observation delivery replayable and idempotent by revision.
 11. Keep long-lived collection workflow state in PS, not stateless WS.
+
+## Ethereum Indexer v1 application of the research
+
+The approved first implementation applies those principles as follows:
+
+- Blockbook's same-height hash comparison and ordered disconnect/connect model
+  becomes HTTP-authoritative reconciliation with a 50-block rollback window.
+- NBXplorer's durable watch/query/replay separation becomes a composite IX
+  repository with immutable revisions and a global event cursor.
+- Geth `newHeads` is treated as a wake-up hint because subscriptions can skip,
+  repeat, and cannot replay missed heads; polling remains authoritative.
+- Standard Execution API blocks, receipts, and logs cover top-level ETH, fees,
+  failures, contract creation, and ERC-20 transfers. Missing trace support is
+  reported instead of silently claiming internal-transfer completeness.
+- RocksDB supplies one-process path locking and atomic batches; the adapter
+  adds a serialized writer, synchronous WAL durability, explicit record
+  framing, migrations, backup, and staged generation activation.
+
+The concrete operations and limitations are recorded in
+[`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md).

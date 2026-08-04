@@ -5,8 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde = { version = "=1.0.219", default-features = false }
+serde_json = { workspace = true, features = ["raw_value"] }
 transport = { path = "../transport" }
 
 [lints]
 workspace = true
-

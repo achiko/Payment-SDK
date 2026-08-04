@@ -16,11 +16,11 @@ use alloy_primitives::B256;
 use alloy_signer::SignerSync as AlloySignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use chain_ethereum::{
-    BoxFuture as EthereumFuture, Ethereum, EthereumAddress, EthereumAsset, EthereumBlock,
-    EthereumBuildContext, EthereumIndexingCapabilities, EthereumReceipt, EthereumRpc,
-    EthereumSignedTransaction, EthereumTransactionId, EthereumTransferRequest, EthereumWallet, Wei,
+    BoxFuture as EthereumFuture, Ethereum, EthereumAddress, EthereumAsset, EthereumBuildContext,
+    EthereumReceipt, EthereumRpc, EthereumSignedTransaction, EthereumTransactionId,
+    EthereumTransferRequest, EthereumWallet, Wei,
 };
-use indexing::{BlockHeight, BlockRef, SourceError};
+use indexing::{BlockRef, SourceError};
 use serde_json::{Map, Value, json};
 use signer::{
     BoxFuture as SignerFuture, Curve, KeyLocator, KeyProvisionRequest, KeyProvisioner,
@@ -340,30 +340,6 @@ impl fmt::Debug for HttpEthereumRpc {
 }
 
 impl EthereumRpc for HttpEthereumRpc {
-    fn indexing_capabilities<'a>(
-        &'a self,
-    ) -> EthereumFuture<'a, Result<EthereumIndexingCapabilities, SourceError>> {
-        Box::pin(async {
-            Ok(EthereumIndexingCapabilities {
-                block_transactions: false,
-                receipts: false,
-                logs: false,
-                traces: false,
-            })
-        })
-    }
-
-    fn tip<'a>(&'a self) -> EthereumFuture<'a, Result<BlockRef, SourceError>> {
-        Box::pin(async { Err(unsupported_rpc("block indexing")) })
-    }
-
-    fn block_at<'a>(
-        &'a self,
-        _height: BlockHeight,
-    ) -> EthereumFuture<'a, Result<EthereumBlock, SourceError>> {
-        Box::pin(async { Err(unsupported_rpc("block lookup")) })
-    }
-
     fn balance<'a>(
         &'a self,
         address: EthereumAddress,

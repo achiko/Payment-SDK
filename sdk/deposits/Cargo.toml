@@ -5,9 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bincode = { version = "=2.0.1", default-features = false, features = ["derive", "std"] }
 chain-identity = { path = "../chains/identity" }
 indexing = { path = "../indexing" }
 signer = { path = "../signing/contract" }
+storage = { path = "../storage" }
+
+[dev-dependencies]
+storage-rocksdb = { path = "../storage/rocksdb" }
+tempfile = "=3.27.0"
+tokio = { version = "=1.49.0", features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

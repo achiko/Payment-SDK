@@ -1,32 +1,15 @@
 use crate::{
-    BoxFuture, EthereumAddress, EthereumAsset, EthereumBlock, EthereumBuildContext,
-    EthereumReceipt, EthereumSignedTransaction, EthereumTransactionId, EthereumTransferRequest,
-    Wei,
+    BoxFuture, EthereumAddress, EthereumAsset, EthereumBuildContext, EthereumReceipt,
+    EthereumSignedTransaction, EthereumTransactionId, EthereumTransferRequest, Wei,
 };
-use indexing::{BlockHeight, BlockRef, SourceError};
+use indexing::{BlockRef, SourceError};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EthereumIndexingCapabilities {
-    pub block_transactions: bool,
-    pub receipts: bool,
-    pub logs: bool,
-    /// Required if internal/native value transfers must be indexed.
-    pub traces: bool,
-}
-
-/// Concrete Ethereum RPC surface; JSON-RPC framing remains generic.
+/// Wallet-facing Ethereum RPC surface.
+///
+/// Canonical block synchronization is deliberately exposed through the
+/// separate `EthereumIndexRpc`/`BlockSource` boundary. Wallet composition must
+/// not acquire Indexer Service ownership by implementing this trait.
 pub trait EthereumRpc: Send + Sync {
-    fn indexing_capabilities<'a>(
-        &'a self,
-    ) -> BoxFuture<'a, Result<EthereumIndexingCapabilities, SourceError>>;
-
-    fn tip<'a>(&'a self) -> BoxFuture<'a, Result<BlockRef, SourceError>>;
-
-    fn block_at<'a>(
-        &'a self,
-        height: BlockHeight,
-    ) -> BoxFuture<'a, Result<EthereumBlock, SourceError>>;
-
     fn balance<'a>(
         &'a self,
         address: EthereumAddress,

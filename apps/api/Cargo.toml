@@ -6,10 +6,19 @@ rust-version.workspace = true
 
 [dependencies]
 chain-identity = { path = "../../sdk/chains/identity" }
+clap = { version = "=4.5.50", features = ["derive", "env"] }
 deposits = { path = "../../sdk/deposits" }
 indexing = { path = "../../sdk/indexing" }
-signer = { path = "../../sdk/signing/contract" }
+reqwest.workspace = true
+serde = { version = "=1.0.219", features = ["derive"] }
+serde_json.workspace = true
 storage = { path = "../../sdk/storage" }
+storage-rocksdb = { path = "../../sdk/storage/rocksdb" }
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+axum = "=0.8.4"
+tempfile = "=3.27.0"
 
 [lints]
 workspace = true

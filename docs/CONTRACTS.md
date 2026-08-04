@@ -1,6 +1,6 @@
 # Contract walkthrough
 
-The scaffold is intentionally split between compile-time chain typing and
+The repository is intentionally split between compile-time chain typing and
 runtime implementation selection.
 
 ## Chain typing
@@ -141,7 +141,16 @@ separate:
   chain facts, including multiple movements, fee, status, and revision.
 
 The same contracts can be adapted to in-process calls, HTTP, queues, polling,
-or WebSockets without changing their semantics.
+or WebSockets without changing their semantics. The first persistent
+implementation uses one composite `IndexRepository`: block/undo state,
+checkpoint movement, current observations, immutable revisions, confirmation
+advancement, and feed rows are one atomic command boundary. Interpreters return
+`ObservationDraft` values and never allocate repository revisions or cursors.
+
+For Ethereum v1, HTTP polling is canonical and optional `newHeads` only wakes
+reconciliation. The public status phase is explicit, depth 12 is confirmation
+policy rather than consensus finality, and rollback retention is 50 bundles
+plus one predecessor anchor. See [`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md).
 
 ## UTXO construction
 
@@ -173,12 +182,13 @@ through this Ethereum-shaped contract.
 
 ## Storage
 
-[`Storage`](../sdk/storage/src/storage.rs) currently proposes a small atomic
-key/value contract with version preconditions, prefix scans, and atomic write
-batches. This allows optimistic concurrency and makes it possible to persist a
-block's events, undo data, and checkpoint together.
+[`Storage`](../sdk/storage/src/storage.rs) provides a small atomic key/value
+contract with version preconditions, prefix scans, and atomic write batches.
+This allows optimistic concurrency and makes it possible to persist a block's
+events, undo data, and checkpoint together.
 
-This API is deliberately marked for validation. Backend independence does not
-mean that a key/value abstraction is automatically the correct universal
-contract. The first real index repository and wallet repository should test
-whether these mechanics are sufficient before a backend is implemented.
+The Ethereum v1 implementation validates this API with a serialized RocksDB
+adapter. Conditional reads and one synchronous WAL-backed write batch form a
+logical commit. Semantic repositories still own record schemas, idempotency,
+cursor allocation, migrations, and rebuild behavior; backend independence does
+not expose raw storage operations to application policy.

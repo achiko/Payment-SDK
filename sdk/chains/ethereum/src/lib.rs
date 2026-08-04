@@ -12,9 +12,13 @@ pub use collection::{
     EthereumCollectionAttribution, EthereumCollectionRequest, EthereumCollectionRequirement,
 };
 pub use indexer::{
-    EthereumBlock, EthereumBlockInterpreter, EthereumIndexEvent, EthereumUndo, EthereumWatchTarget,
+    EthereumBlock, EthereumBlockInterpreter, EthereumHeadWake, EthereumHttpBlockSource,
+    EthereumIndexRecordCodec, EthereumIndexRpc, EthereumIndexSourceConfig,
+    EthereumIndexingCapabilities, EthereumNewHeadsClient, EthereumNewHeadsConfig,
+    EthereumNewHeadsConnection, EthereumNewHeadsConnectionEvent, EthereumNewHeadsConnector,
+    EthereumUndo, EthereumWatchTarget, TokioTungsteniteNewHeadsConnector, parse_new_heads_wake,
 };
-pub use rpc::{EthereumIndexingCapabilities, EthereumRpc};
+pub use rpc::EthereumRpc;
 pub use transaction::{
     EthereumBuildContext, EthereumReceipt, EthereumSignedTransaction, EthereumTransactionBuilder,
     EthereumTransactionCodec, EthereumTransactionId, EthereumTransactionSigning,

@@ -12,10 +12,9 @@ own blocks and transactions.
   hash, and optional timestamp through `BlockRef`.
 - [`BlockInterpreter`](../sdk/indexing/src/source.rs) converts a chain-native
   block and active watch targets into events plus chain-owned undo data.
-- [`WatchStore`](../sdk/indexing/src/store.rs) persists targets and their first
-  relevant height.
-- [`IndexStore`](../sdk/indexing/src/store.rs) atomically commits a block or
-  reverts the current tip.
+- [`IndexRepository`](../sdk/indexing/src/store.rs) persists watches and joins
+  block/undo, observation, confirmation, checkpoint, and feed mutations in one
+  atomic semantic command.
 - [`IndexingWorker`](../sdk/indexing/src/service.rs) exposes sync and checkpoint
   status to the IX worker.
 - [`ObservationRegistry`](../sdk/indexing/src/service.rs) registers address and
@@ -24,8 +23,11 @@ own blocks and transactions.
   transaction facts by transaction ID or address.
 - [`ObservationEventSource`](../sdk/indexing/src/service.rs) provides durable,
   cursor-based replay independent of its push/poll transport.
-- [`ObservationStore`](../sdk/indexing/src/store.rs) is IX-owned and atomically
-  persists transaction revisions plus their outgoing events.
+- [`ObservationDraft`](../sdk/indexing/src/observation.rs) carries interpreted
+  facts before the repository assigns revisions, IDs, and feed cursors.
+
+The approved Ethereum v1 configuration is detailed in
+[`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md). It processes no mempool state.
 
 ## Address registration
 
@@ -115,6 +117,13 @@ Undo retention and the maximum supported reorg depth must be explicit. A reorg
 beyond retained undo data is not a normal retry; it requires a controlled
 rebuild from an earlier checkpoint.
 
+Ethereum v1 retains 50 complete reversible bundles plus one predecessor anchor.
+The parent check is only a sequential fast path: startup, polling, reconnect,
+and sequence gaps compare the persisted hash against the HTTP canonical hash.
+An exact 50-block fork can roll back to the anchor; failure to find an ancestor
+there enters `RebuildRequired` and requires the offline staged rebuild. This
+retention window is recovery capacity, not finality.
+
 ## Mempool
 
 Mempool observations are intentionally separate from canonical block changes:
@@ -146,3 +155,8 @@ Ethereum has several distinct sources of value movement:
 Standard Ethereum JSON-RPC does not guarantee historical traces. The chain RPC
 contract therefore reports indexing capabilities so the application cannot
 silently claim complete transaction history when its node cannot provide it.
+
+Ethereum v1 reports traces and internal transfers as unsupported. It indexes
+successful top-level ETH value, contract-creation value, actual receipt fees,
+fee-only failed receipts, and valid ERC-20 `Transfer` logs. Optional WebSocket
+heads are hints; one HTTP provider remains the canonical source.

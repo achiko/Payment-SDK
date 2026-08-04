@@ -2,14 +2,17 @@
 
 ## Document status
 
-This is the canonical requirements baseline for the contract-first redesign.
+This is the canonical requirements baseline for the contract-first redesign
+and its first Ethereum Indexer Service implementation.
 It gathers the product flows, service boundaries, folder rules, persistence
 semantics, accounting corrections, acceptance criteria, and unresolved
 decisions in one place.
 
-The Rust workspace currently contains interfaces and type scaffolding only.
-Networking, databases, cryptography, parsers, workers, and business-policy
-implementations are outside the current phase.
+The stateless Bitcoin/Ethereum Wallet Service execution path is implemented.
+Payment Service and Indexer Service production behavior is being implemented
+incrementally; code and acceptance tests, not trait presence, determine which
+parts are complete. The approved Ethereum v1 decisions and runbook are in
+[`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md).
 
 The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** express requirement
 strength.
@@ -32,8 +35,10 @@ must:
    replacements, and chain reorganizations; and
 10. keep concrete chain logic removable and isolated inside its chain crate.
 
-The current phase does not choose a database engine, HTTP framework, message
-broker, KMS, or concrete chain library.
+The generic requirements do not impose one backend on every deployment. The
+approved Ethereum v1 IX/PS slice selects RocksDB and Axum at the application
+composition boundary; custody, message broker, and future backend choices
+remain open.
 
 ## 2. Architectural layers and repository structure
 
@@ -944,6 +949,11 @@ webhook format remain open.
 
 ## 13. Open decisions before implementation
 
+The questions below remain open for the general multi-chain system unless a
+more focused decision record closes them. For Ethereum IX v1,
+[`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md) closes the database, transport,
+scope, confirmation, reorg, and completeness choices described there.
+
 ### 13.1 Wallet and address lifecycle
 
 - Is a wallet one root key, one chain account, one customer, or only a key
@@ -956,6 +966,12 @@ webhook format remain open.
   persistence permanently fails?
 
 ### 13.2 Index scope and completeness
+
+Ethereum v1 decision: one process and RocksDB path own one scope; all blocks are
+downloaded and locally filtered; mempool and traces are unwired; depth 12 is the
+confirmation policy; 50 reversible bundles plus one predecessor anchor are
+retained; ERC-20 `Transfer` logs are the only token standard indexed. These are
+v1 boundaries, not answers for every future chain.
 
 - How are multiple IX workers leased so only one advances a chain/network?
 - Are all blocks downloaded and filtered locally, or may a source filter?
@@ -997,6 +1013,12 @@ webhook format remain open.
 
 ### 13.6 Storage
 
+Ethereum v1 decision: semantic IX commands compose over the generic `Storage`
+contract and commit through a serialized RocksDB 0.24 writer. One synchronous
+WAL-backed batch contains block effects, observations, events, checkpoint, and
+retention changes. Records have explicit versions; migrations, backup, and
+generation-based rebuild fail closed.
+
 - Is the atomic key/value contract sufficient, or should implementations expose
   only semantic repositories?
 - What isolation and durability guarantees are mandatory?
@@ -1006,6 +1028,10 @@ webhook format remain open.
 - Which backup, restore, and rebuild procedures are required?
 
 ### 13.7 Deposit accounting
+
+Ethereum v1 decision: a post-credit reorg preserves `accounted`, corrects the
+canonical snapshot, creates an open durable `PostCreditReorg` reconciliation
+case, and blocks automatic credit/collection until explicit resolution.
 
 - Which assets can derive balance completely from events and which require
   periodic direct balance queries?
@@ -1017,6 +1043,14 @@ webhook format remain open.
 - What reservation model prevents duplicate collection?
 
 ### 13.8 Application topology and delivery
+
+Ethereum v1 decision: synchronization, reconciliation, delivery, health, and
+maintenance are supervised by `apps/indexer`. `apps/api` currently composes
+bounded watch-reconciliation and IX-ingestion maintenance runs over durable PS
+state. The independent projection cursor and atomic projection mechanics are
+implemented in `sdk/deposits`, but a long-running PS projection loop remains
+blocked on concrete business classification rules. IX delivery is at-least-once
+with a cursor; semantic effects are idempotent.
 
 - Are reconciliation and delivery loops inside existing apps or separate
   executables?

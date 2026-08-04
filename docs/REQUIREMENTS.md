@@ -21,6 +21,13 @@ should become architecture decisions and tests, not assumptions hidden in code.
 
 ## Index scope and completeness
 
+Ethereum IX v1 resolves this checklist for its own scope: one process per
+RocksDB path, all canonical blocks filtered locally, no mempool, no traces or
+internal-transfer completeness, depth 12, 50 reversible bundles plus an anchor,
+and ERC-20 `Transfer` logs only. See
+[`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md). The questions remain open for
+other chains and future versions.
+
 - How are multiple IX workers leased so only one advances a chain/network scope?
 - Are all blocks downloaded and filtered locally, or may chain-specific sources
   perform address/script filtering?
@@ -73,6 +80,11 @@ the base signer contract about Bitcoin transactions.
 
 ## Storage
 
+Ethereum IX/PS v1 selects separate RocksDB databases, a serialized conditional
+writer, synchronous atomic batches, explicit record versions/migrations, and a
+staged IX rebuild. Semantic repositories remain the public persistence
+boundary.
+
 - Is the proposed atomic key/value contract sufficient, or should semantic
   repositories own all persistence contracts?
 - What consistency and isolation guarantees are required?
@@ -83,6 +95,11 @@ the base signer contract about Bitcoin transactions.
   notifications?
 
 ## Deposit accounting
+
+Ethereum v1 handles a post-credit reorg by preserving `accounted`, opening a
+durable manual reconciliation case, correcting canonical fields in later
+absolute ledger rows, and blocking automated credit/collection until explicit
+resolution.
 
 - Which assets permit a reliable event-derived balance, and which require a
   periodic chain balance reconciliation?
@@ -97,6 +114,10 @@ the base signer contract about Bitcoin transactions.
   two concurrent jobs?
 
 ## Application API
+
+Ethereum v1 keeps reconciliation/delivery loops inside the existing apps and
+uses authenticated versioned HTTP for IX commands/queries plus cursor replay.
+Transport remains at-least-once; repository idempotency makes effects stable.
 
 - Are reconciliation and event-delivery workers separate executables or loops
   inside `apps/api` and `apps/indexer`?

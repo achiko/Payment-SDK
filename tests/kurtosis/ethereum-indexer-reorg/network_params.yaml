@@ -1,0 +1,41 @@
+participants:
+  - el_type: geth
+    el_image: ethereum/client-go@sha256:ee8af3a081fd8f780509541cf8115be03259e106375e50efa9d995400f86e15d
+    cl_type: lighthouse
+    cl_image: sigp/lighthouse@sha256:44aa773dcf274122c32cc41c4dae7124ed3cab5c267ee82174c6dfd9c688da96
+  - el_type: geth
+    el_image: ethereum/client-go@sha256:ee8af3a081fd8f780509541cf8115be03259e106375e50efa9d995400f86e15d
+    cl_type: lighthouse
+    cl_image: sigp/lighthouse@sha256:44aa773dcf274122c32cc41c4dae7124ed3cab5c267ee82174c6dfd9c688da96
+  - el_type: geth
+    el_image: ethereum/client-go@sha256:ee8af3a081fd8f780509541cf8115be03259e106375e50efa9d995400f86e15d
+    cl_type: lighthouse
+    cl_image: sigp/lighthouse@sha256:44aa773dcf274122c32cc41c4dae7124ed3cab5c267ee82174c6dfd9c688da96
+  - el_type: geth
+    el_image: ethereum/client-go@sha256:ee8af3a081fd8f780509541cf8115be03259e106375e50efa9d995400f86e15d
+    cl_type: lighthouse
+    cl_image: sigp/lighthouse@sha256:44aa773dcf274122c32cc41c4dae7124ed3cab5c267ee82174c6dfd9c688da96
+
+network_params:
+  preset: minimal
+
+additional_services:
+  - dora
+  - disruptoor
+  - otel
+
+dora_params:
+  image: ethpandaops/dora@sha256:62c209a9d26eb450b4700d7eb713b9c00be86f64ad18b17304a7b48ffdc6ff62
+
+disruptoor_params:
+  image: ethpandaops/disruptoor@sha256:835a1911ef3a5dd4192c5d5fa2d60e38a5ccac7fb77d6374ee06e40decc14fc9
+  partitions:
+    - name: isolate-indexer-branch
+      groups:
+        - participants: [1]
+        - participants: [2, 3, 4]
+      components: [el, cl]
+
+port_publisher:
+  additional_services:
+    enabled: true

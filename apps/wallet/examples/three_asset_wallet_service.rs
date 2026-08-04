@@ -12,10 +12,9 @@ use chain_bitcoin::{
     BoxFuture as BitcoinFuture, Satoshi,
 };
 use chain_ethereum::{
-    BoxFuture as EthereumFuture, Ethereum, EthereumAddress, EthereumAsset, EthereumBlock,
-    EthereumBuildContext, EthereumCollectionRequest, EthereumGenerateAddress,
-    EthereumIndexingCapabilities, EthereumReceipt, EthereumRpc, EthereumSignedTransaction,
-    EthereumTransactionId, EthereumTransferRequest, EthereumWallet, Wei,
+    BoxFuture as EthereumFuture, Ethereum, EthereumAddress, EthereumAsset, EthereumBuildContext,
+    EthereumCollectionRequest, EthereumGenerateAddress, EthereumReceipt, EthereumRpc,
+    EthereumSignedTransaction, EthereumTransactionId, EthereumTransferRequest, EthereumWallet, Wei,
 };
 use futures_executor::block_on;
 use indexing::{BlockHeight, BlockRef, SourceError};
@@ -342,30 +341,6 @@ impl BitcoinRpc for DemoBitcoinRpc {
 struct DemoEthereumRpc;
 
 impl EthereumRpc for DemoEthereumRpc {
-    fn indexing_capabilities<'a>(
-        &'a self,
-    ) -> EthereumFuture<'a, Result<EthereumIndexingCapabilities, SourceError>> {
-        Box::pin(async {
-            Ok(EthereumIndexingCapabilities {
-                block_transactions: true,
-                receipts: true,
-                logs: true,
-                traces: false,
-            })
-        })
-    }
-
-    fn tip<'a>(&'a self) -> EthereumFuture<'a, Result<BlockRef, SourceError>> {
-        Box::pin(async { Err(offline_error("Ethereum tip")) })
-    }
-
-    fn block_at<'a>(
-        &'a self,
-        _height: BlockHeight,
-    ) -> EthereumFuture<'a, Result<EthereumBlock, SourceError>> {
-        Box::pin(async { Err(offline_error("Ethereum block lookup")) })
-    }
-
     fn balance<'a>(
         &'a self,
         _address: EthereumAddress,

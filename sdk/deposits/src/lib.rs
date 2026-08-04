@@ -9,7 +9,10 @@ mod collection;
 mod deposit;
 mod error;
 mod event_log;
+mod persistent;
+mod reconciliation;
 mod store;
+mod watch_registration;
 
 pub use accounting::{
     AccountingCommand, ApplyResult, DepositBalances, DepositLedger, LedgerEntry, LedgerEntryCause,
@@ -24,10 +27,24 @@ pub use collection::{
 pub use deposit::{CreateDeposit, Deposit, DepositId, DepositState, IdempotencyKey, UserId};
 pub use error::{DepositError, DepositErrorKind};
 pub use event_log::{
-    AppendObservation, AppendOutcome, MirroredObservation, ObservationEventLog, ObservationLogPage,
-    ObservationLogRequest,
+    AppendObservation, AppendOutcome, ConsumerCheckpoint, ConsumerCheckpointName,
+    MirrorObservation, MirrorOutcome, MirroredObservation, ObservationConsumerCheckpoints,
+    ObservationEventLog, ObservationLogPage, ObservationLogRequest, ProjectObservation,
+    ProjectionOutcome,
 };
-pub use store::{CollectionStore, DepositStore};
+pub use persistent::PersistentPaymentRepository;
+pub use reconciliation::{
+    ReconciliationCase, ReconciliationCaseId, ReconciliationPage, ReconciliationPageRequest,
+    ReconciliationReason, ReconciliationState, ReconciliationStore,
+};
+pub use store::{
+    AwaitingWatchPage, AwaitingWatchPageRequest, CollectionStore, CreateDepositWithLedger,
+    CreatedDeposit, DepositStore,
+};
+pub use watch_registration::{
+    DepositAddressRequest, DepositAddressSource, DepositIndexerClient, DepositWatchCoordinator,
+    GeneratedDepositAddress, RegisterDeposit,
+};
 
 use std::{future::Future, pin::Pin};
 

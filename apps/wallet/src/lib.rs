@@ -138,13 +138,12 @@ where
 mod tests {
     use super::*;
     use chain_ethereum::{
-        Ethereum, EthereumAddress, EthereumAsset, EthereumBlock, EthereumBuildContext,
-        EthereumGenerateAddress, EthereumIndexingCapabilities, EthereumReceipt, EthereumRpc,
-        EthereumSignedTransaction, EthereumTransactionId, EthereumTransferRequest, EthereumWallet,
-        Wei,
+        Ethereum, EthereumAddress, EthereumAsset, EthereumBuildContext, EthereumGenerateAddress,
+        EthereumReceipt, EthereumRpc, EthereumSignedTransaction, EthereumTransactionId,
+        EthereumTransferRequest, EthereumWallet, Wei,
     };
     use futures_executor::block_on;
-    use indexing::{BlockHeight, BlockRef, SourceError};
+    use indexing::{BlockRef, SourceError};
     use signer_local::LocalSigner;
     use std::sync::Arc;
 
@@ -152,31 +151,6 @@ mod tests {
     struct MockEthereumRpc;
 
     impl EthereumRpc for MockEthereumRpc {
-        fn indexing_capabilities<'a>(
-            &'a self,
-        ) -> chain_ethereum::BoxFuture<'a, Result<EthereumIndexingCapabilities, SourceError>>
-        {
-            Box::pin(async {
-                Ok(EthereumIndexingCapabilities {
-                    block_transactions: true,
-                    receipts: true,
-                    logs: true,
-                    traces: false,
-                })
-            })
-        }
-
-        fn tip<'a>(&'a self) -> chain_ethereum::BoxFuture<'a, Result<BlockRef, SourceError>> {
-            Box::pin(async { Err(unused_rpc_error()) })
-        }
-
-        fn block_at<'a>(
-            &'a self,
-            _height: BlockHeight,
-        ) -> chain_ethereum::BoxFuture<'a, Result<EthereumBlock, SourceError>> {
-            Box::pin(async { Err(unused_rpc_error()) })
-        }
-
         fn balance<'a>(
             &'a self,
             _address: EthereumAddress,
@@ -220,13 +194,6 @@ mod tests {
             transaction: EthereumSignedTransaction,
         ) -> chain_ethereum::BoxFuture<'a, Result<EthereumTransactionId, SourceError>> {
             Box::pin(async move { Ok(transaction.id) })
-        }
-    }
-
-    fn unused_rpc_error() -> SourceError {
-        SourceError {
-            message: "not used by wallet service test".to_owned(),
-            retryable: false,
         }
     }
 

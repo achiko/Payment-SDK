@@ -2,10 +2,18 @@
 
 ## Verdict
 
-The scaffold now has a contract for every architectural capability in the
-original PS/WS/IX design. It is a structural fit, not a working payment system:
-all networking, storage implementations, cryptography, parsers, workers, and
-business policies are still intentionally absent.
+The repository now contains more than the original contract scaffold. The
+stateless Bitcoin/Ethereum Wallet Service execution path and the Ethereum-first
+Indexer Service vertical slice have concrete implementations, including HTTP
+JSON-RPC, Ethereum parsing, ordered synchronization, RocksDB persistence,
+reorg/rebuild recovery, and the IX HTTP API. Payment Service persistence,
+watch-retry coordination, IX event mirroring, projection mechanics, and
+post-credit reconciliation records are also implemented.
+
+It is not yet a complete working payment system. Concrete PS business
+classification rules, a production Wallet Service transport/address adapter,
+the long-running PS projection supervisor, secure production custody, and
+real-node operational evidence remain intentionally unresolved or unvalidated.
 
 The original document is accepted with five corrections required for safety:
 
@@ -60,15 +68,18 @@ Ethereum generation request types remain in their own chain crates.
 - keep IX facts free of deposit/user/incoming/sweep semantics;
 - reverse orphaned blocks and reconnect the canonical branch.
 
-Contract mapping:
+Contract and implementation mapping:
 
-- `IndexStore` owns atomic block effects, undo data, and checkpoint movement;
-- `IndexingWorker` owns synchronization for an `IndexScope { chain, network }`;
+- `IndexRepository` owns atomic block effects, undo data, observations, feed
+  rows, checkpoint movement, watches, backfills, and staged generations;
+- `OrderedSyncWorker` owns synchronization for an
+  `IndexScope { chain, network }`;
 - `WatchSelector` is `Address` or `Transaction`;
 - `ObservationRegistry`, `ObservationQuery`, and `ObservationEventSource` are
   the semantic public IX surface;
 - `ObservedTransaction` contains movements, fee, status, and revision;
-- `ObservationStore` persists IX facts and its durable event feed atomically.
+- `PersistentIndexRepository` persists IX facts and its durable event feed
+  atomically over the injected `Storage` contract.
 
 An observation is not constrained to a fake single `from/to/amount` tuple.
 UTXO inputs and outputs are independent movements, while EVM native, internal,
@@ -205,19 +216,19 @@ recoverable.
 
 | Original requirement | Scaffold location | Structural status |
 |---|---|---|
-| PS user-facing composition | `apps/api` | Present, implementation empty |
+| PS maintenance composition | `apps/api` | Watch reconciliation, IX ingestion, and projection-backlog status implemented; public deposit creation and business projection supervisor pending |
 | Stateless WS composition | `apps/wallet` | Present; no direct storage/backend |
-| Independent IX composition | `apps/indexer` | Present, implementation empty |
-| Per-chain checkpoint height/hash | `IndexScope`, `IndexStore`, `SyncStatus` | Present |
-| Wait for provable depth | `ConfirmationPolicy`, `Included`, `ConfirmationProof` | Present |
-| `watch(address)` / `watch(txid)` | `ObservationRegistry`, `WatchSelector` | Present |
-| `txs(address)` / `tx(txid)` | `ObservationQuery` | Present |
-| Replayable state events | `ObservationEventSource`, `EventCursor` | Present |
-| IX facts only | `ObservedTransaction`, `ValueMovement` | Present |
-| IX-owned persistence | `ObservationStore` | Contract present; backend absent |
-| PS append-only event mirror | `ObservationEventLog` | Contract present; backend absent |
+| Independent IX composition | `apps/indexer` | Runnable Ethereum worker, API, health, metrics, and maintenance commands implemented |
+| Per-chain checkpoint height/hash | `IndexScope`, `IndexRepository`, `SyncStatus` | Implemented for the Ethereum slice |
+| Wait for provable depth | `ConfirmationPolicy`, `Included`, `ConfirmationProof` | Depth-12 transitions implemented and persisted |
+| `watch(address)` / `watch(txid)` | `ObservationRegistry`, `WatchSelector` | Implemented through repository and IX HTTP API |
+| `txs(address)` / `tx(txid)` | `ObservationQuery` | Implemented through repository and IX HTTP API |
+| Replayable state events | `ObservationEventSource`, `EventCursor` | Persistent cursor feed implemented |
+| IX facts only | `ObservedTransaction`, `ValueMovement` | Implemented without PS semantics |
+| IX-owned persistence | `PersistentIndexRepository`, `storage-rocksdb` | Implemented with atomic batches and explicit RecordV1 formats |
+| PS append-only event mirror | `PersistentPaymentRepository` | Implemented with atomic ingestion cursor advancement |
 | PS classification | `ObservationClassifier` | Contract present; rules absent |
-| Absolute deposit balance journal | `LedgerEntry`, `DepositBalances` | Present; backend absent |
+| Absolute deposit balance journal | `LedgerEntry`, `DepositBalances` | Persisted projection mechanics and reorg corrections implemented; production classifier pending |
 | Included vs deep-confirmed amount | `received`, `confirmed` snapshot fields | Present |
 | Internal user credit | `AccountingCommand` | Present |
 | Generic address generation flow | `KeyProvisioner`, `DepositAddressGenerator<C>` | Present |
@@ -228,7 +239,7 @@ recoverable.
 | ERC-20 prefund then sweep | PS collection legs + Ethereum requirement | Gas requirement and one token sweep implemented; PS still sequences prefunding |
 | Retry pending broadcasts | `CollectionLegState::Broadcast` with optional IX watch | Present |
 | Local/Trezor substitution | `Signer` and separate signer crates | Ephemeral local ECDSA/Schnorr signing implemented; Trezor remains a placeholder |
-| Concrete storage engine | intentionally absent | Out of current scope |
+| Concrete storage engine | `sdk/storage/rocksdb` | Implemented for IX and PS as separate database paths |
 
 ## Corrections to the original accounting statements
 
@@ -299,7 +310,7 @@ apps/api
        -> signer
 
 apps/indexer
-  -> chain-bitcoin / chain-ethereum
+  -> chain-ethereum
        -> indexing -> storage
        -> transaction model + signer contract
 
@@ -318,20 +329,27 @@ State ownership is consequently enforceable:
 - no chain imports deposit/user/accounting semantics;
 - no generic signer imports a chain.
 
-## Deliberately not validated yet
+## Deliberately not validated or composed yet
 
-Compilation cannot establish:
+Compilation still cannot establish:
 
 - chain parser completeness;
-- exact confirmation thresholds;
-- finality behavior for every network;
-- transactional guarantees of a real PS or IX store;
+- finality behavior for every network beyond the explicit Ethereum v1 depth
+  policy;
+- transactional guarantees beyond the real-store failure tests that have run;
 - race-free UTXO and nonce reservations;
 - fee, dust, token-tax, rebasing, or balance reconciliation policy;
 - secure custody and remote signer transport;
 - webhook/event delivery authentication;
-- correctness of reorg inverses;
-- operational recovery from a reorg deeper than retained undo data.
+- correctness of reorg inverses not covered by deterministic or real-node
+  tests;
+- end-to-end PS address creation through a production Wallet Service adapter;
+- production PS classification/projection supervision;
+- the composed IX service against a live Ethereum node; and
+- the checked-in Kurtosis/Disruptoor scenario, which remains opt-in and has not
+  been executed as part of ordinary Rust validation.
 
-Those become implementation tests and architecture decisions after these
-contracts are accepted.
+Ethereum v1 fixes depth 12, rollback retention 50, a RocksDB atomic repository,
+and staged rebuild as testable acceptance criteria. It intentionally does not
+claim Ethereum finality, mempool coverage, traces, internal transfers, or all
+token behavior. See [`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md).
