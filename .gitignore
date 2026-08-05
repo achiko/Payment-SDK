@@ -32,3 +32,5 @@ logs/
 # recorded in reference/README.md rather than vendored into this repository.
 /reference/*
 !/reference/README.md
+
+/anvil_blocks
