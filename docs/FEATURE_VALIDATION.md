@@ -6,14 +6,19 @@ The repository now contains more than the original contract scaffold. The
 stateless Bitcoin/Ethereum Wallet Service execution path and the Ethereum-first
 Indexer Service vertical slice have concrete implementations, including HTTP
 JSON-RPC, Ethereum parsing, ordered synchronization, RocksDB persistence,
-reorg/rebuild recovery, and the IX HTTP API. Payment Service persistence,
-watch-retry coordination, IX event mirroring, projection mechanics, and
-post-credit reconciliation records are also implemented.
+reorg/rebuild recovery, and the IX HTTP API. The Ethereum v1 Payment Service
+source now also includes authenticated public/admin APIs, durable users/jobs
+and command idempotency, deposit/watch recovery, IX mirroring, storage-aware
+classification, absolute ledger projection, a per-deposit observation index,
+typed reconciliation, and native/ERC-20 collection execution. The stateless
+Ethereum Wallet HTTP process uses the concrete RPC adapter and remote-custody
+client and owns no database.
 
-It is not yet a complete working payment system. Concrete PS business
-classification rules, a production Wallet Service transport/address adapter,
-the long-running PS projection supervisor, secure production custody, and
-real-node operational evidence remain intentionally unresolved or unvalidated.
+This is still not evidence of a production deployment. The external durable
+custody service, real-node/Anvil evidence, HA, and multi-network ownership in a
+single PS store are absent or deliberately excluded. The complete failure-window
+test matrix and a single physical commit spanning IX-driven collection-leg and
+ledger/projection-cursor transitions remain acceptance work.
 
 The original document is accepted with five corrections required for safety:
 
@@ -165,6 +170,7 @@ and lowers `collected` without modifying any earlier row.
 - build a chain-native unsigned transaction;
 - inject a generic signer;
 - produce a chain-native signed transaction;
+- prepare a signed Ethereum collection envelope without broadcasting it;
 - broadcast it;
 - read its receipt;
 - perform one stateless collection attempt.
@@ -175,13 +181,18 @@ Contract mapping:
   interface;
 - `TransferBuilder -> TransactionSigner -> Broadcaster` preserves the unsigned
   and signed states;
-- `Collector<C>` reports factual requirements and broadcasts one collection
-  transaction;
+- `Collector<C>` reports factual requirements and retains the compatible
+  prepare-then-broadcast one-shot operation;
+- `EthereumWallet::prepare_collection` returns the exact signed envelope and
+  attribution before the broadcast side effect;
 - `WalletFactory<C>` selects the stateless per-asset adapter exposed by WS;
 - concrete `CollectionRequest`, `CollectionRequirement`, and attribution types
   live in the Bitcoin or Ethereum crate.
 
-The `apps/wallet` composition root deliberately selects no storage or DB backend.
+The `apps/wallet` composition root deliberately selects no storage or DB
+backend. It now serves authenticated ETH/ERC-20 address, balance, signing,
+collection-requirement, collection-preparation, exact-envelope broadcast, and
+receipt endpoints over bounded JSON.
 
 ### 6. Collection modes
 
@@ -216,8 +227,8 @@ recoverable.
 
 | Original requirement | Scaffold location | Structural status |
 |---|---|---|
-| PS maintenance composition | `apps/api` | Watch reconciliation, IX ingestion, and projection-backlog status implemented; public deposit creation and business projection supervisor pending |
-| Stateless WS composition | `apps/wallet` | Present; no direct storage/backend |
+| PS runtime composition | `apps/api` | Authenticated API, durable jobs, watch reconciliation, IX ingestion/projection, expiration, collection, readiness, backup, and migration implemented for one Ethereum scope |
+| Stateless WS composition | `apps/wallet` | Authenticated Ethereum HTTP runtime with concrete RPC and remote custody; no direct storage/backend |
 | Independent IX composition | `apps/indexer` | Runnable Ethereum worker, API, health, metrics, and maintenance commands implemented |
 | Per-chain checkpoint height/hash | `IndexScope`, `IndexRepository`, `SyncStatus` | Implemented for the Ethereum slice |
 | Wait for provable depth | `ConfirmationPolicy`, `Included`, `ConfirmationProof` | Depth-12 transitions implemented and persisted |
@@ -226,20 +237,23 @@ recoverable.
 | Replayable state events | `ObservationEventSource`, `EventCursor` | Persistent cursor feed implemented |
 | IX facts only | `ObservedTransaction`, `ValueMovement` | Implemented without PS semantics |
 | IX-owned persistence | `PersistentIndexRepository`, `storage-rocksdb` | Implemented with atomic batches and explicit RecordV1 formats |
-| PS append-only event mirror | `PersistentPaymentRepository` | Implemented with atomic ingestion cursor advancement |
-| PS classification | `ObservationClassifier` | Contract present; rules absent |
-| Absolute deposit balance journal | `LedgerEntry`, `DepositBalances` | Persisted projection mechanics and reorg corrections implemented; production classifier pending |
+| PS append-only event mirror | `PersistentPaymentRepository` | Implemented with atomic ingestion cursor advancement and durable deposit-to-observation indexing |
+| PS classification | `ObservationClassifier`, `apps/api::runtime` | Storage-aware precedence and unresolved-fact projection stop implemented |
+| Absolute deposit balance journal | `LedgerEntry`, `DepositBalances` | Checked absolute projection, network-fee handling, reorg correction, and accounting isolation implemented |
 | Included vs deep-confirmed amount | `received`, `confirmed` snapshot fields | Present |
-| Internal user credit | `AccountingCommand` | Present |
+| Internal user credit | `AccountingCommand` | Administrator-only absolute command with expected-head and idempotency checks implemented |
+| Post-credit reconciliation | `ReconciliationStore` | Typed reverse-credit, accepted-liability, and external-debt decisions implemented |
 | Generic address generation flow | `KeyProvisioner`, `DepositAddressGenerator<C>` | Present |
 | Balance read | `BalanceReader<C>` | Implemented for Bitcoin and Ethereum/ERC-20 through injected RPC |
 | Build/sign/broadcast | chain transaction capabilities | Bitcoin SegWit/Taproot and Ethereum EIP-1559 implemented |
-| Wallet/account collection | `Collector<C>`, account collection request | Native Ethereum collection implemented |
+| Wallet/account collection | `Collector<C>`, PS collection executor | Native Ethereum durable reservation/sign/broadcast/watch workflow implemented |
 | BTC batched collection | Bitcoin collection request + attribution | Implemented with gross-input attribution |
-| ERC-20 prefund then sweep | PS collection legs + Ethereum requirement | Gas requirement and one token sweep implemented; PS still sequences prefunding |
-| Retry pending broadcasts | `CollectionLegState::Broadcast` with optional IX watch | Present |
-| Local/Trezor substitution | `Signer` and separate signer crates | Ephemeral local ECDSA/Schnorr signing implemented; Trezor remains a placeholder |
+| ERC-20 prefund then sweep | PS collection legs + Ethereum requirement | PS persists planned gas funding, waits for its IX confirmation, then advances the token sweep |
+| Retry pending broadcasts | signed-envelope record + `CollectionLegState` | Exact envelope persists before broadcast; replay verifies hash and attaches an idempotent IX watch |
+| Fee and chain policy | Ethereum envelope inspection + PS policy | Numeric chain ID, gas limit, fee caps, and maximum total fee enforced before collection broadcast |
+| Local/remote/Trezor substitution | `Signer` and separate signer crates | Ephemeral local signer and authenticated remote adapter implemented; Trezor remains a placeholder |
 | Concrete storage engine | `sdk/storage/rocksdb` | Implemented for IX and PS as separate database paths |
+| PS schema migration | `PaymentDatabaseMetadataStore`, `payment-api migrate` | Verified physical backup, semantic validation/index rebuild, and fail-closed schema-v2 binding implemented |
 
 ## Corrections to the original accounting statements
 
@@ -288,8 +302,10 @@ later reorg can reduce canonical `confirmed`. The business must choose one of:
 - post an explicit accounting reversal/debt entry after reorg;
 - accept reorg loss as a business risk.
 
-The scaffold appends explicit `AccountingCommand` rows and does not silently
-decrement user balances.
+The implementation appends explicit `AccountingCommand` rows and does not
+silently decrement user balances. After a post-credit reorg it opens a blocking
+case; an administrator must record a typed reverse-credit, accepted-liability,
+or external-debt decision.
 
 ### “Keys live in PS” means custody authority, not raw bytes in every call
 
@@ -329,22 +345,26 @@ State ownership is consequently enforceable:
 - no chain imports deposit/user/accounting semantics;
 - no generic signer imports a chain.
 
-## Deliberately not validated or composed yet
+## Deliberately not validated, excluded, or still open
 
-Compilation still cannot establish:
+Source structure and deterministic tests cannot establish:
 
 - chain parser completeness;
 - finality behavior for every network beyond the explicit Ethereum v1 depth
   policy;
-- transactional guarantees beyond the real-store failure tests that have run;
+- production filesystem, process, and crash behavior beyond the real-store
+  deterministic tests that have run;
 - race-free UTXO and nonce reservations;
-- fee, dust, token-tax, rebasing, or balance reconciliation policy;
-- secure custody and remote signer transport;
+- nonstandard token-tax/rebasing behavior or unsupported token policies;
+- security and durability of the external custody service (the authenticated,
+  bounded remote signer client is implemented, not the custody server);
 - webhook/event delivery authentication;
 - correctness of reorg inverses not covered by deterministic or real-node
   tests;
-- end-to-end PS address creation through a production Wallet Service adapter;
-- production PS classification/projection supervision;
+- one physical PS transaction spanning collection-leg transitions and the
+  corresponding ledger/reconciliation/projection-cursor commit;
+- the complete PS crash-window, restart, and collection workflow test matrix;
+- the opt-in PS/WS/IX Anvil end-to-end scenario;
 - the composed IX service against a live Ethereum node; and
 - the checked-in Kurtosis/Disruptoor scenario, which remains opt-in and has not
   been executed as part of ordinary Rust validation.
@@ -352,4 +372,9 @@ Compilation still cannot establish:
 Ethereum v1 fixes depth 12, rollback retention 50, a RocksDB atomic repository,
 and staged rebuild as testable acceptance criteria. It intentionally does not
 claim Ethereum finality, mempool coverage, traces, internal transfers, or all
-token behavior. See [`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md).
+token behavior. Payment Service v1 similarly fixes one exclusive RocksDB owner,
+one Ethereum scope/feed, explicit business commands, and polling-only delivery;
+it intentionally does not claim HA, one database spanning multiple networks,
+Bitcoin PS behavior, webhooks, automatic credit/collection, fee replacement, or
+production custody. See [`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md) and
+[`PAYMENT_SERVICE.md`](./PAYMENT_SERVICE.md).

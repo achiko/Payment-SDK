@@ -5,5 +5,9 @@ mod unsigned;
 
 pub use builder::{EthereumBuildContext, EthereumTransactionBuilder, EthereumTransferRequest};
 pub use codec::EthereumTransactionCodec;
-pub use signed::{EthereumReceipt, EthereumSignedTransaction, EthereumTransactionId};
+pub use signed::{
+    EthereumEip1559FeeInspection, EthereumEip1559InspectionError, EthereumReceipt,
+    EthereumSignedTransaction, EthereumSignedTransactionError, EthereumTransactionId,
+    EthereumTransactionIdParseError,
+};
 pub use unsigned::{EthereumTransactionSigning, UnsignedEthereumTransaction};

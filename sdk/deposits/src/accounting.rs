@@ -1,5 +1,9 @@
-use crate::{BoxFuture, DepositError, DepositId, IdempotencyKey};
-use chain_identity::AtomicAmount;
+use std::{error::Error, fmt};
+
+use crate::{
+    BoxFuture, CommandIdentity, DepositError, DepositId, IdempotencyKey, ReconciliationCaseId,
+};
+use chain_identity::{AtomicAmount, AtomicAmountArithmeticError};
 use indexing::{MovementId, ObservationEventId, ObservationRevision, TransactionStatus};
 
 /// Absolute balances after one ledger transition. Every ledger row stores the
@@ -21,6 +25,26 @@ pub struct DepositBalances {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProjectionId(pub String);
 
+impl ProjectionId {
+    /// Builds the stable idempotency identity for one IX revision and deposit.
+    /// Length-prefixing prevents delimiter ambiguity in opaque IDs.
+    #[must_use]
+    pub fn for_observation(
+        event_id: &ObservationEventId,
+        revision: ObservationRevision,
+        deposit_id: &DepositId,
+    ) -> Self {
+        Self(format!(
+            "ix:{}:{}:{}:{}:{}",
+            event_id.0.len(),
+            event_id.0,
+            revision.0,
+            deposit_id.0.len(),
+            deposit_id.0
+        ))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LedgerEntryId(pub String);
 
@@ -30,7 +54,364 @@ pub enum LedgerObservationKind {
     Collection,
     GasFunding,
     OtherBalanceChange,
+    /// Retained only so existing RecordV1 rows remain decodable. New
+    /// transitions retain their business classification when reorged.
     Reorg,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BalanceDirection {
+    Credit,
+    Debit,
+}
+
+/// A classified PS balance effect. Before persistence, `T` is a stable IX
+/// [`MovementId`]; the transition engine receives amounts resolved from the
+/// mirrored IX event, never amounts supplied independently by an API caller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LedgerEffect<T> {
+    Incoming {
+        movements: Vec<T>,
+    },
+    Collection {
+        movements: Vec<T>,
+    },
+    GasFunding {
+        movements: Vec<T>,
+    },
+    OtherBalanceChange {
+        direction: BalanceDirection,
+        movements: Vec<T>,
+    },
+}
+
+impl<T> LedgerEffect<T> {
+    #[must_use]
+    pub const fn kind(&self) -> LedgerObservationKind {
+        match self {
+            Self::Incoming { .. } => LedgerObservationKind::Incoming,
+            Self::Collection { .. } => LedgerObservationKind::Collection,
+            Self::GasFunding { .. } => LedgerObservationKind::GasFunding,
+            Self::OtherBalanceChange { .. } => LedgerObservationKind::OtherBalanceChange,
+        }
+    }
+
+    #[must_use]
+    pub fn movements(&self) -> &[T] {
+        match self {
+            Self::Incoming { movements }
+            | Self::Collection { movements }
+            | Self::GasFunding { movements }
+            | Self::OtherBalanceChange { movements, .. } => movements,
+        }
+    }
+}
+
+pub type ObservationLedgerEffect = LedgerEffect<MovementId>;
+
+/// Fully resolved input to the pure ledger engine. Repositories construct this
+/// from a durable IX revision plus PS classification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LedgerObservationTransition {
+    pub status: TransactionStatus,
+    pub previous_status: Option<TransactionStatus>,
+    pub effect: LedgerEffect<AtomicAmount>,
+    /// Network fee resolved from the mirrored IX fact when the deposit address
+    /// is the payer and the fee asset is the deposit asset.
+    pub network_fee: Option<AtomicAmount>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LedgerBalanceField {
+    Received,
+    Confirmed,
+    Balance,
+    Collected,
+}
+
+impl fmt::Display for LedgerBalanceField {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Received => "received",
+            Self::Confirmed => "confirmed",
+            Self::Balance => "balance",
+            Self::Collected => "collected",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LedgerArithmeticOperation {
+    Add,
+    Subtract,
+}
+
+impl fmt::Display for LedgerArithmeticOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Add => "add",
+            Self::Subtract => "subtract",
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LedgerTransitionError {
+    EmptyEffect,
+    MissingPreviousStatus,
+    Arithmetic {
+        field: LedgerBalanceField,
+        operation: LedgerArithmeticOperation,
+        source: AtomicAmountArithmeticError,
+    },
+}
+
+impl fmt::Display for LedgerTransitionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyEffect => formatter.write_str(
+                "an observation ledger effect must contain at least one movement amount or an eligible network fee",
+            ),
+            Self::MissingPreviousStatus => formatter.write_str(
+                "a terminal observation status must identify the previous status to reverse",
+            ),
+            Self::Arithmetic {
+                field,
+                operation,
+                source,
+            } => write!(
+                formatter,
+                "cannot {operation} the observation amount for ledger field `{field}`: {source}"
+            ),
+        }
+    }
+}
+
+impl Error for LedgerTransitionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Arithmetic { source, .. } => Some(source),
+            Self::EmptyEffect | Self::MissingPreviousStatus => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CanonicalPhase {
+    Absent,
+    Included,
+    Confirmed,
+}
+
+fn canonical_phase(status: &TransactionStatus) -> CanonicalPhase {
+    match status {
+        TransactionStatus::Included { .. } => CanonicalPhase::Included,
+        TransactionStatus::Confirmed { .. } => CanonicalPhase::Confirmed,
+        TransactionStatus::Pending
+        | TransactionStatus::Failed { .. }
+        | TransactionStatus::Replaced { .. }
+        | TransactionStatus::Dropped
+        | TransactionStatus::Reorged { .. } => CanonicalPhase::Absent,
+    }
+}
+
+fn is_terminal(status: &TransactionStatus) -> bool {
+    matches!(
+        status,
+        TransactionStatus::Failed { block: None, .. }
+            | TransactionStatus::Replaced { .. }
+            | TransactionStatus::Dropped
+            | TransactionStatus::Reorged { .. }
+    )
+}
+
+fn movement_total(
+    effect: &LedgerEffect<AtomicAmount>,
+) -> Result<Option<AtomicAmount>, LedgerTransitionError> {
+    let Some((first, rest)) = effect.movements().split_first() else {
+        return Ok(None);
+    };
+    rest.iter()
+        .try_fold(*first, |total, amount| {
+            total
+                .checked_add(amount)
+                .map_err(|source| LedgerTransitionError::Arithmetic {
+                    field: LedgerBalanceField::Balance,
+                    operation: LedgerArithmeticOperation::Add,
+                    source,
+                })
+        })
+        .map(Some)
+}
+
+fn update_field(
+    value: &mut AtomicAmount,
+    amount: &AtomicAmount,
+    field: LedgerBalanceField,
+    operation: LedgerArithmeticOperation,
+) -> Result<(), LedgerTransitionError> {
+    *value = match operation {
+        LedgerArithmeticOperation::Add => value.checked_add(amount),
+        LedgerArithmeticOperation::Subtract => value.checked_sub(amount),
+    }
+    .map_err(|source| LedgerTransitionError::Arithmetic {
+        field,
+        operation,
+        source,
+    })?;
+    Ok(())
+}
+
+fn inverse(operation: LedgerArithmeticOperation) -> LedgerArithmeticOperation {
+    match operation {
+        LedgerArithmeticOperation::Add => LedgerArithmeticOperation::Subtract,
+        LedgerArithmeticOperation::Subtract => LedgerArithmeticOperation::Add,
+    }
+}
+
+fn contribution_operations(
+    effect: &LedgerEffect<AtomicAmount>,
+    phase: CanonicalPhase,
+) -> Vec<(LedgerBalanceField, LedgerArithmeticOperation)> {
+    use LedgerArithmeticOperation::{Add, Subtract};
+    use LedgerBalanceField::{Balance, Collected, Confirmed, Received};
+
+    match (effect, phase) {
+        (_, CanonicalPhase::Absent) => Vec::new(),
+        (LedgerEffect::Incoming { .. }, CanonicalPhase::Included) => {
+            vec![(Received, Add), (Balance, Add)]
+        }
+        (LedgerEffect::Incoming { .. }, CanonicalPhase::Confirmed) => {
+            vec![(Received, Add), (Confirmed, Add), (Balance, Add)]
+        }
+        (LedgerEffect::Collection { .. }, CanonicalPhase::Included) => {
+            vec![(Balance, Subtract)]
+        }
+        (LedgerEffect::Collection { .. }, CanonicalPhase::Confirmed) => {
+            vec![(Balance, Subtract), (Collected, Add)]
+        }
+        (LedgerEffect::GasFunding { .. }, CanonicalPhase::Included | CanonicalPhase::Confirmed) => {
+            vec![(Balance, Add)]
+        }
+        (
+            LedgerEffect::OtherBalanceChange {
+                direction: BalanceDirection::Credit,
+                ..
+            },
+            CanonicalPhase::Included | CanonicalPhase::Confirmed,
+        ) => vec![(Balance, Add)],
+        (
+            LedgerEffect::OtherBalanceChange {
+                direction: BalanceDirection::Debit,
+                ..
+            },
+            CanonicalPhase::Included | CanonicalPhase::Confirmed,
+        ) => vec![(Balance, Subtract)],
+    }
+}
+
+fn network_fee_operations(
+    kind: LedgerObservationKind,
+    status: &TransactionStatus,
+) -> Vec<(LedgerBalanceField, LedgerArithmeticOperation)> {
+    use LedgerArithmeticOperation::{Add, Subtract};
+    use LedgerBalanceField::{Balance, Collected};
+
+    let canonical = matches!(
+        status,
+        TransactionStatus::Included { .. }
+            | TransactionStatus::Confirmed { .. }
+            | TransactionStatus::Failed { block: Some(_), .. }
+    );
+    if !canonical {
+        return Vec::new();
+    }
+
+    let mut operations = vec![(Balance, Subtract)];
+    if kind == LedgerObservationKind::Collection
+        && matches!(status, TransactionStatus::Confirmed { .. })
+    {
+        operations.push((Collected, Add));
+    }
+    operations
+}
+
+fn apply_operations(
+    balances: &mut DepositBalances,
+    amount: &AtomicAmount,
+    operations: impl IntoIterator<Item = (LedgerBalanceField, LedgerArithmeticOperation)>,
+) -> Result<(), LedgerTransitionError> {
+    for (field, operation) in operations {
+        let value = match field {
+            LedgerBalanceField::Received => &mut balances.received,
+            LedgerBalanceField::Confirmed => &mut balances.confirmed,
+            LedgerBalanceField::Balance => &mut balances.balance,
+            LedgerBalanceField::Collected => &mut balances.collected,
+        };
+        update_field(value, amount, field, operation)?;
+    }
+    Ok(())
+}
+
+/// Applies one IX revision to a complete absolute ledger snapshot.
+///
+/// The prior status contribution is removed before the new status contribution
+/// is applied. Movements and an eligible network fee are tracked separately:
+/// the fee debits canonical balance for included, confirmed, and block-backed
+/// failed observations, while only a confirmed collection adds it to
+/// `collected`. This makes confirmation, failure, reorg, and re-inclusion
+/// deterministic without trusting a caller-supplied absolute balance.
+/// `accounted` is copied unchanged.
+///
+/// # Errors
+///
+/// Returns a structured error when neither movements nor a fee are present,
+/// when a non-canonical terminal revision lacks a prior status, or on any
+/// unsigned 256-bit overflow/underflow.
+pub fn apply_observation_transition(
+    current: DepositBalances,
+    transition: &LedgerObservationTransition,
+) -> Result<DepositBalances, LedgerTransitionError> {
+    if is_terminal(&transition.status) && transition.previous_status.is_none() {
+        return Err(LedgerTransitionError::MissingPreviousStatus);
+    }
+
+    let movement_total = movement_total(&transition.effect)?;
+    if movement_total.is_none() && transition.network_fee.is_none() {
+        return Err(LedgerTransitionError::EmptyEffect);
+    }
+
+    let mut next = current;
+    if let Some(previous_status) = transition.previous_status.as_ref() {
+        if let Some(amount) = movement_total.as_ref() {
+            let removal =
+                contribution_operations(&transition.effect, canonical_phase(previous_status))
+                    .into_iter()
+                    .map(|(field, operation)| (field, inverse(operation)));
+            apply_operations(&mut next, amount, removal)?;
+        }
+        if let Some(network_fee) = transition.network_fee.as_ref() {
+            let removal = network_fee_operations(transition.effect.kind(), previous_status)
+                .into_iter()
+                .map(|(field, operation)| (field, inverse(operation)));
+            apply_operations(&mut next, network_fee, removal)?;
+        }
+    }
+    if let Some(amount) = movement_total.as_ref() {
+        apply_operations(
+            &mut next,
+            amount,
+            contribution_operations(&transition.effect, canonical_phase(&transition.status)),
+        )?;
+    }
+    if let Some(network_fee) = transition.network_fee.as_ref() {
+        apply_operations(
+            &mut next,
+            network_fee,
+            network_fee_operations(transition.effect.kind(), &transition.status),
+        )?;
+    }
+    Ok(next)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,9 +427,22 @@ pub enum LedgerEntryCause {
         kind: LedgerObservationKind,
         /// Stable pointers into the mirrored IX fact that changed this deposit.
         movement_ids: Vec<MovementId>,
+        /// Eligible fee amount after repository validation of the mirrored
+        /// fee asset and payer. The status determines whether it contributes;
+        /// legacy rows decode this as `None`.
+        network_fee: Option<AtomicAmount>,
     },
     Accounting {
         idempotency_key: IdempotencyKey,
+        reason: String,
+    },
+    /// Explicit business correction made while resolving a durable
+    /// reconciliation case. Only `accounted` may differ from the previous
+    /// absolute snapshot.
+    ReconciliationResolution {
+        case_id: ReconciliationCaseId,
+        idempotency_key: IdempotencyKey,
+        reason: String,
     },
 }
 
@@ -71,19 +465,15 @@ pub struct LedgerEntry {
     pub recorded_at: u64,
 }
 
-/// Projection result calculated from a classified IX event. The store appends
-/// `next_balances` only if `expected_head` is still the current ledger row.
+/// PS classification for one deposit and mirrored IX event. Callers identify
+/// relevant movement IDs; persistence resolves all amounts and status history
+/// from the immutable mirror and computes the absolute snapshot itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecordObservationBalance {
-    pub projection_id: ProjectionId,
+pub struct RecordObservation {
     pub event_id: ObservationEventId,
-    pub observation_revision: ObservationRevision,
-    pub status: TransactionStatus,
-    pub kind: LedgerObservationKind,
-    pub movement_ids: Vec<MovementId>,
+    pub effect: ObservationLedgerEffect,
     pub deposit_id: DepositId,
     pub expected_head: Option<LedgerEntryId>,
-    pub next_balances: DepositBalances,
     pub recorded_at: u64,
 }
 
@@ -91,10 +481,15 @@ pub struct RecordObservationBalance {
 /// only `accounted`, then appends a new absolute snapshot row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountingCommand {
-    pub idempotency_key: IdempotencyKey,
+    /// Scoped caller idempotency. `operation` must be
+    /// [`crate::CommandOperation::Accounting`].
+    pub command: CommandIdentity,
     pub deposit_id: DepositId,
     pub expected_head: Option<LedgerEntryId>,
     pub next_accounted: AtomicAmount,
+    /// Human-readable administrator/business justification retained in the
+    /// immutable audit row. It must be non-blank and at most 1,024 bytes.
+    pub reason: String,
     pub recorded_at: u64,
 }
 
@@ -131,12 +526,13 @@ pub trait DepositLedger: Send + Sync {
         request: LedgerPageRequest,
     ) -> BoxFuture<'a, Result<LedgerPage, DepositError>>;
 
-    /// Appends the absolute snapshot. Implementations must preserve `accounted`
-    /// for observation rows, apply optimistic head matching, and reject changes
-    /// inconsistent with the supplied IX status and observation kind.
+    /// Resolves and appends the absolute snapshot. Implementations must
+    /// preserve `accounted`, apply optimistic head matching, and derive IX
+    /// status, revision, movement amounts, and eligible network fee from the
+    /// durable event mirror.
     fn record_observation<'a>(
         &'a self,
-        command: RecordObservationBalance,
+        command: RecordObservation,
     ) -> BoxFuture<'a, Result<ApplyResult, DepositError>>;
 
     /// Appends a new absolute row by copying on-chain fields from the current
@@ -146,4 +542,381 @@ pub trait DepositLedger: Send + Sync {
         &'a self,
         command: AccountingCommand,
     ) -> BoxFuture<'a, Result<ApplyResult, DepositError>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chain_identity::{CanonicalTransactionId, ChainId};
+    use indexing::{BlockHash, BlockHeight, BlockRef, ConfirmationProof};
+
+    fn amount(value: u64) -> AtomicAmount {
+        let mut bytes = [0; 32];
+        bytes[24..].copy_from_slice(&value.to_be_bytes());
+        AtomicAmount(bytes)
+    }
+
+    fn block(height: u64) -> BlockRef {
+        BlockRef {
+            height: BlockHeight(height),
+            hash: BlockHash(vec![height as u8; 32]),
+            parent_hash: None,
+            timestamp: None,
+        }
+    }
+
+    fn included() -> TransactionStatus {
+        TransactionStatus::Included {
+            block: block(1),
+            confirmations: 1,
+        }
+    }
+
+    fn confirmed() -> TransactionStatus {
+        TransactionStatus::Confirmed {
+            block: block(1),
+            proof: ConfirmationProof::Depth {
+                required: 12,
+                observed: 12,
+            },
+        }
+    }
+
+    fn incoming(
+        status: TransactionStatus,
+        previous_status: Option<TransactionStatus>,
+        amounts: Vec<AtomicAmount>,
+    ) -> LedgerObservationTransition {
+        LedgerObservationTransition {
+            status,
+            previous_status,
+            effect: LedgerEffect::Incoming { movements: amounts },
+            network_fee: None,
+        }
+    }
+
+    #[test]
+    fn incoming_confirmation_reorg_and_reinclusion_are_absolute_transitions() {
+        let opened = DepositBalances::default();
+        let included_balances = apply_observation_transition(
+            opened,
+            &incoming(included(), None, vec![amount(40), amount(60)]),
+        )
+        .expect("two included movements fit in the ledger");
+        assert_eq!(
+            included_balances,
+            DepositBalances {
+                received: amount(100),
+                confirmed: amount(0),
+                balance: amount(100),
+                collected: amount(0),
+                accounted: amount(0),
+            }
+        );
+
+        let confirmed_balances = apply_observation_transition(
+            included_balances,
+            &incoming(confirmed(), Some(included()), vec![amount(40), amount(60)]),
+        )
+        .expect("confirmation replaces rather than duplicates inclusion");
+        assert_eq!(confirmed_balances.received, amount(100));
+        assert_eq!(confirmed_balances.confirmed, amount(100));
+        assert_eq!(confirmed_balances.balance, amount(100));
+
+        let reorged = apply_observation_transition(
+            confirmed_balances,
+            &incoming(
+                TransactionStatus::Reorged {
+                    previous_block: block(1),
+                },
+                Some(confirmed()),
+                vec![amount(40), amount(60)],
+            ),
+        )
+        .expect("reorg removes the confirmed canonical contribution");
+        assert_eq!(reorged, DepositBalances::default());
+
+        let reincluded = apply_observation_transition(
+            reorged,
+            &incoming(
+                included(),
+                Some(TransactionStatus::Reorged {
+                    previous_block: block(1),
+                }),
+                vec![amount(40), amount(60)],
+            ),
+        )
+        .expect("re-inclusion restores the canonical contribution once");
+        assert_eq!(reincluded, included_balances);
+    }
+
+    #[test]
+    fn observations_preserve_accounted_and_do_not_cap_partial_or_overpayments() {
+        for paid in [40, 150] {
+            let current = DepositBalances {
+                accounted: amount(25),
+                ..DepositBalances::default()
+            };
+            let next = apply_observation_transition(
+                current,
+                &incoming(included(), None, vec![amount(paid)]),
+            )
+            .expect("valid payment amount fits");
+            assert_eq!(next.received, amount(paid));
+            assert_eq!(next.balance, amount(paid));
+            assert_eq!(next.accounted, amount(25));
+        }
+    }
+
+    #[test]
+    fn collected_changes_only_on_confirmation_and_reverses_on_reorg() {
+        let current = DepositBalances {
+            received: amount(100),
+            confirmed: amount(100),
+            balance: amount(100),
+            collected: amount(0),
+            accounted: amount(100),
+        };
+        let included_transition = LedgerObservationTransition {
+            status: included(),
+            previous_status: None,
+            effect: LedgerEffect::Collection {
+                movements: vec![amount(100)],
+            },
+            network_fee: None,
+        };
+        let swept = apply_observation_transition(current, &included_transition)
+            .expect("included collection can debit the current balance");
+        assert_eq!(swept.balance, amount(0));
+        assert_eq!(swept.collected, amount(0));
+        assert_eq!(swept.accounted, amount(100));
+
+        let confirmed_transition = LedgerObservationTransition {
+            status: confirmed(),
+            previous_status: Some(included()),
+            effect: LedgerEffect::Collection {
+                movements: vec![amount(100)],
+            },
+            network_fee: None,
+        };
+        let confirmed_sweep = apply_observation_transition(swept, &confirmed_transition)
+            .expect("confirmed collection increments gross collected once");
+        assert_eq!(confirmed_sweep.balance, amount(0));
+        assert_eq!(confirmed_sweep.collected, amount(100));
+
+        let reorg_transition = LedgerObservationTransition {
+            status: TransactionStatus::Reorged {
+                previous_block: block(1),
+            },
+            previous_status: Some(confirmed()),
+            effect: LedgerEffect::Collection {
+                movements: vec![amount(100)],
+            },
+            network_fee: None,
+        };
+        let restored = apply_observation_transition(confirmed_sweep, &reorg_transition)
+            .expect("reorg restores balance and reverses collected");
+        assert_eq!(restored, current);
+    }
+
+    #[test]
+    fn overflow_and_underflow_report_the_exact_field_and_operation() {
+        let maximum = AtomicAmount([u8::MAX; 32]);
+        let overflow = apply_observation_transition(
+            DepositBalances {
+                received: maximum,
+                ..DepositBalances::default()
+            },
+            &incoming(included(), None, vec![amount(1)]),
+        )
+        .expect_err("received cannot exceed u256");
+        assert_eq!(
+            overflow,
+            LedgerTransitionError::Arithmetic {
+                field: LedgerBalanceField::Received,
+                operation: LedgerArithmeticOperation::Add,
+                source: AtomicAmountArithmeticError::Overflow,
+            }
+        );
+
+        let underflow = apply_observation_transition(
+            DepositBalances::default(),
+            &LedgerObservationTransition {
+                status: included(),
+                previous_status: None,
+                effect: LedgerEffect::Collection {
+                    movements: vec![amount(1)],
+                },
+                network_fee: None,
+            },
+        )
+        .expect_err("collection cannot debit more than the current balance");
+        assert_eq!(
+            underflow,
+            LedgerTransitionError::Arithmetic {
+                field: LedgerBalanceField::Balance,
+                operation: LedgerArithmeticOperation::Subtract,
+                source: AtomicAmountArithmeticError::Underflow,
+            }
+        );
+    }
+
+    #[test]
+    fn terminal_transition_requires_previous_status() {
+        let error = apply_observation_transition(
+            DepositBalances::default(),
+            &incoming(TransactionStatus::Dropped, None, vec![amount(1)]),
+        )
+        .expect_err("a drop without prior state cannot reverse a contribution");
+        assert_eq!(error, LedgerTransitionError::MissingPreviousStatus);
+    }
+
+    #[test]
+    fn failed_dropped_and_replaced_remove_the_previous_canonical_contribution() {
+        let included_balances = apply_observation_transition(
+            DepositBalances::default(),
+            &incoming(included(), None, vec![amount(10)]),
+        )
+        .expect("inclusion contributes the incoming amount");
+        let terminal_statuses = [
+            TransactionStatus::Failed {
+                block: None,
+                reason: Some("execution failed".to_owned()),
+            },
+            TransactionStatus::Dropped,
+            TransactionStatus::Replaced {
+                by: CanonicalTransactionId {
+                    chain: ChainId("ethereum".to_owned()),
+                    value: "0xreplacement".to_owned(),
+                },
+            },
+        ];
+
+        for status in terminal_statuses {
+            let corrected = apply_observation_transition(
+                included_balances,
+                &incoming(status, Some(included()), vec![amount(10)]),
+            )
+            .expect("terminal revision reverses the prior inclusion");
+            assert_eq!(corrected, DepositBalances::default());
+        }
+    }
+
+    #[test]
+    fn collection_fee_changes_balance_immediately_and_collected_on_confirmation() {
+        let current = DepositBalances {
+            received: amount(110),
+            confirmed: amount(110),
+            balance: amount(110),
+            collected: amount(0),
+            accounted: amount(110),
+        };
+        let included_transition = LedgerObservationTransition {
+            status: included(),
+            previous_status: None,
+            effect: LedgerEffect::Collection {
+                movements: vec![amount(100)],
+            },
+            network_fee: Some(amount(10)),
+        };
+        let included_balances = apply_observation_transition(current, &included_transition)
+            .expect("included native collection debits its transfer and network fee");
+        assert_eq!(included_balances.balance, amount(0));
+        assert_eq!(included_balances.collected, amount(0));
+
+        let confirmed_balances = apply_observation_transition(
+            included_balances,
+            &LedgerObservationTransition {
+                status: confirmed(),
+                previous_status: Some(included()),
+                effect: LedgerEffect::Collection {
+                    movements: vec![amount(100)],
+                },
+                network_fee: Some(amount(10)),
+            },
+        )
+        .expect("confirmation retains the debit and records the gross collection");
+        assert_eq!(confirmed_balances.balance, amount(0));
+        assert_eq!(confirmed_balances.collected, amount(110));
+
+        let restored = apply_observation_transition(
+            confirmed_balances,
+            &LedgerObservationTransition {
+                status: TransactionStatus::Reorged {
+                    previous_block: block(1),
+                },
+                previous_status: Some(confirmed()),
+                effect: LedgerEffect::Collection {
+                    movements: vec![amount(100)],
+                },
+                network_fee: Some(amount(10)),
+            },
+        )
+        .expect("reorg reverses both the movement and fee contributions");
+        assert_eq!(restored, current);
+    }
+
+    #[test]
+    fn fee_only_block_failure_debits_balance_and_reorg_restores_it() {
+        let current = DepositBalances {
+            balance: amount(10),
+            ..DepositBalances::default()
+        };
+        let failed = TransactionStatus::Failed {
+            block: Some(block(1)),
+            reason: Some("execution reverted".to_owned()),
+        };
+        let failed_balances = apply_observation_transition(
+            current,
+            &LedgerObservationTransition {
+                status: failed.clone(),
+                previous_status: None,
+                effect: LedgerEffect::Collection {
+                    movements: Vec::new(),
+                },
+                network_fee: Some(amount(10)),
+            },
+        )
+        .expect("a canonical failure may contain only a paid network fee");
+        assert_eq!(failed_balances.balance, amount(0));
+        assert_eq!(failed_balances.collected, amount(0));
+
+        let restored = apply_observation_transition(
+            failed_balances,
+            &LedgerObservationTransition {
+                status: TransactionStatus::Reorged {
+                    previous_block: block(1),
+                },
+                previous_status: Some(failed),
+                effect: LedgerEffect::Collection {
+                    movements: Vec::new(),
+                },
+                network_fee: Some(amount(10)),
+            },
+        )
+        .expect("reorg reverses the canonical failure fee");
+        assert_eq!(restored, current);
+    }
+
+    #[test]
+    fn confirmed_non_collection_fee_never_changes_collected() {
+        let next = apply_observation_transition(
+            DepositBalances {
+                balance: amount(10),
+                ..DepositBalances::default()
+            },
+            &LedgerObservationTransition {
+                status: confirmed(),
+                previous_status: None,
+                effect: LedgerEffect::OtherBalanceChange {
+                    direction: BalanceDirection::Debit,
+                    movements: Vec::new(),
+                },
+                network_fee: Some(amount(10)),
+            },
+        )
+        .expect("a fee-only non-collection effect can be projected");
+        assert_eq!(next.balance, amount(0));
+        assert_eq!(next.collected, amount(0));
+    }
 }

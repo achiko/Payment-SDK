@@ -23,7 +23,7 @@ use chain_ethereum::{
 use indexing::{BlockRef, SourceError};
 use serde_json::{Map, Value, json};
 use signer::{
-    BoxFuture as SignerFuture, Curve, KeyLocator, KeyProvisionRequest, KeyProvisioner,
+    BoxFuture as SignerFuture, Curve, KeyLocator, KeyProvisionRequest, KeyProvisioner, OperationId,
     ProvisionedKey, PublicKey, PublicKeyFormat, SignRequest, SignablePayload, Signature,
     SignatureEncoding, SignatureScheme, Signer as WalletSigner, SignerCapabilities, SignerError,
     SignerErrorKind, SignerStatus,
@@ -74,6 +74,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .build_transfer(
             &asset,
             EthereumTransferRequest {
+                signing_operation_id: OperationId::new("live-example-sign")?,
                 key,
                 from: sender.clone(),
                 to: Some(config.recipient.clone()),

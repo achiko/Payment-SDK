@@ -3,6 +3,7 @@ use chain_bitcoin::{
 };
 use chain_contract::DepositAddressGenerator;
 use futures_executor::block_on;
+use signer::OperationId;
 use signer_local::LocalSigner;
 use std::error::Error;
 
@@ -13,7 +14,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Ephemeral Bitcoin regtest wallets");
     for kind in [BitcoinAddressKind::SegwitV0, BitcoinAddressKind::Taproot] {
         let generated = block_on(generator.generate_address(
-            BitcoinGenerateAddress::new(BitcoinNetwork::Regtest, kind, "bitcoin-example"),
+            BitcoinGenerateAddress::new(
+                BitcoinNetwork::Regtest,
+                kind,
+                OperationId::new(format!("provision-bitcoin-example-{kind:?}"))?,
+                "bitcoin-example",
+            ),
             &keys,
         ))?;
 

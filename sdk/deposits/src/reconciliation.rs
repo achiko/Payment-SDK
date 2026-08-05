@@ -1,4 +1,4 @@
-use crate::{BoxFuture, DepositError, DepositId};
+use crate::{BoxFuture, CommandIdentity, DepositError, DepositId, LedgerEntryId};
 use chain_identity::AtomicAmount;
 use indexing::ObservationEventId;
 
@@ -19,10 +19,56 @@ pub enum ReconciliationReason {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReconciliationState {
     Open,
+    /// Resolution written by the typed, idempotent PS command path.
     Resolved {
-        resolution: String,
+        resolution: ReconciliationResolution,
         resolved_at: u64,
     },
+    /// Backward-compatible representation for a free-form V1 resolution.
+    /// These records remain readable but have no command identity, so they
+    /// cannot be treated as a replay of a typed resolution command.
+    LegacyResolved {
+        description: String,
+        resolved_at: u64,
+    },
+}
+
+/// Explicit business decision for a post-credit reconciliation case.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReconciliationDecision {
+    /// Reverse only the excess business credit. Persistence copies the current
+    /// absolute ledger head and sets `accounted` to `min(accounted, confirmed)`.
+    ReverseCredit {
+        expected_head: LedgerEntryId,
+        reason: String,
+    },
+    /// Preserve the current absolute balances and accept the liability inside
+    /// the payment business.
+    AcceptLiability { reason: String },
+    /// Preserve balances because the excess was recorded in an external debt
+    /// system. The reference is opaque to PS.
+    ExternalDebtRecorded {
+        external_reference: String,
+        reason: String,
+    },
+}
+
+/// Auditable result retained on a resolved reconciliation case.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReconciliationResolution {
+    pub command: CommandIdentity,
+    pub decision: ReconciliationDecision,
+    /// Present exactly when `decision` is `ReverseCredit`.
+    pub ledger_entry_id: Option<LedgerEntryId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolveReconciliation {
+    /// Must use [`crate::CommandOperation::ResolveReconciliation`].
+    pub command: CommandIdentity,
+    pub case_id: ReconciliationCaseId,
+    pub decision: ReconciliationDecision,
+    pub resolved_at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,11 +113,13 @@ pub trait ReconciliationStore: Send + Sync {
         request: ReconciliationPageRequest,
     ) -> BoxFuture<'a, Result<ReconciliationPage, DepositError>>;
 
+    /// Resolves a case and, for `ReverseCredit`, appends the corrected absolute
+    /// ledger row in the same atomic storage commit. Exact command replay
+    /// returns the original case; scoped idempotency-key reuse with a different
+    /// request hash conflicts.
     fn resolve_case<'a>(
         &'a self,
-        id: &'a ReconciliationCaseId,
-        resolution: String,
-        resolved_at: u64,
+        command: ResolveReconciliation,
     ) -> BoxFuture<'a, Result<ReconciliationCase, DepositError>>;
 
     /// Automatic accounting and collection are blocked while this is true.

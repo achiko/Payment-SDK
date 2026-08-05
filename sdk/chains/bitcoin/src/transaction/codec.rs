@@ -18,8 +18,8 @@ use bitcoin::{
 };
 use chain_contract::{ChainError, ChainErrorKind};
 use signer::{
-    Curve, Digest, KeyTweak, PublicKeyFormat, SignRequest, SignablePayload, SignatureEncoding,
-    SignatureScheme, Signer, UserInteraction,
+    Curve, Digest, KeyTweak, OperationId, PublicKeyFormat, SignRequest, SignablePayload,
+    SignatureEncoding, SignatureScheme, Signer, UserInteraction,
 };
 use std::collections::BTreeSet;
 
@@ -35,6 +35,14 @@ impl BitcoinTransactionCodec {
     pub const fn new(network: BitcoinNetwork) -> Self {
         Self { network }
     }
+}
+
+struct BitcoinInputSigningContext<'a> {
+    transaction: &'a Transaction,
+    prevouts: &'a [TxOut],
+    sighash_type: SighashType,
+    network: BitcoinNetwork,
+    signer: &'a dyn Signer,
 }
 
 impl BitcoinTransactionBuilder for BitcoinTransactionCodec {
@@ -67,28 +75,25 @@ impl BitcoinTransactionSigning for BitcoinTransactionCodec {
 
             for (input_index, input) in transaction.inputs.iter().enumerate() {
                 let script = &prevouts[input_index].script_pubkey;
+                let operation_id = transaction
+                    .signing_operation_id
+                    .child(format!("input-{input_index}"))
+                    .map_err(signer_error)?;
+                let signing = BitcoinInputSigningContext {
+                    transaction: &native,
+                    prevouts: &prevouts,
+                    sighash_type: transaction.sighash_type,
+                    network: self.network,
+                    signer,
+                };
                 let witness = if script.is_p2wpkh() {
-                    sign_p2wpkh_input(
-                        &native,
-                        input_index,
-                        input,
-                        script,
-                        transaction.sighash_type,
-                        self.network,
-                        signer,
-                    )
-                    .await?
+                    signing
+                        .sign_p2wpkh_input(operation_id, input_index, input)
+                        .await?
                 } else if script.is_p2tr() {
-                    sign_p2tr_input(
-                        &native,
-                        input_index,
-                        input,
-                        &prevouts,
-                        transaction.sighash_type,
-                        self.network,
-                        signer,
-                    )
-                    .await?
+                    signing
+                        .sign_p2tr_input(operation_id, input_index, input)
+                        .await?
                 } else {
                     return Err(invalid_transaction(format!(
                         "Bitcoin input {input_index} is neither P2WPKH nor P2TR"
@@ -171,7 +176,11 @@ fn build_transaction(
             )));
         }
         request.recipients[0].value = Satoshi(value);
-        return Ok(unsigned(request.available, request.recipients));
+        return Ok(unsigned(
+            request.signing_operation_id,
+            request.available,
+            request.recipients,
+        ));
     }
 
     let recipient_total = request.recipients.iter().try_fold(0_u64, |total, output| {
@@ -229,11 +238,16 @@ fn build_transaction(
             "insufficient Bitcoin funds for {recipient_total} satoshis plus network fee"
         ))
     })?;
-    Ok(unsigned(selected, outputs))
+    Ok(unsigned(request.signing_operation_id, selected, outputs))
 }
 
-fn unsigned(utxos: Vec<BitcoinUtxo>, outputs: Vec<BitcoinOutput>) -> UnsignedBitcoinTransaction {
+fn unsigned(
+    signing_operation_id: OperationId,
+    utxos: Vec<BitcoinUtxo>,
+    outputs: Vec<BitcoinOutput>,
+) -> UnsignedBitcoinTransaction {
     UnsignedBitcoinTransaction {
+        signing_operation_id,
         version: 2,
         lock_time: 0,
         inputs: utxos
@@ -329,133 +343,142 @@ fn native_transaction(
     })
 }
 
-async fn sign_p2wpkh_input(
-    transaction: &Transaction,
-    input_index: usize,
-    input: &BitcoinInput,
-    script: &ScriptBuf,
-    sighash_type: SighashType,
-    network: BitcoinNetwork,
-    signer: &dyn Signer,
-) -> Result<Witness, ChainError> {
-    let public_key = signer
-        .public_key(
-            &input.utxo.key,
-            Curve::Secp256k1,
-            PublicKeyFormat::Compressed,
-        )
-        .await
-        .map_err(signer_error)?;
-    let public_key = CompressedPublicKey::from_slice(&public_key.bytes).map_err(|error| {
-        signer_error_message(format!("invalid compressed Bitcoin public key: {error}"))
-    })?;
-    if Address::p2wpkh(&public_key, native_network(network)).script_pubkey() != *script {
-        return Err(signer_error_message(format!(
-            "Bitcoin input {input_index} does not belong to its signing key"
-        )));
-    }
-    let sighash_type = ecdsa_sighash_type(sighash_type)?;
-    let sighash = SighashCache::new(transaction)
-        .p2wpkh_signature_hash(
-            input_index,
-            script,
-            Amount::from_sat(input.utxo.value.0),
+impl BitcoinInputSigningContext<'_> {
+    async fn sign_p2wpkh_input(
+        &self,
+        operation_id: OperationId,
+        input_index: usize,
+        input: &BitcoinInput,
+    ) -> Result<Witness, ChainError> {
+        let script = &self.prevouts[input_index].script_pubkey;
+        let public_key = self
+            .signer
+            .public_key(
+                &input.utxo.key,
+                Curve::Secp256k1,
+                PublicKeyFormat::Compressed,
+            )
+            .await
+            .map_err(signer_error)?;
+        let public_key = CompressedPublicKey::from_slice(&public_key.bytes).map_err(|error| {
+            signer_error_message(format!("invalid compressed Bitcoin public key: {error}"))
+        })?;
+        if Address::p2wpkh(&public_key, native_network(self.network)).script_pubkey() != *script {
+            return Err(signer_error_message(format!(
+                "Bitcoin input {input_index} does not belong to its signing key"
+            )));
+        }
+        let sighash_type = ecdsa_sighash_type(self.sighash_type)?;
+        let sighash = SighashCache::new(self.transaction)
+            .p2wpkh_signature_hash(
+                input_index,
+                script,
+                Amount::from_sat(input.utxo.value.0),
+                sighash_type,
+            )
+            .map_err(|error| {
+                invalid_transaction(format!("could not compute Bitcoin input sighash: {error}"))
+            })?;
+        let signature = self
+            .signer
+            .sign(SignRequest {
+                operation_id,
+                key: input.utxo.key.clone(),
+                payload: SignablePayload::Digest(Digest {
+                    bytes: sighash.to_byte_array().to_vec(),
+                }),
+                scheme: SignatureScheme::EcdsaSecp256k1,
+                encoding: SignatureEncoding::Der,
+                key_tweak: None,
+                user_interaction: UserInteraction::Allowed,
+            })
+            .await
+            .map_err(signer_error)?;
+        if signature.scheme != SignatureScheme::EcdsaSecp256k1
+            || signature.encoding != SignatureEncoding::Der
+        {
+            return Err(signer_error_message(
+                "Bitcoin signer returned an incompatible ECDSA signature",
+            ));
+        }
+        let signature = ecdsa::Signature::from_der(&signature.bytes).map_err(|error| {
+            signer_error_message(format!("invalid DER Bitcoin signature: {error}"))
+        })?;
+        let signature = bitcoin::ecdsa::Signature {
+            signature,
             sighash_type,
-        )
-        .map_err(|error| {
-            invalid_transaction(format!("could not compute Bitcoin input sighash: {error}"))
-        })?;
-    let signature = signer
-        .sign(SignRequest {
-            key: input.utxo.key.clone(),
-            payload: SignablePayload::Digest(Digest {
-                bytes: sighash.to_byte_array().to_vec(),
-            }),
-            scheme: SignatureScheme::EcdsaSecp256k1,
-            encoding: SignatureEncoding::Der,
-            key_tweak: None,
-            user_interaction: UserInteraction::Allowed,
-        })
-        .await
-        .map_err(signer_error)?;
-    if signature.scheme != SignatureScheme::EcdsaSecp256k1
-        || signature.encoding != SignatureEncoding::Der
-    {
-        return Err(signer_error_message(
-            "Bitcoin signer returned an incompatible ECDSA signature",
-        ));
+        };
+        let signature = signature.serialize();
+        let public_key = public_key.to_bytes();
+        let signature_bytes: &[u8] = signature.as_ref();
+        let witness = vec![signature_bytes.to_vec(), public_key.to_vec()];
+        Ok(Witness::from_slice(&witness))
     }
-    let signature = ecdsa::Signature::from_der(&signature.bytes)
-        .map_err(|error| signer_error_message(format!("invalid DER Bitcoin signature: {error}")))?;
-    let signature = bitcoin::ecdsa::Signature {
-        signature,
-        sighash_type,
-    };
-    let signature = signature.serialize();
-    let public_key = public_key.to_bytes();
-    let signature_bytes: &[u8] = signature.as_ref();
-    let witness = vec![signature_bytes.to_vec(), public_key.to_vec()];
-    Ok(Witness::from_slice(&witness))
-}
 
-async fn sign_p2tr_input(
-    transaction: &Transaction,
-    input_index: usize,
-    input: &BitcoinInput,
-    prevouts: &[TxOut],
-    sighash_type: SighashType,
-    network: BitcoinNetwork,
-    signer: &dyn Signer,
-) -> Result<Witness, ChainError> {
-    let public_key = signer
-        .public_key(&input.utxo.key, Curve::Secp256k1, PublicKeyFormat::XOnly)
-        .await
-        .map_err(signer_error)?;
-    let public_key = XOnlyPublicKey::from_slice(&public_key.bytes).map_err(|error| {
-        signer_error_message(format!("invalid x-only Bitcoin public key: {error}"))
-    })?;
-    let secp = bitcoin::secp256k1::Secp256k1::verification_only();
-    let expected = Address::p2tr(&secp, public_key, None, native_network(network)).script_pubkey();
-    if expected != prevouts[input_index].script_pubkey {
-        return Err(signer_error_message(format!(
-            "Bitcoin Taproot input {input_index} does not belong to its signing key"
-        )));
-    }
-    let sighash_type = taproot_sighash_type(sighash_type)?;
-    let sighash = SighashCache::new(transaction)
-        .taproot_key_spend_signature_hash(input_index, &Prevouts::All(prevouts), sighash_type)
-        .map_err(|error| {
-            invalid_transaction(format!("could not compute Taproot input sighash: {error}"))
+    async fn sign_p2tr_input(
+        &self,
+        operation_id: OperationId,
+        input_index: usize,
+        input: &BitcoinInput,
+    ) -> Result<Witness, ChainError> {
+        let public_key = self
+            .signer
+            .public_key(&input.utxo.key, Curve::Secp256k1, PublicKeyFormat::XOnly)
+            .await
+            .map_err(signer_error)?;
+        let public_key = XOnlyPublicKey::from_slice(&public_key.bytes).map_err(|error| {
+            signer_error_message(format!("invalid x-only Bitcoin public key: {error}"))
         })?;
-    let tweak = TapTweakHash::from_key_and_tweak(public_key, None).to_byte_array();
-    let signature = signer
-        .sign(SignRequest {
-            key: input.utxo.key.clone(),
-            payload: SignablePayload::Digest(Digest {
-                bytes: sighash.to_byte_array().to_vec(),
-            }),
-            scheme: SignatureScheme::SchnorrSecp256k1,
-            encoding: SignatureEncoding::Raw,
-            key_tweak: Some(KeyTweak::Secp256k1Add(tweak)),
-            user_interaction: UserInteraction::Allowed,
-        })
-        .await
-        .map_err(signer_error)?;
-    if signature.scheme != SignatureScheme::SchnorrSecp256k1
-        || signature.encoding != SignatureEncoding::Raw
-    {
-        return Err(signer_error_message(
-            "Bitcoin signer returned an incompatible Schnorr signature",
-        ));
+        let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+        let expected =
+            Address::p2tr(&secp, public_key, None, native_network(self.network)).script_pubkey();
+        if expected != self.prevouts[input_index].script_pubkey {
+            return Err(signer_error_message(format!(
+                "Bitcoin Taproot input {input_index} does not belong to its signing key"
+            )));
+        }
+        let sighash_type = taproot_sighash_type(self.sighash_type)?;
+        let sighash = SighashCache::new(self.transaction)
+            .taproot_key_spend_signature_hash(
+                input_index,
+                &Prevouts::All(self.prevouts),
+                sighash_type,
+            )
+            .map_err(|error| {
+                invalid_transaction(format!("could not compute Taproot input sighash: {error}"))
+            })?;
+        let tweak = TapTweakHash::from_key_and_tweak(public_key, None).to_byte_array();
+        let signature = self
+            .signer
+            .sign(SignRequest {
+                operation_id,
+                key: input.utxo.key.clone(),
+                payload: SignablePayload::Digest(Digest {
+                    bytes: sighash.to_byte_array().to_vec(),
+                }),
+                scheme: SignatureScheme::SchnorrSecp256k1,
+                encoding: SignatureEncoding::Raw,
+                key_tweak: Some(KeyTweak::Secp256k1Add(tweak)),
+                user_interaction: UserInteraction::Allowed,
+            })
+            .await
+            .map_err(signer_error)?;
+        if signature.scheme != SignatureScheme::SchnorrSecp256k1
+            || signature.encoding != SignatureEncoding::Raw
+        {
+            return Err(signer_error_message(
+                "Bitcoin signer returned an incompatible Schnorr signature",
+            ));
+        }
+        let signature = schnorr::Signature::from_slice(&signature.bytes).map_err(|error| {
+            signer_error_message(format!("invalid raw Bitcoin Schnorr signature: {error}"))
+        })?;
+        let signature = bitcoin::taproot::Signature {
+            signature,
+            sighash_type,
+        };
+        Ok(Witness::from_slice(&[signature.to_vec()]))
     }
-    let signature = schnorr::Signature::from_slice(&signature.bytes).map_err(|error| {
-        signer_error_message(format!("invalid raw Bitcoin Schnorr signature: {error}"))
-    })?;
-    let signature = bitcoin::taproot::Signature {
-        signature,
-        sighash_type,
-    };
-    Ok(Witness::from_slice(&[signature.to_vec()]))
 }
 
 fn checked_output(
@@ -581,13 +604,22 @@ mod tests {
     use signer_local::LocalSigner;
     use transaction_utxo::FeeRate;
 
+    fn operation(value: impl Into<String>) -> OperationId {
+        OperationId::new(value).expect("test operation ID must be valid")
+    }
+
     fn generated_address(
         signer: &LocalSigner,
         kind: BitcoinAddressKind,
         purpose: &str,
     ) -> chain_contract::GeneratedAddress<BitcoinAddress> {
         block_on(BitcoinAddressGenerator.generate_address(
-            BitcoinGenerateAddress::new(BitcoinNetwork::Regtest, kind, purpose),
+            BitcoinGenerateAddress::new(
+                BitcoinNetwork::Regtest,
+                kind,
+                operation(format!("provision-{purpose}")),
+                purpose,
+            ),
             signer,
         ))
         .expect("test Bitcoin address should be generated")
@@ -609,6 +641,7 @@ mod tests {
         let codec = BitcoinTransactionCodec::new(BitcoinNetwork::Regtest);
         let unsigned = codec
             .build(BitcoinBuildRequest {
+                signing_operation_id: operation("sign-bitcoin-transfer"),
                 available: vec![BitcoinUtxo {
                     transaction_id: [11; 32],
                     output_index: 1,
@@ -676,6 +709,7 @@ mod tests {
         };
         let error = BitcoinTransactionCodec::new(BitcoinNetwork::Regtest)
             .build(BitcoinBuildRequest {
+                signing_operation_id: operation("sign-duplicate-utxos"),
                 available: vec![utxo.clone(), utxo],
                 recipients: vec![BitcoinOutput {
                     address: recipient.address,

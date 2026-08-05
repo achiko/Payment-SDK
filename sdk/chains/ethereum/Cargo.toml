@@ -12,6 +12,7 @@ alloy-rpc-types-eth = { version = "=1.0.22", default-features = false, features 
 chain-contract = { path = "../contract" }
 chain-identity = { path = "../identity" }
 futures-util = { version = "=0.3.33", default-features = false, features = ["sink", "std"] }
+http = { path = "../../../packages/http" }
 indexing = { path = "../../indexing" }
 json-rpc = { path = "../../../packages/json-rpc" }
 serde_json = { workspace = true, features = ["raw_value"] }

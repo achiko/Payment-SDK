@@ -1,12 +1,13 @@
 use crate::{BoxFuture, EthereumAddress, Wei};
 use chain_contract::ChainError;
 use signer::KeyLocator;
-use signer::Signer;
+use signer::{OperationId, Signer};
 
 use super::EthereumSignedTransaction;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnsignedEthereumTransaction {
+    pub signing_operation_id: OperationId,
     pub key: KeyLocator,
     pub chain_id: u64,
     pub nonce: u64,

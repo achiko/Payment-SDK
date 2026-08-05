@@ -1,11 +1,12 @@
 use crate::BoxFuture;
 use chain_contract::ChainError;
-use signer::Signer;
+use signer::{OperationId, Signer};
 
 use super::{BitcoinInput, BitcoinOutput, BitcoinSignedTransaction, SighashType};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnsignedBitcoinTransaction {
+    pub signing_operation_id: OperationId,
     pub version: i32,
     pub lock_time: u32,
     pub inputs: Vec<BitcoinInput>,

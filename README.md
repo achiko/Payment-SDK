@@ -1,10 +1,10 @@
-# Payment SDK contracts and wallet execution core
+# Payment SDK services and chain-native execution
 
-This workspace combines requirements/contracts for an exchange payment system
-with a concrete stateless Wallet Service execution core. Payment Service,
-Indexer, storage, HTTP, and deployment wiring remain contract-first. The wallet
-path implements ephemeral local secp256k1 provisioning/signing for tests plus
-chain-native Bitcoin and Ethereum adapters over injected RPC backends.
+This workspace combines contract-first boundaries with concrete Ethereum v1
+service slices. It contains a stateless Bitcoin/Ethereum Wallet Service library,
+an authenticated stateless Ethereum Wallet HTTP runtime, a durable Ethereum
+Indexer Service, and a single-network Ethereum Payment Service backed by its own
+RocksDB database. PS and IX never open or write each other's storage.
 
 The implemented wallet capabilities are:
 
@@ -13,14 +13,26 @@ The implemented wallet capabilities are:
 - Bitcoin native SegWit v0 and Taproot address generation, deterministic UTXO
   funding, chain-native signing, balances, receipts, and batched collection;
 - a generic `wallet_worker::WalletService` facade that shares one injected
-  custody backend between provisioning and signing without owning persistence.
+  custody backend between provisioning and signing without owning persistence;
+- an Ethereum Wallet HTTP process using the concrete Ethereum JSON-RPC adapter
+  and authenticated remote key-provisioning/signing adapter;
+- an Ethereum IX process with durable watches, canonical checkpoints,
+  observations, revisions, reorg recovery, and a cursor feed; and
+- an Ethereum PS process with authenticated APIs, durable jobs, deposit/watch
+  recovery, IX mirroring, business projection, absolute ledgers, typed
+  reconciliation, and native/ERC-20 collection workflows.
 
-`signer-local` is deliberately ephemeral and not production custody. Concrete
-RPC transports, authentication, durable secrets, databases, and deployment
-configuration are still injected by the application.
+`signer-local` is deliberately ephemeral and not production custody.
+`signer-remote` supplies the hardened client contract, but the durable custody
+service and its secret storage remain external deployment responsibilities.
+The checked-in code does not by itself prove a live production deployment: the
+opt-in Anvil end-to-end scenario, production custody integration, operational
+TLS configuration, monitoring, and real-node evidence remain separate work.
+Ethereum PS v1 deliberately excludes HA and multi-network ownership in one
+process/database.
 
 The previous experimental workspace is preserved under [`old/`](./old). The
-new scaffold is organized by architectural ownership:
+current workspace is organized by architectural ownership:
 
 ```text
 apps/                             executable composition roots
@@ -41,6 +53,9 @@ The principal documents are:
 - [`ARCHITECTURE.md`](./ARCHITECTURE.md): ownership and dependency rules;
 - [`docs/CONTRACTS.md`](./docs/CONTRACTS.md): how the current traits compose;
 - [`docs/INDEXING.md`](./docs/INDEXING.md): proposed indexing and reorg flow;
+- [`docs/INDEXER_SERVICE.md`](./docs/INDEXER_SERVICE.md): concrete Ethereum IX v1 runtime;
+- [`docs/WALLET_SERVICE.md`](./docs/WALLET_SERVICE.md): concrete stateless Ethereum WS runtime;
+- [`docs/PAYMENT_SERVICE.md`](./docs/PAYMENT_SERVICE.md): concrete Ethereum PS v1 runtime and API;
 - [`docs/FEATURE_VALIDATION.md`](./docs/FEATURE_VALIDATION.md): original PS/WS/IX feature traceability and corrections;
 - [`docs/RESEARCH.md`](./docs/RESEARCH.md): upstream type and architecture findings;
 - [`docs/REQUIREMENTS.md`](./docs/REQUIREMENTS.md): decisions still required before implementation;
@@ -49,15 +64,15 @@ The principal documents are:
 Run the structural compile check with:
 
 ```bash
-cargo check --workspace --all-targets
-cargo test --workspace
+cargo check --locked --workspace --all-targets
+cargo test --locked --workspace
 ```
 
 Generate ephemeral test keys and chain-native addresses with:
 
 ```bash
-cargo run -p chain-ethereum --example ethereum_test_wallet
-cargo run -p chain-bitcoin --example bitcoin_test_wallet
+cargo run --locked -p chain-ethereum --example ethereum_test_wallet
+cargo run --locked -p chain-bitcoin --example bitcoin_test_wallet
 ```
 
 These examples are offline and print only public information. Their private

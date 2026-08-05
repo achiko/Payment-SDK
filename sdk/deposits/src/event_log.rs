@@ -1,4 +1,6 @@
-use crate::{ApplyResult, BoxFuture, DepositError, ReconciliationCase, RecordObservationBalance};
+use crate::{
+    ApplyResult, BoxFuture, DepositError, DepositId, ReconciliationCase, RecordObservation,
+};
 use indexing::{EventCursor, ObservationEvent, ObservationEventId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,6 +28,19 @@ pub struct ObservationLogRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservationLogPage {
+    pub observations: Vec<MirroredObservation>,
+    pub next: Option<EventCursor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DepositObservationLogRequest {
+    pub deposit_id: DepositId,
+    pub after: Option<EventCursor>,
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DepositObservationLogPage {
     pub observations: Vec<MirroredObservation>,
     pub next: Option<EventCursor>,
 }
@@ -60,9 +75,12 @@ pub enum MirrorOutcome {
 pub struct ProjectObservation {
     pub expected_cursor: Option<EventCursor>,
     pub through: EventCursor,
+    /// Every deposit for which this IX fact is relevant, including facts such
+    /// as token gas funding that intentionally do not change the token ledger.
+    pub affected_deposits: Vec<DepositId>,
     /// One mirrored IX event may affect multiple deposits. Every ledger append
     /// and reconciliation case must commit with the projection cursor.
-    pub ledger_updates: Vec<RecordObservationBalance>,
+    pub ledger_updates: Vec<RecordObservation>,
     pub reconciliation_cases: Vec<ReconciliationCase>,
 }
 
@@ -89,6 +107,11 @@ pub trait ObservationEventLog: Send + Sync {
         &'a self,
         request: ObservationLogRequest,
     ) -> BoxFuture<'a, Result<ObservationLogPage, DepositError>>;
+
+    fn observations_for_deposit<'a>(
+        &'a self,
+        request: DepositObservationLogRequest,
+    ) -> BoxFuture<'a, Result<DepositObservationLogPage, DepositError>>;
 }
 
 /// Durable two-stage PS consumer progress. Mirroring and its cursor movement

@@ -3,16 +3,21 @@
 ## Document status
 
 This is the canonical requirements baseline for the contract-first redesign
-and its first Ethereum Indexer Service implementation.
+and its first Ethereum service implementations.
 It gathers the product flows, service boundaries, folder rules, persistence
 semantics, accounting corrections, acceptance criteria, and unresolved
 decisions in one place.
 
-The stateless Bitcoin/Ethereum Wallet Service execution path is implemented.
-Payment Service and Indexer Service production behavior is being implemented
-incrementally; code and acceptance tests, not trait presence, determine which
-parts are complete. The approved Ethereum v1 decisions and runbook are in
-[`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md).
+The stateless Bitcoin/Ethereum Wallet Service execution path, authenticated
+Ethereum Wallet HTTP runtime, Ethereum Indexer Service vertical slice, and
+single-network Ethereum Payment Service v1 runtime are implemented in source.
+Code and acceptance tests, not trait presence or documentation, determine
+which parts are complete. This source status is not live deployment evidence:
+production custody, the opt-in Anvil scenario, HA, and multi-network PS
+ownership remain external, unvalidated, or excluded. The service runbooks are
+[`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md),
+[`WALLET_SERVICE.md`](./WALLET_SERVICE.md), and
+[`PAYMENT_SERVICE.md`](./PAYMENT_SERVICE.md).
 
 The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** express requirement
 strength.
@@ -58,7 +63,8 @@ sdk/
 ├── indexing/                      generic sync, watch, fact, finality contracts
 ├── signing/
 │   ├── contract/                  generic key/signing contracts
-│   ├── local/                     ephemeral test key provisioner; signing placeholder
+│   ├── local/                     ephemeral in-memory test provisioner/signer
+│   ├── remote/                    authenticated remote custody client
 │   └── trezor/                    Trezor signer implementation placeholder
 ├── storage/                       backend-independent atomic storage mechanics
 └── transactions/
@@ -292,11 +298,13 @@ sequenceDiagram
     participant IXDB as IX DB
 
     User->>PS: [request] create deposit(asset, expected, idempotency_key)
+    PS->>IX: [request] scope readiness / canonical checkpoint
+    IX-->>PS: [response] Ready(checkpoint = birthday)
     PS->>WS: [request] generate address(asset, key purpose)
     WS->>KP: [request] provision key
     KP-->>WS: [response] key locator + public key
     Note over WS: derive chain-native address
-    WS-->>PS: [response] address + key locator + birthday
+    WS-->>PS: [response] address + key locator
 
     PS->>PSDB: [write] deposit = AwaitingWatch<br/>open zero-balance ledger row
     PS->>IX: [request] watch(address, birthday, idempotency_key)
@@ -313,6 +321,8 @@ Requirements:
   separate.
 - `AwaitingWatch` MUST be recoverable by an idempotent reconciler.
 - Repeating the same IX idempotency key MUST return the same effective watch.
+- PS MUST capture the birthday from an IX-owned canonical Ready checkpoint;
+  WS MUST NOT invent or return an indexing birthday.
 - The birthday MUST be the earliest block that can contain activity.
 - Imported addresses MUST provide an explicit historical birthday or request
   a deliberate full rescan.
@@ -524,6 +534,13 @@ The mirror MUST:
 - permit rebuilding ledger projections; and
 - remain separate from IX's own event store.
 
+PS MUST also maintain a durable per-deposit observation index as a derived
+projection. The index MUST be updated in the same PS batch as the affected
+ledger/reconciliation rows and projection cursor, MUST be rebuildable from the
+append-only mirror plus PS attribution records, and MUST include relevant
+facts that intentionally produce no ledger row, such as native gas funding for
+an ERC-20 deposit.
+
 ### 7.2 Classification
 
 PS classification MUST consult its own records and produce one or more of:
@@ -599,6 +616,10 @@ modify an earlier row.
 - A post-credit reorg MAY make `accounted > confirmed`; PS MUST explicitly
   reverse the credit, create debt, or accept the loss according to configured
   business policy.
+- Ethereum PS v1 records that response as a typed, idempotent reconciliation
+  decision. `ReverseCredit` appends an expected-head accounting correction;
+  `AcceptLiability` and `ExternalDebtRecorded` preserve `accounted`, with the
+  latter requiring an opaque external reference.
 - `received` and `confirmed` are canonical current balances, not permanent
   monotonic lifetime metrics.
 - Historical monotonicity is the increasing sequence of immutable ledger rows.
@@ -631,11 +652,14 @@ sequenceDiagram
     IX-->>PS: [response] event page + next cursor M
 
     loop each event revision
-        PS->>PSDB: [write] append mirror if absent
-        PS->>PSDB: [write] append ledger rows if projection IDs absent
+        PS->>PSDB: [write] atomically append mirror if absent<br/>advance ingestion cursor
     end
 
-    PS->>PSDB: [write] advance consumed cursor after durable processing
+    PS->>PSDB: [request] load independent projection cursor
+    loop each next mirrored event in cursor order
+        Note over PS: classify using deposits and collection mappings
+        PS->>PSDB: [write] atomically append ledger/reconciliation rows<br/>update deposit observation index<br/>advance projection cursor
+    end
 ```
 
 ## 8. Collection requirements
@@ -651,6 +675,10 @@ Every collection MUST:
 - reserve source value before broadcast;
 - identify asset and master destination;
 - persist one or more durable legs;
+- validate a chain-native signed transaction against the active chain ID and
+  configured gas/fee ceilings before persistence or broadcast;
+- persist the expected transaction ID and exact opaque signed envelope before
+  the first broadcast side effect;
 - record broadcast transaction IDs;
 - call IX `watch(txid)` after broadcast;
 - retain the failure window where a transaction ID exists but watch
@@ -680,7 +708,9 @@ flowchart TD
 ```mermaid
 stateDiagram-v2
     [*] --> Required
-    Required --> Broadcast: WS returns txid
+    Required --> Signed: WS returns txid + exact envelope
+    Signed --> Signed: exact-byte retry after response loss
+    Signed --> Broadcast: exact broadcast accepted
     Broadcast --> Broadcast: IX watch registration/retry
     Broadcast --> Confirmed: IX proof depth reached
     Broadcast --> Failed: failed or dropped
@@ -703,12 +733,16 @@ sequenceDiagram
     PS->>PSDB: [write] create collection + reserve balance
     PS->>WS: [request] collection requirements
     WS-->>PS: [response] none
-    PS->>WS: [request] collect(from key locator, to master)
+    PS->>WS: [request] prepare collection(from key locator, to master)
     Note over WS: build unsigned -> signer -> signed
-    WS->>Chain: [request] broadcast
+    WS-->>PS: [response] txid + opaque envelope + attribution
+    Note over PS: validate chain ID and fee ceilings
+    PS->>PSDB: [write] atomically leg = Signed(txid)<br/>exact envelope + tx index
+    PS->>WS: [request] broadcast exact envelope(expected txid)
+    WS->>Chain: [request] broadcast exact bytes
     Chain-->>WS: [response] txid
-    WS-->>PS: [response] txid + attribution
-    PS->>PSDB: [write] leg = Broadcast(txid, watch=None)
+    WS-->>PS: [response] matching txid
+    PS->>PSDB: [write] atomically leg = Broadcast<br/>delete envelope
     PS->>IX: [request] watch(txid)
     IX-->>PS: [response] watch_id
     PS->>PSDB: [write] attach watch_id
@@ -780,11 +814,15 @@ sequenceDiagram
     WS-->>PS: [response] NativeGasBalance(current, required, deficit)
 
     opt native balance is insufficient
-        PS->>WS: [request] transfer native gas(master to deposit)
-        WS->>Chain: [request] broadcast prefund
+        PS->>WS: [request] prepare native gas transfer(funder to deposit)
+        WS-->>PS: [response] prefund txid + opaque envelope
+        Note over PS: validate chain ID and fee ceilings
+        PS->>PSDB: [write] atomically GasFunding leg = Signed<br/>exact envelope + tx index
+        PS->>WS: [request] broadcast exact envelope(expected txid)
+        WS->>Chain: [request] broadcast exact prefund bytes
         Chain-->>WS: [response] prefund txid
         WS-->>PS: [response] prefund txid
-        PS->>PSDB: [write] GasFunding leg = Broadcast
+        PS->>PSDB: [write] atomically leg = Broadcast<br/>delete envelope
         PS->>IX: [request] watch(prefund txid)
         IX-->>PS: [response] watch_id
         IX-->>PS: [event] prefund Confirmed / Failed / Dropped / Reorged
@@ -792,11 +830,15 @@ sequenceDiagram
         Note over PS: Continue only after confirmation proof
     end
 
-    PS->>WS: [request] collect token(deposit to master)
-    WS->>Chain: [request] broadcast token transfer
+    PS->>WS: [request] prepare token collection(deposit to master)
+    WS-->>PS: [response] sweep txid + opaque envelope + attribution
+    Note over PS: validate chain ID and fee ceilings
+    PS->>PSDB: [write] atomically Sweep leg = Signed<br/>exact envelope + tx index
+    PS->>WS: [request] broadcast exact envelope(expected txid)
+    WS->>Chain: [request] broadcast exact token-transfer bytes
     Chain-->>WS: [response] sweep txid
-    WS-->>PS: [response] sweep txid + token attribution
-    PS->>PSDB: [write] Sweep leg = Broadcast
+    WS-->>PS: [response] matching sweep txid
+    PS->>PSDB: [write] atomically leg = Broadcast<br/>delete envelope
     PS->>IX: [request] watch(sweep txid)
     IX-->>PS: [response] watch_id
     IX-->>PS: [event] sweep transaction state revision
@@ -904,13 +946,23 @@ For one reverted block, inverse effects and checkpoint movement MUST be atomic.
 - Accounting commands MUST have independent idempotency keys.
 - Collection creation, reservations, leg transitions, and attribution MUST be
   durable.
+- A deposit close MUST be conditioned on the exact zero-balance ledger head
+  and the absence of active reservations and open reconciliation. Concurrent
+  projection, reservation, or reconciliation changes MUST force a retry.
+- PS MUST NOT remove a closed deposit's IX address watch unless IX supplies a
+  durable cutoff and PS drains projection through that cutoff. Without that
+  protocol the watch MUST remain active so late payments stay visible.
+- PS MUST persist the expected transaction ID and opaque signed envelope before
+  broadcast. A retry after response loss MUST rebroadcast the exact bytes and
+  MUST verify that WS/RPC returns the expected hash; it MUST NOT silently
+  re-sign the same leg as a fresh transaction.
 - A crash between event mirroring and projection MUST be recoverable by replay.
 - A crash between broadcast and IX watch registration MUST be recoverable from
   the persisted collection leg and idempotent reconciliation.
 
 ## 11. API requirements
 
-PS must eventually expose semantic operations for:
+Ethereum PS v1 exposes internal exchange-backend JSON/HTTP operations for:
 
 - create deposit;
 - retrieve deposit address and expiration;
@@ -920,12 +972,36 @@ PS must eventually expose semantic operations for:
 - retrieve collection state and legs;
 - initiate/enable collection according to policy;
 - apply a user accounting credit/reversal; and
-- inspect reconciliation or failure state.
+- inspect reconciliation or failure state; and
+- resolve reconciliation explicitly as reverse credit, accepted liability, or
+  externally recorded debt.
 
 Commands that can outlive one request SHOULD return durable job IDs.
 
-External transport, authentication, authorization, pagination format, and
-webhook format remain open.
+Ethereum PS v1 uses `/v1`, strict JSON, unsigned decimal strings for atomic
+amounts, bounded cursor pagination, and separate ordinary and administrator
+bearer credentials. The administrator credential MAY use ordinary routes; the
+ordinary credential MUST receive `403` on administrator routes. Non-loopback
+listeners require trusted upstream TLS termination. Webhooks are excluded.
+
+Every external mutation MUST carry `Idempotency-Key`. PS scopes it by the
+authenticated principal and semantic operation and stores a hash of the
+canonical request meaning. Exact replay returns the original resource/job IDs;
+reuse for different content returns `409`. Server-owned IDs are
+lowercase-prefixed UUIDv7 values. Long-running create-deposit, close-deposit,
+create-collection, and retry-collection commands return `202` and a durable
+job in `queued`, `running`, `waiting_retry`, `succeeded`, or `failed` state.
+
+The Ethereum v1 deployment unit is one PS process with exclusive ownership of
+one PS RocksDB path, one Ethereum `IndexScope`, one active policy identity, and
+one IX feed. Multiple networks require separate instances/databases until a
+future scope-keyed PS persistence design is approved.
+
+The required Ethereum v1 policy supplies both a human-readable network label
+and numeric EVM chain ID, asset allowlist, TTL, master destinations, collection
+thresholds, gas-funder limit, and ceilings for gas limit, maximum fee per gas,
+priority fee per gas, and maximum total fee. These values have no permissive
+financial defaults.
 
 ## 12. Operational and security requirements
 
@@ -947,7 +1023,7 @@ webhook format remain open.
 - A node/RPC outage MUST not silently convert unknown state into dropped or
   failed state.
 
-## 13. Open decisions before implementation
+## 13. Remaining open decisions and selected v1 decisions
 
 The questions below remain open for the general multi-chain system unless a
 more focused decision record closes them. For Ethereum IX v1,
@@ -1019,6 +1095,13 @@ WAL-backed batch contains block effects, observations, events, checkpoint, and
 retention changes. Records have explicit versions; migrations, backup, and
 generation-based rebuild fail closed.
 
+Ethereum PS v1 separately binds its RocksDB database to the PS owner, schema
+v2, one Ethereum scope, numeric chain ID through policy, and active policy
+identity. `migrate` requires and verifies a physical backup, validates semantic
+records and references, rebuilds supplementary indexes, and binds metadata
+only after validation succeeds. These are v1 selections, not mandatory
+backends for every future deployment.
+
 - Is the atomic key/value contract sufficient, or should implementations expose
   only semantic repositories?
 - What isolation and durability guarantees are mandatory?
@@ -1044,13 +1127,14 @@ case, and blocks automatic credit/collection until explicit resolution.
 
 ### 13.8 Application topology and delivery
 
-Ethereum v1 decision: synchronization, reconciliation, delivery, health, and
-maintenance are supervised by `apps/indexer`. `apps/api` currently composes
-bounded watch-reconciliation and IX-ingestion maintenance runs over durable PS
-state. The independent projection cursor and atomic projection mechanics are
-implemented in `sdk/deposits`, but a long-running PS projection loop remains
-blocked on concrete business classification rules. IX delivery is at-least-once
-with a cursor; semantic effects are idempotent.
+Ethereum v1 decision: `apps/indexer` supervises IX synchronization, reorg, and
+fact delivery. `apps/api` supervises PS HTTP, durable jobs, watch
+reconciliation, IX mirroring, business projection, expiration, collection,
+readiness, and maintenance over a separate PS database. IX delivery is
+at-least-once with a cursor; command and semantic effects are idempotent. PS
+classification precedence is durable collection mapping, gas-funding mapping,
+incoming movement to a known deposit, then other balance change. A relevant
+unresolved fact stops projection/readiness rather than being silently skipped.
 
 - Are reconciliation and delivery loops inside existing apps or separate
   executables?
@@ -1060,9 +1144,9 @@ with a cursor; semantic effects are idempotent.
   transport plus idempotency?
 - Are webhooks required, and how are they authenticated/retried?
 
-## 14. Contract traceability
+## 14. Contract and implementation traceability
 
-| Requirement area | Rust scaffold |
+| Requirement area | Rust location |
 |---|---|
 | Chain identity and atomic value | `sdk/chains/identity` |
 | Stateless wallet capabilities/factory | `sdk/chains/contract` |
@@ -1074,6 +1158,9 @@ with a cursor; semantic effects are idempotent.
 | IX fact and transaction state model | `sdk/indexing::observation` |
 | PS deposits/event mirror/ledger | `sdk/deposits` |
 | PS durable collection workflow | `sdk/deposits::collection` |
+| Ethereum PS API and workers | `apps/api` |
+| PS users/jobs/reconciliation/migration | `sdk/deposits::{user,job,reconciliation,metadata,migration}` |
+| Stateless authenticated Ethereum WS | `apps/wallet`, `sdk/signing/remote` |
 | Backend-independent storage mechanics | `sdk/storage` |
 | Generic UTXO construction | `sdk/transactions/utxo` |
 | Narrow account construction | `sdk/transactions/account` |
@@ -1100,8 +1187,9 @@ The contract phase is structurally accepted when:
 - token collection can persist gas-funding and sweep legs; and
 - reorg and replay paths can append corrective state without deleting history.
 
-Behavioral acceptance requires real store, parser, and worker implementations
-and is deliberately not claimed by this document.
+Behavioral acceptance requires proportionate store, parser, worker,
+failure-window, and live-environment evidence. The existence of the concrete
+Ethereum v1 source slices does not make that evidence automatic.
 
 ## 16. Related documents
 

@@ -4,6 +4,8 @@
 //! with injected provisioning and signing backends. Durable workflow state,
 //! transport authentication, and request persistence stay outside this crate.
 
+pub mod api;
+
 use chain_contract::{
     Balance, Chain, ChainError, CollectionSubmission, GeneratedAddress, WalletFactory,
 };
@@ -17,6 +19,167 @@ pub struct WalletService<C, F, K, S> {
     keys: K,
     signer: S,
     chain: PhantomData<C>,
+}
+
+/// Production-facing object-safe Ethereum operation adapter used by the HTTP
+/// process. It remains stateless: RPC and custody clients are injected and no
+/// database or durable workflow state is available here.
+pub struct EthereumOperations<R, K, S> {
+    service: WalletService<chain_ethereum::Ethereum, chain_ethereum::EthereumWallet<R>, K, S>,
+}
+
+impl<R, K, S> EthereumOperations<R, K, S>
+where
+    R: chain_ethereum::EthereumRpc,
+    K: KeyProvisioner,
+    S: Signer,
+{
+    #[must_use]
+    pub const fn new(
+        service: WalletService<chain_ethereum::Ethereum, chain_ethereum::EthereumWallet<R>, K, S>,
+    ) -> Self {
+        Self { service }
+    }
+}
+
+impl<R, K, S> api::EthereumWalletOperations for EthereumOperations<R, K, S>
+where
+    R: chain_ethereum::EthereumRpc + 'static,
+    K: KeyProvisioner + 'static,
+    S: Signer + 'static,
+{
+    fn generate_address<'a>(
+        &'a self,
+        asset: chain_ethereum::EthereumAsset,
+        operation_id: signer::OperationId,
+        key_purpose: String,
+    ) -> api::OperationFuture<
+        'a,
+        Result<GeneratedAddress<chain_ethereum::EthereumAddress>, ChainError>,
+    > {
+        Box::pin(async move {
+            self.service
+                .generate_address(
+                    &asset,
+                    chain_ethereum::EthereumGenerateAddress::new(
+                        self.service.wallets().chain_id(),
+                        operation_id,
+                        key_purpose,
+                    ),
+                )
+                .await
+        })
+    }
+
+    fn balance<'a>(
+        &'a self,
+        asset: chain_ethereum::EthereumAsset,
+        address: chain_ethereum::EthereumAddress,
+    ) -> api::OperationFuture<'a, Result<Balance<chain_ethereum::Wei>, ChainError>> {
+        Box::pin(async move { self.service.balance(&asset, &address).await })
+    }
+
+    fn sign_transfer<'a>(
+        &'a self,
+        asset: chain_ethereum::EthereumAsset,
+        request: chain_ethereum::EthereumTransferRequest,
+    ) -> api::OperationFuture<'a, Result<chain_ethereum::EthereumSignedTransaction, ChainError>>
+    {
+        Box::pin(async move {
+            validate_transfer_asset(&asset, &request)?;
+            let unsigned = self.service.build_transfer(&asset, request).await?;
+            self.service.sign_transaction(&asset, unsigned).await
+        })
+    }
+
+    fn collection_requirements<'a>(
+        &'a self,
+        asset: chain_ethereum::EthereumAsset,
+        request: chain_ethereum::EthereumCollectionRequest,
+    ) -> api::OperationFuture<
+        'a,
+        Result<Vec<chain_ethereum::EthereumCollectionRequirement>, ChainError>,
+    > {
+        Box::pin(async move {
+            validate_collection_asset(&asset, &request)?;
+            self.service.collection_requirements(&asset, &request).await
+        })
+    }
+
+    fn prepare_collection<'a>(
+        &'a self,
+        asset: chain_ethereum::EthereumAsset,
+        request: chain_ethereum::EthereumCollectionRequest,
+    ) -> api::OperationFuture<'a, Result<chain_ethereum::EthereumPreparedCollection, ChainError>>
+    {
+        Box::pin(async move {
+            validate_collection_asset(&asset, &request)?;
+            self.service
+                .wallets()
+                .prepare_collection(request, self.service.signer())
+                .await
+        })
+    }
+
+    fn broadcast<'a>(
+        &'a self,
+        transaction: chain_ethereum::EthereumSignedTransaction,
+    ) -> api::OperationFuture<'a, Result<chain_ethereum::EthereumTransactionId, ChainError>> {
+        Box::pin(async move {
+            self.service
+                .broadcast(&chain_ethereum::EthereumAsset::Native, transaction)
+                .await
+        })
+    }
+
+    fn receipt<'a>(
+        &'a self,
+        transaction_id: chain_ethereum::EthereumTransactionId,
+    ) -> api::OperationFuture<'a, Result<Option<chain_ethereum::EthereumReceipt>, ChainError>> {
+        Box::pin(async move {
+            self.service
+                .transaction(&chain_ethereum::EthereumAsset::Native, &transaction_id)
+                .await
+        })
+    }
+}
+
+fn validate_transfer_asset(
+    asset: &chain_ethereum::EthereumAsset,
+    request: &chain_ethereum::EthereumTransferRequest,
+) -> Result<(), ChainError> {
+    match asset {
+        chain_ethereum::EthereumAsset::Native if request.data.is_empty() => Ok(()),
+        chain_ethereum::EthereumAsset::Erc20(token)
+            if request.to.as_ref() == Some(token) && request.data.len() == 68 =>
+        {
+            Ok(())
+        }
+        _ => Err(ChainError {
+            kind: chain_contract::ChainErrorKind::InvalidTransaction,
+            message: "Ethereum transfer asset does not match its chain-native request".to_owned(),
+        }),
+    }
+}
+
+fn validate_collection_asset(
+    asset: &chain_ethereum::EthereumAsset,
+    request: &chain_ethereum::EthereumCollectionRequest,
+) -> Result<(), ChainError> {
+    match (asset, request) {
+        (
+            chain_ethereum::EthereumAsset::Native,
+            chain_ethereum::EthereumCollectionRequest::Native { .. },
+        ) => Ok(()),
+        (
+            chain_ethereum::EthereumAsset::Erc20(asset_token),
+            chain_ethereum::EthereumCollectionRequest::Token { token, .. },
+        ) if asset_token == token => Ok(()),
+        _ => Err(ChainError {
+            kind: chain_contract::ChainErrorKind::InvalidTransaction,
+            message: "Ethereum collection asset does not match its chain-native request".to_owned(),
+        }),
+    }
 }
 
 impl<C, F, K, S> WalletService<C, F, K, S>
@@ -147,6 +310,10 @@ mod tests {
     use signer_local::LocalSigner;
     use std::sync::Arc;
 
+    fn operation(value: &str) -> signer::OperationId {
+        signer::OperationId::new(value).expect("test operation ID must be valid")
+    }
+
     #[derive(Debug)]
     struct MockEthereumRpc;
 
@@ -208,12 +375,17 @@ mod tests {
         let asset = EthereumAsset::Native;
         let generated = block_on(service.generate_address(
             &asset,
-            EthereumGenerateAddress::new(31_337, "service-sender"),
+            EthereumGenerateAddress::new(
+                31_337,
+                operation("provision-service-sender"),
+                "service-sender",
+            ),
         ))
         .expect("service should generate an Ethereum address");
         let unsigned = block_on(service.build_transfer(
             &asset,
             EthereumTransferRequest {
+                signing_operation_id: operation("sign-service-transfer"),
                 key: generated.key,
                 from: generated.address,
                 to: Some(EthereumAddress([9; 20])),

@@ -1,4 +1,5 @@
 use crate::{BitcoinAddress, Satoshi};
+use signer::OperationId;
 use transaction_utxo::{Amount, FeeRate, Utxo};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +42,7 @@ pub struct BitcoinOutput {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BitcoinBuildRequest {
+    pub signing_operation_id: OperationId,
     pub available: Vec<BitcoinUtxo>,
     pub recipients: Vec<BitcoinOutput>,
     pub change_address: BitcoinAddress,

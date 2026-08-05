@@ -40,6 +40,7 @@ impl EthereumTransactionBuilder for EthereumTransactionCodec {
         }
 
         Ok(UnsignedEthereumTransaction {
+            signing_operation_id: request.signing_operation_id,
             key: request.key,
             chain_id: context.chain_id,
             nonce: context.nonce,
@@ -65,6 +66,7 @@ impl EthereumTransactionSigning for EthereumTransactionCodec {
             let signature_hash = native.signature_hash();
             let signature = signer
                 .sign(SignRequest {
+                    operation_id: transaction.signing_operation_id,
                     key: transaction.key,
                     payload: SignablePayload::Digest(Digest {
                         bytes: signature_hash.to_vec(),
@@ -161,18 +163,23 @@ mod tests {
     use futures_executor::block_on;
     use signer_local::LocalSigner;
 
+    fn operation(value: &str) -> signer::OperationId {
+        signer::OperationId::new(value).expect("test operation ID must be valid")
+    }
+
     #[test]
     fn builds_and_signs_eip1559_transfer() {
         let signer = LocalSigner::ephemeral_for_testing();
-        let generated = block_on(
-            EthereumAddressGenerator
-                .generate_address(EthereumGenerateAddress::new(31_337, "sender"), &signer),
-        )
+        let generated = block_on(EthereumAddressGenerator.generate_address(
+            EthereumGenerateAddress::new(31_337, operation("provision-sender"), "sender"),
+            &signer,
+        ))
         .expect("Ethereum sender should be generated");
         let codec = EthereumTransactionCodec;
         let unsigned = codec
             .build(
                 EthereumTransferRequest {
+                    signing_operation_id: operation("sign-transfer"),
                     key: generated.key,
                     from: generated.address,
                     to: Some(crate::EthereumAddress([9; 20])),
@@ -193,20 +200,47 @@ mod tests {
 
         assert_eq!(signed.envelope[0], 0x02);
         assert_eq!(signed.id.0, keccak256(&signed.envelope).0);
+        let inspection = signed
+            .inspect_eip1559_fees()
+            .expect("signed EIP-1559 fee fields should be inspectable");
+        assert_eq!(inspection.chain_id, 31_337);
+        assert_eq!(inspection.gas_limit, 21_000);
+        assert_eq!(inspection.max_fee_per_gas, Wei::from_u128(2_000_000_000));
+        assert_eq!(
+            inspection.max_priority_fee_per_gas,
+            Wei::from_u128(1_000_000_000)
+        );
+        assert_eq!(
+            inspection.maximum_total_fee,
+            Wei::from_u128(42_000_000_000_000)
+        );
+
+        let mut envelope_with_trailing_byte = signed.envelope.clone();
+        envelope_with_trailing_byte.push(0);
+        let non_exact = EthereumSignedTransaction::from_envelope(
+            EthereumTransactionId(keccak256(&envelope_with_trailing_byte).0),
+            envelope_with_trailing_byte,
+        )
+        .expect("matching transaction ID should preserve the exact test bytes");
+        assert!(matches!(
+            non_exact.inspect_eip1559_fees(),
+            Err(crate::EthereumEip1559InspectionError::MalformedEnvelope)
+        ));
     }
 
     #[test]
     fn rejects_signature_from_the_wrong_sender() {
         let signer = LocalSigner::ephemeral_for_testing();
-        let generated = block_on(
-            EthereumAddressGenerator
-                .generate_address(EthereumGenerateAddress::new(1, "actual-signer"), &signer),
-        )
+        let generated = block_on(EthereumAddressGenerator.generate_address(
+            EthereumGenerateAddress::new(1, operation("provision-actual-signer"), "actual-signer"),
+            &signer,
+        ))
         .expect("Ethereum signer should be generated");
         let codec = EthereumTransactionCodec;
         let unsigned = codec
             .build(
                 EthereumTransferRequest {
+                    signing_operation_id: operation("sign-wrong-sender"),
                     key: generated.key,
                     from: crate::EthereumAddress([7; 20]),
                     to: Some(crate::EthereumAddress([8; 20])),

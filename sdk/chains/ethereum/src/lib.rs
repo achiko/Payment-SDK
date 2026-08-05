@@ -7,9 +7,10 @@ mod rpc;
 mod transaction;
 mod wallet;
 
-pub use address::EthereumAddress;
+pub use address::{EthereumAddress, EthereumAddressParseError};
 pub use collection::{
     EthereumCollectionAttribution, EthereumCollectionRequest, EthereumCollectionRequirement,
+    EthereumPreparedCollection,
 };
 pub use indexer::{
     EthereumBlock, EthereumBlockInterpreter, EthereumHeadWake, EthereumHttpBlockSource,
@@ -18,11 +19,16 @@ pub use indexer::{
     EthereumNewHeadsConnection, EthereumNewHeadsConnectionEvent, EthereumNewHeadsConnector,
     EthereumUndo, EthereumWatchTarget, TokioTungsteniteNewHeadsConnector, parse_new_heads_wake,
 };
-pub use rpc::EthereumRpc;
+pub use rpc::{
+    EthereumHttpRpc, EthereumHttpRpcBuildError, EthereumHttpRpcBuildErrorKind,
+    EthereumHttpRpcConfig, EthereumRpc, EthereumRpcLimits,
+};
 pub use transaction::{
-    EthereumBuildContext, EthereumReceipt, EthereumSignedTransaction, EthereumTransactionBuilder,
-    EthereumTransactionCodec, EthereumTransactionId, EthereumTransactionSigning,
-    EthereumTransferRequest, UnsignedEthereumTransaction,
+    EthereumBuildContext, EthereumEip1559FeeInspection, EthereumEip1559InspectionError,
+    EthereumReceipt, EthereumSignedTransaction, EthereumSignedTransactionError,
+    EthereumTransactionBuilder, EthereumTransactionCodec, EthereumTransactionId,
+    EthereumTransactionIdParseError, EthereumTransactionSigning, EthereumTransferRequest,
+    UnsignedEthereumTransaction,
 };
 pub use wallet::{EthereumAddressGenerator, EthereumGenerateAddress, EthereumWallet};
 

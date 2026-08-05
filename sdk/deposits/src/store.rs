@@ -1,6 +1,6 @@
 use crate::{
-    BoxFuture, Collection, CollectionId, CollectionLegId, CollectionLegState, CreateDeposit,
-    Deposit, DepositError, DepositId, DepositState, IdempotencyKey, LedgerEntry,
+    BoxFuture, CreateDeposit, Deposit, DepositError, DepositId, DepositState, DepositStateKind,
+    IdempotencyKey, LedgerEntry, LedgerEntryId, UserId,
 };
 use chain_identity::CanonicalAddress;
 use indexing::WatchId;
@@ -19,6 +19,15 @@ pub struct CreatedDeposit {
     pub ledger: LedgerEntry,
 }
 
+/// Optimistic close command tied to the exact zero-balance ledger snapshot
+/// used for the business eligibility decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloseDeposit {
+    pub deposit_id: DepositId,
+    pub expected_state: DepositState,
+    pub expected_ledger_head: LedgerEntryId,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AwaitingWatchPageRequest {
     pub after: Option<DepositId>,
@@ -29,6 +38,35 @@ pub struct AwaitingWatchPageRequest {
 pub struct AwaitingWatchPage {
     pub deposits: Vec<Deposit>,
     pub next: Option<DepositId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DepositPageRequest {
+    pub after: Option<DepositId>,
+    pub limit: usize,
+    pub user_id: Option<UserId>,
+    pub state: Option<DepositStateKind>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DepositPage {
+    pub deposits: Vec<Deposit>,
+    pub next: Option<DepositId>,
+}
+
+/// Bounded, restart-safe request for backfilling association indexes from
+/// authoritative deposit rows created by older repository versions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DepositIndexRebuildRequest {
+    pub after: Option<DepositId>,
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DepositIndexRebuild {
+    pub scanned: usize,
+    pub next: Option<DepositId>,
+    pub complete: bool,
 }
 
 /// Backend-independent PS persistence contract. No database engine is selected here.
@@ -55,11 +93,32 @@ pub trait DepositStore: Send + Sync {
         address: &'a CanonicalAddress,
     ) -> BoxFuture<'a, Result<Option<Deposit>, DepositError>>;
 
+    /// Lists deposits in stable deposit-ID order. Optional user and lifecycle
+    /// filters use durable association indexes and share the same cursor.
+    fn deposits<'a>(
+        &'a self,
+        request: DepositPageRequest,
+    ) -> BoxFuture<'a, Result<DepositPage, DepositError>>;
+
+    /// Idempotently backfills all deposit association indexes. Until a full
+    /// rebuild completes, filtered listing falls back to authoritative rows so
+    /// legacy deposits are never silently hidden.
+    fn rebuild_deposit_indexes<'a>(
+        &'a self,
+        request: DepositIndexRebuildRequest,
+    ) -> BoxFuture<'a, Result<DepositIndexRebuild, DepositError>>;
+
     fn set_state<'a>(
         &'a self,
         id: &'a DepositId,
         state: DepositState,
     ) -> BoxFuture<'a, Result<(), DepositError>>;
+
+    /// The only supported path to `Closed`. Atomically closes a zero-balance
+    /// deposit while invalidating concurrent ledger projections and rejecting
+    /// active reservations. The IX address watch is deliberately retained so
+    /// late payments cannot become invisible.
+    fn close<'a>(&'a self, command: CloseDeposit) -> BoxFuture<'a, Result<(), DepositError>>;
 
     fn awaiting_watch<'a>(
         &'a self,
@@ -74,23 +133,4 @@ pub trait DepositStore: Send + Sync {
         idempotency_key: &'a IdempotencyKey,
         watch_id: WatchId,
     ) -> BoxFuture<'a, Result<Deposit, DepositError>>;
-}
-
-pub trait CollectionStore: Send + Sync {
-    fn create_collection<'a>(
-        &'a self,
-        collection: Collection,
-    ) -> BoxFuture<'a, Result<(), DepositError>>;
-
-    fn collection<'a>(
-        &'a self,
-        id: &'a CollectionId,
-    ) -> BoxFuture<'a, Result<Option<Collection>, DepositError>>;
-
-    fn set_leg_state<'a>(
-        &'a self,
-        collection_id: &'a CollectionId,
-        leg_id: &'a CollectionLegId,
-        state: CollectionLegState,
-    ) -> BoxFuture<'a, Result<(), DepositError>>;
 }

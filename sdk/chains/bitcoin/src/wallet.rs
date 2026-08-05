@@ -15,7 +15,8 @@ use chain_contract::{
 };
 use indexing::SourceError;
 use signer::{
-    Curve, KeyProvisionRequest, KeyProvisioner, PublicKey, PublicKeyFormat, Signer, SignerError,
+    Curve, KeyProvisionRequest, KeyProvisioner, OperationId, PublicKey, PublicKeyFormat, Signer,
+    SignerError,
 };
 
 const COINBASE_MATURITY: u64 = 100;
@@ -51,12 +52,14 @@ impl BitcoinGenerateAddress {
     pub fn new(
         network: BitcoinNetwork,
         kind: BitcoinAddressKind,
+        operation_id: OperationId,
         purpose: impl Into<String>,
     ) -> Self {
         Self {
             network,
             kind,
             key: KeyProvisionRequest {
+                operation_id,
                 curve: Curve::Secp256k1,
                 public_key_format: required_public_key_format(kind),
                 purpose: purpose.into(),
@@ -323,6 +326,7 @@ impl<R: BitcoinRpc> Collector<Bitcoin> for BitcoinWallet<R> {
             let unsigned = crate::BitcoinTransactionBuilder::build(
                 &self.codec,
                 crate::BitcoinBuildRequest {
+                    signing_operation_id: request.signing_operation_id,
                     available,
                     recipients: vec![crate::BitcoinOutput {
                         address: request.destination.clone(),
@@ -539,6 +543,10 @@ mod tests {
         }
     }
 
+    fn operation(value: impl Into<String>) -> OperationId {
+        OperationId::new(value).expect("test operation ID must be valid")
+    }
+
     #[test]
     fn generates_native_segwit_addresses_for_each_network() {
         let keys = LocalSigner::ephemeral_for_testing();
@@ -552,7 +560,12 @@ mod tests {
             (BitcoinNetwork::Regtest, "bcrt1q"),
         ] {
             let generated = block_on(generator.generate_address(
-                BitcoinGenerateAddress::new(network, BitcoinAddressKind::SegwitV0, "segwit-test"),
+                BitcoinGenerateAddress::new(
+                    network,
+                    BitcoinAddressKind::SegwitV0,
+                    operation(format!("provision-segwit-{network:?}")),
+                    "segwit-test",
+                ),
                 &keys,
             ))
             .expect("native SegWit address should be generated");
@@ -577,7 +590,12 @@ mod tests {
             (BitcoinNetwork::Regtest, "bcrt1p"),
         ] {
             let generated = block_on(generator.generate_address(
-                BitcoinGenerateAddress::new(network, BitcoinAddressKind::Taproot, "taproot-test"),
+                BitcoinGenerateAddress::new(
+                    network,
+                    BitcoinAddressKind::Taproot,
+                    operation(format!("provision-taproot-{network:?}")),
+                    "taproot-test",
+                ),
                 &keys,
             ))
             .expect("Taproot address should be generated");
@@ -596,6 +614,7 @@ mod tests {
             BitcoinGenerateAddress::new(
                 BitcoinNetwork::Regtest,
                 BitcoinAddressKind::SegwitV0,
+                operation("provision-balance-source"),
                 "balance-source",
             ),
             &keys,
@@ -652,6 +671,7 @@ mod tests {
             BitcoinGenerateAddress::new(
                 BitcoinNetwork::Regtest,
                 BitcoinAddressKind::SegwitV0,
+                operation("provision-collection-source"),
                 "collection-source",
             ),
             &keys,
@@ -661,6 +681,7 @@ mod tests {
             BitcoinGenerateAddress::new(
                 BitcoinNetwork::Regtest,
                 BitcoinAddressKind::SegwitV0,
+                operation("provision-collection-destination"),
                 "collection-destination",
             ),
             &keys,
@@ -687,6 +708,7 @@ mod tests {
         let source_key = source.key.clone();
         let submission = block_on(wallet.collect(
             BitcoinBatchCollectionRequest {
+                signing_operation_id: operation("sign-bitcoin-collection"),
                 sources: vec![crate::BitcoinCollectionSource {
                     address: source.address,
                     key: source.key,

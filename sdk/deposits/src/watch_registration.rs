@@ -6,14 +6,21 @@ use signer::KeyLocator;
 
 use crate::{
     AwaitingWatchPageRequest, BoxFuture, CreateDeposit, CreateDepositWithLedger, Deposit,
-    DepositError, DepositErrorKind, DepositId, DepositState, DepositStore, IdempotencyKey, UserId,
+    DepositError, DepositErrorKind, DepositId, DepositState, DepositStore, IdempotencyKey,
+    LEGACY_DEPOSIT_KEY_PURPOSE, UserId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DepositAddressRequest {
     pub scope: IndexScope,
-    /// The Wallet Service adapter must use this to return the same address when
-    /// PS retries after losing the first response.
+    pub asset: AssetId,
+    /// PS-owned durable custody operation identity. WS forwards it unchanged
+    /// and must return the same address after a lost response.
+    pub operation_id: String,
+    /// Opaque custody purpose selected by PS policy.
+    pub key_purpose: String,
+    /// Business-command audit context. Custody idempotency uses the
+    /// server-owned `operation_id`, not this client-provided key.
     pub idempotency_key: IdempotencyKey,
 }
 
@@ -51,6 +58,7 @@ pub struct RegisterDeposit {
     pub user_id: UserId,
     pub asset: AssetId,
     pub expected: AtomicAmount,
+    pub key_purpose: String,
     pub expires_at: u64,
     pub created_at: u64,
 }
@@ -60,7 +68,8 @@ pub struct RegisterDeposit {
 /// A retry first consults the durable deposit. Consequently a crash after the
 /// local transaction cannot replace the captured checkpoint birthday or
 /// address with newer values. A crash before that transaction is covered by
-/// the Wallet Service idempotency key.
+/// the Wallet Service idempotency key. IX watch idempotency is derived from the
+/// server-owned deposit ID, never from the client-provided command key.
 pub struct DepositWatchCoordinator<'a, S, I, A> {
     store: &'a S,
     indexer: &'a I,
@@ -103,6 +112,9 @@ where
             .addresses
             .address(DepositAddressRequest {
                 scope: command.scope.clone(),
+                asset: command.asset.clone(),
+                operation_id: address_operation_id(&command.id),
+                key_purpose: command.key_purpose.clone(),
                 idempotency_key: command.idempotency_key.clone(),
             })
             .await?;
@@ -124,6 +136,7 @@ where
                     asset: command.asset,
                     address: generated.address,
                     key: generated.key,
+                    key_purpose: command.key_purpose,
                     expected: command.expected,
                     birthday: checkpoint.height,
                     expires_at: command.expires_at,
@@ -157,7 +170,7 @@ where
         match &deposit.state {
             DepositState::Active { .. } => return Ok(deposit),
             DepositState::AwaitingWatch => {}
-            DepositState::Expired | DepositState::Closed => {
+            DepositState::Expired { .. } | DepositState::Closed => {
                 return Err(DepositError {
                     kind: DepositErrorKind::InvalidState,
                     message: "only an AwaitingWatch deposit can complete watch registration"
@@ -173,7 +186,7 @@ where
                 scope: self.scope.clone(),
                 selector: WatchSelector::Address(deposit.address.clone()),
                 start_height: deposit.birthday,
-                idempotency_key: watch_idempotency_key(&deposit.idempotency_key),
+                idempotency_key: watch_idempotency_key(&deposit.id),
             })
             .await
             .map_err(map_index_error)?;
@@ -214,8 +227,12 @@ where
     })
 }
 
-fn watch_idempotency_key(key: &IdempotencyKey) -> String {
-    format!("ps-deposit:{}", key.0)
+fn watch_idempotency_key(id: &DepositId) -> String {
+    format!("ps-deposit:{}", id.0)
+}
+
+fn address_operation_id(id: &DepositId) -> String {
+    format!("ps:deposit-address:{}", id.0)
 }
 
 fn validate_command(command: &RegisterDeposit) -> Result<(), DepositError> {
@@ -223,9 +240,15 @@ fn validate_command(command: &RegisterDeposit) -> Result<(), DepositError> {
         || command.scope.network.trim().is_empty()
         || command.id.0.trim().is_empty()
         || command.idempotency_key.0.trim().is_empty()
+        || command.key_purpose.trim().is_empty()
+        || command.key_purpose.len() > 1_024
+        || command
+            .key_purpose
+            .bytes()
+            .any(|byte| byte.is_ascii_control())
     {
         return Err(invariant(
-            "deposit scope, ID, and idempotency key must be non-empty",
+            "deposit scope, ID, idempotency key, and key purpose must be valid",
         ));
     }
     if command.asset.chain != command.scope.chain {
@@ -243,6 +266,8 @@ fn validate_existing(existing: &Deposit, command: &RegisterDeposit) -> Result<()
     if existing.idempotency_key != command.idempotency_key
         || existing.user_id != command.user_id
         || existing.asset != command.asset
+        || (existing.key_purpose != LEGACY_DEPOSIT_KEY_PURPOSE
+            && existing.key_purpose != command.key_purpose)
         || existing.expected != command.expected
         || existing.expires_at != command.expires_at
         || existing.created_at != command.created_at

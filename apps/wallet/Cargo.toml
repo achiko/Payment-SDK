@@ -5,11 +5,24 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+axum = "=0.8.4"
 chain-bitcoin = { path = "../../sdk/chains/bitcoin" }
 chain-contract = { path = "../../sdk/chains/contract" }
+chain-identity = { path = "../../sdk/chains/identity" }
 chain-ethereum = { path = "../../sdk/chains/ethereum" }
+clap = { version = "=4.5.50", features = ["derive", "env"] }
+hex.workspace = true
+http-support = { package = "http", path = "../../packages/http" }
+reqwest.workspace = true
+serde = { version = "=1.0.219", features = ["derive"] }
+serde_json.workspace = true
 signer = { path = "../../sdk/signing/contract" }
+signer-remote = { path = "../../sdk/signing/remote" }
 telemetry = { path = "../../packages/telemetry" }
+tokio = { workspace = true, features = ["net", "signal", "sync", "time"] }
+tracing = "=0.1.41"
+tracing-subscriber = { version = "=0.3.20", features = ["env-filter", "fmt", "json"] }
+uuid.workspace = true
 
 [dev-dependencies]
 alloy-primitives.workspace = true
@@ -17,10 +30,8 @@ alloy-signer.workspace = true
 alloy-signer-local.workspace = true
 futures-executor.workspace = true
 indexing = { path = "../../sdk/indexing" }
-reqwest.workspace = true
-serde_json.workspace = true
 signer-local = { path = "../../sdk/signing/local" }
-tokio.workspace = true
+tower = { version = "=0.5.2", features = ["util"] }
 transaction-utxo = { path = "../../sdk/transactions/utxo" }
 zeroize.workspace = true
 

@@ -1008,6 +1008,7 @@ dependencies = [
  "chain-identity",
  "futures-executor",
  "futures-util",
+ "http 0.1.0",
  "indexing",
  "json-rpc",
  "serde_json",
@@ -1314,6 +1315,7 @@ dependencies = [
  "bincode",
  "chain-identity",
  "indexing",
+ "sha2",
  "signer",
  "storage",
  "storage-rocksdb",
@@ -2548,17 +2550,27 @@ name = "payment-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chain-ethereum",
  "chain-identity",
  "clap",
  "deposits",
+ "hex",
+ "http 0.1.0",
  "indexing",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
+ "signer",
  "storage",
  "storage-rocksdb",
+ "telemetry",
  "tempfile",
  "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -3485,6 +3497,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "signer-remote"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "signer",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "signer-trezor"
 version = "0.1.0"
 dependencies = [
@@ -4099,6 +4125,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
+name = "uuid"
+version = "1.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f87b8aa10b915a06587d0dec516c282ff295b475d94abf425d62b57710070a2"
+dependencies = [
+ "getrandom 0.3.4",
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4138,18 +4175,29 @@ dependencies = [
  "alloy-primitives",
  "alloy-signer",
  "alloy-signer-local",
+ "axum",
  "chain-bitcoin",
  "chain-contract",
  "chain-ethereum",
+ "chain-identity",
+ "clap",
  "futures-executor",
+ "hex",
+ "http 0.1.0",
  "indexing",
  "reqwest",
+ "serde",
  "serde_json",
  "signer",
  "signer-local",
+ "signer-remote",
  "telemetry",
  "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
  "transaction-utxo",
+ "uuid",
  "zeroize",
 ]
 

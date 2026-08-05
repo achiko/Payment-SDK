@@ -149,7 +149,10 @@ impl BearerToken {
         Ok(Self(Arc::from(bytes)))
     }
 
-    fn matches_header(&self, value: Option<&HeaderValue>) -> bool {
+    /// Compares an HTTP `Authorization` value without timing-dependent early
+    /// exits over the credential bytes.
+    #[must_use]
+    pub fn matches_authorization_header(&self, value: Option<&HeaderValue>) -> bool {
         const PREFIX: &[u8] = b"Bearer ";
         let Some(value) = value else {
             return false;
@@ -184,6 +187,7 @@ pub struct HttpServerConfig {
     bind_addr: SocketAddr,
     transport_security: TransportSecurity,
     bearer_token: Option<BearerToken>,
+    custom_authentication: bool,
     limits: RequestLimits,
 }
 
@@ -199,8 +203,17 @@ impl HttpServerConfig {
             bind_addr,
             transport_security,
             bearer_token,
+            custom_authentication: false,
             limits,
         }
+    }
+
+    /// Declares that the application router installs its own authentication
+    /// middleware, for example when it supports multiple credential roles.
+    #[must_use]
+    pub const fn with_custom_authentication(mut self) -> Self {
+        self.custom_authentication = true;
+        self
     }
 
     pub fn validate(&self) -> Result<(), HttpServerConfigError> {
@@ -212,7 +225,10 @@ impl HttpServerConfig {
                 "a non-loopback listener requires upstream TLS termination",
             ));
         }
-        if !self.bind_addr.ip().is_loopback() && self.bearer_token.is_none() {
+        if !self.bind_addr.ip().is_loopback()
+            && self.bearer_token.is_none()
+            && !self.custom_authentication
+        {
             return Err(HttpServerConfigError::new(
                 HttpServerConfigErrorKind::MissingBearerToken,
                 "a non-loopback listener requires bearer authentication",
@@ -321,7 +337,8 @@ async fn require_bearer(
     request: Request,
     next: Next,
 ) -> Response {
-    if token.matches_header(request.headers().get(axum::http::header::AUTHORIZATION)) {
+    if token.matches_authorization_header(request.headers().get(axum::http::header::AUTHORIZATION))
+    {
         next.run(request).await
     } else {
         static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -575,13 +592,18 @@ impl HttpTransport {
             ));
         }
 
-        let client = reqwest::Client::builder().build().map_err(|error| {
-            HttpTransportBuildError::with_source(
-                HttpTransportBuildErrorKind::Client,
-                "failed to construct HTTP client",
-                error,
-            )
-        })?;
+        let client = reqwest::Client::builder()
+            // RPC POST bodies and credentials must never be replayed to a
+            // provider-selected redirect target.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| {
+                HttpTransportBuildError::with_source(
+                    HttpTransportBuildErrorKind::Client,
+                    "failed to construct HTTP client",
+                    error,
+                )
+            })?;
         Ok(Self { config, client })
     }
 
@@ -834,6 +856,23 @@ mod tests {
         )
     }
 
+    #[test]
+    fn non_loopback_bind_accepts_declared_application_authentication() {
+        let config = HttpServerConfig::new(
+            "0.0.0.0:8443"
+                .parse()
+                .expect("test socket address must parse"),
+            TransportSecurity::TlsTerminatedUpstream,
+            None,
+            RequestLimits::default(),
+        )
+        .with_custom_authentication();
+
+        config
+            .validate()
+            .expect("TLS plus declared application authentication must be accepted");
+    }
+
     #[tokio::test]
     async fn protected_routes_require_the_exact_bearer_token() {
         let token = BearerToken::new("correct-secret").expect("test token must be valid");
@@ -1072,6 +1111,47 @@ mod tests {
         for secret in ["password", "Bearer hidden", "sensitive-request-body"] {
             assert!(!error.message.contains(secret));
         }
+    }
+
+    #[tokio::test]
+    async fn http_transport_does_not_follow_redirects() {
+        use std::io::{Read, Write};
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("test redirect listener must bind");
+        let address = listener
+            .local_addr()
+            .expect("test redirect listener address must be available");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test request must connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("test request read timeout must configure");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/must-not-follow\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("test redirect response must write");
+        });
+        let transport = HttpTransport::new(HttpTransportConfig::new(
+            format!("http://{address}/rpc"),
+            Duration::from_secs(1),
+        ))
+        .expect("test HTTP transport must build");
+
+        let response = transport
+            .send(TransportRequest {
+                endpoint: String::new(),
+                headers: Vec::new(),
+                body: b"{}".to_vec(),
+            })
+            .await
+            .expect("the original redirect response must be returned");
+
+        assert_eq!(response.status, 302);
+        server.join().expect("test redirect server must stop");
     }
 
     #[test]

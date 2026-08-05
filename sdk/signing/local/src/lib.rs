@@ -336,9 +336,17 @@ fn locator_for(raw_public_key: &[u8]) -> KeyLocator {
 mod tests {
     use super::*;
     use futures_executor::block_on;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
 
     fn request(curve: Curve, format: PublicKeyFormat) -> KeyProvisionRequest {
         KeyProvisionRequest {
+            operation_id: signer::OperationId::new(format!(
+                "local-provision-{}",
+                NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed)
+            ))
+            .expect("test operation ID must be valid"),
             curve,
             public_key_format: format,
             purpose: "test-deposit".to_owned(),
@@ -393,11 +401,15 @@ mod tests {
             assert_eq!(error.kind, SignerErrorKind::UnsupportedCurve);
         }
 
-        let error = block_on(keys.provision(KeyProvisionRequest {
-            curve: Curve::Secp256k1,
-            public_key_format: PublicKeyFormat::Raw,
-            purpose: "  ".to_owned(),
-        }))
+        let error = block_on(
+            keys.provision(KeyProvisionRequest {
+                operation_id: signer::OperationId::new("local-empty-purpose")
+                    .expect("test operation ID must be valid"),
+                curve: Curve::Secp256k1,
+                public_key_format: PublicKeyFormat::Raw,
+                purpose: "  ".to_owned(),
+            }),
+        )
         .expect_err("empty purpose should fail");
         assert_eq!(error.kind, SignerErrorKind::InvalidRequest);
     }
@@ -410,32 +422,44 @@ mod tests {
                 .expect("test key should be provisioned");
         let digest = signer::Digest { bytes: vec![7; 32] };
 
-        let recoverable = block_on(signer.sign(SignRequest {
-            key: key.locator.clone(),
-            payload: SignablePayload::Digest(digest.clone()),
-            scheme: SignatureScheme::EcdsaSecp256k1,
-            encoding: SignatureEncoding::Recoverable,
-            key_tweak: None,
-            user_interaction: signer::UserInteraction::NotRequired,
-        }))
+        let recoverable = block_on(
+            signer.sign(SignRequest {
+                operation_id: signer::OperationId::new("local-sign-recoverable")
+                    .expect("test operation ID must be valid"),
+                key: key.locator.clone(),
+                payload: SignablePayload::Digest(digest.clone()),
+                scheme: SignatureScheme::EcdsaSecp256k1,
+                encoding: SignatureEncoding::Recoverable,
+                key_tweak: None,
+                user_interaction: signer::UserInteraction::NotRequired,
+            }),
+        )
         .expect("ECDSA digest should be signed");
-        let der = block_on(signer.sign(SignRequest {
-            key: key.locator.clone(),
-            payload: SignablePayload::Digest(digest.clone()),
-            scheme: SignatureScheme::EcdsaSecp256k1,
-            encoding: SignatureEncoding::Der,
-            key_tweak: None,
-            user_interaction: signer::UserInteraction::NotRequired,
-        }))
+        let der = block_on(
+            signer.sign(SignRequest {
+                operation_id: signer::OperationId::new("local-sign-der")
+                    .expect("test operation ID must be valid"),
+                key: key.locator.clone(),
+                payload: SignablePayload::Digest(digest.clone()),
+                scheme: SignatureScheme::EcdsaSecp256k1,
+                encoding: SignatureEncoding::Der,
+                key_tweak: None,
+                user_interaction: signer::UserInteraction::NotRequired,
+            }),
+        )
         .expect("ECDSA digest should be DER encoded");
-        let schnorr = block_on(signer.sign(SignRequest {
-            key: key.locator,
-            payload: SignablePayload::Digest(digest),
-            scheme: SignatureScheme::SchnorrSecp256k1,
-            encoding: SignatureEncoding::Raw,
-            key_tweak: Some(KeyTweak::Secp256k1Add([3; 32])),
-            user_interaction: signer::UserInteraction::NotRequired,
-        }))
+        let schnorr = block_on(
+            signer.sign(SignRequest {
+                operation_id: signer::OperationId::new("local-sign-schnorr")
+                    .expect("test operation ID must be valid"),
+                key: key.locator,
+                payload: SignablePayload::Digest(digest),
+                scheme: SignatureScheme::SchnorrSecp256k1,
+                encoding: SignatureEncoding::Raw,
+                key_tweak: Some(KeyTweak::Secp256k1Add([3; 32])),
+                user_interaction: signer::UserInteraction::NotRequired,
+            }),
+        )
         .expect("tweaked Schnorr digest should be signed");
 
         assert_eq!(recoverable.bytes.len(), 65);

@@ -4,15 +4,33 @@
 //! IX facts durably, reports the independent projection cursor, and leaves
 //! deposit/collection/accounting classification to a configured PS workflow.
 
+mod api;
+mod api_error;
+mod auth;
+mod collection_executor;
+mod commands;
 mod config;
+mod ids;
 mod indexer_client;
+mod policy;
 mod runtime;
+pub mod wallet_client;
 
 use clap::Parser;
 use config::{Cli, Command};
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    if let Err(error) = tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(filter)
+        .try_init()
+    {
+        eprintln!("payment-api telemetry initialization failed: {error}");
+        std::process::exit(1);
+    }
     if let Err(error) = run(Cli::parse()).await {
         eprintln!("payment-api failed: {error}");
         std::process::exit(1);
@@ -21,6 +39,9 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<(), runtime::RuntimeError> {
     match cli.command {
+        Command::Serve(options) => runtime::serve(options).await?,
+        Command::Backup(options) => runtime::backup(options).await?,
+        Command::Migrate(options) => runtime::migrate(options).await?,
         Command::ReconcileWatches(options) => {
             let report = runtime::reconcile_watches(&options).await?;
             println!(
@@ -42,7 +63,7 @@ async fn run(cli: Cli) -> Result<(), runtime::RuntimeError> {
         Command::ProjectionStatus(options) => {
             let report = runtime::projection_status(&options).await?;
             println!(
-                "ingestion_cursor={} projection_cursor={} pending_sample={} more_pending={} classification_configured=false",
+                "ingestion_cursor={} projection_cursor={} pending_sample={} more_pending={} classification_configured=true",
                 cursor_text(report.ingestion_cursor),
                 cursor_text(report.projection_cursor),
                 report.pending_sample,

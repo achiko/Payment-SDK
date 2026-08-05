@@ -131,6 +131,7 @@ fn command(scope: IndexScope) -> RegisterDeposit {
             asset: "native".to_owned(),
         },
         expected: AtomicAmount([0; 32]),
+        key_purpose: "payment-service-deposit-address-v1".to_owned(),
         expires_at: 2_000,
         created_at: 1_000,
     }
@@ -164,6 +165,7 @@ async fn response_loss_reuses_durable_address_and_birthday_until_watch_acknowled
         .expect("deposit must be durable before IX acknowledgement");
     assert_eq!(awaiting.state, DepositState::AwaitingWatch);
     assert_eq!(awaiting.birthday, BlockHeight(42));
+    assert_eq!(awaiting.key_purpose, "payment-service-deposit-address-v1");
 
     let active = coordinator.register(request).await?;
     assert_eq!(
@@ -180,5 +182,7 @@ async fn response_loss_reuses_durable_address_and_birthday_until_watch_acknowled
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0], requests[1]);
     assert_eq!(requests[0].start_height, BlockHeight(42));
+    assert_eq!(requests[0].idempotency_key, "ps-deposit:deposit-1");
+    assert!(!requests[0].idempotency_key.contains("request-1"));
     Ok(())
 }

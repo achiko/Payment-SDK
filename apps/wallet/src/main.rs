@@ -1,7 +1,21 @@
-//! WS composition root: stateless chain operations. It intentionally has no storage dependency.
-//!
-//! Deployments construct `wallet_worker::WalletService` with authenticated
-//! transport, concrete chain RPC clients, and a custody backend. Those choices
-//! are deployment configuration and are intentionally not hard-coded here.
+//! WS composition root: authenticated stateless Ethereum chain operations.
 
-fn main() {}
+mod config;
+mod runtime;
+
+use clap::Parser;
+use config::{Cli, Command};
+use tracing_subscriber::EnvFilter;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(filter)
+        .try_init()?;
+
+    match Cli::parse().command {
+        Command::Serve(options) => runtime::serve(options).await,
+    }
+}

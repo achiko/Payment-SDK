@@ -18,7 +18,7 @@ use chain_ethereum::{
 };
 use futures_executor::block_on;
 use indexing::{BlockHeight, BlockRef, SourceError};
-use signer::{KeyProvisioner, Signer};
+use signer::{KeyProvisioner, OperationId, Signer};
 use signer_local::LocalSigner;
 use std::{error::Error, sync::Arc};
 use transaction_utxo::FeeRate;
@@ -26,6 +26,10 @@ use wallet_worker::WalletService;
 
 const BITCOIN_NETWORK: BitcoinNetwork = BitcoinNetwork::Testnet4;
 const ETHEREUM_CHAIN_ID: u64 = 1;
+
+fn operation(value: impl Into<String>) -> OperationId {
+    OperationId::new(value).expect("example operation ID must be valid")
+}
 
 /// Ethereum-mainnet USDC (`6` decimal places).
 /// Source: <https://developers.circle.com/stablecoins/usdc-contract-addresses>
@@ -107,6 +111,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             BitcoinGenerateAddress::new(
                 BITCOIN_NETWORK,
                 BitcoinAddressKind::SegwitV0,
+                operation("provision-btc-deposit-customer-42"),
                 "deposit:btc:customer-42",
             ),
         )
@@ -118,6 +123,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             BitcoinGenerateAddress::new(
                 BITCOIN_NETWORK,
                 BitcoinAddressKind::Taproot,
+                operation("provision-btc-treasury"),
                 "treasury:btc",
             ),
         )
@@ -126,21 +132,33 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .ethereum()
         .generate_address(
             &ethereum_asset,
-            EthereumGenerateAddress::new(ETHEREUM_CHAIN_ID, "deposit:eth:customer-42"),
+            EthereumGenerateAddress::new(
+                ETHEREUM_CHAIN_ID,
+                operation("provision-eth-deposit-customer-42"),
+                "deposit:eth:customer-42",
+            ),
         )
         .await?;
     let usdc_deposit = service
         .ethereum()
         .generate_address(
             &usdc_asset,
-            EthereumGenerateAddress::new(ETHEREUM_CHAIN_ID, "deposit:usdc:customer-42"),
+            EthereumGenerateAddress::new(
+                ETHEREUM_CHAIN_ID,
+                operation("provision-usdc-deposit-customer-42"),
+                "deposit:usdc:customer-42",
+            ),
         )
         .await?;
     let ethereum_treasury = service
         .ethereum()
         .generate_address(
             &ethereum_asset,
-            EthereumGenerateAddress::new(ETHEREUM_CHAIN_ID, "treasury:ethereum"),
+            EthereumGenerateAddress::new(
+                ETHEREUM_CHAIN_ID,
+                operation("provision-ethereum-treasury"),
+                "treasury:ethereum",
+            ),
         )
         .await?;
 
@@ -174,6 +192,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // Bitcoin collection discovers confirmed UTXOs, builds a drain transaction,
     // signs every input, broadcasts once, and attributes the gross source value.
     let bitcoin_collection = BitcoinBatchCollectionRequest {
+        signing_operation_id: operation("sign-btc-collection-customer-42"),
         sources: vec![BitcoinCollectionSource {
             address: bitcoin_deposit.address,
             key: bitcoin_deposit.key,
@@ -211,6 +230,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .build_transfer(
             &ethereum_asset,
             EthereumTransferRequest {
+                signing_operation_id: operation("sign-eth-transfer-customer-42"),
                 key: ethereum_deposit.key,
                 from: ethereum_deposit.address,
                 to: Some(ethereum_treasury.address.clone()),
@@ -238,6 +258,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // report whether the token deposit needs native ETH for gas; Payment Service
     // would fund any reported deficit before retrying this collection.
     let usdc_collection = EthereumCollectionRequest::Token {
+        signing_operation_id: operation("sign-usdc-collection-customer-42"),
         token: USDC_CONTRACT,
         from: usdc_deposit.address,
         key: usdc_deposit.key,

@@ -1,6 +1,6 @@
 use crate::{BitcoinAddress, Satoshi};
 use indexing::BlockHeight;
-use signer::KeyLocator;
+use signer::{KeyLocator, OperationId};
 use transaction_utxo::FeeRate;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13,6 +13,7 @@ pub struct BitcoinCollectionSource {
 /// One UTXO transaction can debit many deposit addresses and create one master output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BitcoinBatchCollectionRequest {
+    pub signing_operation_id: OperationId,
     pub sources: Vec<BitcoinCollectionSource>,
     pub destination: BitcoinAddress,
     pub minimum_confirmations: u64,

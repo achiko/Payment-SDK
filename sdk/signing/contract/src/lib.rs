@@ -11,6 +11,7 @@ pub use key::{
     ChildIndex, Curve, DerivationPath, KeyLocator, KeyProvisionRequest, ProvisionedKey, PublicKey,
     PublicKeyFormat,
 };
+pub use request::OperationId;
 pub use request::{Digest, KeyTweak, SignRequest, SignablePayload, UserInteraction};
 pub use signature::{Signature, SignatureEncoding, SignatureScheme};
 pub use signer::{KeyProvisioner, Signer, SignerCapabilities, SignerStatus};

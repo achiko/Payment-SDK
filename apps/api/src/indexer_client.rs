@@ -100,6 +100,10 @@ impl IndexerClient {
         })
     }
 
+    pub async fn status(&self, scope: &IndexScope) -> Result<SyncStatus, IndexError> {
+        self.status_request(scope).await
+    }
+
     async fn status_request(&self, scope: &IndexScope) -> Result<SyncStatus, IndexError> {
         ensure_ethereum_scope(scope)?;
         let url = self.route(&["v1", "scopes", "ethereum", &scope.network, "status"])?;

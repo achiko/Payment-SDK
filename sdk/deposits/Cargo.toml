@@ -9,6 +9,7 @@ bincode = { version = "=2.0.1", default-features = false, features = ["derive", 
 chain-identity = { path = "../chains/identity" }
 indexing = { path = "../indexing" }
 signer = { path = "../signing/contract" }
+sha2.workspace = true
 storage = { path = "../storage" }
 
 [dev-dependencies]

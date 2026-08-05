@@ -57,6 +57,12 @@ The signer does not receive a Bitcoin or Ethereum transaction. The concrete
 chain computes its protocol signing payload and inserts the returned signature
 into the chain-native transaction.
 
+Key provisioning and signing requests also carry an opaque caller-owned
+`OperationId`. A durable custody backend uses it to replay an identical result
+after response loss and rejects reuse with different request content. For
+multi-input Bitcoin transactions, the chain derives one stable child operation
+ID per input from the caller-provided transaction operation ID.
+
 [`signer-local`](../sdk/signing/local/src/lib.rs) supplies a deliberately
 ephemeral `KeyProvisioner + Signer` for tests and local experiments. It retains
 random secp256k1 private keys only in process memory, exposes opaque locators
@@ -65,6 +71,12 @@ supports raw Schnorr signing with signer-internal public scalar tweaks. It does
 not export private keys or provide HD derivation, persistence, or production
 custody. `Arc<T>` delegates both signer contracts so one custody instance can
 provision and later sign for the same locator.
+
+[`signer-remote`](../sdk/signing/remote/src/lib.rs) implements both contracts
+over authenticated versioned JSON endpoints. It enforces HTTPS outside
+loopback, disables redirects, bounds response bodies and timeouts, redacts its
+endpoint and bearer credential, and retries only operation-ID-bearing
+provision/sign calls.
 
 Current flow:
 
@@ -100,9 +112,20 @@ capability set for native ETH and ERC-20 assets over an injected `EthereumRpc`.
 Its codec produces EIP-1559 envelopes and verifies the recovered sender;
 collection calculates native maximum gas cost and encodes ERC-20 `transfer`.
 
-The current phase intentionally does not select an HTTP framework or wire
-protocol. A deployment may adapt this semantic facade in-process, over HTTP,
-or through a queue without changing service ownership.
+[`apps/wallet`](../apps/wallet) now composes the production Ethereum HTTP RPC
+adapter and remote custody adapter behind an authenticated versioned HTTP API.
+Signing and collection preparation return a canonical transaction ID plus the
+exact opaque signed envelope without broadcasting. The separate broadcast
+operation validates the expected envelope hash before submitting the same
+bytes. This lets PS durably record an envelope before the external side effect.
+The generic `Collector<C>` convenience operation remains compatible by
+preparing and then broadcasting within one stateless call.
+
+The process has no storage dependency. Its health routes are detail-free;
+readiness is enabled only after RPC chain-identity and custody capability/status
+probes succeed, and is disabled before graceful shutdown. The concrete wire
+contract and deployment settings are documented in
+[`WALLET_SERVICE.md`](./WALLET_SERVICE.md).
 
 ## PS deposit and accounting contracts
 
@@ -112,15 +135,50 @@ payment semantics to IX facts:
 - [`DepositStore`](../sdk/deposits/src/store.rs) persists deposit lifecycle,
   including the recoverable `AwaitingWatch` state;
 - [`ObservationEventLog`](../sdk/deposits/src/event_log.rs) is PS's append-only,
-  idempotent mirror of relevant IX event revisions;
+  idempotent mirror of relevant IX event revisions and exposes the durable
+  per-deposit observation index;
 - [`ObservationClassifier`](../sdk/deposits/src/classification.rs) consults PS
   records to identify incoming, collection, and gas-funding movements;
 - [`DepositLedger`](../sdk/deposits/src/accounting.rs) appends an immutable row
   containing absolute `received`, `confirmed`, `balance`, `collected`, and
   `accounted` values after each relevant transition; `AccountingCommand` alone
   may change `accounted`;
-- [`CollectionStore`](../sdk/deposits/src/store.rs) persists account, UTXO batch,
-  and token-with-gas collection legs across restarts.
+- [`CollectionStore`](../sdk/deposits/src/collection.rs) persists account, UTXO
+  batch, and token-with-gas collection legs across restarts.
+
+The Ethereum v1 implementation adds the remaining PS-owned durable contracts:
+
+- [`UserStore`](../sdk/deposits/src/user.rs) stores only opaque exchange-owned
+  user identity and ownership association;
+- [`JobStore`](../sdk/deposits/src/job.rs) combines command idempotency with
+  durable queued/running/retry/terminal jobs;
+- [`ReconciliationStore`](../sdk/deposits/src/reconciliation.rs) stores blocking
+  post-credit cases and typed `ReverseCredit`, `AcceptLiability`, or
+  `ExternalDebtRecorded` decisions; and
+- [`PaymentDatabaseMetadataStore`](../sdk/deposits/src/metadata.rs) binds a PS
+  store to its owner, schema, Ethereum scope, and policy identity and exposes
+  the explicit semantic migration contract.
+
+[`PersistentPaymentRepository`](../sdk/deposits/src/persistent.rs) implements
+these boundaries over injected `Storage`. Mirroring commits the immutable IX
+fact and ingestion cursor together. Business projection commits all ledger
+updates, reconciliation cases, affected-deposit observation-index rows, and the
+projection cursor together. The index deliberately includes relevant facts such
+as ERC-20 gas funding even when that fact does not change the token ledger.
+
+[`apps/api`](../apps/api) composes that repository with RocksDB, authenticated
+IX and WS HTTP clients, a required Ethereum policy, public/admin HTTP routes,
+and supervised job, watch-reconciliation, ingestion, projection, expiration,
+collection, readiness, and maintenance workers. It inspects exact signed
+EIP-1559 envelopes in `chain-ethereum` before persistence/broadcast so the
+configured numeric chain ID and gas/fee ceilings are enforced without moving
+Ethereum parsing into the PS domain.
+
+The `payment-api migrate` composition creates and verifies a physical RocksDB
+backup before invoking semantic validation. It checks PS ownership and record
+references, rebuilds deposit association and deposit-observation indexes, and
+only then binds schema v2, the selected Ethereum scope, and active policy.
+Normal serving refuses old, unbound, IX-owned, or mismatched databases.
 
 IX and concrete chain crates do not depend on `deposits`.
 

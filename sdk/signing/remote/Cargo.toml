@@ -1,0 +1,21 @@
+[package]
+name = "signer-remote"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hex.workspace = true
+reqwest.workspace = true
+serde = { version = "=1.0.219", features = ["derive"] }
+serde_json.workspace = true
+signer = { path = "../contract" }
+tokio = { workspace = true, features = ["time"] }
+zeroize.workspace = true
+
+[dev-dependencies]
+axum = "=0.8.4"
+tokio = { workspace = true, features = ["net", "sync"] }
+
+[lints]
+workspace = true

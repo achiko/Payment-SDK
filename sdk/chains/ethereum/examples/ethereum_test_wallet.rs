@@ -1,6 +1,7 @@
 use chain_contract::DepositAddressGenerator;
 use chain_ethereum::{EthereumAddressGenerator, EthereumGenerateAddress};
 use futures_executor::block_on;
+use signer::OperationId;
 use signer_local::LocalSigner;
 use std::error::Error;
 
@@ -8,7 +9,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let keys = LocalSigner::ephemeral_for_testing();
     let generator = EthereumAddressGenerator;
     let generated = block_on(generator.generate_address(
-        EthereumGenerateAddress::new(31_337, "ethereum-example"),
+        EthereumGenerateAddress::new(
+            31_337,
+            OperationId::new("provision-ethereum-example")?,
+            "ethereum-example",
+        ),
         &keys,
     ))?;
 

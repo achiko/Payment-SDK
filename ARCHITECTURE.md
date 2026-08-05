@@ -25,7 +25,8 @@ repository root.
 ## Ownership
 
 - `apps/` selects concrete chains, signers, storage, transports, and workers.
-- `apps/api/` is the PS composition root and owns user/deposit orchestration.
+- `apps/api/` is the PS composition root and owns one Ethereum scope's
+  user/deposit orchestration, PS RocksDB, policy, jobs, and business workers.
 - `apps/indexer/` is the IX composition root and owns its checkpoint/watch/observation DB.
 - `apps/wallet/` is the stateless WS composition root and must not select or own
   a storage backend.
@@ -79,9 +80,10 @@ indexing, storage, HTTP, and JSON-RPC usable.
 ```text
 apps/api
 ├── deposits
-├── indexing boundary
-├── signer boundary
-└── storage boundary
+├── indexing + chain-identity
+├── chain-ethereum (signed-envelope inspection only)
+├── storage-rocksdb
+└── packages/http + telemetry
 
 apps/indexer                         (Ethereum v1 composition)
 ├── chain-ethereum
@@ -91,7 +93,8 @@ apps/indexer                         (Ethereum v1 composition)
 
 apps/wallet
 ├── chain-bitcoin / chain-ethereum
-└── signer (no direct storage or DB backend)
+├── signer + signer-remote
+└── packages/http + telemetry (no direct storage or DB backend)
 
 chain-bitcoin
 ├── chain-contract
@@ -105,12 +108,13 @@ chain-ethereum
 ├── transaction-account
 ├── signer
 ├── indexing
-└── json-rpc
+└── json-rpc + packages/http
 
 deposits      -> indexing + chain-identity + signer
 indexing      -> storage + chain-identity
 chain-contract -> chain-identity + signer
 signer-local  -> signer
+signer-remote -> signer (external reqwest transport; no chain dependency)
 signer-trezor -> signer + transport
 json-rpc      -> transport
 http          -> transport
@@ -134,3 +138,26 @@ rules above:
   wake-up hints only.
 - One RocksDB owner replaces distributed leasing only for v1. It does not
   authorize multiple independent writers or claim high availability.
+
+## Ethereum Payment Service v1 selection
+
+[`docs/PAYMENT_SERVICE.md`](./docs/PAYMENT_SERVICE.md) records the first
+concrete PS selection without weakening the ownership rules above:
+
+- `apps/api` exclusively owns one PS RocksDB path, one Ethereum `IndexScope`,
+  one numeric EVM chain ID, one active policy identity, and one IX feed;
+- `sdk/deposits` owns durable users, jobs, command idempotency, deposits,
+  deposit-to-observation indexes, absolute ledgers, typed reconciliation, and
+  collection aggregates/legs/reservations;
+- PS reaches IX and stateless WS only through semantic HTTP clients, requires
+  bearer authentication for every WS connection and every non-loopback IX
+  connection, and never opens IX storage or custody secret material;
+- the collection executor persists the exact signed envelope before broadcast,
+  checks its chain ID and configured fee ceilings, and advances durable legs
+  from IX facts; and
+- normal startup validates immutable owner/schema/scope/policy metadata, while
+  explicit migration first creates a verified physical backup, validates
+  semantic records, and rebuilds supplementary indexes before rebinding; and
+- one exclusive writer is an Ethereum v1 constraint, not a claim of HA.
+  Another network requires another process/database until a scope-keyed PS
+  design is approved.

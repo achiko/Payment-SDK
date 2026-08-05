@@ -1,10 +1,10 @@
 use crate::{
     Ethereum, EthereumAddress, EthereumAsset, EthereumCollectionAttribution,
-    EthereumCollectionRequest, EthereumCollectionRequirement, EthereumRpc,
-    EthereumSignedTransaction, EthereumTransactionCodec, EthereumTransactionId,
+    EthereumCollectionRequest, EthereumCollectionRequirement, EthereumPreparedCollection,
+    EthereumRpc, EthereumSignedTransaction, EthereumTransactionCodec, EthereumTransactionId,
     EthereumTransferRequest, UnsignedEthereumTransaction, Wei,
 };
-use alloy_primitives::{Address, keccak256};
+use alloy_primitives::Address;
 use chain_contract::{
     Balance, BalanceReader, BoxFuture, Broadcaster, ChainError, ChainErrorKind,
     CollectionSubmission, Collector, DepositAddressGenerator, GeneratedAddress, TransactionReader,
@@ -12,7 +12,8 @@ use chain_contract::{
 };
 use indexing::SourceError;
 use signer::{
-    Curve, KeyProvisionRequest, KeyProvisioner, PublicKey, PublicKeyFormat, Signer, SignerError,
+    Curve, KeyProvisionRequest, KeyProvisioner, OperationId, PublicKey, PublicKeyFormat, Signer,
+    SignerError,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,10 +26,11 @@ pub struct EthereumGenerateAddress {
 
 impl EthereumGenerateAddress {
     #[must_use]
-    pub fn new(chain_id: u64, purpose: impl Into<String>) -> Self {
+    pub fn new(chain_id: u64, operation_id: OperationId, purpose: impl Into<String>) -> Self {
         Self {
             chain_id,
             key: KeyProvisionRequest {
+                operation_id,
                 curve: Curve::Secp256k1,
                 public_key_format: PublicKeyFormat::Raw,
                 purpose: purpose.into(),
@@ -100,6 +102,152 @@ impl<R> EthereumWallet<R> {
             )));
         }
         Ok(())
+    }
+}
+
+impl<R: EthereumRpc> EthereumWallet<R> {
+    /// Builds and signs one collection transaction without broadcasting it.
+    ///
+    /// This separation lets the Payment Service durably persist the exact
+    /// opaque envelope and transaction ID before the external broadcast side
+    /// effect. The wallet retains no state between this and a later call to
+    /// [`Broadcaster::broadcast`].
+    pub async fn prepare_collection(
+        &self,
+        request: EthereumCollectionRequest,
+        signer: &dyn Signer,
+    ) -> Result<EthereumPreparedCollection, ChainError> {
+        let (transfer, context, attribution) = self.collection_transfer(request).await?;
+        let unsigned = crate::EthereumTransactionBuilder::build(&self.codec, transfer, context)?;
+        let transaction =
+            crate::EthereumTransactionSigning::sign(&self.codec, unsigned, signer).await?;
+        Ok(EthereumPreparedCollection {
+            transaction,
+            attribution: vec![attribution],
+        })
+    }
+
+    async fn collection_transfer(
+        &self,
+        request: EthereumCollectionRequest,
+    ) -> Result<
+        (
+            EthereumTransferRequest,
+            crate::EthereumBuildContext,
+            EthereumCollectionAttribution,
+        ),
+        ChainError,
+    > {
+        match request {
+            EthereumCollectionRequest::Native {
+                signing_operation_id,
+                from,
+                key,
+                destination,
+            } => {
+                let current = self
+                    .rpc
+                    .balance(from.clone(), &EthereumAsset::Native, None)
+                    .await
+                    .map_err(rpc_error)?;
+                let mut transfer = EthereumTransferRequest::native(
+                    signing_operation_id,
+                    key,
+                    from.clone(),
+                    destination,
+                    Wei::ZERO,
+                );
+                let context = self.rpc.build_context(&transfer).await.map_err(rpc_error)?;
+                self.validate_context(&context)?;
+                let maximum_fee = context
+                    .max_fee_per_gas
+                    .checked_mul_u64(context.gas_limit)
+                    .ok_or_else(|| {
+                        invalid_transaction("Ethereum maximum gas fee overflowed U256")
+                    })?;
+                let value = current
+                    .checked_sub(&maximum_fee)
+                    .ok_or_else(|| ChainError {
+                        kind: ChainErrorKind::InsufficientFunds,
+                        message: "Ethereum native balance cannot cover the maximum gas fee"
+                            .to_owned(),
+                    })?;
+                if value.is_zero() {
+                    return Err(ChainError {
+                        kind: ChainErrorKind::InsufficientFunds,
+                        message: "Ethereum native collection would transfer zero wei".to_owned(),
+                    });
+                }
+                transfer.value = value.clone();
+                Ok((
+                    transfer,
+                    context,
+                    EthereumCollectionAttribution {
+                        address: from,
+                        asset: EthereumAsset::Native,
+                        gross_debit: value,
+                    },
+                ))
+            }
+            EthereumCollectionRequest::Token {
+                signing_operation_id,
+                token,
+                from,
+                key,
+                destination,
+                amount,
+            } => {
+                let asset = EthereumAsset::Erc20(token.clone());
+                let token_balance = self
+                    .rpc
+                    .balance(from.clone(), &asset, None)
+                    .await
+                    .map_err(rpc_error)?;
+                let amount = requested_token_amount(amount.as_ref(), token_balance)?;
+                if amount.is_zero() {
+                    return Err(ChainError {
+                        kind: ChainErrorKind::InsufficientFunds,
+                        message: "Ethereum token collection would transfer zero units".to_owned(),
+                    });
+                }
+                let transfer = EthereumTransferRequest::erc20(
+                    signing_operation_id,
+                    key,
+                    from.clone(),
+                    token,
+                    destination,
+                    amount.clone(),
+                );
+                let context = self.rpc.build_context(&transfer).await.map_err(rpc_error)?;
+                self.validate_context(&context)?;
+                let required = context
+                    .max_fee_per_gas
+                    .checked_mul_u64(context.gas_limit)
+                    .ok_or_else(|| {
+                        invalid_transaction("Ethereum maximum gas fee overflowed U256")
+                    })?;
+                let current = self
+                    .rpc
+                    .balance(from.clone(), &EthereumAsset::Native, None)
+                    .await
+                    .map_err(rpc_error)?;
+                if current < required {
+                    return Err(ChainError {
+                        kind: ChainErrorKind::InsufficientFunds,
+                        message: "Ethereum token address lacks native gas funds".to_owned(),
+                    });
+                }
+                Ok((
+                    transfer,
+                    context,
+                    EthereumCollectionAttribution {
+                        address: from,
+                        asset,
+                        gross_debit: amount,
+                    },
+                ))
+            }
+        }
     }
 }
 
@@ -192,6 +340,7 @@ impl<R: EthereumRpc> Collector<Ethereum> for EthereumWallet<R> {
     ) -> BoxFuture<'a, Result<Vec<EthereumCollectionRequirement>, ChainError>> {
         Box::pin(async move {
             let EthereumCollectionRequest::Token {
+                signing_operation_id,
                 token,
                 from,
                 key,
@@ -210,10 +359,11 @@ impl<R: EthereumRpc> Collector<Ethereum> for EthereumWallet<R> {
             if amount.is_zero() {
                 return Ok(Vec::new());
             }
-            let transfer = token_transfer(
-                token.clone(),
-                from.clone(),
+            let transfer = EthereumTransferRequest::erc20(
+                signing_operation_id.clone(),
                 key.clone(),
+                from.clone(),
+                token.clone(),
                 destination.clone(),
                 amount,
             );
@@ -255,113 +405,15 @@ impl<R: EthereumRpc> Collector<Ethereum> for EthereumWallet<R> {
         >,
     > {
         Box::pin(async move {
-            let (transfer, context, attribution) = match request {
-                EthereumCollectionRequest::Native {
-                    from,
-                    key,
-                    destination,
-                } => {
-                    let current = self
-                        .rpc
-                        .balance(from.clone(), &EthereumAsset::Native, None)
-                        .await
-                        .map_err(rpc_error)?;
-                    let mut transfer = EthereumTransferRequest {
-                        key,
-                        from: from.clone(),
-                        to: Some(destination),
-                        value: Wei::ZERO,
-                        data: Vec::new(),
-                    };
-                    let context = self.rpc.build_context(&transfer).await.map_err(rpc_error)?;
-                    self.validate_context(&context)?;
-                    let maximum_fee = context
-                        .max_fee_per_gas
-                        .checked_mul_u64(context.gas_limit)
-                        .ok_or_else(|| {
-                            invalid_transaction("Ethereum maximum gas fee overflowed U256")
-                        })?;
-                    let value = current
-                        .checked_sub(&maximum_fee)
-                        .ok_or_else(|| ChainError {
-                            kind: ChainErrorKind::InsufficientFunds,
-                            message: "Ethereum native balance cannot cover the maximum gas fee"
-                                .to_owned(),
-                        })?;
-                    if value.is_zero() {
-                        return Err(ChainError {
-                            kind: ChainErrorKind::InsufficientFunds,
-                            message: "Ethereum native collection would transfer zero wei"
-                                .to_owned(),
-                        });
-                    }
-                    transfer.value = value.clone();
-                    let attribution = EthereumCollectionAttribution {
-                        address: from,
-                        asset: EthereumAsset::Native,
-                        gross_debit: value,
-                    };
-                    (transfer, context, attribution)
-                }
-                EthereumCollectionRequest::Token {
-                    token,
-                    from,
-                    key,
-                    destination,
-                    amount,
-                } => {
-                    let asset = EthereumAsset::Erc20(token.clone());
-                    let token_balance = self
-                        .rpc
-                        .balance(from.clone(), &asset, None)
-                        .await
-                        .map_err(rpc_error)?;
-                    let amount = requested_token_amount(amount.as_ref(), token_balance)?;
-                    if amount.is_zero() {
-                        return Err(ChainError {
-                            kind: ChainErrorKind::InsufficientFunds,
-                            message: "Ethereum token collection would transfer zero units"
-                                .to_owned(),
-                        });
-                    }
-                    let transfer =
-                        token_transfer(token, from.clone(), key, destination, amount.clone());
-                    let context = self.rpc.build_context(&transfer).await.map_err(rpc_error)?;
-                    self.validate_context(&context)?;
-                    let required = context
-                        .max_fee_per_gas
-                        .checked_mul_u64(context.gas_limit)
-                        .ok_or_else(|| {
-                            invalid_transaction("Ethereum maximum gas fee overflowed U256")
-                        })?;
-                    let current = self
-                        .rpc
-                        .balance(from.clone(), &EthereumAsset::Native, None)
-                        .await
-                        .map_err(rpc_error)?;
-                    if current < required {
-                        return Err(ChainError {
-                            kind: ChainErrorKind::InsufficientFunds,
-                            message: "Ethereum token address lacks native gas funds".to_owned(),
-                        });
-                    }
-                    let attribution = EthereumCollectionAttribution {
-                        address: from,
-                        asset,
-                        gross_debit: amount,
-                    };
-                    (transfer, context, attribution)
-                }
-            };
-
-            let unsigned =
-                crate::EthereumTransactionBuilder::build(&self.codec, transfer, context)?;
-            let signed =
-                crate::EthereumTransactionSigning::sign(&self.codec, unsigned, signer).await?;
-            let transaction_id = self.rpc.broadcast(signed).await.map_err(rpc_error)?;
+            let prepared = self.prepare_collection(request, signer).await?;
+            let transaction_id = self
+                .rpc
+                .broadcast(prepared.transaction)
+                .await
+                .map_err(rpc_error)?;
             Ok(CollectionSubmission {
                 transaction_id,
-                attribution: vec![attribution],
+                attribution: prepared.attribution,
             })
         })
     }
@@ -373,27 +425,6 @@ impl<R: EthereumRpc> WalletFactory<Ethereum> for EthereumWallet<R> {
         _asset: &'a EthereumAsset,
     ) -> Result<&'a dyn WalletAdapter<Ethereum>, ChainError> {
         Ok(self)
-    }
-}
-
-fn token_transfer(
-    token: EthereumAddress,
-    from: EthereumAddress,
-    key: signer::KeyLocator,
-    destination: EthereumAddress,
-    amount: Wei,
-) -> EthereumTransferRequest {
-    let mut data = Vec::with_capacity(68);
-    data.extend_from_slice(&keccak256("transfer(address,uint256)").0[..4]);
-    data.extend_from_slice(&[0; 12]);
-    data.extend_from_slice(&destination.0);
-    data.extend_from_slice(&amount.0);
-    EthereumTransferRequest {
-        key,
-        from,
-        to: Some(token),
-        value: Wei::ZERO,
-        data,
     }
 }
 
@@ -411,7 +442,11 @@ fn requested_token_amount(requested: Option<&Wei>, available: Wei) -> Result<Wei
 
 fn rpc_error(error: SourceError) -> ChainError {
     ChainError {
-        kind: ChainErrorKind::RpcUnavailable,
+        kind: if error.retryable {
+            ChainErrorKind::RpcUnavailable
+        } else {
+            ChainErrorKind::Other
+        },
         message: format!("Ethereum RPC operation failed: {error}"),
     }
 }
@@ -460,10 +495,26 @@ fn invalid_public_key(message: impl Into<String>) -> ChainError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::keccak256;
     use futures_executor::block_on;
     use indexing::BlockRef;
     use signer_local::LocalSigner;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn rpc_error_does_not_turn_permanent_source_failures_into_retries() {
+        let retryable = rpc_error(SourceError {
+            message: "temporary".to_owned(),
+            retryable: true,
+        });
+        let permanent = rpc_error(SourceError {
+            message: "permanent".to_owned(),
+            retryable: false,
+        });
+
+        assert_eq!(retryable.kind, ChainErrorKind::RpcUnavailable);
+        assert_eq!(permanent.kind, ChainErrorKind::Other);
+    }
 
     #[derive(Debug)]
     struct MockEthereumRpc {
@@ -535,11 +586,19 @@ mod tests {
         }
     }
 
+    fn operation(value: &str) -> OperationId {
+        OperationId::new(value).expect("test operation ID must be valid")
+    }
+
     #[test]
     fn generates_address_from_an_ephemeral_key() {
         let keys = LocalSigner::ephemeral_for_testing();
         let generator = EthereumAddressGenerator;
-        let request = EthereumGenerateAddress::new(31_337, "ethereum-test-deposit");
+        let request = EthereumGenerateAddress::new(
+            31_337,
+            operation("provision-ethereum-test-deposit"),
+            "ethereum-test-deposit",
+        );
 
         let generated = block_on(generator.generate_address(request, &keys))
             .expect("Ethereum address should be generated");
@@ -556,13 +615,15 @@ mod tests {
         let keys = LocalSigner::ephemeral_for_testing();
         let generator = EthereumAddressGenerator;
 
-        let first = block_on(
-            generator.generate_address(EthereumGenerateAddress::new(31_337, "first"), &keys),
-        )
+        let first = block_on(generator.generate_address(
+            EthereumGenerateAddress::new(31_337, operation("provision-first"), "first"),
+            &keys,
+        ))
         .expect("first address should be generated");
-        let second = block_on(
-            generator.generate_address(EthereumGenerateAddress::new(31_337, "second"), &keys),
-        )
+        let second = block_on(generator.generate_address(
+            EthereumGenerateAddress::new(31_337, operation("provision-second"), "second"),
+            &keys,
+        ))
         .expect("second address should be generated");
 
         assert_ne!(first.address, second.address);
@@ -573,6 +634,7 @@ mod tests {
     fn reports_token_gas_deficit() {
         let wallet = EthereumWallet::new(31_337, mock_rpc(12, 500));
         let request = EthereumCollectionRequest::Token {
+            signing_operation_id: operation("requirements-token"),
             token: EthereumAddress([1; 20]),
             from: EthereumAddress([2; 20]),
             key: signer::KeyLocator::Identifier("token-source".to_owned()),
@@ -598,6 +660,7 @@ mod tests {
     fn rejects_token_collection_above_the_available_balance() {
         let wallet = EthereumWallet::new(31_337, mock_rpc(100, 500));
         let request = EthereumCollectionRequest::Token {
+            signing_operation_id: operation("requirements-overdrawn-token"),
             token: EthereumAddress([1; 20]),
             from: EthereumAddress([2; 20]),
             key: signer::KeyLocator::Identifier("token-source".to_owned()),
@@ -615,7 +678,11 @@ mod tests {
     fn collects_one_token_transfer_and_returns_attribution() {
         let signer = LocalSigner::ephemeral_for_testing();
         let generated = block_on(EthereumAddressGenerator.generate_address(
-            EthereumGenerateAddress::new(31_337, "token-source"),
+            EthereumGenerateAddress::new(
+                31_337,
+                operation("provision-token-source"),
+                "token-source",
+            ),
             &signer,
         ))
         .expect("token source should be generated");
@@ -624,6 +691,7 @@ mod tests {
         let token = EthereumAddress([4; 20]);
         let submission = block_on(wallet.collect(
             EthereumCollectionRequest::Token {
+                signing_operation_id: operation("sign-token-collection"),
                 token: token.clone(),
                 from: generated.address,
                 key: generated.key,
@@ -642,6 +710,46 @@ mod tests {
                 address: source,
                 asset: EthereumAsset::Erc20(token),
                 gross_debit: Wei::from_u128(500),
+            }]
+        );
+    }
+
+    #[test]
+    fn prepares_collection_without_broadcasting_the_signed_envelope() {
+        let signer = LocalSigner::ephemeral_for_testing();
+        let generated = block_on(EthereumAddressGenerator.generate_address(
+            EthereumGenerateAddress::new(
+                31_337,
+                operation("provision-native-source"),
+                "native-source",
+            ),
+            &signer,
+        ))
+        .expect("native source should be generated");
+        let wallet = EthereumWallet::new(31_337, mock_rpc(100, 0));
+        let source = generated.address.clone();
+        let prepared = block_on(wallet.prepare_collection(
+            EthereumCollectionRequest::Native {
+                signing_operation_id: operation("sign-native-collection"),
+                from: generated.address,
+                key: generated.key,
+                destination: EthereumAddress([6; 20]),
+            },
+            &signer,
+        ))
+        .expect("native collection should be prepared");
+
+        assert_eq!(wallet.rpc().broadcasts.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            prepared.transaction.id.0,
+            keccak256(&prepared.transaction.envelope).0
+        );
+        assert_eq!(
+            prepared.attribution,
+            vec![EthereumCollectionAttribution {
+                address: source,
+                asset: EthereumAsset::Native,
+                gross_debit: Wei::from_u128(80),
             }]
         );
     }

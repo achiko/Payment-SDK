@@ -37,6 +37,8 @@ pub struct PublicKey {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyProvisionRequest {
+    /// Caller-owned durable identity for this allocation attempt.
+    pub operation_id: crate::OperationId,
     pub curve: Curve,
     pub public_key_format: PublicKeyFormat,
     /// Application-supplied purpose or derivation namespace. It contains no chain type.
