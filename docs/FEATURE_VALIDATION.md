@@ -14,9 +14,10 @@ typed reconciliation, and native/ERC-20 collection execution. The stateless
 Ethereum Wallet HTTP process uses the concrete RPC adapter and remote-custody
 client and owns no database.
 
-This is still not evidence of a production deployment. The external durable
-custody service, real-node/Anvil evidence, HA, and multi-network ownership in a
-single PS store are absent or deliberately excluded. The complete failure-window
+This is still not evidence of a production deployment. A loopback-only
+ephemeral custody adapter now exists, but external durable custody, automated
+Anvil acceptance, HA, and multi-network ownership in a single PS store remain
+absent or deliberately excluded. The complete failure-window
 test matrix and a single physical commit spanning IX-driven collection-leg and
 ledger/projection-cursor transitions remain acceptance work.
 
@@ -356,15 +357,15 @@ Source structure and deterministic tests cannot establish:
   deterministic tests that have run;
 - race-free UTXO and nonce reservations;
 - nonstandard token-tax/rebasing behavior or unsupported token policies;
-- security and durability of the external custody service (the authenticated,
-  bounded remote signer client is implemented, not the custody server);
+- security and durability of a production custody service (the local server is
+  explicitly ephemeral and loopback-only);
 - webhook/event delivery authentication;
 - correctness of reorg inverses not covered by deterministic or real-node
   tests;
 - one physical PS transaction spanning collection-leg transitions and the
   corresponding ledger/reconciliation/projection-cursor commit;
 - the complete PS crash-window, restart, and collection workflow test matrix;
-- the opt-in PS/WS/IX Anvil end-to-end scenario;
+- automated, repeatable PS/WS/IX Anvil end-to-end acceptance;
 - the composed IX service against a live Ethereum node; and
 - the checked-in Kurtosis/Disruptoor scenario, which remains opt-in and has not
   been executed as part of ordinary Rust validation.

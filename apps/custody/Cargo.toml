@@ -1,0 +1,20 @@
+[package]
+name = "custody-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum = "=0.8.4"
+clap = { version = "=4.5.50", features = ["derive", "env"] }
+hex.workspace = true
+http-support = { package = "http", path = "../../packages/http" }
+signer = { path = "../../sdk/signing/contract" }
+signer-local = { path = "../../sdk/signing/local" }
+signer-remote = { path = "../../sdk/signing/remote" }
+tokio = { workspace = true, features = ["net", "signal", "sync", "time"] }
+tracing = "=0.1.41"
+tracing-subscriber = { version = "=0.3.20", features = ["env-filter", "fmt", "json"] }
+
+[lints]
+workspace = true

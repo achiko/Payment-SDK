@@ -18,11 +18,12 @@ Do not silently resolve an item listed as an open decision. Record or propose th
 The repository remains contract-first at its reusable boundaries, but the
 concrete implementation is no longer only a scaffold. The stateless
 Bitcoin/Ethereum Wallet Service library, authenticated Ethereum Wallet HTTP
-runtime with remote custody, durable Ethereum Indexer Service vertical slice,
-RocksDB storage adapter, and single-network Ethereum Payment Service v1 runtime
-are implemented in source. Trezor and the durable custody service remain
-placeholders or external integrations. Live deployment/Anvil evidence, HA, and
-multi-network PS ownership are not implemented or claimed. Do not infer
+runtime with remote custody, loopback-only ephemeral development custody,
+durable Ethereum Indexer Service vertical slice, RocksDB storage adapter, and
+single-network Ethereum Payment Service v1 runtime are implemented in source.
+Trezor and durable production custody remain placeholders or external
+integrations. HA and multi-network PS ownership are not implemented or
+claimed. Do not infer
 production readiness from trait presence or compilation alone.
 
 `old/` is a recoverable previous design and `reference/` contains upstream research material. Both are excluded from the workspace. Do not copy their architecture into production code or edit them unless the task explicitly targets them.
@@ -32,6 +33,7 @@ production readiness from trait presence or compilation alone.
 | Path | Ownership |
 |---|---|
 | `apps/api` | Payment Service (PS) composition root and user/deposit orchestration |
+| `apps/custody` | Loopback-only ephemeral custody adapter for disposable local development |
 | `apps/indexer` | Indexer Service (IX) composition root |
 | `apps/wallet` | Stateless Wallet Service (WS) composition root and facade |
 | `sdk/chains/identity` | Opaque cross-process identifiers and 256-bit atomic amounts |

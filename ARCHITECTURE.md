@@ -27,6 +27,8 @@ repository root.
 - `apps/` selects concrete chains, signers, storage, transports, and workers.
 - `apps/api/` is the PS composition root and owns one Ethereum scope's
   user/deposit orchestration, PS RocksDB, policy, jobs, and business workers.
+- `apps/custody/` is a loopback-only, ephemeral local-development adapter over
+  `signer-local`; it is not durable or production custody.
 - `apps/indexer/` is the IX composition root and owns its checkpoint/watch/observation DB.
 - `apps/wallet/` is the stateless WS composition root and must not select or own
   a storage backend.
@@ -84,6 +86,10 @@ apps/api
 ├── chain-ethereum (signed-envelope inspection only)
 ├── storage-rocksdb
 └── packages/http + telemetry
+
+apps/custody                        (local development only)
+├── signer + signer-local + signer-remote wire DTOs
+└── packages/http (loopback-only; no storage backend)
 
 apps/indexer                         (Ethereum v1 composition)
 ├── chain-ethereum

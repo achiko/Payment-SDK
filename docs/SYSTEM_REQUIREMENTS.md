@@ -12,9 +12,10 @@ The stateless Bitcoin/Ethereum Wallet Service execution path, authenticated
 Ethereum Wallet HTTP runtime, Ethereum Indexer Service vertical slice, and
 single-network Ethereum Payment Service v1 runtime are implemented in source.
 Code and acceptance tests, not trait presence or documentation, determine
-which parts are complete. This source status is not live deployment evidence:
-production custody, the opt-in Anvil scenario, HA, and multi-network PS
-ownership remain external, unvalidated, or excluded. The service runbooks are
+which parts are complete. A loopback-only ephemeral custody adapter supports
+disposable local development. This is not production deployment evidence:
+durable production custody, automated Anvil acceptance, HA, and multi-network
+PS ownership remain external, unvalidated, or excluded. The service runbooks are
 [`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md),
 [`WALLET_SERVICE.md`](./WALLET_SERVICE.md), and
 [`PAYMENT_SERVICE.md`](./PAYMENT_SERVICE.md).
@@ -50,6 +51,7 @@ remain open.
 ```text
 apps/
 ├── api/                           Payment Service composition root
+├── custody/                       ephemeral loopback custody for local development
 ├── indexer/                       Indexer Service composition root
 └── wallet/                        stateless Wallet Service composition root
 
@@ -1159,6 +1161,7 @@ unresolved fact stops projection/readiness rather than being silently skipped.
 | PS deposits/event mirror/ledger | `sdk/deposits` |
 | PS durable collection workflow | `sdk/deposits::collection` |
 | Ethereum PS API and workers | `apps/api` |
+| Ephemeral local custody adapter | `apps/custody`, `sdk/signing/local` |
 | PS users/jobs/reconciliation/migration | `sdk/deposits::{user,job,reconciliation,metadata,migration}` |
 | Stateless authenticated Ethereum WS | `apps/wallet`, `sdk/signing/remote` |
 | Backend-independent storage mechanics | `sdk/storage` |

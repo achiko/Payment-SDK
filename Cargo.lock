@@ -1233,6 +1233,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "custody-worker"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "clap",
+ "hex",
+ "http 0.1.0",
+ "signer",
+ "signer-local",
+ "signer-remote",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
