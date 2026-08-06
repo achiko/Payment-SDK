@@ -4,7 +4,8 @@ This workspace combines contract-first boundaries with concrete Ethereum v1
 service slices. It contains a stateless Bitcoin/Ethereum Wallet Service library,
 an authenticated stateless Ethereum Wallet HTTP runtime, a durable Ethereum
 Indexer Service, and a single-network Ethereum Payment Service backed by its own
-RocksDB database. PS and IX never open or write each other's storage.
+RocksDB database. A loopback-only ephemeral custody process supports disposable
+local development. PS and IX never open or write each other's storage.
 
 The implemented wallet capabilities are:
 
@@ -22,12 +23,12 @@ The implemented wallet capabilities are:
   recovery, IX mirroring, business projection, absolute ledgers, typed
   reconciliation, and native/ERC-20 collection workflows.
 
-`signer-local` is deliberately ephemeral and not production custody.
-`signer-remote` supplies the hardened client contract, but the durable custody
-service and its secret storage remain external deployment responsibilities.
-The checked-in code does not by itself prove a live production deployment: the
-opt-in Anvil end-to-end scenario, production custody integration, operational
-TLS configuration, monitoring, and real-node evidence remain separate work.
+`signer-local` and `apps/custody` are deliberately ephemeral and not production
+custody. `signer-remote` supplies the hardened client contract, but durable
+custody and secret storage remain external deployment responsibilities. The
+checked-in code does not by itself prove a live production deployment:
+production custody integration, operational TLS configuration, monitoring,
+automated Anvil acceptance, and real-node evidence remain separate work.
 Ethereum PS v1 deliberately excludes HA and multi-network ownership in one
 process/database.
 
@@ -56,10 +57,25 @@ The principal documents are:
 - [`docs/INDEXER_SERVICE.md`](./docs/INDEXER_SERVICE.md): concrete Ethereum IX v1 runtime;
 - [`docs/WALLET_SERVICE.md`](./docs/WALLET_SERVICE.md): concrete stateless Ethereum WS runtime;
 - [`docs/PAYMENT_SERVICE.md`](./docs/PAYMENT_SERVICE.md): concrete Ethereum PS v1 runtime and API;
+- [`docs/PAYMENT_SERVICE_USAGE.md`](./docs/PAYMENT_SERVICE_USAGE.md): step-by-step PS startup, complete curl request catalog, recovery, and maintenance usage;
+- [`docs/PAYMENT_SERVICE_POSTMAN.md`](./docs/PAYMENT_SERVICE_POSTMAN.md): Postman import, variables, safe manual smoke flow, and mutation gates;
+- [`docs/PAYMENT_SERVICE.postman_collection.json`](./docs/PAYMENT_SERVICE.postman_collection.json): importable Payment Service Postman collection;
+- [`docs/PAYMENT_SERVICE_AGENT_RUNBOOK.md`](./docs/PAYMENT_SERVICE_AGENT_RUNBOOK.md): safe local PS startup and evidence checklist for agent handoffs;
 - [`docs/FEATURE_VALIDATION.md`](./docs/FEATURE_VALIDATION.md): original PS/WS/IX feature traceability and corrections;
 - [`docs/RESEARCH.md`](./docs/RESEARCH.md): upstream type and architecture findings;
 - [`docs/REQUIREMENTS.md`](./docs/REQUIREMENTS.md): decisions still required before implementation;
 - [`reference/README.md`](./reference/README.md): local reference repositories and revisions.
+
+To start IX, local ephemeral custody, WS, and PS against an already-running
+loopback Ethereum RPC, use:
+
+```bash
+./scripts/run-local-payment-services.sh --disposable-policy
+```
+
+The launcher does not start or stop Anvil. See the
+[`Payment Service usage guide`](./docs/PAYMENT_SERVICE_USAGE.md#one-command-local-service-launcher)
+for configuration, generated credentials, logs, and shutdown behavior.
 
 Run the structural compile check with:
 

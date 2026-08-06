@@ -1,5 +1,9 @@
 # Ethereum v1 Payment Service
 
+For step-by-step startup, configuration, the complete curl request catalog,
+lifecycle workflows, and maintenance commands, see
+[`PAYMENT_SERVICE_USAGE.md`](./PAYMENT_SERVICE_USAGE.md).
+
 `apps/api` is the Payment Service (PS) composition root. It owns users,
 deposits, command idempotency, the append-only IX mirror, business
 classification, absolute ledgers, reconciliation cases, collection workflows,
@@ -163,11 +167,13 @@ priority-fee cap, or maximum total fee.
 
 ## Operations and recovery
 
-Run `payment-api --help` for the complete CLI/environment mapping. `serve`
-opens RocksDB and dependency clients once, then supervises HTTP, loopback-only
-Prometheus metrics, jobs, IX ingestion, projection, watch reconciliation,
-expiration, collection, and readiness. SIGINT/SIGTERM disables readiness before
-a bounded drain.
+The `serve` runtime opens RocksDB and dependency clients once, then
+supervises HTTP, loopback-only Prometheus metrics, jobs, IX ingestion,
+projection, watch reconciliation, expiration, collection, and readiness.
+SIGINT/SIGTERM disables readiness before a bounded drain. IX and WS options use
+distinct CLI names, and a command-definition regression test protects the
+flattened `serve` command. See the usage guide for the complete local startup
+sequence and maintenance commands.
 
 `backup` creates and verifies a RocksDB BackupEngine snapshot. `migrate` first
 creates that verified physical backup and then performs semantic migration. It
