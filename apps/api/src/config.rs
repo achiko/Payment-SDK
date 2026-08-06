@@ -229,19 +229,44 @@ pub struct WalletOptions {
     #[arg(long, env = "PS_WALLET_URL")]
     pub wallet_url: IndexerEndpoint,
 
-    #[arg(long, env = "PS_WALLET_BEARER_TOKEN", hide_env_values = true)]
+    #[arg(
+        id = "wallet_bearer_token",
+        long = "wallet-bearer-token",
+        env = "PS_WALLET_BEARER_TOKEN",
+        hide_env_values = true
+    )]
     pub bearer_token: BearerSecret,
 
-    #[arg(long, env = "PS_WALLET_TIMEOUT_SECONDS", default_value_t = 15)]
+    #[arg(
+        id = "wallet_request_timeout_seconds",
+        long = "wallet-timeout-seconds",
+        env = "PS_WALLET_TIMEOUT_SECONDS",
+        default_value_t = 15
+    )]
     pub request_timeout_seconds: u64,
 
-    #[arg(long, env = "PS_WALLET_RETRY_ATTEMPTS", default_value_t = 3)]
+    #[arg(
+        id = "wallet_retry_attempts",
+        long = "wallet-retry-attempts",
+        env = "PS_WALLET_RETRY_ATTEMPTS",
+        default_value_t = 3
+    )]
     pub retry_attempts: u32,
 
-    #[arg(long, env = "PS_WALLET_RETRY_INITIAL_MILLIS", default_value_t = 100)]
+    #[arg(
+        id = "wallet_retry_initial_millis",
+        long = "wallet-retry-initial-millis",
+        env = "PS_WALLET_RETRY_INITIAL_MILLIS",
+        default_value_t = 100
+    )]
     pub retry_initial_millis: u64,
 
-    #[arg(long, env = "PS_WALLET_RETRY_MAX_MILLIS", default_value_t = 1_000)]
+    #[arg(
+        id = "wallet_retry_max_millis",
+        long = "wallet-retry-max-millis",
+        env = "PS_WALLET_RETRY_MAX_MILLIS",
+        default_value_t = 1_000
+    )]
     pub retry_max_millis: u64,
 }
 
@@ -312,19 +337,44 @@ pub struct IndexerOptions {
     #[arg(long, env = "PS_INDEXER_NETWORK")]
     pub network: String,
 
-    #[arg(long, env = "PS_INDEXER_BEARER_TOKEN", hide_env_values = true)]
+    #[arg(
+        id = "indexer_bearer_token",
+        long = "indexer-bearer-token",
+        env = "PS_INDEXER_BEARER_TOKEN",
+        hide_env_values = true
+    )]
     pub bearer_token: Option<BearerSecret>,
 
-    #[arg(long, env = "PS_INDEXER_TIMEOUT_SECONDS", default_value_t = 15)]
+    #[arg(
+        id = "indexer_request_timeout_seconds",
+        long = "indexer-timeout-seconds",
+        env = "PS_INDEXER_TIMEOUT_SECONDS",
+        default_value_t = 15
+    )]
     pub request_timeout_seconds: u64,
 
-    #[arg(long, env = "PS_INDEXER_RETRY_ATTEMPTS", default_value_t = 3)]
+    #[arg(
+        id = "indexer_retry_attempts",
+        long = "indexer-retry-attempts",
+        env = "PS_INDEXER_RETRY_ATTEMPTS",
+        default_value_t = 3
+    )]
     pub retry_attempts: u32,
 
-    #[arg(long, env = "PS_INDEXER_RETRY_INITIAL_MILLIS", default_value_t = 100)]
+    #[arg(
+        id = "indexer_retry_initial_millis",
+        long = "indexer-retry-initial-millis",
+        env = "PS_INDEXER_RETRY_INITIAL_MILLIS",
+        default_value_t = 100
+    )]
     pub retry_initial_millis: u64,
 
-    #[arg(long, env = "PS_INDEXER_RETRY_MAX_MILLIS", default_value_t = 1_000)]
+    #[arg(
+        id = "indexer_retry_max_millis",
+        long = "indexer-retry-max-millis",
+        env = "PS_INDEXER_RETRY_MAX_MILLIS",
+        default_value_t = 1_000
+    )]
     pub retry_max_millis: u64,
 }
 
@@ -637,7 +687,14 @@ impl std::error::Error for ConfigError {}
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
     use super::*;
+
+    #[test]
+    fn clap_command_has_no_duplicate_argument_ids() {
+        Cli::command().debug_assert();
+    }
 
     fn indexer_options(endpoint: &str, bearer_token: Option<&str>) -> IndexerOptions {
         IndexerOptions {
