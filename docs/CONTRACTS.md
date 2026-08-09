@@ -205,6 +205,17 @@ checkpoint movement, current observations, immutable revisions, confirmation
 advancement, and feed rows are one atomic command boundary. Interpreters return
 `ObservationDraft` values and never allocate repository revisions or cursors.
 
+[`apps/indexer`](../apps/indexer) exports `IndexerService` and
+`IndexerServiceConfig` for applications that host the complete Ethereum v1 IX
+runtime in-process. The facade composes the same Ethereum source, RocksDB
+repository, worker supervisor, HTTP API, and metrics listener as the
+`indexer-worker` binary. It does not replace the semantic observation
+contracts, add PS meanings to facts, permit another database writer, or make
+multiple IX instances safe inside one process. Embedded callers may provide
+their own shutdown future and must provide the process Prometheus adapter
+explicitly; `run` uses Ctrl+C while `run_until` delegates shutdown ownership to
+the host.
+
 For Ethereum v1, HTTP polling is canonical and optional `newHeads` only wakes
 reconciliation. The public status phase is explicit, depth 12 is confirmation
 policy rather than consensus finality, and rollback retention is 50 bundles

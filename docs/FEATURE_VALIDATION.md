@@ -230,7 +230,7 @@ recoverable.
 |---|---|---|
 | PS runtime composition | `apps/api` | Authenticated API, durable jobs, watch reconciliation, IX ingestion/projection, expiration, collection, readiness, backup, and migration implemented for one Ethereum scope |
 | Stateless WS composition | `apps/wallet` | Authenticated Ethereum HTTP runtime with concrete RPC and remote custody; no direct storage/backend |
-| Independent IX composition | `apps/indexer` | Runnable Ethereum worker, API, health, metrics, and maintenance commands implemented |
+| Independent IX composition | `apps/indexer` | Runnable Ethereum worker, API, health, metrics, maintenance commands, and embeddable lifecycle facade implemented |
 | Per-chain checkpoint height/hash | `IndexScope`, `IndexRepository`, `SyncStatus` | Implemented for the Ethereum slice |
 | Wait for provable depth | `ConfirmationPolicy`, `Included`, `ConfirmationProof` | Depth-12 transitions implemented and persisted |
 | `watch(address)` / `watch(txid)` | `ObservationRegistry`, `WatchSelector` | Implemented through repository and IX HTTP API |

@@ -13,6 +13,10 @@ One IX process owns one Ethereum chain/network scope and one RocksDB path. The
 process downloads every canonical block from a mandatory bootstrap height and
 filters facts against durable address and transaction watches.
 
+The process may be the `indexer-worker` binary or an application embedding the
+`IndexerService` library facade. Both placements run the same runtime and obey
+the same single-scope, exclusive-database ownership rules.
+
 V1 indexes:
 
 - successful top-level native ETH transfers;
@@ -28,7 +32,7 @@ separate and unwired.
 
 ## Runtime configuration
 
-The `serve` command requires these values on first boot:
+The CLI and library runtime require these values on first boot:
 
 | Setting | Requirement |
 |---|---|
@@ -53,6 +57,53 @@ One process owns one database. RocksDB's path lock and the storage adapter's
 serialized writer provide the v1 single-owner guarantee. This is not a
 distributed lease or high-availability design. Operators must not run copied
 databases for the same scope as independent writers.
+
+### In-process composition
+
+`IndexerServiceConfig::new` requires the database path, logical network slug,
+bootstrap height, expected chain ID, expected genesis hash, and authoritative
+HTTP RPC URL. It selects the documented v1 defaults for confirmation,
+retention, polling, loopback listeners, and readiness. Callers may override
+those public configuration fields before validation:
+
+```rust
+use indexer_worker::{IndexerService, IndexerServiceConfig, PrometheusTelemetry};
+
+// Replace this with the actual block-zero hash reported by the target node.
+let genesis_hash =
+    "0x0000000000000000000000000000000000000000000000000000000000000000";
+let mut config = IndexerServiceConfig::new(
+    "./indexer.db",
+    "anvil",
+    0,
+    31_337,
+    genesis_hash,
+    "http://127.0.0.1:8545",
+);
+// One confirmation is suitable only for this disposable local test.
+config.confirmation_depth = 1;
+
+let service = IndexerService::new(config)?;
+let telemetry = PrometheusTelemetry::install()?;
+service.run(telemetry).await?;
+```
+
+`run()` owns Ctrl+C handling. A larger application should normally call
+`run_until(telemetry, shutdown)` with its existing shutdown future. Startup
+still opens the exclusive RocksDB path, verifies RPC chain identity, uses the
+provided Prometheus adapter, and binds the configured HTTP and metrics
+listeners. The facade does not turn IX into a stateless object like WS.
+Configuration validation and synchronous RocksDB opening finish before the
+shutdown future is polled; asynchronous RPC preflight and the supervised
+runtime are cancellation-aware.
+
+Only one process-global metrics recorder can be installed. Library execution
+therefore requires the host to pass a compatible `PrometheusTelemetry`
+explicitly. A standalone host may call `PrometheusTelemetry::install()`; a host
+that already owns the recorder must construct the adapter from its existing
+handle. Offline backup, migration, rebuild, and cleanup remain explicit
+`indexer-worker` maintenance commands and must not run concurrently with the
+embedded service.
 
 ## Confirmation policy
 

@@ -2590,6 +2590,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "payment_sdk_demo"
+version = "0.1.0"
+dependencies = [
+ "chain-ethereum",
+ "http 0.1.0",
+ "indexer-worker",
+ "reqwest",
+ "signer",
+ "signer-local",
+ "tokio",
+ "wallet-worker",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

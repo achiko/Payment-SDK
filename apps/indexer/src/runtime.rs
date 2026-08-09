@@ -2,6 +2,7 @@ use std::{
     error::Error,
     future::Future,
     num::NonZeroU32,
+    pin::Pin,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -287,14 +288,36 @@ struct OperationalSnapshot {
 
 type SharedOperationalSnapshot = Arc<Mutex<OperationalSnapshot>>;
 
-pub async fn serve(options: ServeOptions) -> AppResult<()> {
+pub async fn serve(options: ServeOptions, telemetry: PrometheusTelemetry) -> AppResult<()> {
+    serve_until(options, telemetry, async {
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|error| Box::new(error) as AppError)
+    })
+    .await
+}
+
+pub(crate) async fn serve_until<F>(
+    options: ServeOptions,
+    telemetry: PrometheusTelemetry,
+    shutdown: F,
+) -> AppResult<()>
+where
+    F: Future<Output = AppResult<()>>,
+{
+    tokio::pin!(shutdown);
     options.validate()?;
     let scope = options.repository.scope()?;
     let storage = RocksDbStorage::open(&options.repository.database.database_path)?;
     let repository = repository(storage, &options.repository)?;
-    let source = Arc::new(connect_source(&scope, &options.source).await?);
+    let source =
+        match startup_or_shutdown(connect_source(&scope, &options.source), shutdown.as_mut())
+            .await?
+        {
+            Some(source) => Arc::new(source),
+            None => return Ok(()),
+        };
     let interpreter = EthereumBlockInterpreter::new(scope.clone())?;
-    let telemetry = PrometheusTelemetry::install()?;
     let metric_context = MetricContext::new(
         Arc::new(telemetry.clone()),
         options.repository.network.clone(),
@@ -445,9 +468,42 @@ pub async fn serve(options: ServeOptions) -> AppResult<()> {
     let wake_sender_guard = wake_tx;
 
     tracing::info!(network = %options.repository.network, "Indexer Service started");
+    supervise_tasks_until(
+        &mut tasks,
+        shutdown_tx,
+        wake_sender_guard,
+        shutdown.as_mut(),
+    )
+    .await
+}
+
+async fn startup_or_shutdown<T, F, S>(startup: F, shutdown: Pin<&mut S>) -> AppResult<Option<T>>
+where
+    F: Future<Output = AppResult<T>>,
+    S: Future<Output = AppResult<()>>,
+{
+    tokio::select! {
+        biased;
+        result = shutdown => {
+            result?;
+            Ok(None)
+        }
+        result = startup => result.map(Some),
+    }
+}
+
+async fn supervise_tasks_until<F>(
+    tasks: &mut JoinSet<AppResult<()>>,
+    shutdown_tx: watch::Sender<bool>,
+    wake_sender_guard: tokio::sync::mpsc::Sender<()>,
+    shutdown: Pin<&mut F>,
+) -> AppResult<()>
+where
+    F: Future<Output = AppResult<()>>,
+{
     let termination = tokio::select! {
-        signal = tokio::signal::ctrl_c() => {
-            signal.map_err(|error| Box::new(error) as AppError)?;
+        result = shutdown => {
+            result?;
             None
         }
         result = tasks.join_next() => Some(result),
@@ -457,13 +513,13 @@ pub async fn serve(options: ServeOptions) -> AppResult<()> {
 
     let shutdown_deadline = tokio::time::sleep(Duration::from_secs(10));
     tokio::pin!(shutdown_deadline);
-    loop {
+    while !tasks.is_empty() {
         tokio::select! {
             _ = &mut shutdown_deadline => {
                 tasks.abort_all();
                 break;
             }
-            result = tasks.join_next(), if !tasks.is_empty() => {
+            result = tasks.join_next() => {
                 match result {
                     Some(Ok(Ok(()))) => {}
                     Some(Ok(Err(error))) => tracing::error!(error = %error, "service task failed during shutdown"),
@@ -471,7 +527,6 @@ pub async fn serve(options: ServeOptions) -> AppResult<()> {
                     None => break,
                 }
             }
-            else => break,
         }
     }
 
@@ -1058,7 +1113,6 @@ impl Error for RuntimeError {}
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
-        pin::Pin,
         sync::atomic::{AtomicBool, Ordering},
         task::{Context, Poll},
     };
@@ -1161,6 +1215,14 @@ mod tests {
     impl Drop for PendingWebsocket {
         fn drop(&mut self) {
             self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
         }
     }
 
@@ -1344,5 +1406,40 @@ mod tests {
                     value: "testnet".to_owned(),
                 }]
         }));
+    }
+
+    #[tokio::test]
+    async fn caller_shutdown_cancels_async_startup() {
+        let mut shutdown = std::future::ready(Ok(()));
+        let result = startup_or_shutdown(
+            std::future::pending::<AppResult<()>>(),
+            Pin::new(&mut shutdown),
+        )
+        .await
+        .expect("caller shutdown must complete cleanly");
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn caller_shutdown_drains_supervised_resource_owners() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = Arc::clone(&dropped);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut tasks = JoinSet::<AppResult<()>>::new();
+        tasks.spawn(async move {
+            let _resource = DropFlag(task_dropped);
+            shutdown_signal(shutdown_rx).await;
+            Ok(())
+        });
+        let (wake_tx, _wake_rx) = tokio::sync::mpsc::channel(1);
+        let mut shutdown = std::future::ready(Ok(()));
+
+        supervise_tasks_until(&mut tasks, shutdown_tx, wake_tx, Pin::new(&mut shutdown))
+            .await
+            .expect("caller shutdown must drain supervised tasks");
+
+        assert!(tasks.is_empty());
+        assert!(dropped.load(Ordering::Acquire));
     }
 }

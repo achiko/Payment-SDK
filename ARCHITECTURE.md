@@ -29,7 +29,9 @@ repository root.
   user/deposit orchestration, PS RocksDB, policy, jobs, and business workers.
 - `apps/custody/` is a loopback-only, ephemeral local-development adapter over
   `signer-local`; it is not durable or production custody.
-- `apps/indexer/` is the IX composition root and owns its checkpoint/watch/observation DB.
+- `apps/indexer/` is the IX composition root and owns its
+  checkpoint/watch/observation DB. Its library facade and thin CLI host the
+  same runtime; embedding does not weaken exclusive database ownership.
 - `apps/wallet/` is the stateless WS composition root and must not select or own
   a storage backend.
 - `sdk/chains/identity/` owns only opaque cross-process chain, asset, address,
@@ -137,7 +139,9 @@ rules above:
   commands; the application injects `storage-rocksdb`.
 - `sdk/chains/ethereum` owns Ethereum RPC methods, decoding, and fact drafts.
 - `apps/indexer` selects one Ethereum scope, source, repository, HTTP adapter,
-  telemetry, and worker supervisor.
+  telemetry, and worker supervisor. `IndexerService` exposes that composition
+  to an in-process application, while `indexer-worker` delegates to the same
+  library runtime.
 - `sdk/deposits` and `apps/api` own the separate PS database, retry window,
   event mirror, projection cursor, and reconciliation cases.
 - HTTP reconciliation is authoritative; WebSocket `newHeads` messages are
