@@ -237,6 +237,121 @@ policy or databases: the corresponding custody keys disappear at shutdown.
 Run `./scripts/run-local-payment-services.sh --help` for timeout, bind, policy,
 and chain configuration variables.
 
+## Release/staging launcher with mock custody
+
+[`scripts/run-release-payment-services-with-mock-custody.sh`](../scripts/run-release-payment-services-with-mock-custody.sh)
+uses locked release binaries, an operator-reviewed policy, explicit chain
+identity, externally supplied bearer credentials, and private one-shot IX/PS
+databases. It is useful for a production-shaped development or staging run
+against a remote test network. It is **not** a production deployment and must
+not hold real funds.
+
+The limitation is fundamental to the included custody adapter: it generates
+random keys and keeps its operation map only in memory. Once custody exits,
+every persisted deposit and gas-funder locator from that run becomes unusable.
+Provisioning a replacement gas funder also changes the runtime policy digest,
+so reopening the old PS database would fail policy binding even though its
+business records remain on disk. The launcher therefore:
+
+- requires `STACK_ENVIRONMENT=development` or `staging` and accepts only the
+  explicit test/private chain-ID allowlist below;
+- requires `--acknowledge-ephemeral-custody` before any preflight or startup;
+- requires a new absolute `STACK_RUN_ROOT` outside the source repository,
+  refuses an existing path, and restricts its final name to 1-128 safe ASCII
+  filename characters;
+- creates fresh IX and PS databases under that root and marks the whole root
+  diagnostic-only after shutdown;
+- snapshots a reviewed `STACK_POLICY_TEMPLATE` before building or starting
+  services, preserving its assets, master destinations, thresholds, and fee
+  limits while replacing only the mock gas-funder address and locator;
+- requires five distinct credentials from the calling shell or secret manager
+  then removes their exported input names, scopes each credential to only the
+  service that needs it, and never writes a `client.env`; and
+- keeps IX, custody, WS, PS, and both metrics listeners on loopback. Remote PS
+  access requires a separately reviewed TLS reverse proxy.
+
+Required configuration is:
+
+```text
+STACK_ENVIRONMENT
+STACK_RUN_ROOT
+STACK_POLICY_TEMPLATE
+ETHEREUM_RPC_URL
+ETHEREUM_CHAIN_ID
+ETHEREUM_GENESIS_HASH
+PAYMENT_NETWORK
+IX_BOOTSTRAP_HEIGHT
+
+CUSTODY_BEARER_TOKEN
+IX_BEARER_TOKEN
+WS_BEARER_TOKEN
+PS_API_BEARER_TOKEN
+PS_ADMIN_BEARER_TOKEN
+```
+
+Accepted chain IDs are `1337` and `31337` for local private development,
+`11155111` for Sepolia, and `560048` for Hoodi. Custom private chains, legacy
+testnets, other public testnets, and every production EVM chain are refused.
+This deliberately narrow list avoids treating "not Ethereum mainnet" as a
+sufficient safety check; extending it requires a reviewed script change.
+
+Remote HTTP RPC must use HTTPS. Loopback HTTP remains available for a safe
+local smoke test. Provider credentials may be carried in an HTTPS path, but
+embedded URL credentials, query parameters, and fragments are rejected. IX
+has no custom provider-header configuration, so use a private authenticated
+proxy when the provider requires secret headers.
+
+After exporting the configuration from a private operator shell, run a
+non-mutating, read-only preflight first:
+
+```bash
+./scripts/run-release-payment-services-with-mock-custody.sh \
+  --acknowledge-ephemeral-custody \
+  --check
+```
+
+The check validates policy field sets, ranges, asset uniqueness, fee ordering,
+free loopback ports, explicit chain ID and genesis hash, RPC transport, and
+live RPC identity without building, creating the run root, or starting
+services. Start the release stack with:
+
+```bash
+./scripts/run-release-payment-services-with-mock-custody.sh \
+  --acknowledge-ephemeral-custody
+```
+
+Use `--no-build` only when all four `target/release` executables are already
+current. The launcher starts RPC-dependent IX and mock custody, then WS, then
+PS; it requires every readiness check and the authenticated PS administrator
+status before reporting success. The `PS_API_BEARER_TOKEN` already present in
+the calling shell is the ordinary API token for curl or Postman.
+
+The launcher provisions but does not fund its fresh mock gas-funder address;
+funding would be an external asset transfer and is intentionally outside this
+script. ERC-20 collection legs that need gas remain unavailable until the
+operator sends test native currency to that public address. Read it without
+exposing the opaque locator:
+
+```bash
+jq --raw-output '.gas_funder.address' \
+  "$STACK_RUN_ROOT/runtime/policy.json"
+```
+
+Use only a faucet or an operator-reviewed test-network sender, and never send
+real assets. The configured `maximum_funding_amount` is a workflow ceiling,
+not proof that the gas-funder address has a balance.
+
+Keep the supervisor attached. `Ctrl-C` stops PS, WS, custody, and IX in reverse
+dependency order and never touches the external RPC. The supervisor timeout
+defaults to 60 seconds per service, leaving margin above WS's 30-second grace.
+Logs, reviewed policy snapshot, runtime policy, and databases remain under
+`STACK_RUN_ROOT` for diagnosis, but the entire root must never be reused. A
+long-running staging run must add external log rotation and disk-space
+monitoring because the launcher does not rotate its service logs. A real
+deployment must replace mock custody with reviewed durable custody and use
+encrypted persistent volumes, a process orchestrator, TLS termination,
+monitored backups, staged rollout, and a tested rollback procedure.
+
 ## Step-by-step: run the service
 
 ### Step 1: start and verify dependencies

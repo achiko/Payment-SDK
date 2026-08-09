@@ -56,7 +56,9 @@ The principal documents are:
 - [`docs/INDEXING.md`](./docs/INDEXING.md): proposed indexing and reorg flow;
 - [`docs/INDEXER_SERVICE.md`](./docs/INDEXER_SERVICE.md): concrete Ethereum IX v1 runtime;
 - [`docs/WALLET_SERVICE.md`](./docs/WALLET_SERVICE.md): concrete stateless Ethereum WS runtime;
+- [`docs/WALLET_SERVICE_USAGE.md`](./docs/WALLET_SERVICE_USAGE.md): step-by-step native ETH and ERC-20 Rust library usage;
 - [`docs/PAYMENT_SERVICE.md`](./docs/PAYMENT_SERVICE.md): concrete Ethereum PS v1 runtime and API;
+- [`docs/manual-local-stack/README.md`](./docs/manual-local-stack/README.md): manual Anvil, IX, custody, WS, and PS startup using one private `.env` file;
 - [`docs/PAYMENT_SERVICE_USAGE.md`](./docs/PAYMENT_SERVICE_USAGE.md): step-by-step PS startup, complete curl request catalog, recovery, and maintenance usage;
 - [`docs/PAYMENT_SERVICE_POSTMAN.md`](./docs/PAYMENT_SERVICE_POSTMAN.md): Postman import, variables, safe manual smoke flow, and mutation gates;
 - [`docs/PAYMENT_SERVICE.postman_collection.json`](./docs/PAYMENT_SERVICE.postman_collection.json): importable Payment Service Postman collection;
@@ -66,8 +68,12 @@ The principal documents are:
 - [`docs/REQUIREMENTS.md`](./docs/REQUIREMENTS.md): decisions still required before implementation;
 - [`reference/README.md`](./reference/README.md): local reference repositories and revisions.
 
-To start IX, local ephemeral custody, WS, and PS against an already-running
-loopback Ethereum RPC, use:
+To start Anvil, IX, local ephemeral custody, WS, and PS one process at a time
+with a single private `.env` file, follow the
+[`manual local stack guide`](./docs/manual-local-stack/README.md).
+
+As an optional one-command alternative, start IX, custody, WS, and PS against
+an already-running loopback Ethereum RPC with:
 
 ```bash
 ./scripts/run-local-payment-services.sh --disposable-policy

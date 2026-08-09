@@ -6,6 +6,10 @@ chain-independent remote custody client. It does not open a database and does
 not own users, deposits, watches, jobs, reservations, retries, accounting, or
 multi-leg collection sequencing.
 
+For direct in-process Rust integration with every asynchronous
+`WalletService` operation, use the step-by-step
+[`Wallet Service Rust library guide`](./WALLET_SERVICE_USAGE.md).
+
 ## Runtime safety
 
 - All operation routes require the configured bearer token.
