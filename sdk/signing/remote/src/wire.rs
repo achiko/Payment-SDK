@@ -114,6 +114,12 @@ pub enum KeyTweak {
     Secp256k1Add { scalar_hex: String },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyTweakKind {
+    Secp256k1Add,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignRequest {
@@ -122,6 +128,7 @@ pub struct SignRequest {
     pub payload: SignablePayload,
     pub scheme: SignatureScheme,
     pub encoding: SignatureEncoding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_tweak: Option<KeyTweak>,
     pub user_interaction: UserInteraction,
 }
@@ -139,6 +146,8 @@ pub struct SignResponse {
 pub struct CapabilitiesResponse {
     pub curves: Vec<Curve>,
     pub schemes: Vec<SignatureScheme>,
+    #[serde(default)]
+    pub key_tweaks: Vec<KeyTweakKind>,
     pub can_sign_messages: bool,
     pub can_sign_digests: bool,
     pub requires_user_interaction: bool,
@@ -164,4 +173,29 @@ pub struct ErrorResponse {
     pub code: String,
     pub message: String,
     pub retryable: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn untweaked_sign_request_omits_the_extension_for_old_servers() {
+        let request = SignRequest {
+            operation_id: "sign-existing-client".to_owned(),
+            locator: KeyLocator::Identifier {
+                value: "opaque-key".to_owned(),
+            },
+            payload: SignablePayload::Digest {
+                bytes_hex: format!("0x{}", "11".repeat(32)),
+            },
+            scheme: SignatureScheme::EcdsaSecp256k1,
+            encoding: SignatureEncoding::Recoverable,
+            key_tweak: None,
+            user_interaction: UserInteraction::NotRequired,
+        };
+
+        let value = serde_json::to_value(request).expect("wire request must serialize");
+        assert!(value.get("key_tweak").is_none());
+    }
 }

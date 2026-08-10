@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 axum = "=0.8.4"
 chain-identity = { path = "../../sdk/chains/identity" }
+chain-bitcoin = { path = "../../sdk/chains/bitcoin" }
 chain-ethereum = { path = "../../sdk/chains/ethereum" }
 clap = { version = "=4.5.50", features = ["derive", "env"] }
 http = { path = "../../packages/http" }
@@ -20,8 +21,10 @@ telemetry = { path = "../../packages/telemetry" }
 tokio = { workspace = true, features = ["net", "signal", "sync", "time"] }
 tracing = "=0.1.41"
 tracing-subscriber = { version = "=0.3.20", features = ["env-filter", "fmt", "json"] }
+url = "=2.5.8"
 
 [dev-dependencies]
+bitcoin.workspace = true
 tower = { version = "=0.5.2", features = ["util"] }
 
 [lints]

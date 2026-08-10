@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 axum = "=0.8.4"
+chain-bitcoin = { path = "../../sdk/chains/bitcoin" }
 chain-ethereum = { path = "../../sdk/chains/ethereum" }
 chain-identity = { path = "../../sdk/chains/identity" }
 clap = { version = "=4.5.50", features = ["derive", "env"] }
@@ -27,6 +28,7 @@ tracing-subscriber = { version = "=0.3.20", features = ["env-filter", "fmt", "js
 uuid.workspace = true
 
 [dev-dependencies]
+bitcoin.workspace = true
 tempfile = "=3.27.0"
 tower = { version = "=0.5.2", features = ["util"] }
 

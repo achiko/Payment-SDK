@@ -3,10 +3,10 @@ use indexing::IndexScope;
 use crate::{BoxFuture, DepositError};
 
 pub const PAYMENT_SERVICE_OWNER: &str = "payment-service";
-/// Version 2 requires bound scope/policy metadata plus rebuilt, verified
-/// deposit association indexes. Older bound stores require explicit semantic
-/// migration before the normal runtime may open them.
-pub const PAYMENT_DOMAIN_SCHEMA_VERSION: u16 = 2;
+/// Version 3 adds multi-participant collection records plus exact active
+/// spend-resource ownership indexes. Older bound stores require explicit
+/// semantic migration before the normal runtime may open them.
+pub const PAYMENT_DOMAIN_SCHEMA_VERSION: u16 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyIdentity {

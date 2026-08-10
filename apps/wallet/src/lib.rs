@@ -5,6 +5,12 @@
 //! transport authentication, and request persistence stay outside this crate.
 
 pub mod api;
+pub mod bitcoin_api;
+mod bitcoin_ix;
+mod bitcoin_operations;
+
+pub use bitcoin_ix::{BitcoinIxClient, BitcoinIxClientConfig, BitcoinIxReadiness};
+pub use bitcoin_operations::{BitcoinOperationPolicy, BitcoinOperations};
 
 use chain_contract::{
     Balance, Chain, ChainError, CollectionSubmission, GeneratedAddress, WalletFactory,

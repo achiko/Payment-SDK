@@ -181,6 +181,7 @@ pub struct UnwatchCommand {
     pub scope: IndexScope,
     pub watch_id: WatchId,
     pub inactive_from: BlockHeight,
+    pub expected_checkpoint: Option<BlockRef>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

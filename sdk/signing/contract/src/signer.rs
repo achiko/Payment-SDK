@@ -1,6 +1,6 @@
 use crate::{
-    BoxFuture, Curve, KeyLocator, KeyProvisionRequest, ProvisionedKey, PublicKey, PublicKeyFormat,
-    SignRequest, Signature, SignatureScheme, SignerError,
+    BoxFuture, Curve, KeyLocator, KeyProvisionRequest, KeyTweakKind, ProvisionedKey, PublicKey,
+    PublicKeyFormat, SignRequest, Signature, SignatureScheme, SignerError,
 };
 use std::sync::Arc;
 
@@ -8,6 +8,7 @@ use std::sync::Arc;
 pub struct SignerCapabilities {
     pub curves: Vec<Curve>,
     pub schemes: Vec<SignatureScheme>,
+    pub key_tweaks: Vec<KeyTweakKind>,
     pub can_sign_messages: bool,
     pub can_sign_digests: bool,
     pub requires_user_interaction: bool,

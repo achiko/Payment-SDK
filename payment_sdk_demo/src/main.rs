@@ -1,3 +1,5 @@
+mod env_file;
+
 use chain_ethereum::{
     EthereumHttpRpc, EthereumHttpRpcConfig, EthereumRpcLimits, EthereumTransferRequest, Wei,
 };
@@ -14,6 +16,8 @@ use chain_ethereum::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    env_file::load_demo_env()?;
+
     let limits = EthereumRpcLimits::new(
         128 * 1024,                                // Maximum transaction input
         2_000,                                     // 20% gas margin

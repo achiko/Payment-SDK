@@ -1,6 +1,8 @@
 use crate::{
-    ApplyResult, BoxFuture, DepositError, DepositId, ReconciliationCase, RecordObservation,
+    ApplyResult, BoxFuture, Collection, CollectionId, CollectionLegId, CollectionTransitionGuard,
+    DepositError, DepositId, ReconciliationCase, RecordObservation, UtxoBatchProjectionTransition,
 };
+use chain_identity::CanonicalTransactionId;
 use indexing::{EventCursor, ObservationEvent, ObservationEventId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +73,20 @@ pub enum MirrorOutcome {
     AlreadyPresent { cursor: EventCursor },
 }
 
+/// Determines whether a mirrored transaction fee is an independent debit or
+/// is already contained in an input-based movement effect.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProjectionFeeTreatment {
+    /// Apply the factual fee separately when the mirrored payer and asset
+    /// identify the projected deposit.
+    #[default]
+    Separate,
+    /// Do not apply a second fee debit because the factual input or net-input
+    /// movement amount already includes it. Persistence validates that this is
+    /// used only with an input-derived debit for any fee-paying deposit.
+    IncludedInMovementEffect,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectObservation {
     pub expected_cursor: Option<EventCursor>,
@@ -82,6 +98,21 @@ pub struct ProjectObservation {
     /// and reconciliation case must commit with the projection cursor.
     pub ledger_updates: Vec<RecordObservation>,
     pub reconciliation_cases: Vec<ReconciliationCase>,
+    pub fee_treatment: ProjectionFeeTreatment,
+    /// Optional collection aggregate mutation committed in the exact same
+    /// storage batch as ledger rows, deposit-event indexes, reconciliation,
+    /// and cursor movement. Generic/account-model projection leaves this
+    /// empty; callers should prefer `project_utxo_batch_and_advance` when set.
+    pub utxo_batch_transition: Option<UtxoBatchProjectionMutation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UtxoBatchProjectionMutation {
+    pub collection_id: CollectionId,
+    pub leg_id: CollectionLegId,
+    pub expected: CollectionTransitionGuard,
+    pub transaction_id: CanonicalTransactionId,
+    pub transition: UtxoBatchProjectionTransition,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,6 +120,24 @@ pub struct ProjectionOutcome {
     pub checkpoint: ConsumerCheckpoint,
     pub ledger_results: Vec<ApplyResult>,
     pub reconciliation_cases: Vec<ReconciliationCase>,
+}
+
+/// Couples a Bitcoin collection lifecycle transition to every PS semantic
+/// effect of the same mirrored IX fact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectUtxoBatchCollection {
+    pub projection: ProjectObservation,
+    pub collection_id: CollectionId,
+    pub leg_id: CollectionLegId,
+    pub expected: CollectionTransitionGuard,
+    pub transaction_id: CanonicalTransactionId,
+    pub transition: UtxoBatchProjectionTransition,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UtxoBatchProjectionOutcome {
+    pub projection: ProjectionOutcome,
+    pub collection: Collection,
 }
 
 /// PS-owned append-only mirror. IX owns the source facts; this log owns what PS received.
@@ -132,4 +181,9 @@ pub trait ObservationConsumerCheckpoints: Send + Sync {
         &'a self,
         command: ProjectObservation,
     ) -> BoxFuture<'a, Result<ProjectionOutcome, DepositError>>;
+
+    fn project_utxo_batch_and_advance<'a>(
+        &'a self,
+        command: ProjectUtxoBatchCollection,
+    ) -> BoxFuture<'a, Result<UtxoBatchProjectionOutcome, DepositError>>;
 }

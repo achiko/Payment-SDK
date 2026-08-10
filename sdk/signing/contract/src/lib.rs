@@ -12,7 +12,7 @@ pub use key::{
     PublicKeyFormat,
 };
 pub use request::OperationId;
-pub use request::{Digest, KeyTweak, SignRequest, SignablePayload, UserInteraction};
+pub use request::{Digest, KeyTweak, KeyTweakKind, SignRequest, SignablePayload, UserInteraction};
 pub use signature::{Signature, SignatureEncoding, SignatureScheme};
 pub use signer::{KeyProvisioner, Signer, SignerCapabilities, SignerStatus};
 

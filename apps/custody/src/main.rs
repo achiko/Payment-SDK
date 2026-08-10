@@ -16,7 +16,7 @@ use clap::{Args, Parser, Subcommand};
 use http_support::{BearerToken, HealthState, HttpServerConfig, RequestLimits, TransportSecurity};
 use signer::{
     ChildIndex, Curve, DerivationPath, Digest, KeyLocator, KeyProvisionRequest, KeyProvisioner,
-    KeyTweak, OperationId, PublicKey, PublicKeyFormat, SignRequest, SignablePayload,
+    KeyTweak, KeyTweakKind, OperationId, PublicKey, PublicKeyFormat, SignRequest, SignablePayload,
     SignatureEncoding, SignatureScheme, Signer, SignerError, SignerErrorKind, SignerStatus,
     UserInteraction,
 };
@@ -168,6 +168,13 @@ async fn capabilities(State(state): State<AppState>) -> Json<wire::CapabilitiesR
             .schemes
             .into_iter()
             .map(signature_scheme_to_wire)
+            .collect(),
+        key_tweaks: capabilities
+            .key_tweaks
+            .into_iter()
+            .map(|value| match value {
+                KeyTweakKind::Secp256k1Add => wire::KeyTweakKind::Secp256k1Add,
+            })
             .collect(),
         can_sign_messages: capabilities.can_sign_messages,
         can_sign_digests: capabilities.can_sign_digests,

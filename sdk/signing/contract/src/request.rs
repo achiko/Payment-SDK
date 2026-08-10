@@ -90,6 +90,16 @@ pub enum KeyTweak {
     Secp256k1Add([u8; 32]),
 }
 
+/// Curve-level key transformations a signer is able to apply internally.
+///
+/// Capabilities name the operation without carrying the per-signature public
+/// tweak material from [`KeyTweak`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyTweakKind {
+    /// Add a BIP340-compatible secp256k1 scalar before signing.
+    Secp256k1Add,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignRequest {
     pub operation_id: OperationId,

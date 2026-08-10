@@ -28,10 +28,6 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "CLI options are constructed once and boxing would leak allocation details into command dispatch"
-)]
 pub enum Command {
     /// Run the Payment Service HTTP API and durable workflow workers.
     Serve(ServeOptions),
@@ -44,6 +40,34 @@ pub enum Command {
     /// Mirror a bounded page sequence from the IX event feed into PS storage.
     IngestEvents(IngestOptions),
     /// Report independent ingestion and business-projection progress.
+    ProjectionStatus(ProjectionStatusOptions),
+    /// Operate one native-Bitcoin Payment Service scope.
+    Bitcoin(BitcoinOptions),
+}
+
+#[derive(Args)]
+pub struct BitcoinOptions {
+    #[command(subcommand)]
+    pub command: BitcoinCommand,
+}
+
+#[derive(Subcommand)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "CLI options are constructed once and boxing would obscure command dispatch"
+)]
+pub enum BitcoinCommand {
+    /// Run the native-Bitcoin Payment Service and durable workflow workers.
+    Serve(BitcoinServeOptions),
+    /// Create and verify a consistent Bitcoin Payment Service backup.
+    Backup(BackupOptions),
+    /// Back up, migrate, validate, and bind a Bitcoin Payment Service database.
+    Migrate(MigrationOptions),
+    /// Retry durable Bitcoin AwaitingWatch deposits against IX.
+    ReconcileWatches(ReconcileOptions),
+    /// Mirror a bounded Bitcoin IX event-feed page sequence into PS storage.
+    IngestEvents(IngestOptions),
+    /// Report Bitcoin ingestion and business-projection progress.
     ProjectionStatus(ProjectionStatusOptions),
 }
 
@@ -552,6 +576,40 @@ impl fmt::Debug for ServeOptions {
     }
 }
 
+/// Bitcoin uses the common PS transport and worker controls, with stricter IX
+/// authentication and canonical-network requirements.
+#[derive(Args, Clone)]
+pub struct BitcoinServeOptions {
+    #[command(flatten)]
+    pub common: ServeOptions,
+}
+
+impl BitcoinServeOptions {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.common.validate()?;
+        if self.common.indexer.bearer_token.is_none() {
+            return Err(ConfigError::new(
+                "Bitcoin Indexer Service authentication is required even on loopback",
+            ));
+        }
+        match self.common.indexer.network.as_str() {
+            "mainnet" | "testnet3" | "testnet4" | "signet" | "regtest" => Ok(()),
+            _ => Err(ConfigError::new(
+                "Bitcoin network must be mainnet, testnet3, testnet4, signet, or regtest",
+            )),
+        }
+    }
+}
+
+impl fmt::Debug for BitcoinServeOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BitcoinServeOptions")
+            .field("common", &self.common)
+            .finish()
+    }
+}
+
 #[derive(Args, Clone, Debug)]
 pub struct ReconcileOptions {
     #[command(flatten)]
@@ -879,5 +937,67 @@ mod tests {
         options.tls_terminated_upstream = true;
         options.metrics_bind = "0.0.0.0:9091".parse().expect("bind must parse");
         assert!(options.validate().is_err());
+    }
+
+    #[test]
+    fn bitcoin_serve_requires_authenticated_ix_and_canonical_network() {
+        let common = ServeOptions {
+            database: DatabaseOptions {
+                database_path: PathBuf::from("/tmp/bitcoin-payment-service-test"),
+            },
+            indexer: IndexerOptions {
+                indexer_url: "http://127.0.0.1:18080"
+                    .parse()
+                    .expect("test URL must parse"),
+                network: "regtest".to_owned(),
+                bearer_token: Some("indexer-secret".parse().expect("token must parse")),
+                request_timeout_seconds: 15,
+                retry_attempts: 3,
+                retry_initial_millis: 100,
+                retry_max_millis: 1_000,
+            },
+            wallet: WalletOptions {
+                wallet_url: "http://127.0.0.1:18082"
+                    .parse()
+                    .expect("test URL must parse"),
+                bearer_token: "wallet-secret".parse().expect("token must parse"),
+                request_timeout_seconds: 15,
+                retry_attempts: 3,
+                retry_initial_millis: 100,
+                retry_max_millis: 1_000,
+            },
+            policy_path: PathBuf::from("bitcoin-policy.json"),
+            http_bind: "127.0.0.1:18081".parse().expect("bind must parse"),
+            metrics_bind: "127.0.0.1:19091".parse().expect("bind must parse"),
+            tls_terminated_upstream: false,
+            ordinary_bearer_token: "ordinary-secret".parse().expect("token must parse"),
+            admin_bearer_token: "admin-secret".parse().expect("token must parse"),
+            worker_interval_millis: 1_000,
+            worker_page_size: 100,
+            shutdown_grace_seconds: 10,
+        };
+        BitcoinServeOptions {
+            common: common.clone(),
+        }
+        .validate()
+        .expect("canonical authenticated Bitcoin configuration must validate");
+
+        let mut missing_auth = common.clone();
+        missing_auth.indexer.bearer_token = None;
+        let error = BitcoinServeOptions {
+            common: missing_auth,
+        }
+        .validate()
+        .expect_err("Bitcoin IX authentication is mandatory even on loopback");
+        assert!(error.to_string().contains("authentication is required"));
+
+        let mut noncanonical = common;
+        noncanonical.indexer.network = "test".to_owned();
+        let error = BitcoinServeOptions {
+            common: noncanonical,
+        }
+        .validate()
+        .expect_err("Bitcoin aliases must not cross the PS boundary");
+        assert!(error.to_string().contains("mainnet"));
     }
 }

@@ -2,6 +2,9 @@
 
 This guide explains how an exchange backend and an operator use the
 single-network Ethereum v1 Payment Service (PS) implemented by `payment-api`.
+The separate native-Bitcoin mode and its strict policy are documented in
+[`BITCOIN_SERVICES.md`](./BITCOIN_SERVICES.md); do not apply this Ethereum
+startup procedure to `payment-api bitcoin`.
 For ownership rules and persistence semantics, see
 [`PAYMENT_SERVICE.md`](./PAYMENT_SERVICE.md). For the canonical system
 requirements, see [`SYSTEM_REQUIREMENTS.md`](./SYSTEM_REQUIREMENTS.md).
@@ -1562,5 +1565,7 @@ sample. During normal service operation, use `/v1/admin/status` instead.
 - The complete crash-window and collection-workflow test matrix is unfinished.
 - Ethereum v1 does not detect mempool replacement/drop behavior, index internal
   native transfers, or support nonstandard fee-on-transfer/rebasing tokens.
-- Bitcoin Payment Service workflows, automatic credit/collection, webhooks,
-  HA, fee replacement, and a multi-network PS database are excluded.
+- This guide does not cover the implemented Bitcoin PS mode; see
+  [`BITCOIN_SERVICES.md`](./BITCOIN_SERVICES.md). Both modes exclude automatic
+  credit/collection decisions, webhooks, HA, fee replacement, and a multi-
+  network PS database.

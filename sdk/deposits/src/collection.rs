@@ -1,9 +1,19 @@
-use crate::{BoxFuture, DepositError, DepositId, JobId, PolicyIdentity, UserId};
+use crate::{BoxFuture, DepositError, DepositId, JobId, LedgerEntryId, PolicyIdentity, UserId};
 use chain_identity::{AssetId, AtomicAmount, CanonicalAddress, CanonicalTransactionId};
 use indexing::WatchId;
+use std::fmt;
 
 /// Maximum opaque signed transaction size accepted by PS persistence.
 pub const MAX_SIGNED_ENVELOPE_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum opaque evidence retained for one exact spend resource.
+///
+/// The evidence is PS-owned replay material (for example, the bounded UTXO
+/// snapshot used for policy approval). It is not a replacement for the exact
+/// outpoint identity and must never contain signing secrets.
+pub const MAX_SPEND_RESOURCE_EVIDENCE_BYTES: usize = 64 * 1024;
+pub const MAX_COLLECTION_PARTICIPANTS: usize = 4_096;
+pub const MAX_COLLECTION_SPEND_RESOURCES: usize = 16_384;
+pub const MAX_TOTAL_SPEND_RESOURCE_EVIDENCE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CollectionId(pub String);
@@ -109,6 +119,78 @@ pub struct CollectionReservation {
     pub state: CollectionReservationState,
 }
 
+/// Exact UTXO spend-resource identity. Output indexes are interpreted in the
+/// transaction identified by `transaction_id`; string-only or address-level
+/// reservations are deliberately insufficient for Bitcoin collection.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CollectionSpendResourceId {
+    pub transaction_id: CanonicalTransactionId,
+    pub output_index: u32,
+}
+
+/// Bounded opaque evidence retained with an exact spend-resource reservation.
+/// Its redacting `Debug` implementation reports only byte length so chain
+/// evidence cannot enter ordinary diagnostic output.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CollectionSpendResourceEvidence(Vec<u8>);
+
+impl fmt::Debug for CollectionSpendResourceEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CollectionSpendResourceEvidence")
+            .field("byte_len", &self.0.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl CollectionSpendResourceEvidence {
+    /// Creates non-empty bounded replay evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invariant error for empty or oversized evidence.
+    pub fn new(bytes: Vec<u8>) -> Result<Self, DepositError> {
+        if bytes.is_empty() {
+            return Err(invalid("spend-resource evidence must not be empty"));
+        }
+        if bytes.len() > MAX_SPEND_RESOURCE_EVIDENCE_BYTES {
+            return Err(invalid(
+                "spend-resource evidence exceeds the PS persistence limit",
+            ));
+        }
+        Ok(Self(bytes))
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// One exact resource reserved for a collection participant.
+///
+/// `amount` is duplicated deliberately from the chain evidence as a stable,
+/// integer PS policy input. Persistence validates that the participant's
+/// reservation is exactly the checked sum of its resources.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CollectionSpendResource {
+    pub id: CollectionSpendResourceId,
+    pub amount: AtomicAmount,
+    pub evidence: CollectionSpendResourceEvidence,
+}
+
+/// One deposit participating in a collection aggregate.
+///
+/// Account-model collections contain exactly one participant with no exact
+/// spend resources. A Bitcoin UTXO batch contains one or more participants,
+/// each with one or more canonically ordered outpoint reservations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CollectionParticipant {
+    pub user_id: UserId,
+    pub reservation: CollectionReservation,
+    pub spend_resources: Vec<CollectionSpendResource>,
+}
+
 /// Confirmed factual attribution for the sweep transaction.
 ///
 /// `allocated_fee_asset` may differ from `asset` for token collection, where
@@ -139,7 +221,12 @@ pub struct CollectionLeg {
     /// Durable IX watch registration, retained after terminal state changes.
     pub watch_id: Option<WatchId>,
     pub attempt_count: u32,
+    /// Compatibility projection for one-source account-model callers. It is
+    /// `Some` exactly when `allocations` contains one item.
     pub allocation: Option<CollectionAllocation>,
+    /// Factual per-deposit attribution. Bitcoin batches require one allocation
+    /// for every participant in canonical participant order.
+    pub allocations: Vec<CollectionAllocation>,
     pub last_error: Option<SafeCollectionError>,
     pub updated_at: u64,
 }
@@ -157,11 +244,24 @@ pub struct Collection {
     pub policy: PolicyIdentity,
     pub state: CollectionState,
     pub reservation: CollectionReservation,
+    /// Canonically ordered participant reservations. The legacy
+    /// `user_id`/`deposit_id`/`reservation` fields mirror the first participant
+    /// so existing one-source Ethereum callers remain source compatible.
+    pub participants: Vec<CollectionParticipant>,
     pub legs: Vec<CollectionLeg>,
     pub attempt_count: u32,
     pub last_error: Option<SafeCollectionError>,
     pub created_at: u64,
     pub updated_at: u64,
+}
+
+impl Collection {
+    #[must_use]
+    pub fn participant(&self, deposit_id: &DepositId) -> Option<&CollectionParticipant> {
+        self.participants
+            .iter()
+            .find(|participant| &participant.reservation.deposit_id == deposit_id)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,6 +284,33 @@ pub struct CreateCollection {
     pub policy: PolicyIdentity,
     pub reservation_amount: AtomicAmount,
     pub legs: Vec<CreateCollectionLeg>,
+    pub created_at: u64,
+}
+
+/// One participant supplied when atomically creating a Bitcoin UTXO batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateUtxoBatchParticipant {
+    pub user_id: UserId,
+    pub deposit_id: DepositId,
+    /// Ledger head against which the caller selected and approved these exact
+    /// spend resources. Creation atomically fences every participant head so
+    /// an intervening IX projection cannot leave a stale UTXO reservation.
+    pub expected_ledger_head: LedgerEntryId,
+    pub reservation_amount: AtomicAmount,
+    pub spend_resources: Vec<CollectionSpendResource>,
+}
+
+/// Creates one Bitcoin collection aggregate over an exact, canonically
+/// ordered set of participant outpoints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateUtxoBatchCollection {
+    pub id: CollectionId,
+    pub job_id: JobId,
+    pub asset: AssetId,
+    pub destination: CanonicalAddress,
+    pub policy: PolicyIdentity,
+    pub participants: Vec<CreateUtxoBatchParticipant>,
+    pub leg: CreateCollectionLeg,
     pub created_at: u64,
 }
 
@@ -235,11 +362,13 @@ impl SignedEnvelopeBytes {
     }
 }
 
-/// Durable recovery envelope persisted before any broadcast attempt and
-/// deleted atomically when broadcast is accepted. `expires_at` is an
-/// operational retention/alerting hint; it must not force PS to sign different
-/// bytes while the original broadcast outcome is unknown. This type
-/// intentionally has no `Debug` implementation.
+/// Durable recovery envelope persisted before any broadcast attempt.
+/// Account-model envelopes are deleted when broadcast is accepted. UTXO-batch
+/// envelopes are retained across accepted broadcast, confirmation, and reorg
+/// so the same transaction can be monitored/rebroadcast without releasing
+/// outpoints or signing different bytes. `expires_at` is only an operational
+/// retention/alerting hint. This type intentionally has no `Debug`
+/// implementation.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SignedCollectionEnvelope {
     pub collection_id: CollectionId,
@@ -259,6 +388,9 @@ pub struct RecordSignedCollectionLeg {
     pub expected: CollectionTransitionGuard,
     pub expected_transaction_id: CanonicalTransactionId,
     pub envelope: SignedEnvelopeBytes,
+    /// Required, canonical, and one-per-participant for UTXO batches. Other
+    /// modes leave this empty and attach factual attribution at confirmation.
+    pub allocations: Vec<CollectionAllocation>,
     pub signed_at: u64,
     pub expires_at: u64,
 }
@@ -290,6 +422,24 @@ pub struct ConfirmCollectionLeg {
     /// Required for a sweep and forbidden for a gas-funding leg.
     pub allocation: Option<CollectionAllocation>,
     pub confirmed_at: u64,
+}
+
+/// Atomic lifecycle transition coupled to one mirrored IX projection for a
+/// Bitcoin UTXO batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UtxoBatchProjectionTransition {
+    /// Canonical re-inclusion of the exact retained transaction after a reorg.
+    /// The durable leg returns to `Broadcast` without changing bytes,
+    /// allocations, or resource ownership.
+    Reincluded { included_at: u64 },
+    Confirmed {
+        allocations: Vec<CollectionAllocation>,
+        confirmed_at: u64,
+    },
+    Reorged {
+        error: SafeCollectionError,
+        reorged_at: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -355,9 +505,31 @@ pub trait CollectionStore: Send + Sync {
         command: CreateCollection,
     ) -> BoxFuture<'a, Result<CreateCollectionOutcome, DepositError>>;
 
+    fn create_or_replay_utxo_batch<'a>(
+        &'a self,
+        command: CreateUtxoBatchCollection,
+    ) -> BoxFuture<'a, Result<CreateCollectionOutcome, DepositError>>;
+
     fn collection<'a>(
         &'a self,
         id: &'a CollectionId,
+    ) -> BoxFuture<'a, Result<Option<Collection>, DepositError>>;
+
+    /// Resolves the collection currently holding an active reservation for
+    /// one deposit/asset pair. Implementations validate the ownership index
+    /// and return `None` for absent or already-consumed ownership.
+    fn active_collection_for<'a>(
+        &'a self,
+        deposit_id: &'a DepositId,
+        asset: &'a AssetId,
+    ) -> BoxFuture<'a, Result<Option<Collection>, DepositError>>;
+
+    /// Resolves active ownership plus confirmed UTXO ownership retained for
+    /// deterministic reorg handling. Released ownership is never returned.
+    fn retained_collection_for<'a>(
+        &'a self,
+        deposit_id: &'a DepositId,
+        asset: &'a AssetId,
     ) -> BoxFuture<'a, Result<Option<Collection>, DepositError>>;
 
     fn collections_for_deposit<'a>(

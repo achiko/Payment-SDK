@@ -1,9 +1,13 @@
+mod env_file;
+
 use std::path::PathBuf;
 
 use indexer_worker::{IndexerService, IndexerServiceConfig, PrometheusTelemetry};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    env_file::load_demo_env()?;
+
     println!("Indexer test started");
 
     let expected_genesis_hash = std::env::var("IX_EXPECTED_GENESIS_HASH")?;

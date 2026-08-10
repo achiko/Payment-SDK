@@ -3,21 +3,23 @@
 ## Document status
 
 This is the canonical requirements baseline for the contract-first redesign
-and its first Ethereum service implementations.
+and its first Ethereum and Bitcoin service implementations.
 It gathers the product flows, service boundaries, folder rules, persistence
 semantics, accounting corrections, acceptance criteria, and unresolved
 decisions in one place.
 
-The stateless Bitcoin/Ethereum Wallet Service execution path, authenticated
-Ethereum Wallet HTTP runtime, Ethereum Indexer Service vertical slice, and
-single-network Ethereum Payment Service v1 runtime are implemented in source.
-Code and acceptance tests, not trait presence or documentation, determine
-which parts are complete. A loopback-only ephemeral custody adapter supports
-disposable local development. This is not production deployment evidence:
-durable production custody, automated Anvil acceptance, HA, and multi-network
-PS ownership remain external, unvalidated, or excluded. The service runbooks are
+The stateless Bitcoin/Ethereum Wallet Service execution paths and authenticated
+chain-specific HTTP runtimes, both durable Indexer Service modes, and the
+single-network Ethereum and Bitcoin Payment Service v1 runtimes are implemented
+in source. Code and acceptance tests, not trait presence or documentation,
+determine which parts are complete. A loopback-only ephemeral custody adapter
+supports disposable local development. This is not production
+deployment evidence: durable production custody, automated Anvil and Bitcoin
+Core 31 acceptance, HA, and multi-network PS ownership remain external,
+unvalidated, or excluded. The service runbooks are
 [`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md),
-[`WALLET_SERVICE.md`](./WALLET_SERVICE.md), and
+[`WALLET_SERVICE.md`](./WALLET_SERVICE.md),
+[`BITCOIN_SERVICES.md`](./BITCOIN_SERVICES.md), and
 [`PAYMENT_SERVICE.md`](./PAYMENT_SERVICE.md).
 
 The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** express requirement
@@ -242,6 +244,11 @@ IX MUST:
 
 IX MUST NOT label a movement as “incoming deposit,” “sweep,” “user credit,” or
 “collection.”
+
+Bitcoin IX v1 is an explicit block-only subset: it emits included, confirmed,
+and reorg revisions but does not claim mempool drop, conflict, or replacement
+coverage. Those generic lifecycle requirements remain mandatory for a future
+mempool-capable Bitcoin release.
 
 ## 4. Shared identifiers and monetary representation
 
@@ -686,7 +693,9 @@ Every collection MUST:
 - retain the failure window where a transaction ID exists but watch
   registration has not completed;
 - update `collected` only after IX confirmation proof;
-- release/retry reservations after terminal failure or drop; and
+- release or retry reservations only after a chain-specific proven-safe
+  transition; Bitcoin UTXO-batch v1 exposes retry but no generic failure or
+  release transition; and
 - reverse canonical collection balances after reorg.
 
 Collection modes are:
@@ -720,6 +729,12 @@ stateDiagram-v2
     Reorged --> Required: retry/resume policy
     Failed --> Required: retry policy
 ```
+
+For Bitcoin PS block-only v1, `Reorged -> Required` is not permission to sign a
+replacement. The leg retains its exact bytes, txid, reservations, allocations,
+and watch; recovery may rebroadcast those bytes and accept same-txid
+re-inclusion. Any later replacement attempt requires an explicit future policy
+and evidence that the original exact outpoints cannot be reused ambiguously.
 
 ### 8.3 Account/wallet collection
 
@@ -767,19 +782,19 @@ sequenceDiagram
 
     PS->>PSDB: [request] deposits eligible for batch
     PSDB-->>PS: [response] N deposits + key locators
-    PS->>PSDB: [write] reserve all source deposits/UTXOs
-    PS->>WS: [request] collect batch(N sources, master)
+    PS->>IX: [request] canonical unspent-output facts for N addresses
+    IX-->>PS: [response] exact outpoints + values + scripts + confirmations
+    PS->>PSDB: [write] atomically reserve exact source outpoints
+    PS->>WS: [request] sign exact selection(N inputs, master)
 
-    loop each source address
-        WS->>Chain: [request] spendable UTXOs
-        Chain-->>WS: [response] UTXOs
-    end
-
-    Note over WS: build one PSBT/transaction<br/>N inputs, per-input keys, one master output
-    WS->>Chain: [request] broadcast signed transaction
-    Chain-->>WS: [response] txid
-    WS-->>PS: [response] txid + per-deposit gross-input attribution
-    PS->>PSDB: [write] one Broadcast leg + N allocations
+    Note over WS: validate every selected outpoint/value/script/key<br/>build one raw transaction and sign without broadcast
+    WS-->>PS: [response] txid + exact signed bytes + gross attribution
+    PS->>PSDB: [write] persist exact bytes + one Prepared leg + N allocations
+    PS->>WS: [request] broadcast expected txid + exact signed bytes
+    WS->>Chain: [request] preflight then send unchanged bytes
+    Chain-->>WS: [response] same txid
+    WS-->>PS: [response] verified txid
+    PS->>PSDB: [write] advance leg to Broadcast
     PS->>IX: [request] watch(txid)
     IX-->>PS: [response] watch_id
 
@@ -793,10 +808,63 @@ sequenceDiagram
 UTXO requirements:
 
 - Input attribution MUST use the amount of the previous output being spent.
+- IX MUST materialize canonical UTXOs; PS MUST atomically reserve exact
+  outpoints; WS MUST sign only the supplied, revalidated selection.
+- PS MUST persist the exact signed consensus bytes and expected txid before
+  requesting broadcast. WS MUST submit those bytes unchanged.
 - One batch transaction MUST resolve all included deposits consistently.
 - The shared network fee MUST have an explicit allocation policy.
 - `collected` uses gross deposit input; master receipt is net of shared fee.
 - Concurrent jobs MUST NOT select the same reserved outpoint.
+
+Bitcoin PS block-only v1 makes these additional selections:
+
+- One PS process and RocksDB path own one native-BTC network, policy identity,
+  IX feed, and exchange-principal namespace. Bitcoin and Ethereum or two
+  Bitcoin networks MUST NOT share one PS database.
+- One explicitly requested batch MAY contain deposits for different users only
+  when every durable user belongs to the same authenticated exchange principal.
+  It MUST NOT mix principals, networks, assets, policies, or master
+  destinations.
+- For every requested deposit, PS selects the complete eligible UTXO set from
+  one generation/revision/checkpoint-fenced IX snapshot, sorts it canonically by
+  `(txid, vout)`, and drains it to exactly one policy master output with no
+  change output.
+- Collection creation atomically reserves every exact outpoint and its bounded
+  previous-output evidence. Overlap on any outpoint MUST make the whole
+  reservation attempt fail and retry; partial reservation is forbidden.
+- The actual transaction fee is allocated in proportion to gross input using
+  integer largest-remainder allocation. Equal remainders are ordered by
+  canonical deposit ID. Allocated fees MUST sum to the exact fee and per-source
+  master credits MUST sum to the one master output.
+- The active policy MUST explicitly configure the deposit address kind,
+  minimum collection amount, minimum spend confirmations, requested and maximum
+  fee rates in satoshis per kvB, maximum absolute fee, and batch deposit/input
+  limits. None has a permissive financial default.
+- Before broadcast, PS independently validates the exact inputs, one master
+  output, txid, fee, vsize, fee ceilings, attribution, and dust/value bounds of
+  the returned Bitcoin transaction.
+- Once signed bytes are durably recorded, neither reservations nor the exact
+  envelope expire automatically. Bitcoin PS v1 retains the same txid, bytes,
+  allocations, reservations, and watch indefinitely through broadcast
+  ambiguity, inclusion, confirmation, and reorg. IX's separately configured
+  rollback retention does not release PS ownership. A reorg permits identical-
+  byte rebroadcast and same-txid re-inclusion, never replacement signing or
+  outpoint reuse.
+- V1 permits only one Bitcoin collection aggregate per deposit. Later payments
+  to that address remain watched and affect its ledger, but the retained per-
+  deposit collection ownership prevents another collection. Multi-collection-
+  per-deposit support, archival, and space reclamation require a future approved
+  design.
+- Bitcoin PS v1 has no mempool, dropped, conflict, or replacement feed and does
+  not implement PS-generated RBF replacement, CPFP, fee bumping, PSBT, or
+  conflicting replacement signing. Timeout, RPC outage, or one missing receipt
+  is not evidence that a reserved outpoint is reusable.
+
+These decisions are recorded in
+[`../TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md`](../TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md).
+Their source implementation and deterministic evidence are not composed Core 31
+or production-runtime acceptance evidence.
 
 ### 8.5 ERC-20/token collection with gas
 
@@ -958,6 +1026,11 @@ For one reverted block, inverse effects and checkpoint movement MUST be atomic.
   broadcast. A retry after response loss MUST rebroadcast the exact bytes and
   MUST verify that WS/RPC returns the expected hash; it MUST NOT silently
   re-sign the same leg as a fresh transaction.
+- Bitcoin PS MUST retain those exact bytes indefinitely in v1 once durably
+  signed. A Bitcoin reorg MUST preserve the same transaction watch and
+  authorize only same-byte rebroadcast/re-inclusion, not a newly signed
+  replacement. IX rollback retention is a separate policy and MUST NOT release
+  PS ownership.
 - A crash between event mirroring and projection MUST be recoverable by replay.
 - A crash between broadcast and IX watch registration MUST be recoverable from
   the persisted collection leg and idempotent reconciliation.
@@ -1005,6 +1078,17 @@ thresholds, gas-funder limit, and ceilings for gas limit, maximum fee per gas,
 priority fee per gas, and maximum total fee. These values have no permissive
 financial defaults.
 
+Bitcoin PS block-only v1 implements `/v1`, strict JSON, bounded cursor pagination,
+separate ordinary/administrator credentials, mutation idempotency, and durable
+jobs. Its batch collection command explicitly identifies multiple deposits and
+may cross user IDs only within one authenticated exchange-principal ownership
+boundary. Its mandatory versioned policy selects one Bitcoin network, native
+BTC, P2WPKH or P2TR deposit addresses, TTL, master destination, collection and
+spend-confirmation minimums, fee-rate and absolute-fee ceilings, and batch
+limits. The runnable mode is selected through `payment-api bitcoin`; its source
+and deterministic coverage do not satisfy the still-pending Core 31 regtest
+acceptance scenario.
+
 ## 12. Operational and security requirements
 
 - All externally caused commands MUST be idempotent.
@@ -1031,8 +1115,19 @@ The questions below remain open for the general multi-chain system unless a
 more focused decision record closes them. For Ethereum IX v1,
 [`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md) closes the database, transport,
 scope, confirmation, reorg, and completeness choices described there.
+For Bitcoin WS/IX block-only v1, the implemented choices are recorded below and
+tracked in [`../TODO/BITCOIN_WALLET_INDEXER_IMPLEMENTATION_PLAN.md`](../TODO/BITCOIN_WALLET_INDEXER_IMPLEMENTATION_PLAN.md).
+For Bitcoin PS block-only v1, the implemented application and financial-policy
+choices are tracked separately in
+[`../TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md`](../TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md).
 
 ### 13.1 Wallet and address lifecycle
+
+Bitcoin PS v1 decision: the mandatory deployment policy selects either P2WPKH
+or P2TR key-path for newly generated deposit addresses. Imported/watch-only
+addresses, additional derivation/script families, and orphan-key retirement
+automation are excluded from v1. PS persists only opaque key ownership and does
+not infer semantics from a locator.
 
 - Is a wallet one root key, one chain account, one customer, or only a key
   ownership abstraction?
@@ -1051,6 +1146,16 @@ confirmation policy; 50 reversible bundles plus one predecessor anchor are
 retained; ERC-20 `Transfer` logs are the only token standard indexed. These are
 v1 boundaries, not answers for every future chain.
 
+Bitcoin v1 decision: one process and RocksDB path own one Bitcoin network;
+Bitcoin Core 31 must be unpruned, report local block/header synchronization, be
+on the configured genesis, and have a synchronized transaction index. These
+node-local checks are not independent proof of peer connectivity or network-tip
+freshness, which production operators monitor separately. IX downloads
+canonical blocks, resolves input previous outputs, indexes P2WPKH/P2TR watches,
+and atomically materializes canonical UTXOs. It has no mempool coverage.
+Confirmation depth and reorg retention are required deployment values rather
+than universal constants.
+
 - How are multiple IX workers leased so only one advances a chain/network?
 - Are all blocks downloaded and filtered locally, or may a source filter?
 - Are mempool deposit notifications required for the first release?
@@ -1063,14 +1168,31 @@ v1 boundaries, not answers for every future chain.
 
 ### 13.3 Bitcoin transaction construction
 
-- Which script types are supported: legacy, nested SegWit, native SegWit,
-  Taproot, multisig?
-- Is PSBT the durable unsigned/partially signed representation?
-- Which coin-selection policies are required?
-- How are UTXOs reserved across concurrent collections/withdrawals?
-- When is a change address allocated and may it be reused?
-- What fee ceilings and dust rules apply?
-- Are RBF, CPFP, rebroadcast, and fee bump workflows required?
+Bitcoin v1 decision: support native SegWit v0 P2WPKH and Taproot key-path P2TR;
+use finalized raw consensus transactions rather than PSBT; express fee rates as
+integer satoshis per kvB; let IX materialize UTXOs, PS reserve exact outpoints,
+and WS validate/sign the supplied selection. Mempool replacement and fee-bump
+workflows are not part of block-only v1.
+
+Bitcoin PS v1 decision: an explicit same-principal batch drains every eligible
+UTXO for each requested deposit, sorted by `(txid, vout)`, into one master
+output with no change. PS atomically reserves every exact outpoint before
+signing. UTXO-batch v1 has no generic failure or reservation-release path: a
+required unsigned reservation remains active and may be retried. Cancellation
+or release requires a future explicit safe design. Once durably signed there is
+no time-based expiry. Mandatory policy values bound minimum collection/spend
+confirmations, requested and maximum sat/kvB rates, maximum absolute fee, and
+batch size. Only same-byte rebroadcast and same-txid re-inclusion are supported;
+PS-generated RBF replacement, CPFP, fee bumping, PSBT, and conflicting
+replacement signing are excluded.
+
+- Which additional scripts follow P2WPKH/P2TR: legacy, nested SegWit,
+  script-path Taproot, or multisig?
+- Which hardware/multisignature workflows require PSBT and which version?
+- Which post-v1 privacy grouping, partial-selection, change, or address-reuse
+  policies are required?
+- Which future mempool/RBF, CPFP, replacement, or fee-bump workflows are
+  required after the block-only release?
 
 ### 13.4 Account transaction construction
 
@@ -1118,14 +1240,20 @@ Ethereum v1 decision: a post-credit reorg preserves `accounted`, corrects the
 canonical snapshot, creates an open durable `PostCreditReorg` reconciliation
 case, and blocks automatic credit/collection until explicit resolution.
 
+Bitcoin PS v1 decision: IX `Confirmed` is the maximum automatic
+confirmation-qualified input to PS; user credit remains an explicit accounting
+command. A post-credit reorg reuses the typed blocking reconciliation behavior.
+For a batch fee `F` and gross inputs `G_i`, PS applies proportional integer
+largest-remainder allocation with canonical deposit-ID tie-breaking. Exact
+outpoint uniqueness prevents duplicate collection, and one physical projection
+batch must update the collection leg/reservations, all attributed ledger rows,
+observation indexes, reconciliation cases, and cursor consistently.
+
 - Which assets can derive balance completely from events and which require
   periodic direct balance queries?
-- How is shared Bitcoin fee allocated across deposits?
 - What exact reconciliation drift is permitted?
-- What is the business response to a post-credit reorg?
-- Is IX `Confirmed` sufficient to credit a user, or does PS require a stronger
-  policy?
-- What reservation model prevents duplicate collection?
+- Which post-v1 assets or business policies require a stronger gate than IX
+  `Confirmed`?
 
 ### 13.8 Application topology and delivery
 
@@ -1137,6 +1265,13 @@ at-least-once with a cursor; command and semantic effects are idempotent. PS
 classification precedence is durable collection mapping, gas-funding mapping,
 incoming movement to a known deposit, then other balance change. A relevant
 unresolved fact stops projection/readiness rather than being silently skipped.
+
+Bitcoin PS v1 decision: `apps/api` selects a separate Bitcoin mode over one
+exclusive PS database, Bitcoin IX feed, and Bitcoin WS. Reconciliation,
+ingestion, projection, expiration, collection, and readiness remain supervised
+loops in that application. Cross-user UTXO batches are durable jobs and are
+authorized only when all source users share the authenticated exchange
+principal. Transport remains at-least-once with repository idempotency.
 
 - Are reconciliation and delivery loops inside existing apps or separate
   executables?
@@ -1161,6 +1296,7 @@ unresolved fact stops projection/readiness rather than being silently skipped.
 | PS deposits/event mirror/ledger | `sdk/deposits` |
 | PS durable collection workflow | `sdk/deposits::collection` |
 | Ethereum PS API and workers | `apps/api` |
+| Bitcoin PS API and workers | `apps/api` (`payment-api bitcoin`) |
 | Ephemeral local custody adapter | `apps/custody`, `sdk/signing/local` |
 | PS users/jobs/reconciliation/migration | `sdk/deposits::{user,job,reconciliation,metadata,migration}` |
 | Stateless authenticated Ethereum WS | `apps/wallet`, `sdk/signing/remote` |
@@ -1194,6 +1330,13 @@ Behavioral acceptance requires proportionate store, parser, worker,
 failure-window, and live-environment evidence. The existence of the concrete
 Ethereum v1 source slices does not make that evidence automatic.
 
+Bitcoin PS deterministic and real-store acceptance includes atomic overlapping-
+outpoint rejection, all-or-nothing multi-deposit projection, exact-envelope
+retention/reorg recovery, deterministic fee allocation, and same-principal
+cross-user authorization. Operational acceptance still requires the composed
+disposable Bitcoin Core 31 regtest scenario; source and repository tests do not
+satisfy that live-node criterion.
+
 ## 16. Related documents
 
 - [`ARCHITECTURE.md`](../ARCHITECTURE.md) — concise ownership and dependency rules.
@@ -1203,3 +1346,4 @@ Ethereum v1 source slices does not make that evidence automatic.
 - [`RESEARCH.md`](./RESEARCH.md) — Alloy, BDK, Blockbook, NBXplorer,
   BTCPay, SHKeeper, Trezor, and Solana findings.
 - [`REQUIREMENTS.md`](./REQUIREMENTS.md) — compact open-decision checklist.
+- [`../TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md`](../TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md) — implemented Bitcoin PS v1 decisions and pending Core 31 operational acceptance.

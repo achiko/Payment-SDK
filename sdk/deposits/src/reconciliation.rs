@@ -1,5 +1,5 @@
-use crate::{BoxFuture, CommandIdentity, DepositError, DepositId, LedgerEntryId};
-use chain_identity::AtomicAmount;
+use crate::{BoxFuture, CollectionId, CommandIdentity, DepositError, DepositId, LedgerEntryId};
+use chain_identity::{AtomicAmount, CanonicalTransactionId};
 use indexing::ObservationEventId;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -13,6 +13,14 @@ pub enum ReconciliationReason {
     PostCreditReorg {
         accounted: AtomicAmount,
         corrected_confirmed: AtomicAmount,
+    },
+    /// A canonical debit conflicts with a PS-owned exact spend-resource
+    /// reservation but is not the retained collection transaction. Automatic
+    /// collection/accounting stays blocked until an operator resolves the
+    /// ownership conflict.
+    ReservedSpendConflict {
+        collection_id: CollectionId,
+        transaction_id: CanonicalTransactionId,
     },
 }
 

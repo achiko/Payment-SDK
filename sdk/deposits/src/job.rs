@@ -78,6 +78,21 @@ pub struct RetryCollectionJob {
     pub user_id: UserId,
 }
 
+/// Durable job payload for creating one multi-deposit UTXO collection. Deposit
+/// IDs are strictly canonical and unique; their actual users are resolved from
+/// durable deposit records under the job's common authenticated owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateUtxoBatchCollectionJob {
+    pub collection_id: CollectionId,
+    pub deposit_ids: Vec<DepositId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetryUtxoBatchCollectionJob {
+    pub collection_id: CollectionId,
+    pub deposit_ids: Vec<DepositId>,
+}
+
 /// Typed durable payload retained so a worker can resume after a PS restart.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JobPayload {
@@ -85,6 +100,8 @@ pub enum JobPayload {
     CloseDeposit(CloseDepositJob),
     CreateCollection(CreateCollectionJob),
     RetryCollection(RetryCollectionJob),
+    CreateUtxoBatchCollection(CreateUtxoBatchCollectionJob),
+    RetryUtxoBatchCollection(RetryUtxoBatchCollectionJob),
 }
 
 impl JobPayload {
@@ -95,6 +112,8 @@ impl JobPayload {
             Self::CloseDeposit(_) => JobKind::CloseDeposit,
             Self::CreateCollection(_) => JobKind::CreateCollection,
             Self::RetryCollection(_) => JobKind::RetryCollection,
+            Self::CreateUtxoBatchCollection(_) => JobKind::CreateCollection,
+            Self::RetryUtxoBatchCollection(_) => JobKind::RetryCollection,
         }
     }
 
@@ -105,16 +124,31 @@ impl JobPayload {
             Self::CloseDeposit(_) => CommandOperation::CloseDeposit,
             Self::CreateCollection(_) => CommandOperation::CreateCollection,
             Self::RetryCollection(_) => CommandOperation::RetryCollection,
+            Self::CreateUtxoBatchCollection(_) => CommandOperation::CreateCollection,
+            Self::RetryUtxoBatchCollection(_) => CommandOperation::RetryCollection,
         }
     }
 
     #[must_use]
-    pub fn user_id(&self) -> &UserId {
+    pub fn user_id(&self) -> Option<&UserId> {
         match self {
-            Self::CreateDeposit(payload) => &payload.user_id,
-            Self::CloseDeposit(payload) => &payload.user_id,
-            Self::CreateCollection(payload) => &payload.user_id,
-            Self::RetryCollection(payload) => &payload.user_id,
+            Self::CreateDeposit(payload) => Some(&payload.user_id),
+            Self::CloseDeposit(payload) => Some(&payload.user_id),
+            Self::CreateCollection(payload) => Some(&payload.user_id),
+            Self::RetryCollection(payload) => Some(&payload.user_id),
+            Self::CreateUtxoBatchCollection(_) | Self::RetryUtxoBatchCollection(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn deposit_ids(&self) -> Option<&[DepositId]> {
+        match self {
+            Self::CreateUtxoBatchCollection(payload) => Some(&payload.deposit_ids),
+            Self::RetryUtxoBatchCollection(payload) => Some(&payload.deposit_ids),
+            Self::CreateDeposit(_)
+            | Self::CloseDeposit(_)
+            | Self::CreateCollection(_)
+            | Self::RetryCollection(_) => None,
         }
     }
 
@@ -127,6 +161,12 @@ impl JobPayload {
                 JobResource::Collection(payload.collection_id.clone())
             }
             Self::RetryCollection(payload) => {
+                JobResource::Collection(payload.collection_id.clone())
+            }
+            Self::CreateUtxoBatchCollection(payload) => {
+                JobResource::Collection(payload.collection_id.clone())
+            }
+            Self::RetryUtxoBatchCollection(payload) => {
                 JobResource::Collection(payload.collection_id.clone())
             }
         }
@@ -213,8 +253,8 @@ pub struct CreateJob {
     pub id: JobId,
     pub command: CommandIdentity,
     pub payload: JobPayload,
-    /// Expected durable owner of `payload.user_id()`. An administrator may
-    /// submit a command while retaining the exchange principal as user owner.
+    /// Expected durable owner of every payload-associated user. For a UTXO
+    /// batch these users are resolved from its durable deposits.
     pub user_owner: CommandPrincipal,
     pub policy: PolicyIdentity,
     pub created_at: u64,

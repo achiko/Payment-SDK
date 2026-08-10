@@ -5,7 +5,8 @@ mod repository;
 mod tests;
 
 use crate::{
-    BlockHeight, ConfirmationPolicy, IndexError, IndexErrorKind, IndexScope, RebuildGeneration,
+    BlockHeight, ConfirmationPolicy, IndexError, IndexErrorKind, IndexScope, ProjectionBatch,
+    RebuildGeneration,
 };
 
 /// Explicit serialization boundary for chain-owned watch targets and undo data.
@@ -24,6 +25,15 @@ pub trait IndexRecordCodec: Send + Sync {
     fn encode_undo(&self, undo: &Self::Undo) -> Result<Vec<u8>, IndexError>;
 
     fn decode_undo(&self, encoded: &[u8]) -> Result<Self::Undo, IndexError>;
+
+    /// Converts chain-owned undo data into inverse opaque projection changes.
+    ///
+    /// Chains without a durable projection retain the empty default. The
+    /// repository invokes this only after decoding the retained undo bundle
+    /// and before changing canonical state.
+    fn rollback_projection(&self, _undo: &Self::Undo) -> Result<ProjectionBatch, IndexError> {
+        Ok(ProjectionBatch::default())
+    }
 }
 
 /// Strict pass-through codec for chain adapters that already own a versioned

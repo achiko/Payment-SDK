@@ -223,6 +223,15 @@ pub(super) struct BundleRecordV1 {
     pub changes: Vec<BundleChangeRecordV1>,
 }
 
+/// Projection keys first materialized by historical watch backfill for one
+/// retained canonical block. Reverting that block deletes these keys after
+/// the chain-owned rollback has been decoded and validated.
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
+pub(super) struct BackfillProjectionRollbackRecordV1 {
+    pub block: BlockRefRecordV1,
+    pub relative_keys: Vec<Vec<u8>>,
+}
+
 #[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
 pub(super) enum SyncPhaseRecordV1 {
     Starting,

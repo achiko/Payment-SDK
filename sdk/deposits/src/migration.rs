@@ -48,6 +48,7 @@ const DEPOSIT_COLLECTION_NS: &str = "ps.v1.deposit_collection";
 const ACTIVE_RESERVATION_NS: &str = "ps.v1.active_collection_reservation";
 const COLLECTION_TRANSACTION_NS: &str = "ps.v1.collection_transaction";
 const SIGNED_ENVELOPE_NS: &str = "ps.v1.signed_collection_envelope";
+const ACTIVE_SPEND_RESOURCE_NS: &str = "ps.v2.active_collection_spend_resource";
 
 pub(crate) struct MigrationValidationReport {
     pub(crate) deposits: usize,
@@ -186,15 +187,17 @@ where
     let mut collection_transactions =
         BTreeMap::<DepositId, BTreeSet<CanonicalTransactionId>>::new();
     for collection in collections.values() {
-        for transaction_id in collection
-            .legs
-            .iter()
-            .filter_map(|leg| leg.state.transaction_id())
-        {
-            collection_transactions
-                .entry(collection.deposit_id.clone())
-                .or_default()
-                .insert(transaction_id.clone());
+        for participant in &collection.participants {
+            for transaction_id in collection
+                .legs
+                .iter()
+                .filter_map(|leg| leg.state.transaction_id())
+            {
+                collection_transactions
+                    .entry(participant.reservation.deposit_id.clone())
+                    .or_default()
+                    .insert(transaction_id.clone());
+            }
         }
     }
 
@@ -861,7 +864,10 @@ where
         for job in page.jobs {
             if job.kind != job.payload.kind()
                 || job.resource != job.payload.resource()
-                || job.user_id != *job.payload.user_id()
+                || job
+                    .payload
+                    .user_id()
+                    .is_some_and(|payload_user| &job.user_id != payload_user)
                 || job.command.operation != job.payload.operation()
             {
                 return Err(invariant(
@@ -922,8 +928,20 @@ where
             )
         })
         .count();
+    let associated_users_by_job = jobs
+        .values()
+        .map(|job| Ok((job.id.clone(), associated_job_users(job, deposits)?)))
+        .collect::<Result<BTreeMap<_, _>, DepositError>>()?;
+    let user_job_indexes =
+        associated_users_by_job
+            .values()
+            .try_fold(0_usize, |total, associated_users| {
+                total
+                    .checked_add(associated_users.len())
+                    .ok_or_else(|| invariant("job user-index count overflow"))
+            })?;
     validate_raw_count(repository, COMMAND_JOB_NS, jobs.len(), page_size).await?;
-    validate_raw_count(repository, USER_JOB_NS, jobs.len(), page_size).await?;
+    validate_raw_count(repository, USER_JOB_NS, user_job_indexes, page_size).await?;
     validate_raw_count(repository, RESOURCE_JOB_NS, jobs.len(), page_size).await?;
     validate_raw_count(repository, READY_JOB_NS, ready, page_size).await?;
     let jobs_to_validate = jobs.values().cloned().collect::<Vec<_>>();
@@ -932,10 +950,10 @@ where
         .await?;
 
     for user_id in users.keys() {
-        let expected = jobs
-            .values()
-            .filter(|job| &job.user_id == user_id)
-            .map(|job| job.id.clone())
+        let expected = associated_users_by_job
+            .iter()
+            .filter(|(_, associated_users)| associated_users.contains(user_id))
+            .map(|(job_id, _)| job_id.clone())
             .collect::<BTreeSet<_>>();
         let actual = load_jobs_for_user(repository, user_id, page_size).await?;
         if actual != expected {
@@ -980,9 +998,72 @@ where
                     return Err(invariant("collection job references a missing deposit"));
                 }
             }
+            JobPayload::CreateUtxoBatchCollection(payload) => {
+                validate_utxo_job_deposits(job, &payload.deposit_ids, deposits, users)?;
+            }
+            JobPayload::RetryUtxoBatchCollection(payload) => {
+                validate_utxo_job_deposits(job, &payload.deposit_ids, deposits, users)?;
+            }
         }
     }
     Ok(jobs)
+}
+
+fn associated_job_users(
+    job: &Job,
+    deposits: &BTreeMap<DepositId, Deposit>,
+) -> Result<BTreeSet<UserId>, DepositError> {
+    let Some(deposit_ids) = job.payload.deposit_ids() else {
+        return Ok(BTreeSet::from([job.user_id.clone()]));
+    };
+    deposit_ids
+        .iter()
+        .map(|deposit_id| {
+            deposits
+                .get(deposit_id)
+                .map(|deposit| deposit.user_id.clone())
+                .ok_or_else(|| invariant("UTXO-batch job references a missing deposit"))
+        })
+        .collect()
+}
+
+fn validate_utxo_job_deposits(
+    job: &Job,
+    deposit_ids: &[DepositId],
+    deposits: &BTreeMap<DepositId, Deposit>,
+    users: &BTreeMap<UserId, User>,
+) -> Result<(), DepositError> {
+    let mut previous = None;
+    let mut primary_user = None;
+    for deposit_id in deposit_ids {
+        if previous
+            .as_ref()
+            .is_some_and(|current| current >= deposit_id)
+        {
+            return Err(invariant(
+                "UTXO-batch job deposit IDs are not canonical and unique",
+            ));
+        }
+        previous = Some(deposit_id.clone());
+        let deposit = deposits
+            .get(deposit_id)
+            .ok_or_else(|| invariant("UTXO-batch job references a missing deposit"))?;
+        let user = users
+            .get(&deposit.user_id)
+            .ok_or_else(|| invariant("UTXO-batch job deposit user is missing"))?;
+        if user.owner != job.user_owner {
+            return Err(invariant(
+                "UTXO-batch job spans users owned by another principal",
+            ));
+        }
+        primary_user.get_or_insert(&deposit.user_id);
+    }
+    if primary_user != Some(&job.user_id) {
+        return Err(invariant(
+            "UTXO-batch job primary user does not match its first deposit",
+        ));
+    }
+    Ok(())
 }
 
 async fn load_jobs_for_user<S>(
@@ -1068,6 +1149,7 @@ where
     let mut active_reservations = 0_usize;
     let mut transaction_legs = 0_usize;
     let mut signed_envelopes = 0_usize;
+    let mut active_spend_resources = 0_usize;
     for deposit_id in deposits.keys() {
         let mut after = None;
         loop {
@@ -1081,10 +1163,18 @@ where
                 )
                 .await?;
             for collection in page.collections {
-                if &collection.deposit_id != deposit_id {
+                if collection.participant(deposit_id).is_none() {
                     return Err(invariant(
-                        "collection deposit index points to another deposit",
+                        "collection deposit index points to a non-participant deposit",
                     ));
+                }
+                if let Some(existing) = collections.get(&collection.id) {
+                    if existing != &collection {
+                        return Err(invariant(
+                            "collection participant indexes resolve different aggregates",
+                        ));
+                    }
+                    continue;
                 }
                 validate_collection(
                     repository,
@@ -1096,14 +1186,10 @@ where
                     &mut active_reservations,
                     &mut transaction_legs,
                     &mut signed_envelopes,
+                    &mut active_spend_resources,
                 )
                 .await?;
-                if collections
-                    .insert(collection.id.clone(), collection)
-                    .is_some()
-                {
-                    return Err(invariant("duplicate collection ID or deposit index"));
-                }
+                collections.insert(collection.id.clone(), collection);
             }
             let Some(next) = page.next else {
                 break;
@@ -1116,7 +1202,10 @@ where
     validate_raw_count(
         repository,
         DEPOSIT_COLLECTION_NS,
-        collections.len(),
+        collections
+            .values()
+            .map(|collection| collection.participants.len())
+            .sum(),
         page_size,
     )
     .await?;
@@ -1135,6 +1224,13 @@ where
     )
     .await?;
     validate_raw_count(repository, SIGNED_ENVELOPE_NS, signed_envelopes, page_size).await?;
+    validate_raw_count(
+        repository,
+        ACTIVE_SPEND_RESOURCE_NS,
+        active_spend_resources,
+        page_size,
+    )
+    .await?;
     Ok(collections)
 }
 
@@ -1149,6 +1245,7 @@ async fn validate_collection<S>(
     active_reservations: &mut usize,
     transaction_legs: &mut usize,
     signed_envelopes: &mut usize,
+    active_spend_resources: &mut usize,
 ) -> Result<(), DepositError>
 where
     S: Storage,
@@ -1167,16 +1264,27 @@ where
             "collection reservation does not match its aggregate",
         ));
     }
-    let deposit = deposits
-        .get(&collection.deposit_id)
-        .ok_or_else(|| invariant("collection references a missing deposit"))?;
-    if collection.user_id != deposit.user_id || collection.asset != deposit.asset {
-        return Err(invariant(
-            "collection user/asset does not match its deposit",
-        ));
-    }
-    if !users.contains_key(&collection.user_id) {
-        return Err(invariant("collection references a missing user"));
+    for participant in &collection.participants {
+        let deposit = deposits
+            .get(&participant.reservation.deposit_id)
+            .ok_or_else(|| invariant("collection references a missing participant deposit"))?;
+        if participant.user_id != deposit.user_id || collection.asset != deposit.asset {
+            return Err(invariant(
+                "collection participant user/asset does not match its deposit",
+            ));
+        }
+        if !users.contains_key(&participant.user_id) {
+            return Err(invariant(
+                "collection references a missing participant user",
+            ));
+        }
+        for resource in &participant.spend_resources {
+            ensure_transaction_scope(
+                &resource.id.transaction_id,
+                scope,
+                "collection spend resource",
+            )?;
+        }
     }
     let job = jobs
         .get(&collection.job_id)
@@ -1188,13 +1296,48 @@ where
             "collection durable job association does not match the aggregate",
         ));
     }
+    if collection.mode == crate::CollectionMode::UtxoBatch {
+        let participant_deposit_ids = collection
+            .participants
+            .iter()
+            .map(|participant| participant.reservation.deposit_id.clone())
+            .collect::<Vec<_>>();
+        match &job.payload {
+            JobPayload::CreateUtxoBatchCollection(payload)
+                if payload.collection_id == collection.id
+                    && payload.deposit_ids == participant_deposit_ids => {}
+            _ => {
+                return Err(invariant(
+                    "UTXO-batch collection participants differ from its durable create job",
+                ));
+            }
+        }
+    }
     if collection.policy.version.trim().is_empty() {
         return Err(invariant("collection policy version is empty"));
     }
-    if collection.reservation.state == CollectionReservationState::Active {
-        *active_reservations = active_reservations
-            .checked_add(1)
-            .ok_or_else(|| invariant("active reservation count overflow"))?;
+    for participant in &collection.participants {
+        let ownership_retained = collection.mode == crate::CollectionMode::UtxoBatch
+            && !matches!(
+                participant.reservation.state,
+                CollectionReservationState::Released { .. }
+            );
+        if participant.reservation.state == CollectionReservationState::Active || ownership_retained
+        {
+            *active_reservations = active_reservations
+                .checked_add(1)
+                .ok_or_else(|| invariant("active reservation count overflow"))?;
+        }
+        if ownership_retained {
+            if participant.spend_resources.is_empty() {
+                return Err(invariant(
+                    "UTXO-batch collection cannot migrate without exact spend resources",
+                ));
+            }
+            *active_spend_resources = active_spend_resources
+                .checked_add(participant.spend_resources.len())
+                .ok_or_else(|| invariant("active spend-resource count overflow"))?;
+        }
     }
     let direct = repository
         .collection(&collection.id)
@@ -1214,10 +1357,10 @@ where
                 "collection leg positions or identifiers are invalid",
             ));
         }
-        if let Some(allocation) = &leg.allocation {
-            if allocation.deposit_id != collection.deposit_id {
+        for allocation in &leg.allocations {
+            if collection.participant(&allocation.deposit_id).is_none() {
                 return Err(invariant(
-                    "collection allocation references another deposit",
+                    "collection allocation references a non-participant",
                 ));
             }
             ensure_asset_scope(&allocation.asset, scope, "collection allocation asset")?;
@@ -1247,7 +1390,18 @@ where
                 .checked_add(1)
                 .ok_or_else(|| invariant("collection transaction count overflow"))?;
         }
-        if let Some(envelope) = repository.signed_envelope(&collection.id, &leg.id).await? {
+        let envelope = repository.signed_envelope(&collection.id, &leg.id).await?;
+        let envelope_required = match (&collection.mode, &leg.state) {
+            (crate::CollectionMode::UtxoBatch, state) => state.transaction_id().is_some(),
+            (_, crate::CollectionLegState::Signed { .. }) => true,
+            _ => false,
+        };
+        if envelope.is_some() != envelope_required {
+            return Err(invariant(
+                "signed collection envelope retention does not match its mode and leg state",
+            ));
+        }
+        if let Some(envelope) = envelope {
             if leg.state.transaction_id() != Some(&envelope.expected_transaction_id) {
                 return Err(invariant(
                     "signed collection envelope transaction differs from the leg state",

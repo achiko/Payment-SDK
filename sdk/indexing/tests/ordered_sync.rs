@@ -272,6 +272,7 @@ impl BlockInterpreter for TestInterpreter {
         Ok(InterpretedBlock {
             block: block.reference.clone(),
             drafts: block.drafts.clone(),
+            projection: indexing::ProjectionBatch::default(),
             undo: (),
             raw: RawBlockData {
                 block: block.reference.hash.0.clone(),

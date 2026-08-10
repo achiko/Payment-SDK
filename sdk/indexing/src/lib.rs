@@ -6,6 +6,7 @@ mod error;
 mod observation;
 mod observer;
 mod persistent;
+mod projection;
 mod service;
 mod source;
 mod store;
@@ -30,6 +31,11 @@ pub use observer::{
 };
 pub use persistent::{
     IndexRecordCodec, PersistentIndexConfig, PersistentIndexRepository, RawBytesIndexCodec,
+};
+pub use projection::{
+    ProjectionBatch, ProjectionCursor, ProjectionEntry, ProjectionGetRequest,
+    ProjectionGetResponse, ProjectionMutation, ProjectionPage, ProjectionQuery,
+    ProjectionScanRequest, ProjectionSnapshot,
 };
 pub use service::{
     IndexingWorker, ObservationEventSource, ObservationQuery, ObservationRegistry, RebuildReason,

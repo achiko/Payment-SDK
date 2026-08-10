@@ -10,19 +10,20 @@ use axum::{
     routing::{get, post},
 };
 use chain_ethereum::EthereumAddress;
-use chain_identity::{AssetId, AtomicAmount, ChainId};
+use chain_identity::{AssetId, AtomicAmount};
 use deposits::{
     AccountingCommand, ApplyResult, CloseDepositJob, Collection, CollectionId, CollectionLeg,
     CollectionLegKind, CollectionLegState, CollectionMode, CollectionPageRequest,
     CollectionReservationState, CollectionState, CollectionStore, CommandIdentity,
-    CommandOperation, CommandPrincipal, CreateCollectionJob, CreateDepositJob, CreateJob, Deposit,
-    DepositId, DepositLedger, DepositObservationLogRequest, DepositPageRequest, DepositState,
-    DepositStateKind, DepositStore, Job, JobId, JobKind, JobPageRequest, JobPayload, JobResource,
-    JobState, JobStore, LedgerEntry, LedgerEntryCause, LedgerEntryId, LedgerObservationKind,
-    LedgerPageRequest, ObservationEventLog, PersistentPaymentRepository, ProjectionId,
-    ReconciliationCase, ReconciliationCaseId, ReconciliationDecision, ReconciliationPageRequest,
-    ReconciliationReason, ReconciliationResolution, ReconciliationState, ReconciliationStore,
-    ResolveReconciliation, RetryCollectionJob, UserId, UserStore,
+    CommandOperation, CommandPrincipal, CreateCollectionJob, CreateDepositJob, CreateJob,
+    CreateUtxoBatchCollectionJob, Deposit, DepositId, DepositLedger, DepositObservationLogRequest,
+    DepositPageRequest, DepositState, DepositStateKind, DepositStore, Job, JobId, JobKind,
+    JobPageRequest, JobPayload, JobResource, JobState, JobStore, LedgerEntry, LedgerEntryCause,
+    LedgerEntryId, LedgerObservationKind, LedgerPageRequest, ObservationEventLog,
+    PersistentPaymentRepository, ProjectionId, ReconciliationCase, ReconciliationCaseId,
+    ReconciliationDecision, ReconciliationPageRequest, ReconciliationReason,
+    ReconciliationResolution, ReconciliationState, ReconciliationStore, ResolveReconciliation,
+    RetryCollectionJob, RetryUtxoBatchCollectionJob, UserId, UserStore,
 };
 use http_support::{HealthState, RequestLimits};
 use indexing::{
@@ -33,13 +34,13 @@ use serde::{Deserialize, Serialize};
 use storage_rocksdb::RocksDbStorage;
 
 use crate::{
+    active_policy::ActivePaymentPolicy,
     api_error::ApiError,
     auth::{
         AuthenticatedPrincipal, Credentials, PrincipalRole, administrator_routes, ordinary_routes,
     },
     commands::{idempotency_key, request_hash, validate_opaque_id},
     ids::ServerIdGenerator,
-    policy::PaymentPolicy,
 };
 
 const USER_OWNER_PRINCIPAL: &str = "exchange";
@@ -50,7 +51,7 @@ type Repository = PersistentPaymentRepository<RocksDbStorage>;
 #[derive(Clone)]
 pub struct ApiState {
     repository: Repository,
-    policy: Arc<PaymentPolicy>,
+    policy: Arc<ActivePaymentPolicy>,
     limits: RequestLimits,
     ids: ServerIdGenerator,
     health: HealthState,
@@ -60,7 +61,11 @@ pub struct ApiState {
 
 impl ApiState {
     #[must_use]
-    pub fn new(repository: Repository, policy: Arc<PaymentPolicy>, limits: RequestLimits) -> Self {
+    pub fn new(
+        repository: Repository,
+        policy: Arc<ActivePaymentPolicy>,
+        limits: RequestLimits,
+    ) -> Self {
         Self {
             repository,
             policy,
@@ -172,8 +177,8 @@ async fn create_deposit(
         ApiError::bad_request("invalid_json", "deposit request body is not valid JSON")
     })?;
     validate_opaque_id(&body.user_id, "user_id")?;
-    if body.scope.chain != state.policy.scope.chain.0
-        || body.scope.network != state.policy.scope.network
+    if body.scope.chain != state.policy.scope().chain.0
+        || body.scope.network != state.policy.scope().network
     {
         return Err(ApiError::bad_request(
             "scope_mismatch",
@@ -182,6 +187,14 @@ async fn create_deposit(
     }
     let asset = parse_asset(&body.asset, &state.policy)?;
     let expected = parse_positive_amount(&body.expected_amount, "expected_amount")?;
+    if matches!(state.policy.as_ref(), ActivePaymentPolicy::Bitcoin(_))
+        && expected.0[..24].iter().any(|byte| *byte != 0)
+    {
+        return Err(ApiError::bad_request(
+            "invalid_amount",
+            "Bitcoin expected_amount must fit the native unsigned 64-bit satoshi range",
+        ));
+    }
     let command = CommandIdentity {
         principal: command_principal(principal),
         operation: CommandOperation::CreateDeposit,
@@ -207,7 +220,7 @@ async fn create_deposit(
     }
     let now = unix_timestamp()?;
     let expires_at = now
-        .checked_add(state.policy.deposit_ttl.as_secs())
+        .checked_add(state.policy.deposit_ttl().as_secs())
         .ok_or_else(|| {
             ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -224,7 +237,7 @@ async fn create_deposit(
             payload: JobPayload::CreateDeposit(CreateDepositJob {
                 deposit_id: DepositId(state.ids.deposit_id()),
                 user_id: UserId(body.user_id),
-                scope: state.policy.scope.clone(),
+                scope: state.policy.scope().clone(),
                 asset,
                 expected,
                 expires_at,
@@ -317,7 +330,7 @@ async fn deposits(
         response.push(DepositDto::new(
             deposit,
             balances,
-            state.policy.scope.network.clone(),
+            state.policy.scope().network.clone(),
         ));
     }
     Ok(Json(DepositPageDto {
@@ -381,7 +394,10 @@ fn accepted_deposit_job(
     let deposit_id = match &job.payload {
         JobPayload::CreateDeposit(payload) => &payload.deposit_id,
         JobPayload::CloseDeposit(payload) => &payload.deposit_id,
-        JobPayload::CreateCollection(_) | JobPayload::RetryCollection(_) => {
+        JobPayload::CreateCollection(_)
+        | JobPayload::RetryCollection(_)
+        | JobPayload::CreateUtxoBatchCollection(_)
+        | JobPayload::RetryUtxoBatchCollection(_) => {
             return Err(internal_invariant(
                 "deposit command resolved to a collection job payload",
             ));
@@ -494,7 +510,7 @@ async fn deposit(
     Ok(Json(DepositDto::new(
         deposit,
         balances,
-        state.policy.scope.network.clone(),
+        state.policy.scope().network.clone(),
     )))
 }
 
@@ -1077,7 +1093,39 @@ impl From<ConfirmationProof> for ConfirmationProofDto {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateCollectionDto {
-    deposit_id: String,
+    deposit_id: Option<String>,
+    deposit_ids: Option<Vec<String>>,
+}
+
+enum CollectionJobRequest {
+    Ethereum {
+        deposit_id: DepositId,
+        user_id: UserId,
+    },
+    Bitcoin {
+        deposit_ids: Vec<DepositId>,
+    },
+}
+
+impl CollectionJobRequest {
+    fn into_payload(self, collection_id: CollectionId) -> JobPayload {
+        match self {
+            Self::Ethereum {
+                deposit_id,
+                user_id,
+            } => JobPayload::CreateCollection(CreateCollectionJob {
+                collection_id,
+                deposit_id,
+                user_id,
+            }),
+            Self::Bitcoin { deposit_ids } => {
+                JobPayload::CreateUtxoBatchCollection(CreateUtxoBatchCollectionJob {
+                    collection_id,
+                    deposit_ids,
+                })
+            }
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1096,14 +1144,94 @@ async fn create_collection(
     let Json(body) = body.map_err(|_| {
         ApiError::bad_request("invalid_json", "collection request body is not valid JSON")
     })?;
-    validate_opaque_id(&body.deposit_id, "deposit_id")?;
-    let deposit = find_deposit(&state, &body.deposit_id).await?;
-    authorize_user(&state, principal, &deposit.user_id).await?;
+    let (payload, hash_fields) = match state.policy.as_ref() {
+        ActivePaymentPolicy::Ethereum(_) => {
+            let deposit_id = body.deposit_id.ok_or_else(|| {
+                ApiError::bad_request(
+                    "invalid_collection",
+                    "Ethereum collection requires exactly one deposit_id",
+                )
+            })?;
+            if body.deposit_ids.is_some() {
+                return Err(ApiError::bad_request(
+                    "invalid_collection",
+                    "Ethereum collection does not accept deposit_ids",
+                ));
+            }
+            validate_opaque_id(&deposit_id, "deposit_id")?;
+            let deposit = find_deposit(&state, &deposit_id).await?;
+            authorize_user(&state, principal, &deposit.user_id).await?;
+            (
+                CollectionJobRequest::Ethereum {
+                    deposit_id: deposit.id,
+                    user_id: deposit.user_id,
+                },
+                vec![deposit_id],
+            )
+        }
+        ActivePaymentPolicy::Bitcoin(policy) => {
+            if body.deposit_id.is_some() {
+                return Err(ApiError::bad_request(
+                    "invalid_collection",
+                    "Bitcoin collection requires the explicit deposit_ids array",
+                ));
+            }
+            let mut deposit_ids = body.deposit_ids.ok_or_else(|| {
+                ApiError::bad_request(
+                    "invalid_collection",
+                    "Bitcoin collection requires deposit_ids",
+                )
+            })?;
+            if deposit_ids.is_empty() {
+                return Err(ApiError::bad_request(
+                    "invalid_collection",
+                    "Bitcoin collection deposit_ids must not be empty",
+                ));
+            }
+            for deposit_id in &deposit_ids {
+                validate_opaque_id(deposit_id, "deposit_ids")?;
+            }
+            deposit_ids.sort();
+            if deposit_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(ApiError::bad_request(
+                    "invalid_collection",
+                    "Bitcoin collection deposit_ids must be unique",
+                ));
+            }
+            if deposit_ids.len() > policy.maximum_deposits {
+                return Err(ApiError::bad_request(
+                    "invalid_collection",
+                    "Bitcoin collection exceeds the active maximum deposit count",
+                ));
+            }
+            let mut durable_ids = Vec::with_capacity(deposit_ids.len());
+            for deposit_id in &deposit_ids {
+                let deposit = find_deposit(&state, deposit_id).await?;
+                authorize_user(&state, principal, &deposit.user_id).await?;
+                if deposit.asset != policy.asset {
+                    return Err(ApiError::bad_request(
+                        "scope_mismatch",
+                        "Bitcoin collection deposit does not belong to this policy",
+                    ));
+                }
+                durable_ids.push(deposit.id);
+            }
+            (
+                CollectionJobRequest::Bitcoin {
+                    deposit_ids: durable_ids,
+                },
+                deposit_ids,
+            )
+        }
+    };
     let command = CommandIdentity {
         principal: command_principal(principal),
         operation: CommandOperation::CreateCollection,
         client_key,
-        request_hash: request_hash("create_collection", &[&body.deposit_id]),
+        request_hash: request_hash(
+            "create_collection",
+            &hash_fields.iter().map(String::as_str).collect::<Vec<_>>(),
+        ),
     };
     if let Some(job) = state
         .repository
@@ -1118,11 +1246,7 @@ async fn create_collection(
         .create_or_replay(CreateJob {
             id: JobId(state.ids.job_id()),
             command,
-            payload: JobPayload::CreateCollection(CreateCollectionJob {
-                collection_id: CollectionId(state.ids.collection_id()),
-                deposit_id: deposit.id,
-                user_id: deposit.user_id,
-            }),
+            payload: payload.into_payload(CollectionId(state.ids.collection_id())),
             user_owner: exchange_user_owner(),
             policy: state.policy.identity(),
             created_at: unix_timestamp()?,
@@ -1186,7 +1310,14 @@ async fn collection(
 ) -> Result<Json<CollectionDto>, ApiError> {
     validate_opaque_id(&collection_id, "collection_id")?;
     let collection = find_collection(&state, &collection_id).await?;
-    authorize_user(&state, principal, &collection.user_id).await?;
+    if collection.participants.is_empty() {
+        return Err(internal_invariant(
+            "collection has no durable participant ownership",
+        ));
+    }
+    for participant in &collection.participants {
+        authorize_user(&state, principal, &participant.user_id).await?;
+    }
     Ok(Json(CollectionDto::from(&collection)))
 }
 
@@ -1199,7 +1330,14 @@ async fn retry_collection(
     validate_opaque_id(&collection_id, "collection_id")?;
     let client_key = idempotency_key(&headers)?;
     let collection = find_collection(&state, &collection_id).await?;
-    authorize_user(&state, principal, &collection.user_id).await?;
+    for participant in &collection.participants {
+        authorize_user(&state, principal, &participant.user_id).await?;
+    }
+    if collection.participants.is_empty() {
+        return Err(internal_invariant(
+            "collection has no durable participant ownership",
+        ));
+    }
     let command = CommandIdentity {
         principal: command_principal(principal),
         operation: CommandOperation::RetryCollection,
@@ -1214,16 +1352,28 @@ async fn retry_collection(
     {
         return accepted_collection_job(&job, JobKind::RetryCollection);
     }
+    let payload = if collection.mode == CollectionMode::UtxoBatch {
+        JobPayload::RetryUtxoBatchCollection(RetryUtxoBatchCollectionJob {
+            collection_id: collection.id.clone(),
+            deposit_ids: collection
+                .participants
+                .iter()
+                .map(|participant| participant.reservation.deposit_id.clone())
+                .collect(),
+        })
+    } else {
+        JobPayload::RetryCollection(RetryCollectionJob {
+            collection_id: collection.id.clone(),
+            deposit_id: collection.deposit_id.clone(),
+            user_id: collection.user_id.clone(),
+        })
+    };
     let outcome = state
         .repository
         .create_or_replay(CreateJob {
             id: JobId(state.ids.job_id()),
             command,
-            payload: JobPayload::RetryCollection(RetryCollectionJob {
-                collection_id: collection.id,
-                deposit_id: collection.deposit_id,
-                user_id: collection.user_id,
-            }),
+            payload,
             user_owner: exchange_user_owner(),
             policy: state.policy.identity(),
             created_at: unix_timestamp()?,
@@ -1245,6 +1395,8 @@ fn accepted_collection_job(
     let collection_id = match &job.payload {
         JobPayload::CreateCollection(payload) => &payload.collection_id,
         JobPayload::RetryCollection(payload) => &payload.collection_id,
+        JobPayload::CreateUtxoBatchCollection(payload) => &payload.collection_id,
+        JobPayload::RetryUtxoBatchCollection(payload) => &payload.collection_id,
         JobPayload::CreateDeposit(_) | JobPayload::CloseDeposit(_) => {
             return Err(internal_invariant(
                 "collection command resolved to a deposit job payload",
@@ -1273,6 +1425,7 @@ struct CollectionDto {
     policy_digest: String,
     state: &'static str,
     reservation: CollectionReservationDto,
+    participants: Vec<CollectionParticipantDto>,
     legs: Vec<CollectionLegDto>,
     attempt_count: u32,
     last_error: Option<CollectionErrorDto>,
@@ -1294,11 +1447,56 @@ impl From<&Collection> for CollectionDto {
             policy_digest: hex_bytes(&collection.policy.digest),
             state: collection_state(collection.state),
             reservation: CollectionReservationDto::from(&collection.reservation),
+            participants: collection
+                .participants
+                .iter()
+                .map(CollectionParticipantDto::from)
+                .collect(),
             legs: collection.legs.iter().map(CollectionLegDto::from).collect(),
             attempt_count: collection.attempt_count,
             last_error: collection.last_error.as_ref().map(CollectionErrorDto::from),
             created_at: collection.created_at.to_string(),
             updated_at: collection.updated_at.to_string(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CollectionParticipantDto {
+    user_id: String,
+    deposit_id: String,
+    reservation: CollectionReservationDto,
+    spend_resources: Vec<CollectionSpendResourceDto>,
+}
+
+impl From<&deposits::CollectionParticipant> for CollectionParticipantDto {
+    fn from(participant: &deposits::CollectionParticipant) -> Self {
+        Self {
+            user_id: participant.user_id.0.clone(),
+            deposit_id: participant.reservation.deposit_id.0.clone(),
+            reservation: CollectionReservationDto::from(&participant.reservation),
+            spend_resources: participant
+                .spend_resources
+                .iter()
+                .map(CollectionSpendResourceDto::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CollectionSpendResourceDto {
+    transaction_id: String,
+    output_index: u32,
+    amount: String,
+}
+
+impl From<&deposits::CollectionSpendResource> for CollectionSpendResourceDto {
+    fn from(resource: &deposits::CollectionSpendResource) -> Self {
+        Self {
+            transaction_id: resource.id.transaction_id.value.clone(),
+            output_index: resource.id.output_index,
+            amount: resource.amount.to_string(),
         }
     }
 }
@@ -1360,6 +1558,7 @@ struct CollectionLegDto {
     watch_id: Option<String>,
     attempt_count: u32,
     allocation: Option<CollectionAllocationDto>,
+    allocations: Vec<CollectionAllocationDto>,
     last_error: Option<CollectionErrorDto>,
     updated_at: String,
 }
@@ -1379,6 +1578,11 @@ impl From<&CollectionLeg> for CollectionLegDto {
             watch_id: leg.watch_id.as_ref().map(|watch_id| watch_id.0.clone()),
             attempt_count: leg.attempt_count,
             allocation: leg.allocation.as_ref().map(CollectionAllocationDto::from),
+            allocations: leg
+                .allocations
+                .iter()
+                .map(CollectionAllocationDto::from)
+                .collect(),
             last_error: leg.last_error.as_ref().map(CollectionErrorDto::from),
             updated_at: leg.updated_at.to_string(),
         }
@@ -1715,6 +1919,10 @@ enum ReconciliationReasonDto {
         accounted: String,
         corrected_confirmed: String,
     },
+    ReservedSpendConflict {
+        collection_id: String,
+        transaction_id: String,
+    },
 }
 
 impl From<&ReconciliationReason> for ReconciliationReasonDto {
@@ -1726,6 +1934,13 @@ impl From<&ReconciliationReason> for ReconciliationReasonDto {
             } => Self::PostCreditReorg {
                 accounted: accounted.to_string(),
                 corrected_confirmed: corrected_confirmed.to_string(),
+            },
+            ReconciliationReason::ReservedSpendConflict {
+                collection_id,
+                transaction_id,
+            } => Self::ReservedSpendConflict {
+                collection_id: collection_id.0.clone(),
+                transaction_id: transaction_id.value.clone(),
             },
         }
     }
@@ -1752,7 +1967,7 @@ struct AdminStatusDto {
 struct AdminScopeResponseDto {
     chain: String,
     network: String,
-    chain_id: u64,
+    chain_id: Option<u64>,
 }
 
 async fn admin_status(
@@ -1795,11 +2010,11 @@ async fn admin_status(
     Ok(Json(AdminStatusDto {
         service: "payment-service",
         scope: AdminScopeResponseDto {
-            chain: state.policy.scope.chain.0.clone(),
-            network: state.policy.scope.network.clone(),
-            chain_id: state.policy.ethereum_chain_id,
+            chain: state.policy.scope().chain.0.clone(),
+            network: state.policy.scope().network.clone(),
+            chain_id: state.policy.ethereum_chain_id(),
         },
-        policy_version: state.policy.version.to_string(),
+        policy_version: state.policy.version().to_string(),
         policy_digest: state.policy.digest_hex(),
         ingestion_cursor: ingestion.cursor.map(|cursor| cursor.0.to_string()),
         projection_cursor: projection.cursor.map(|cursor| cursor.0.to_string()),
@@ -1882,37 +2097,45 @@ fn exchange_user_owner() -> CommandPrincipal {
     CommandPrincipal(USER_OWNER_PRINCIPAL.to_owned())
 }
 
-fn parse_asset(input: &str, policy: &PaymentPolicy) -> Result<AssetId, ApiError> {
-    let canonical = if input == "native" {
-        input.to_owned()
-    } else {
-        let address = input.parse::<EthereumAddress>().map_err(|_| {
-            ApiError::bad_request(
-                "invalid_asset",
-                "asset must be `native` or a canonical ERC-20 address",
-            )
-        })?;
-        let canonical = address.to_string();
-        if input != canonical {
+fn parse_asset(input: &str, policy: &ActivePaymentPolicy) -> Result<AssetId, ApiError> {
+    let canonical = match policy {
+        ActivePaymentPolicy::Bitcoin(_) if input == "native" => input.to_owned(),
+        ActivePaymentPolicy::Bitcoin(_) => {
             return Err(ApiError::bad_request(
                 "invalid_asset",
-                "ERC-20 asset address must use lowercase canonical hexadecimal",
+                "Bitcoin Payment Service supports only the `native` asset",
             ));
         }
-        canonical
+        ActivePaymentPolicy::Ethereum(_) if input == "native" => input.to_owned(),
+        ActivePaymentPolicy::Ethereum(_) => {
+            let address = input.parse::<EthereumAddress>().map_err(|_| {
+                ApiError::bad_request(
+                    "invalid_asset",
+                    "asset must be `native` or a canonical ERC-20 address",
+                )
+            })?;
+            let canonical = address.to_string();
+            if input != canonical {
+                return Err(ApiError::bad_request(
+                    "invalid_asset",
+                    "ERC-20 asset address must use lowercase canonical hexadecimal",
+                ));
+            }
+            canonical
+        }
     };
     let asset = AssetId {
-        chain: ChainId("ethereum".to_owned()),
+        chain: policy.scope().chain.clone(),
         asset: canonical,
     };
-    policy.asset(&asset).map_err(|_| {
-        ApiError::new(
+    if !policy.enabled_asset(&asset) {
+        return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "unsupported_asset",
             "asset is not enabled by the active Payment Service policy",
             false,
-        )
-    })?;
+        ));
+    }
     Ok(asset)
 }
 
@@ -2071,7 +2294,8 @@ mod tests {
         body::{Body, to_bytes},
         http::{Method, Request, header},
     };
-    use chain_identity::{CanonicalAddress, CanonicalTransactionId};
+    use bitcoin::{Address, CompressedPublicKey, Network, PublicKey, secp256k1};
+    use chain_identity::{CanonicalAddress, CanonicalTransactionId, ChainId};
     use deposits::{
         CreateDeposit, CreateDepositWithLedger, DepositBalances, EnsureUser, IdempotencyKey,
         InitializePaymentDatabase, PaymentDatabaseMetadataStore,
@@ -2087,6 +2311,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::{bitcoin_policy::BitcoinPaymentPolicy, policy::PaymentPolicy};
 
     fn amount(value: u64) -> AtomicAmount {
         value.to_string().parse().expect("test amount must parse")
@@ -2261,10 +2486,11 @@ mod tests {
         let repository = PersistentPaymentRepository::new(
             RocksDbStorage::open(directory.path()).expect("test RocksDB must open"),
         );
-        let policy = Arc::new(test_policy());
+        let ethereum_policy = test_policy();
+        let policy = Arc::new(ActivePaymentPolicy::Ethereum(ethereum_policy));
         repository
             .initialize_or_validate(InitializePaymentDatabase {
-                scope: policy.scope.clone(),
+                scope: policy.scope().clone(),
                 active_policy: policy.identity(),
                 initialized_at: 1,
             })
@@ -2383,8 +2609,153 @@ mod tests {
         .expect("test policy must parse")
     }
 
+    struct BitcoinHttpFixture {
+        _directory: TempDir,
+        router: Router,
+        repository: Repository,
+    }
+
+    async fn bitcoin_http_fixture() -> BitcoinHttpFixture {
+        let directory = TempDir::new().expect("temporary directory must be available");
+        let repository = PersistentPaymentRepository::new(
+            RocksDbStorage::open(directory.path()).expect("test RocksDB must open"),
+        );
+        let policy = Arc::new(ActivePaymentPolicy::Bitcoin(
+            BitcoinPaymentPolicy::from_json(
+                br#"{
+                    "version": 1,
+                    "scope": {"chain": "bitcoin", "network": "regtest"},
+                    "deposit_address_kind": "p2wpkh",
+                    "deposit_ttl_seconds": 3600,
+                    "master_destination": "bcrt1qtwxw3vnj3f29szvhvr84k0aekcrhh9cla5nxa0",
+                    "minimum_collection_satoshis": "10000",
+                    "minimum_spend_confirmations": 2,
+                    "requested_satoshis_per_kvb": "1000",
+                    "maximum_satoshis_per_kvb": "5000",
+                    "maximum_absolute_fee_satoshis": "50000",
+                    "maximum_deposits": 2,
+                    "maximum_inputs": 10
+                }"#,
+            )
+            .expect("complete Bitcoin test policy must parse"),
+        ));
+        repository
+            .initialize_or_validate(InitializePaymentDatabase {
+                scope: policy.scope().clone(),
+                active_policy: policy.identity(),
+                initialized_at: 1,
+            })
+            .await
+            .expect("Bitcoin test database metadata must initialize");
+        for (index, user_id) in ["bitcoin-user-a", "bitcoin-user-b"].into_iter().enumerate() {
+            repository
+                .ensure_user(EnsureUser {
+                    id: UserId(user_id.to_owned()),
+                    owner: exchange_user_owner(),
+                    first_seen_at: u64::try_from(index + 1).expect("test index must fit u64"),
+                })
+                .await
+                .expect("Bitcoin test user must persist");
+        }
+        create_test_bitcoin_deposit(&repository, "bitcoin-deposit-a", "bitcoin-user-a", 1).await;
+        create_test_bitcoin_deposit(&repository, "bitcoin-deposit-b", "bitcoin-user-b", 2).await;
+        let credentials = Arc::new(Credentials::new(
+            BearerToken::new("exchange-secret").expect("test token must parse"),
+            BearerToken::new("administrator-secret").expect("test token must parse"),
+        ));
+        let router = router(
+            Arc::new(ApiState::new(
+                repository.clone(),
+                policy,
+                RequestLimits::new(1024 * 1024, 25, 100).expect("test limits must be valid"),
+            )),
+            credentials,
+        );
+        BitcoinHttpFixture {
+            _directory: directory,
+            router,
+            repository,
+        }
+    }
+
+    async fn create_test_bitcoin_deposit(
+        repository: &Repository,
+        deposit_id: &str,
+        user_id: &str,
+        key_byte: u8,
+    ) {
+        let secret = secp256k1::SecretKey::from_slice(&[key_byte; 32])
+            .expect("test secret scalar must be valid");
+        let secp = secp256k1::Secp256k1::new();
+        let public_key = PublicKey::new(secp256k1::PublicKey::from_secret_key(&secp, &secret));
+        let compressed =
+            CompressedPublicKey::try_from(public_key).expect("test public key must be compressed");
+        let address = Address::p2wpkh(&compressed, Network::Regtest).to_string();
+        repository
+            .create_with_ledger(CreateDepositWithLedger {
+                deposit: CreateDeposit {
+                    id: DepositId(deposit_id.to_owned()),
+                    idempotency_key: IdempotencyKey(format!("create-{deposit_id}")),
+                    user_id: UserId(user_id.to_owned()),
+                    asset: AssetId {
+                        chain: ChainId("bitcoin".to_owned()),
+                        asset: "native".to_owned(),
+                    },
+                    address: CanonicalAddress {
+                        chain: ChainId("bitcoin".to_owned()),
+                        value: address,
+                    },
+                    key: KeyLocator::Identifier(format!("bitcoin-test-key-{key_byte}")),
+                    key_purpose: DEPOSIT_KEY_PURPOSE.to_owned(),
+                    expected: amount(100_000),
+                    birthday: BlockHeight(10),
+                    expires_at: 1_000,
+                    created_at: u64::from(key_byte),
+                },
+                ledger_recorded_at: u64::from(key_byte),
+            })
+            .await
+            .expect("Bitcoin test deposit and ledger must persist");
+    }
+
     async fn call_json(
         fixture: &HttpFixture,
+        method: Method,
+        path: &str,
+        token: &str,
+        idempotency_key: Option<&str>,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"));
+        if let Some(idempotency_key) = idempotency_key {
+            builder = builder.header("Idempotency-Key", idempotency_key);
+        }
+        let body = match body {
+            Some(body) => {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+                Body::from(serde_json::to_vec(&body).expect("test JSON must encode"))
+            }
+            None => Body::empty(),
+        };
+        let response = fixture
+            .router
+            .clone()
+            .oneshot(builder.body(body).expect("test request must build"))
+            .await
+            .expect("router must respond");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("response body must be readable");
+        let body = serde_json::from_slice(&bytes).expect("response must be JSON");
+        (status, body)
+    }
+
+    async fn call_bitcoin_json(
+        fixture: &BitcoinHttpFixture,
         method: Method,
         path: &str,
         token: &str,
@@ -2465,6 +2836,112 @@ mod tests {
         .await;
         assert_eq!(conflicting.0, StatusCode::CONFLICT);
         assert_eq!(conflicting.1["code"], "conflict");
+    }
+
+    #[tokio::test]
+    async fn bitcoin_batch_command_is_canonical_cross_user_and_idempotent() {
+        let fixture = bitcoin_http_fixture().await;
+        let command = json!({
+            "deposit_ids": ["bitcoin-deposit-b", "bitcoin-deposit-a"]
+        });
+        let first = call_bitcoin_json(
+            &fixture,
+            Method::POST,
+            "/v1/collections",
+            "exchange-secret",
+            Some("collect-bitcoin-batch-once"),
+            Some(command.clone()),
+        )
+        .await;
+        assert_eq!(first.0, StatusCode::ACCEPTED);
+        let job_id = first.1["job_id"]
+            .as_str()
+            .expect("accepted Bitcoin batch must return a job ID");
+        let job = fixture
+            .repository
+            .job(&JobId(job_id.to_owned()))
+            .await
+            .expect("Bitcoin batch job read must succeed")
+            .expect("Bitcoin batch job must persist");
+        let JobPayload::CreateUtxoBatchCollection(payload) = job.payload else {
+            panic!("Bitcoin batch command must persist a UTXO payload");
+        };
+        assert_eq!(
+            payload.deposit_ids,
+            vec![
+                DepositId("bitcoin-deposit-a".to_owned()),
+                DepositId("bitcoin-deposit-b".to_owned()),
+            ]
+        );
+
+        let replay = call_bitcoin_json(
+            &fixture,
+            Method::POST,
+            "/v1/collections",
+            "exchange-secret",
+            Some("collect-bitcoin-batch-once"),
+            Some(command),
+        )
+        .await;
+        assert_eq!(replay, first);
+
+        let changed_membership = call_bitcoin_json(
+            &fixture,
+            Method::POST,
+            "/v1/collections",
+            "exchange-secret",
+            Some("collect-bitcoin-batch-once"),
+            Some(json!({"deposit_ids": ["bitcoin-deposit-a"]})),
+        )
+        .await;
+        assert_eq!(changed_membership.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn bitcoin_batch_command_rejects_ambiguous_or_over_limit_membership() {
+        let fixture = bitcoin_http_fixture().await;
+        for body in [
+            json!({"deposit_id": "bitcoin-deposit-a"}),
+            json!({"deposit_ids": []}),
+            json!({"deposit_ids": ["bitcoin-deposit-a", "bitcoin-deposit-a"]}),
+        ] {
+            let response = call_bitcoin_json(
+                &fixture,
+                Method::POST,
+                "/v1/collections",
+                "exchange-secret",
+                Some("invalid-bitcoin-batch"),
+                Some(body),
+            )
+            .await;
+            assert_eq!(response.0, StatusCode::BAD_REQUEST);
+            assert_eq!(response.1["code"], "invalid_collection");
+        }
+
+        create_test_bitcoin_deposit(
+            &fixture.repository,
+            "bitcoin-deposit-c",
+            "bitcoin-user-a",
+            3,
+        )
+        .await;
+        let over_limit = call_bitcoin_json(
+            &fixture,
+            Method::POST,
+            "/v1/collections",
+            "exchange-secret",
+            Some("over-limit-bitcoin-batch"),
+            Some(json!({
+                "deposit_ids": [
+                    "bitcoin-deposit-a",
+                    "bitcoin-deposit-b",
+                    "bitcoin-deposit-c"
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(over_limit.0, StatusCode::BAD_REQUEST);
+        assert_eq!(over_limit.1["code"], "invalid_collection");
     }
 
     #[tokio::test]

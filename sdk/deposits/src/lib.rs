@@ -32,12 +32,16 @@ pub use collection::{
     AcceptCollectionBroadcast, AttachCollectionWatch, Collection, CollectionAllocation,
     CollectionId, CollectionLeg, CollectionLegId, CollectionLegKind, CollectionLegReference,
     CollectionLegState, CollectionMode, CollectionPage, CollectionPageRequest,
-    CollectionReservation, CollectionReservationState, CollectionState, CollectionStore,
-    CollectionTransitionGuard, ConfirmCollectionLeg, CreateCollection, CreateCollectionLeg,
-    CreateCollectionOutcome, FailCollectionLeg, MAX_SIGNED_ENVELOPE_BYTES,
-    RecordSignedCollectionLeg, ReleaseCollectionReservation, ReorgCollectionLeg,
-    ReservationReleaseReason, RetryCollectionLeg, SafeCollectionError, SignedCollectionEnvelope,
-    SignedEnvelopeBytes,
+    CollectionParticipant, CollectionReservation, CollectionReservationState,
+    CollectionSpendResource, CollectionSpendResourceEvidence, CollectionSpendResourceId,
+    CollectionState, CollectionStore, CollectionTransitionGuard, ConfirmCollectionLeg,
+    CreateCollection, CreateCollectionLeg, CreateCollectionOutcome, CreateUtxoBatchCollection,
+    CreateUtxoBatchParticipant, FailCollectionLeg, MAX_COLLECTION_PARTICIPANTS,
+    MAX_COLLECTION_SPEND_RESOURCES, MAX_SIGNED_ENVELOPE_BYTES, MAX_SPEND_RESOURCE_EVIDENCE_BYTES,
+    MAX_TOTAL_SPEND_RESOURCE_EVIDENCE_BYTES, RecordSignedCollectionLeg,
+    ReleaseCollectionReservation, ReorgCollectionLeg, ReservationReleaseReason, RetryCollectionLeg,
+    SafeCollectionError, SignedCollectionEnvelope, SignedEnvelopeBytes,
+    UtxoBatchProjectionTransition,
 };
 pub use deposit::{
     CreateDeposit, Deposit, DepositId, DepositState, DepositStateKind, IdempotencyKey,
@@ -48,13 +52,15 @@ pub use event_log::{
     AppendObservation, AppendOutcome, ConsumerCheckpoint, ConsumerCheckpointName,
     DepositObservationLogPage, DepositObservationLogRequest, MirrorObservation, MirrorOutcome,
     MirroredObservation, ObservationConsumerCheckpoints, ObservationEventLog, ObservationLogPage,
-    ObservationLogRequest, ProjectObservation, ProjectionOutcome,
+    ObservationLogRequest, ProjectObservation, ProjectUtxoBatchCollection, ProjectionFeeTreatment,
+    ProjectionOutcome, UtxoBatchProjectionMutation, UtxoBatchProjectionOutcome,
 };
 pub use job::{
     ClaimJob, CloseDepositJob, CommandIdentity, CommandOperation, CommandPrincipal,
-    CreateCollectionJob, CreateDepositJob, CreateJob, CreateJobOutcome, Job, JobError, JobId,
-    JobKind, JobPage, JobPageRequest, JobPayload, JobResource, JobState, JobStateKind, JobStore,
-    RequestHash, RetryCollectionJob, TransitionJob,
+    CreateCollectionJob, CreateDepositJob, CreateJob, CreateJobOutcome,
+    CreateUtxoBatchCollectionJob, Job, JobError, JobId, JobKind, JobPage, JobPageRequest,
+    JobPayload, JobResource, JobState, JobStateKind, JobStore, RequestHash, RetryCollectionJob,
+    RetryUtxoBatchCollectionJob, TransitionJob,
 };
 pub use metadata::{
     InitializePaymentDatabase, MigratePaymentDatabase, PAYMENT_DOMAIN_SCHEMA_VERSION,

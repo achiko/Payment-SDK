@@ -479,7 +479,6 @@ mod tests {
     use indexing::{BlockHeight, BlockRef};
     use signer_local::LocalSigner;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use transaction_utxo::FeeRate;
 
     #[derive(Debug)]
     struct MockBitcoinRpc {
@@ -512,12 +511,10 @@ mod tests {
             Box::pin(async move { Ok(utxos) })
         }
 
-        fn estimate_fee_rate<'a>(&'a self) -> crate::BoxFuture<'a, Result<FeeRate, SourceError>> {
-            Box::pin(async {
-                Ok(FeeRate {
-                    units_per_weight: 1,
-                })
-            })
+        fn estimate_fee_rate<'a>(
+            &'a self,
+        ) -> crate::BoxFuture<'a, Result<crate::SatoshisPerKvb, SourceError>> {
+            Box::pin(async { Ok(crate::SatoshisPerKvb::new(1_000)) })
         }
 
         fn broadcast<'a>(
@@ -525,7 +522,7 @@ mod tests {
             transaction: BitcoinSignedTransaction,
         ) -> crate::BoxFuture<'a, Result<BitcoinTransactionId, SourceError>> {
             self.broadcasts.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async move { Ok(transaction.id) })
+            Box::pin(async move { Ok(transaction.id()) })
         }
 
         fn receipt<'a>(

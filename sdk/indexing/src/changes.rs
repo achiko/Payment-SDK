@@ -1,4 +1,7 @@
-use crate::{BlockRef, ConfirmationPolicy, IndexScope, ObservationDraft, WatchId, WatchVersion};
+use crate::{
+    BlockRef, ConfirmationPolicy, IndexScope, ObservationDraft, ProjectionBatch, WatchId,
+    WatchVersion,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexedEvent<E> {
@@ -28,6 +31,8 @@ pub struct RawBlockData {
 pub struct InterpretedBlock<U> {
     pub block: BlockRef,
     pub drafts: Vec<ObservationDraft>,
+    /// Opaque chain-owned state changes committed with this canonical block.
+    pub projection: ProjectionBatch,
     /// Chain-owned information required to reverse the block.
     pub undo: U,
     pub raw: RawBlockData,

@@ -3,23 +3,32 @@
 ## Verdict
 
 The repository now contains more than the original contract scaffold. The
-stateless Bitcoin/Ethereum Wallet Service execution path and the Ethereum-first
-Indexer Service vertical slice have concrete implementations, including HTTP
-JSON-RPC, Ethereum parsing, ordered synchronization, RocksDB persistence,
-reorg/rebuild recovery, and the IX HTTP API. The Ethereum v1 Payment Service
-source now also includes authenticated public/admin APIs, durable users/jobs
-and command idempotency, deposit/watch recovery, IX mirroring, storage-aware
-classification, absolute ledger projection, a per-deposit observation index,
-typed reconciliation, and native/ERC-20 collection execution. The stateless
-Ethereum Wallet HTTP process uses the concrete RPC adapter and remote-custody
-client and owns no database.
+stateless Bitcoin/Ethereum Wallet Service execution paths and both chain-specific
+Indexer Service modes have concrete implementations. Ethereum retains its
+HTTP JSON-RPC parser and durable IX vertical slice. Bitcoin adds a direct Core
+31 adapter, authenticated stateless WS runtime, block interpreter, canonical
+UTXO projection, generation/revision/checkpoint-fenced query surface, and durable IX runtime over
+the same ordered synchronization, RocksDB, reorg, replay, and staged-rebuild
+machinery. The Payment Service source includes authenticated
+public/admin APIs, durable users/jobs and command idempotency, deposit/watch
+recovery, IX mirroring, storage-aware classification, absolute ledger
+projection, a per-deposit observation index, typed reconciliation, and
+native/ERC-20 collection execution. Its nested Bitcoin mode adds strict native-
+BTC policy binding, multi-source jobs, atomic exact-outpoint reservations,
+full-drain/no-change execution, deterministic fee allocation, retained exact
+bytes, and all-participant projection. Neither Wallet HTTP mode owns a database.
 
 This is still not evidence of a production deployment. A loopback-only
 ephemeral custody adapter now exists, but external durable custody, automated
 Anvil acceptance, HA, and multi-network ownership in a single PS store remain
-absent or deliberately excluded. The complete failure-window
-test matrix and a single physical commit spanning IX-driven collection-leg and
-ledger/projection-cursor transitions remain acceptance work.
+absent or deliberately excluded. The Bitcoin Core 31 disposable-regtest
+acceptance scenario is also pending because the required binary is unavailable
+in the current environment; deterministic fixtures do not prove composed
+real-node behavior. Its checked-in
+[`manual acceptance procedure`](./manual-bitcoin-regtest/README.md) has not been
+executed and is not pass evidence. The complete composed failure-window matrix
+remains acceptance work even though the repository command applies a Bitcoin
+batch's collection/ledger/reconciliation/cursor effects atomically.
 
 The original document is accepted with five corrections required for safety:
 
@@ -85,7 +94,10 @@ Contract and implementation mapping:
   the semantic public IX surface;
 - `ObservedTransaction` contains movements, fee, status, and revision;
 - `PersistentIndexRepository` persists IX facts and its durable event feed
-  atomically over the injected `Storage` contract.
+  atomically over the injected `Storage` contract; and
+- `ProjectionQuery` exposes active-generation opaque chain projections;
+  Bitcoin uses it for canonical watched UTXOs while Ethereum supplies an empty
+  projection batch.
 
 An observation is not constrained to a fake single `from/to/amount` tuple.
 UTXO inputs and outputs are independent movements, while EVM native, internal,
@@ -191,9 +203,14 @@ Contract mapping:
   live in the Bitcoin or Ethereum crate.
 
 The `apps/wallet` composition root deliberately selects no storage or DB
-backend. It now serves authenticated ETH/ERC-20 address, balance, signing,
+backend. It serves authenticated ETH/ERC-20 address, balance, signing,
 collection-requirement, collection-preparation, exact-envelope broadcast, and
-receipt endpoints over bounded JSON.
+receipt endpoints over bounded JSON. Its nested Bitcoin mode adds authenticated
+P2WPKH/P2TR address generation, IX-backed balances, exact-selected-input
+transfer/collection signing, Core preflight/broadcast, and receipt endpoints.
+WS revalidates selected outputs against one generation/revision/checkpoint IX
+snapshot, verifies that checkpoint against Core immediately before signing,
+but never reserves the outputs.
 
 ### 6. Collection modes
 
@@ -228,16 +245,18 @@ recoverable.
 
 | Original requirement | Scaffold location | Structural status |
 |---|---|---|
-| PS runtime composition | `apps/api` | Authenticated API, durable jobs, watch reconciliation, IX ingestion/projection, expiration, collection, readiness, backup, and migration implemented for one Ethereum scope |
-| Stateless WS composition | `apps/wallet` | Authenticated Ethereum HTTP runtime with concrete RPC and remote custody; no direct storage/backend |
-| Independent IX composition | `apps/indexer` | Runnable Ethereum worker, API, health, metrics, maintenance commands, and embeddable lifecycle facade implemented |
-| Per-chain checkpoint height/hash | `IndexScope`, `IndexRepository`, `SyncStatus` | Implemented for the Ethereum slice |
-| Wait for provable depth | `ConfirmationPolicy`, `Included`, `ConfirmationProof` | Depth-12 transitions implemented and persisted |
-| `watch(address)` / `watch(txid)` | `ObservationRegistry`, `WatchSelector` | Implemented through repository and IX HTTP API |
-| `txs(address)` / `tx(txid)` | `ObservationQuery` | Implemented through repository and IX HTTP API |
+| PS runtime composition | `apps/api` | Authenticated Ethereum and nested Bitcoin modes with durable jobs, watch reconciliation, IX ingestion/projection, expiration, collection, readiness, backup, and migration |
+| Stateless WS composition | `apps/wallet` | Authenticated chain-specific Ethereum and Bitcoin HTTP runtimes with concrete RPC/IX and remote-custody adapters; no direct storage/backend |
+| Independent IX composition | `apps/indexer` | Runnable Ethereum and nested Bitcoin workers, APIs, health, metrics, maintenance commands, and embeddable lifecycle facades implemented |
+| Per-chain checkpoint height/hash | `IndexScope`, `IndexRepository`, `SyncStatus` | Implemented for Ethereum and Bitcoin scopes |
+| Wait for provable depth | `ConfirmationPolicy`, `Included`, `ConfirmationProof` | Persisted depth transitions; Ethereum v1 defaults to 12 while Bitcoin requires an explicit deployment value |
+| `watch(address)` / `watch(txid)` | `ObservationRegistry`, `WatchSelector` | Implemented through both chain-specific IX HTTP APIs |
+| `txs(address)` / `tx(txid)` | `ObservationQuery` | Implemented through both chain-specific IX HTTP APIs |
 | Replayable state events | `ObservationEventSource`, `EventCursor` | Persistent cursor feed implemented |
 | IX facts only | `ObservedTransaction`, `ValueMovement` | Implemented without PS semantics |
-| IX-owned persistence | `PersistentIndexRepository`, `storage-rocksdb` | Implemented with atomic batches and explicit RecordV1 formats |
+| IX-owned persistence | `PersistentIndexRepository`, `storage-rocksdb` | Implemented with atomic batches, explicit RecordV1 formats, and generation-scoped chain projections |
+| Bitcoin Core identity/readiness | `BitcoinCoreClient` | Core 31.x, network/genesis, unpruned state, IBD, block/header sync, and current txindex checks implemented |
+| Bitcoin canonical UTXOs | `BitcoinIndexRecordCodec`, `ProjectionQuery`, Bitcoin IX API | Watched output create/spend, atomic rollback, full projection-snapshot pagination, Core checkpoint binding, and coinbase metadata implemented |
 | PS append-only event mirror | `PersistentPaymentRepository` | Implemented with atomic ingestion cursor advancement and durable deposit-to-observation indexing |
 | PS classification | `ObservationClassifier`, `apps/api::runtime` | Storage-aware precedence and unresolved-fact projection stop implemented |
 | Absolute deposit balance journal | `LedgerEntry`, `DepositBalances` | Checked absolute projection, network-fee handling, reorg correction, and accounting isolation implemented |
@@ -245,13 +264,14 @@ recoverable.
 | Internal user credit | `AccountingCommand` | Administrator-only absolute command with expected-head and idempotency checks implemented |
 | Post-credit reconciliation | `ReconciliationStore` | Typed reverse-credit, accepted-liability, and external-debt decisions implemented |
 | Generic address generation flow | `KeyProvisioner`, `DepositAddressGenerator<C>` | Present |
-| Balance read | `BalanceReader<C>` | Implemented for Bitcoin and Ethereum/ERC-20 through injected RPC |
-| Build/sign/broadcast | chain transaction capabilities | Bitcoin SegWit/Taproot and Ethereum EIP-1559 implemented |
+| Balance read | `BalanceReader<C>` | Implemented for Ethereum/ERC-20 RPC and Bitcoin IX-backed canonical UTXOs |
+| Build/sign/broadcast | chain transaction capabilities | Bitcoin SegWit/Taproot and Ethereum EIP-1559 implemented with separate non-broadcasting sign and exact-byte broadcast APIs |
 | Wallet/account collection | `Collector<C>`, PS collection executor | Native Ethereum durable reservation/sign/broadcast/watch workflow implemented |
-| BTC batched collection | Bitcoin collection request + attribution | Implemented with gross-input attribution |
+| BTC batched collection | Bitcoin collection request + attribution | Same-principal multi-deposit job, fenced complete-UTXO selection, atomic exact-outpoint reservation, stateless signing, fee allocation, exact-byte persistence/broadcast, watch, and block-only projection implemented |
+| Bitcoin PS v1 decision record | `TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md` | Implemented: one native-BTC scope, same-principal full-drain/no-change batches, mandatory ceilings, retained exact bytes, same-txid re-inclusion, and block-only exclusions; live Core 31 acceptance pending |
 | ERC-20 prefund then sweep | PS collection legs + Ethereum requirement | PS persists planned gas funding, waits for its IX confirmation, then advances the token sweep |
 | Retry pending broadcasts | signed-envelope record + `CollectionLegState` | Exact envelope persists before broadcast; replay verifies hash and attaches an idempotent IX watch |
-| Fee and chain policy | Ethereum envelope inspection + PS policy | Numeric chain ID, gas limit, fee caps, and maximum total fee enforced before collection broadcast |
+| Fee and chain policy | Chain-native signed-transaction inspection + PS policy | Ethereum chain/gas/fee ceilings and Bitcoin exact-input/output/vsize/rate/absolute-fee bounds enforced before collection broadcast |
 | Local/remote/Trezor substitution | `Signer` and separate signer crates | Ephemeral local signer and authenticated remote adapter implemented; Trezor remains a placeholder |
 | Concrete storage engine | `sdk/storage/rocksdb` | Implemented for IX and PS as separate database paths |
 | PS schema migration | `PaymentDatabaseMetadataStore`, `payment-api migrate` | Verified physical backup, semantic validation/index rebuild, and fail-closed schema-v2 binding implemented |
@@ -355,27 +375,53 @@ Source structure and deterministic tests cannot establish:
   policy;
 - production filesystem, process, and crash behavior beyond the real-store
   deterministic tests that have run;
-- race-free UTXO and nonce reservations;
+- nonce reservations and distributed multi-writer UTXO ownership beyond the
+  selected single-owner PS database model;
+- repeated Bitcoin collections for one deposit, or archival/space reclamation
+  of its indefinitely retained signed aggregate;
+- a generic UTXO-batch cancellation/failure transition or release of its
+  unsigned required reservation;
 - nonstandard token-tax/rebasing behavior or unsupported token policies;
 - security and durability of a production custody service (the local server is
   explicitly ephemeral and loopback-only);
 - webhook/event delivery authentication;
 - correctness of reorg inverses not covered by deterministic or real-node
   tests;
-- one physical PS transaction spanning collection-leg transitions and the
-  corresponding ledger/reconciliation/projection-cursor commit;
 - the complete PS crash-window, restart, and collection workflow test matrix;
 - automated, repeatable PS/WS/IX Anvil end-to-end acceptance;
-- the composed IX service against a live Ethereum node; and
+- the composed IX service against a live Ethereum node;
+- the composed Bitcoin IX/WS/PS services against the pinned Bitcoin Core 31
+  regtest node, including restart, controlled reorg, UTXO restoration, and
+  re-inclusion; the unexecuted procedure is documented in
+  [`manual-bitcoin-regtest/README.md`](./manual-bitcoin-regtest/README.md); and
 - the checked-in Kurtosis/Disruptoor scenario, which remains opt-in and has not
   been executed as part of ordinary Rust validation.
 
 Ethereum v1 fixes depth 12, rollback retention 50, a RocksDB atomic repository,
 and staged rebuild as testable acceptance criteria. It intentionally does not
 claim Ethereum finality, mempool coverage, traces, internal transfers, or all
-token behavior. Payment Service v1 similarly fixes one exclusive RocksDB owner,
-one Ethereum scope/feed, explicit business commands, and polling-only delivery;
-it intentionally does not claim HA, one database spanning multiple networks,
-Bitcoin PS behavior, webhooks, automatic credit/collection, fee replacement, or
-production custody. See [`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md) and
-[`PAYMENT_SERVICE.md`](./PAYMENT_SERVICE.md).
+token behavior. Bitcoin block-only v1 requires explicit confirmation and reorg
+policies and fixes Core 31, unpruned history, synchronized txindex, P2WPKH/P2TR,
+raw finalized transactions, and an IX-owned canonical UTXO projection. It does
+not claim mempool/RBF/drop/replacement coverage. Bitcoin PS block-only v1 now
+has a concrete source/runtime and deterministic repository/HTTP/workflow
+coverage, but no Core 31 operational acceptance evidence. Its behavior is one
+native-BTC scope per database, same-principal cross-user full-drain/no-change
+batches,
+atomic exact-outpoint reservations, proportional largest-remainder fee
+allocation, mandatory financial limits, retained same bytes across broadcast/
+reorg, and same-txid re-inclusion without replacement signing. That retained
+ownership limits v1 to one Bitcoin collection aggregate per deposit; late
+payments remain watched/accounted but require a new deposit address to be
+collectable.
+
+Each Payment Service v1 mode fixes one exclusive RocksDB owner, one chain
+scope/feed, explicit business commands, and polling-only delivery; it
+intentionally does not claim HA, one database spanning multiple networks,
+webhooks, automatic credit/collection, fee replacement, or production custody.
+See
+[`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md),
+[`BITCOIN_SERVICES.md`](./BITCOIN_SERVICES.md), and
+[`PAYMENT_SERVICE.md`](./PAYMENT_SERVICE.md). The Bitcoin PS implementation and
+remaining acceptance record is
+[`BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md`](../TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md).

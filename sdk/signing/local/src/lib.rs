@@ -11,9 +11,10 @@ use k256::{
     schnorr::SigningKey as SchnorrSigningKey,
 };
 use signer::{
-    BoxFuture, Curve, KeyLocator, KeyProvisionRequest, KeyProvisioner, KeyTweak, ProvisionedKey,
-    PublicKey, PublicKeyFormat, SignRequest, SignablePayload, Signature, SignatureEncoding,
-    SignatureScheme, Signer, SignerCapabilities, SignerError, SignerErrorKind, SignerStatus,
+    BoxFuture, Curve, KeyLocator, KeyProvisionRequest, KeyProvisioner, KeyTweak, KeyTweakKind,
+    ProvisionedKey, PublicKey, PublicKeyFormat, SignRequest, SignablePayload, Signature,
+    SignatureEncoding, SignatureScheme, Signer, SignerCapabilities, SignerError, SignerErrorKind,
+    SignerStatus,
 };
 use std::{
     collections::{BTreeMap, btree_map::Entry},
@@ -115,6 +116,7 @@ impl Signer for LocalSigner {
                 SignatureScheme::EcdsaSecp256k1,
                 SignatureScheme::SchnorrSecp256k1,
             ],
+            key_tweaks: vec![KeyTweakKind::Secp256k1Add],
             can_sign_messages: false,
             can_sign_digests: true,
             requires_user_interaction: false,

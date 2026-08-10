@@ -9,7 +9,7 @@ use chain_bitcoin::{
     Bitcoin, BitcoinAddressKind, BitcoinAsset, BitcoinBatchCollectionRequest, BitcoinBlock,
     BitcoinCollectionSource, BitcoinGenerateAddress, BitcoinNetwork, BitcoinReceipt, BitcoinRpc,
     BitcoinRpcUtxo, BitcoinSignedTransaction, BitcoinTransactionId, BitcoinWallet,
-    BoxFuture as BitcoinFuture, Satoshi,
+    BoxFuture as BitcoinFuture, Satoshi, SatoshisPerKvb,
 };
 use chain_ethereum::{
     BoxFuture as EthereumFuture, Ethereum, EthereumAddress, EthereumAsset, EthereumBuildContext,
@@ -21,7 +21,6 @@ use indexing::{BlockHeight, BlockRef, SourceError};
 use signer::{KeyProvisioner, OperationId, Signer};
 use signer_local::LocalSigner;
 use std::{error::Error, sync::Arc};
-use transaction_utxo::FeeRate;
 use wallet_worker::WalletService;
 
 const BITCOIN_NETWORK: BitcoinNetwork = BitcoinNetwork::Testnet4;
@@ -333,19 +332,15 @@ impl BitcoinRpc for DemoBitcoinRpc {
         })
     }
 
-    fn estimate_fee_rate<'a>(&'a self) -> BitcoinFuture<'a, Result<FeeRate, SourceError>> {
-        Box::pin(async {
-            Ok(FeeRate {
-                units_per_weight: 1,
-            })
-        })
+    fn estimate_fee_rate<'a>(&'a self) -> BitcoinFuture<'a, Result<SatoshisPerKvb, SourceError>> {
+        Box::pin(async { Ok(SatoshisPerKvb::new(1_000)) })
     }
 
     fn broadcast<'a>(
         &'a self,
         transaction: BitcoinSignedTransaction,
     ) -> BitcoinFuture<'a, Result<BitcoinTransactionId, SourceError>> {
-        Box::pin(async move { Ok(transaction.id) })
+        Box::pin(async move { Ok(transaction.id()) })
     }
 
     fn receipt<'a>(

@@ -17,6 +17,7 @@ const REBUILD_STATE: u8 = 9;
 const POLICY_MIGRATION_COUNTER: u8 = 10;
 const POLICY_MIGRATION: u8 = 11;
 const POLICY_MIGRATION_ID: u8 = 12;
+const PROJECTION_REVISION: u8 = 13;
 const WATCH: u8 = 16;
 const WATCH_IDEMPOTENCY: u8 = 17;
 const WATCH_BACKFILL: u8 = 18;
@@ -30,6 +31,8 @@ const OBSERVATION_REVISION: u8 = 35;
 const PENDING_CONFIRMATION: u8 = 36;
 const ADDRESS_TRANSACTION: u8 = 37;
 const PREPARED_REBUILD_EVENT: u8 = 38;
+const PROJECTION: u8 = 39;
+const BACKFILL_PROJECTION_ROLLBACK: u8 = 40;
 const EVENT: u8 = 48;
 const EVENT_ID: u8 = 49;
 
@@ -129,6 +132,11 @@ pub(super) fn policy_migration_id(scope: &IndexScope, idempotency_key: &str) -> 
     let mut key = scope_prefix(scope, POLICY_MIGRATION_ID);
     component(&mut key, idempotency_key.as_bytes());
     Key(key)
+}
+
+#[must_use]
+pub(super) fn projection_revision(scope: &IndexScope) -> Key {
+    Key(scope_prefix(scope, PROJECTION_REVISION))
 }
 
 #[must_use]
@@ -343,6 +351,47 @@ pub(super) fn prepared_rebuild_event_prefix(
 }
 
 #[must_use]
+pub(super) fn projection(
+    scope: &IndexScope,
+    generation: RebuildGeneration,
+    relative_key: &[u8],
+) -> Key {
+    let mut key = projection_prefix(scope, generation, &[]);
+    key.extend_from_slice(relative_key);
+    Key(key)
+}
+
+#[must_use]
+pub(super) fn projection_prefix(
+    scope: &IndexScope,
+    generation: RebuildGeneration,
+    relative_prefix: &[u8],
+) -> Vec<u8> {
+    let mut key = generation_prefix(scope, PROJECTION, generation);
+    key.extend_from_slice(relative_prefix);
+    key
+}
+
+#[must_use]
+pub(super) fn backfill_projection_rollback(
+    scope: &IndexScope,
+    generation: RebuildGeneration,
+    height: BlockHeight,
+) -> Key {
+    let mut key = backfill_projection_rollback_prefix(scope, generation);
+    key.extend_from_slice(&height.0.to_be_bytes());
+    Key(key)
+}
+
+#[must_use]
+pub(super) fn backfill_projection_rollback_prefix(
+    scope: &IndexScope,
+    generation: RebuildGeneration,
+) -> Vec<u8> {
+    generation_prefix(scope, BACKFILL_PROJECTION_ROLLBACK, generation)
+}
+
+#[must_use]
 pub(super) fn event(scope: &IndexScope, cursor: EventCursor) -> Key {
     let mut key = scope_prefix(scope, EVENT);
     key.extend_from_slice(&cursor.0.to_be_bytes());
@@ -374,5 +423,7 @@ pub(super) fn generation_prefixes(
         pending_confirmation_prefix(scope, generation),
         address_transaction_generation_prefix(scope, generation),
         prepared_rebuild_event_prefix(scope, generation),
+        projection_prefix(scope, generation, &[]),
+        backfill_projection_rollback_prefix(scope, generation),
     ]
 }

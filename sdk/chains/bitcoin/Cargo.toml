@@ -7,8 +7,11 @@ rust-version.workspace = true
 [dependencies]
 bitcoin.workspace = true
 chain-contract = { path = "../contract" }
+chain-identity = { path = "../identity" }
+futures-util = { version = "=0.3.33", default-features = false, features = ["std"] }
 indexing = { path = "../../indexing" }
 json-rpc = { path = "../../../packages/json-rpc" }
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
 signer = { path = "../../signing/contract" }
 transaction-utxo = { path = "../../transactions/utxo" }
 

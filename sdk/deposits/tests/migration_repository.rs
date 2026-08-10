@@ -325,7 +325,10 @@ async fn explicit_migration_upgrades_an_older_bound_schema()
         .migrate_and_bind(migrate_command("sepolia", policy("policy-v2", 2)))
         .await?;
     assert_eq!(report.previous_domain_schema_version, Some(1));
-    assert_eq!(report.metadata.domain_schema_version, 2);
+    assert_eq!(
+        report.metadata.domain_schema_version,
+        PAYMENT_DOMAIN_SCHEMA_VERSION
+    );
     assert_eq!(report.metadata.active_policy, policy("policy-v2", 2));
     assert_eq!(report.metadata.initialized_at, 100);
     Ok(())
