@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use bincode::{Decode, Encode};
 use chain_identity::{AssetId, AtomicAmount, ChainId};
 use indexing::IndexScope;
@@ -9,12 +11,13 @@ use storage::{
 use crate::{
     BoxFuture, ClaimJob, CloseDepositJob, CollectionId, CommandIdentity, CommandOperation,
     CommandPrincipal, CreateCollectionJob, CreateDepositJob, CreateJob, CreateJobOutcome,
-    DepositError, DepositErrorKind, DepositId, EnsureUser, IdempotencyKey,
-    InitializePaymentDatabase, Job, JobError, JobId, JobKind, JobPage, JobPageRequest, JobPayload,
-    JobResource, JobState, JobStore, MigratePaymentDatabase, PAYMENT_DOMAIN_SCHEMA_VERSION,
-    PAYMENT_SERVICE_OWNER, PaymentDatabaseMetadata, PaymentDatabaseMetadataStore,
-    PaymentDatabaseMigrationReport, PersistentPaymentRepository, PolicyIdentity, RequestHash,
-    RetryCollectionJob, TransitionJob, User, UserId, UserStore,
+    CreateUtxoBatchCollectionJob, DepositError, DepositErrorKind, DepositId, DepositStore,
+    EnsureUser, IdempotencyKey, InitializePaymentDatabase, Job, JobError, JobId, JobKind, JobPage,
+    JobPageRequest, JobPayload, JobResource, JobState, JobStore, MigratePaymentDatabase,
+    PAYMENT_DOMAIN_SCHEMA_VERSION, PAYMENT_SERVICE_OWNER, PaymentDatabaseMetadata,
+    PaymentDatabaseMetadataStore, PaymentDatabaseMigrationReport, PersistentPaymentRepository,
+    PolicyIdentity, RequestHash, RetryCollectionJob, RetryUtxoBatchCollectionJob, TransitionJob,
+    User, UserId, UserStore,
 };
 
 const RECORD_VERSION: u16 = 1;
@@ -430,6 +433,14 @@ enum JobPayloadRecordV1 {
         deposit_id: String,
         user_id: String,
     },
+    CreateUtxoBatchCollection {
+        collection_id: String,
+        deposit_ids: Vec<String>,
+    },
+    RetryUtxoBatchCollection {
+        collection_id: String,
+        deposit_ids: Vec<String>,
+    },
 }
 
 impl From<&JobPayload> for JobPayloadRecordV1 {
@@ -458,6 +469,22 @@ impl From<&JobPayload> for JobPayloadRecordV1 {
                 collection_id: payload.collection_id.0.clone(),
                 deposit_id: payload.deposit_id.0.clone(),
                 user_id: payload.user_id.0.clone(),
+            },
+            JobPayload::CreateUtxoBatchCollection(payload) => Self::CreateUtxoBatchCollection {
+                collection_id: payload.collection_id.0.clone(),
+                deposit_ids: payload
+                    .deposit_ids
+                    .iter()
+                    .map(|deposit_id| deposit_id.0.clone())
+                    .collect(),
+            },
+            JobPayload::RetryUtxoBatchCollection(payload) => Self::RetryUtxoBatchCollection {
+                collection_id: payload.collection_id.0.clone(),
+                deposit_ids: payload
+                    .deposit_ids
+                    .iter()
+                    .map(|deposit_id| deposit_id.0.clone())
+                    .collect(),
             },
         }
     }
@@ -509,6 +536,20 @@ impl From<JobPayloadRecordV1> for JobPayload {
                 collection_id: CollectionId(collection_id),
                 deposit_id: DepositId(deposit_id),
                 user_id: UserId(user_id),
+            }),
+            JobPayloadRecordV1::CreateUtxoBatchCollection {
+                collection_id,
+                deposit_ids,
+            } => Self::CreateUtxoBatchCollection(CreateUtxoBatchCollectionJob {
+                collection_id: CollectionId(collection_id),
+                deposit_ids: deposit_ids.into_iter().map(DepositId).collect(),
+            }),
+            JobPayloadRecordV1::RetryUtxoBatchCollection {
+                collection_id,
+                deposit_ids,
+            } => Self::RetryUtxoBatchCollection(RetryUtxoBatchCollectionJob {
+                collection_id: CollectionId(collection_id),
+                deposit_ids: deposit_ids.into_iter().map(DepositId).collect(),
             }),
         }
     }
@@ -654,7 +695,11 @@ impl TryFrom<JobRecordV1> for Job {
         let kind: JobKind = value.kind.into();
         let resource: JobResource = value.resource.into();
         let user_id = UserId(value.user_id);
-        if payload.kind() != kind || payload.resource() != resource || payload.user_id() != &user_id
+        if payload.kind() != kind
+            || payload.resource() != resource
+            || payload
+                .user_id()
+                .is_some_and(|payload_user| payload_user != &user_id)
         {
             return Err(storage_error(
                 "PS job record payload associations are inconsistent",
@@ -755,7 +800,9 @@ fn validate_create(command: &CreateJob) -> Result<(), DepositError> {
     validate_non_empty(&command.id.0, "job ID")?;
     validate_non_empty(&command.command.principal.0, "command principal")?;
     validate_non_empty(&command.command.client_key.0, "command idempotency key")?;
-    validate_non_empty(&command.payload.user_id().0, "user ID")?;
+    if let Some(user_id) = command.payload.user_id() {
+        validate_non_empty(&user_id.0, "user ID")?;
+    }
     validate_non_empty(&command.user_owner.0, "user owner principal")?;
     validate_non_empty(&command.policy.version, "job policy version")?;
     if command.command.operation != command.payload.operation() {
@@ -795,6 +842,34 @@ fn validate_create(command: &CreateJob) -> Result<(), DepositError> {
             validate_non_empty(&payload.collection_id.0, "collection ID")?;
             validate_non_empty(&payload.deposit_id.0, "deposit ID")?;
         }
+        JobPayload::CreateUtxoBatchCollection(payload) => {
+            validate_non_empty(&payload.collection_id.0, "collection ID")?;
+            validate_canonical_deposit_ids(&payload.deposit_ids)?;
+        }
+        JobPayload::RetryUtxoBatchCollection(payload) => {
+            validate_non_empty(&payload.collection_id.0, "collection ID")?;
+            validate_canonical_deposit_ids(&payload.deposit_ids)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_canonical_deposit_ids(deposit_ids: &[DepositId]) -> Result<(), DepositError> {
+    if deposit_ids.is_empty() {
+        return Err(invalid("UTXO-batch job must contain at least one deposit"));
+    }
+    let mut previous = None;
+    for deposit_id in deposit_ids {
+        validate_non_empty(&deposit_id.0, "UTXO-batch deposit ID")?;
+        if previous
+            .as_ref()
+            .is_some_and(|current| current >= deposit_id)
+        {
+            return Err(invalid(
+                "UTXO-batch job deposit IDs must be strictly canonical and unique",
+            ));
+        }
+        previous = Some(deposit_id.clone());
     }
     Ok(())
 }
@@ -819,9 +894,9 @@ fn validate_metadata_command(command: &InitializePaymentDatabase) -> Result<(), 
 }
 
 fn validate_migration_command(command: &MigratePaymentDatabase) -> Result<(), DepositError> {
-    if command.scope.chain.0 != "ethereum" {
+    if !matches!(command.scope.chain.0.as_str(), "ethereum" | "bitcoin") {
         return Err(invalid(
-            "Payment Service semantic migration supports only the Ethereum scope",
+            "Payment Service semantic migration supports only Ethereum or Bitcoin scope",
         ));
     }
     validate_non_empty(&command.scope.network, "Payment Service scope network")?;
@@ -884,6 +959,40 @@ impl<S> PersistentPaymentRepository<S>
 where
     S: Storage,
 {
+    async fn resolve_job_users(
+        &self,
+        payload: &JobPayload,
+        owner: &CommandPrincipal,
+    ) -> Result<(UserId, Vec<UserId>), DepositError> {
+        if let Some(user_id) = payload.user_id() {
+            return Ok((user_id.clone(), vec![user_id.clone()]));
+        }
+        let deposit_ids = payload
+            .deposit_ids()
+            .ok_or_else(|| invalid("job payload has no user or deposit associations"))?;
+        let mut primary = None;
+        let mut associated = BTreeSet::new();
+        for deposit_id in deposit_ids {
+            let deposit = self
+                .deposit(deposit_id)
+                .await?
+                .ok_or_else(|| not_found("UTXO-batch job deposit was not found"))?;
+            let user = self
+                .stored_user_record(&deposit.user_id)
+                .await?
+                .ok_or_else(|| storage_error("UTXO-batch deposit user record is missing"))?;
+            if &user.owner != owner {
+                return Err(conflict(
+                    "UTXO-batch deposit user belongs to another authenticated owner",
+                ));
+            }
+            primary.get_or_insert_with(|| deposit.user_id.clone());
+            associated.insert(deposit.user_id);
+        }
+        let primary = primary.ok_or_else(|| invalid("UTXO-batch job has no participant user"))?;
+        Ok((primary, associated.into_iter().collect()))
+    }
+
     async fn stored_database_metadata_with_value(
         &self,
     ) -> Result<Option<(PaymentDatabaseMetadata, StoredValue)>, DepositError> {
@@ -960,6 +1069,7 @@ where
             "ps.v1.collection_eligibility_generation",
             "ps.v1.collection_transaction",
             "ps.v1.signed_collection_envelope",
+            "ps.v2.active_collection_spend_resource",
         ] {
             if self.namespace_has_records(ns(namespace)).await? {
                 return Ok(true);
@@ -1134,12 +1244,26 @@ where
         Ok(JobPage { jobs, next })
     }
 
-    async fn store_new_job(&self, job: &Job, user_missing: bool) -> Result<(), DepositError> {
+    async fn store_new_job(
+        &self,
+        job: &Job,
+        associated_users: &[UserId],
+        missing_users: &[UserId],
+    ) -> Result<(), DepositError> {
         let job_key = key_text(&job.id.0);
         let command_key = command_key(&job.command)?;
-        let user_job_key = user_job_key(&job.user_id, &job.id)?;
         let resource_job_key = resource_job_key(&job.resource, &job.id)?;
         let ready_key = ready_job_key(job.created_at, &job.id);
+        if associated_users.is_empty()
+            || !associated_users.contains(&job.user_id)
+            || associated_users
+                .windows(2)
+                .any(|users| users[0] >= users[1])
+        {
+            return Err(storage_error(
+                "job associated users must be canonical and include the primary user",
+            ));
+        }
         let mut conditions = vec![
             Condition::Missing {
                 namespace: job_ns(),
@@ -1148,10 +1272,6 @@ where
             Condition::Missing {
                 namespace: command_job_ns(),
                 key: command_key.clone(),
-            },
-            Condition::Missing {
-                namespace: user_job_ns(),
-                key: user_job_key.clone(),
             },
             Condition::Missing {
                 namespace: resource_job_ns(),
@@ -1182,11 +1302,6 @@ where
                 })?,
             },
             Operation::Put {
-                namespace: user_job_ns(),
-                key: user_job_key,
-                value: encode(&index)?,
-            },
-            Operation::Put {
                 namespace: resource_job_ns(),
                 key: resource_job_key,
                 value: encode(&index)?,
@@ -1197,9 +1312,26 @@ where
                 value: encode(&index)?,
             },
         ];
-        if user_missing {
+        for user_id in associated_users {
+            let key = user_job_key(user_id, &job.id)?;
+            conditions.push(Condition::Missing {
+                namespace: user_job_ns(),
+                key: key.clone(),
+            });
+            operations.push(Operation::Put {
+                namespace: user_job_ns(),
+                key,
+                value: encode(&index)?,
+            });
+        }
+        for user_id in missing_users {
+            if !associated_users.contains(user_id) {
+                return Err(storage_error(
+                    "missing job user is not one of the associated users",
+                ));
+            }
             let user = User {
-                id: job.user_id.clone(),
+                id: user_id.clone(),
                 owner: job.user_owner.clone(),
                 first_seen_at: job.created_at,
             };
@@ -1534,12 +1666,15 @@ where
                     "job policy does not match the database active policy",
                 ));
             }
+            let (primary_user, associated_users) = self
+                .resolve_job_users(&command.payload, &command.user_owner)
+                .await?;
             let job = Job {
                 id: command.id,
                 command: command.command,
                 kind: command.payload.kind(),
                 resource: command.payload.resource(),
-                user_id: command.payload.user_id().clone(),
+                user_id: primary_user,
                 user_owner: command.user_owner,
                 policy: command.policy,
                 payload: command.payload,
@@ -1554,17 +1689,22 @@ where
             // One retry lets that harmless race settle without weakening any job
             // or command uniqueness condition.
             for attempt in 0..2 {
-                let existing_user = self.stored_user_record(&job.user_id).await?;
-                if existing_user
-                    .as_ref()
-                    .is_some_and(|user| user.owner != job.user_owner)
-                {
-                    return Err(conflict(
-                        "opaque user ID is already owned by another authenticated principal",
-                    ));
+                let mut missing_users = Vec::new();
+                for user_id in &associated_users {
+                    match self.stored_user_record(user_id).await? {
+                        Some(user) if user.owner != job.user_owner => {
+                            return Err(conflict(
+                                "opaque user ID is already owned by another authenticated principal",
+                            ));
+                        }
+                        Some(_) => {}
+                        None => missing_users.push(user_id.clone()),
+                    }
                 }
-                let user_missing = existing_user.is_none();
-                match self.store_new_job(&job, user_missing).await {
+                match self
+                    .store_new_job(&job, &associated_users, &missing_users)
+                    .await
+                {
                     Ok(()) => return Ok(CreateJobOutcome::Created { job }),
                     Err(error) if error.kind == DepositErrorKind::Conflict => {
                         if let Some(existing) = self.idempotent_job(&job.command).await? {

@@ -10,7 +10,7 @@ use axum::{Router, extract::State, response::IntoResponse, routing::get};
 use chain_identity::{AssetId, AtomicAmount, ChainId};
 use deposits::{
     AwaitingWatchPageRequest, BalanceDirection, BoxFuture, ClaimJob, CloseDeposit, Collection,
-    CollectionAllocation, CollectionLeg, CollectionLegKind, CollectionLegState,
+    CollectionAllocation, CollectionLeg, CollectionLegKind, CollectionLegState, CollectionMode,
     CollectionPageRequest, CollectionReservationState, CollectionStore, CollectionTransitionGuard,
     ConfirmCollectionLeg, ConsumerCheckpointName, Deposit, DepositAddressRequest,
     DepositAddressSource, DepositError, DepositErrorKind, DepositId, DepositLedger,
@@ -20,24 +20,32 @@ use deposits::{
     MigratePaymentDatabase, MirrorObservation, MirrorOutcome, MirroredObservation,
     ObservationConsumerCheckpoints, ObservationEventLog, ObservationLogRequest,
     PaymentDatabaseMetadataStore, PersistentPaymentRepository, ProjectObservation,
-    ReconciliationCase, ReconciliationCaseId, ReconciliationReason, ReconciliationState,
-    ReconciliationStore, RecordObservation, RegisterDeposit, ReleaseCollectionReservation,
-    ReorgCollectionLeg, ReservationReleaseReason, SafeCollectionError, TransitionJob,
+    ProjectionFeeTreatment, ReconciliationCase, ReconciliationCaseId, ReconciliationReason,
+    ReconciliationState, ReconciliationStore, RecordObservation, RegisterDeposit,
+    ReleaseCollectionReservation, ReorgCollectionLeg, ReservationReleaseReason,
+    SafeCollectionError, TransitionJob, UtxoBatchProjectionMutation, UtxoBatchProjectionTransition,
     apply_observation_transition,
 };
 use http_support::{BearerToken, HealthState, HttpServerConfig, RequestLimits, TransportSecurity};
-use indexing::{EventCursor, IndexError, IndexScope, MovementId, SyncPhase, TransactionStatus};
+use indexing::{
+    EventCursor, IndexError, IndexScope, MovementId, MovementKind, SyncPhase, SyncStatus,
+    TransactionStatus,
+};
 use storage_rocksdb::RocksDbStorage;
 use telemetry::PrometheusTelemetry;
 use tokio::{sync::watch, task::JoinSet, time::MissedTickBehavior};
 
 use crate::{
+    active_policy::ActivePaymentPolicy,
     api::{self, ApiState},
     auth::Credentials,
+    bitcoin_collection_executor,
+    bitcoin_policy::BitcoinPaymentPolicy,
+    bitcoin_wallet_client::BitcoinWalletClient,
     collection_executor,
     config::{
-        BackupOptions, IngestOptions, MigrationOptions, ProjectionStatusOptions, ReconcileOptions,
-        ServeOptions,
+        BackupOptions, BitcoinServeOptions, IndexerOptions, IngestOptions, MigrationOptions,
+        ProjectionStatusOptions, ReconcileOptions, ServeOptions,
     },
     indexer_client::IndexerClient,
     policy::PaymentPolicy,
@@ -109,6 +117,55 @@ pub async fn migrate(options: MigrationOptions) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+pub async fn migrate_bitcoin(options: MigrationOptions) -> Result<(), RuntimeError> {
+    options.validate().map_err(RuntimeError::configuration)?;
+    let policy = BitcoinPaymentPolicy::load(&options.policy_path).map_err(|error| {
+        RuntimeError::configuration(format!(
+            "failed to load Bitcoin Payment Service policy ({:?}): {error}",
+            error.kind
+        ))
+    })?;
+    if policy.scope.network != options.network {
+        return Err(RuntimeError::configuration(
+            "migration network must exactly match the Bitcoin policy scope",
+        ));
+    }
+    let outcome = RocksDbStorage::migrate(&options.database.database_path, &options.backup_path)?;
+    tracing::info!(
+        backup_id = outcome.backup.backup_id,
+        from = outcome.report.previous.0,
+        to = outcome.report.current.0,
+        "pre-migration Bitcoin Payment Service backup and physical schema validation completed"
+    );
+    let storage = RocksDbStorage::open(&options.database.database_path)?;
+    let repository = PersistentPaymentRepository::new(storage);
+    let scope = policy.scope.clone();
+    let active_policy = policy.identity();
+    let report = repository
+        .migrate_and_bind(MigratePaymentDatabase {
+            scope,
+            active_policy,
+            migrated_at: unix_timestamp()?,
+            page_size: MIGRATION_PAGE_SIZE,
+        })
+        .await?;
+    tracing::info!(
+        previous_schema = ?report.previous_domain_schema_version,
+        current_schema = report.metadata.domain_schema_version,
+        deposits = report.deposits,
+        ledger_entries = report.ledger_entries,
+        mirrored_observations = report.mirrored_observations,
+        deposit_observations = report.deposit_observations,
+        reconciliation_cases = report.reconciliation_cases,
+        users = report.users,
+        jobs = report.jobs,
+        collections = report.collections,
+        deposit_indexes_rebuilt = report.deposit_indexes_rebuilt,
+        "Bitcoin Payment Service semantic migration validated and bound metadata"
+    );
+    Ok(())
+}
+
 pub async fn serve(options: ServeOptions) -> Result<(), RuntimeError> {
     options.validate().map_err(RuntimeError::configuration)?;
     let policy = Arc::new(PaymentPolicy::load(&options.policy_path).map_err(|error| {
@@ -147,8 +204,9 @@ pub async fn serve(options: ServeOptions) -> Result<(), RuntimeError> {
     let indexer_health = HealthState::new(false);
     let wallet_health = HealthState::new(false);
     let limits = RequestLimits::default();
+    let api_policy = Arc::new(ActivePaymentPolicy::Ethereum(policy.as_ref().clone()));
     let api_state = Arc::new(
-        ApiState::new(repository.clone(), Arc::clone(&policy), limits.clone()).with_runtime_health(
+        ApiState::new(repository.clone(), api_policy, limits.clone()).with_runtime_health(
             health.clone(),
             indexer_health.clone(),
             wallet_health.clone(),
@@ -357,6 +415,267 @@ pub async fn serve(options: ServeOptions) -> Result<(), RuntimeError> {
     }
 }
 
+/// Run one native-Bitcoin Payment Service scope.
+///
+/// The process owns one Bitcoin network and one PS database. IX remains the
+/// source of canonical chain facts, while WS remains stateless and receives
+/// only exact PS-selected inputs for signing and broadcast.
+pub async fn serve_bitcoin(options: BitcoinServeOptions) -> Result<(), RuntimeError> {
+    options.validate().map_err(RuntimeError::configuration)?;
+    let options = options.common;
+    let policy = Arc::new(
+        BitcoinPaymentPolicy::load(&options.policy_path).map_err(|error| {
+            RuntimeError::configuration(format!(
+                "failed to load Bitcoin Payment Service policy ({:?}): {error}",
+                error.kind
+            ))
+        })?,
+    );
+    if policy.scope.network != options.indexer.network || policy.scope.chain.0 != "bitcoin" {
+        return Err(RuntimeError::configuration(
+            "policy scope must match the configured Bitcoin Indexer network",
+        ));
+    }
+
+    let storage = RocksDbStorage::open(&options.database.database_path)?;
+    let repository = PersistentPaymentRepository::new(storage);
+    repository
+        .initialize_or_validate(InitializePaymentDatabase {
+            scope: policy.scope.clone(),
+            active_policy: policy.identity(),
+            initialized_at: unix_timestamp()?,
+        })
+        .await?;
+    // Client construction validates transport and request bounds, but never
+    // generates a key, signs a transaction, or contacts Bitcoin Core.
+    let indexer = Arc::new(IndexerClient::new(&options.indexer)?);
+    let wallet = Arc::new(BitcoinWalletClient::new(
+        &options.wallet,
+        policy.network,
+        policy.deposit_address_kind,
+    )?);
+
+    let credentials = Arc::new(Credentials::new(
+        BearerToken::new(options.ordinary_bearer_token.expose())
+            .map_err(RuntimeError::configuration)?,
+        BearerToken::new(options.admin_bearer_token.expose())
+            .map_err(RuntimeError::configuration)?,
+    ));
+    let health = HealthState::new(false);
+    let indexer_health = HealthState::new(false);
+    let wallet_health = HealthState::new(false);
+    let limits = RequestLimits::default();
+    let api_policy = Arc::new(ActivePaymentPolicy::Bitcoin(policy.as_ref().clone()));
+    let api_state = Arc::new(
+        ApiState::new(repository.clone(), api_policy, limits.clone()).with_runtime_health(
+            health.clone(),
+            indexer_health.clone(),
+            wallet_health.clone(),
+        ),
+    );
+    let security = if options.http_bind.ip().is_loopback() {
+        TransportSecurity::PlaintextLoopback
+    } else {
+        TransportSecurity::TlsTerminatedUpstream
+    };
+    let server_config = HttpServerConfig::new(options.http_bind, security, None, limits)
+        .with_custom_authentication();
+    let application_router = http_support::service_router(
+        api::router(api_state, credentials),
+        &server_config,
+        health.clone(),
+    )
+    .map_err(RuntimeError::configuration)?;
+
+    let telemetry = PrometheusTelemetry::install()
+        .map_err(|error| RuntimeError::invariant(error.to_string()))?;
+    let metrics_config = HttpServerConfig::new(
+        options.metrics_bind,
+        TransportSecurity::PlaintextLoopback,
+        None,
+        RequestLimits::default(),
+    );
+    let metrics_router = Router::new()
+        .route("/metrics", get(metrics))
+        .with_state(telemetry);
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut tasks = JoinSet::<Result<(), RuntimeError>>::new();
+    let worker_interval = options.worker_interval();
+    let worker_page_size = options.worker_page_size;
+
+    let worker_repository = repository.clone();
+    let worker_indexer = Arc::clone(&indexer);
+    let worker_wallet = Arc::clone(&wallet);
+    let worker_policy = Arc::clone(&policy);
+    let worker_shutdown = shutdown_rx.clone();
+    tasks.spawn(async move {
+        run_bitcoin_job_worker(
+            BitcoinJobWorkerContext {
+                repository: worker_repository,
+                indexer: worker_indexer,
+                wallet: worker_wallet,
+                policy: worker_policy,
+                interval: worker_interval,
+                page_size: worker_page_size,
+            },
+            worker_shutdown,
+        )
+        .await
+    });
+
+    let watch_repository = repository.clone();
+    let watch_indexer = Arc::clone(&indexer);
+    let watch_scope = policy.scope.clone();
+    let watch_shutdown = shutdown_rx.clone();
+    tasks.spawn(async move {
+        run_watch_reconciliation_worker(
+            watch_repository,
+            watch_indexer,
+            watch_scope,
+            worker_interval,
+            worker_page_size,
+            watch_shutdown,
+        )
+        .await
+    });
+
+    let ingestion_repository = repository.clone();
+    let ingestion_indexer = Arc::clone(&indexer);
+    let ingestion_scope = policy.scope.clone();
+    let ingestion_shutdown = shutdown_rx.clone();
+    tasks.spawn(async move {
+        run_ingestion_worker(
+            ingestion_repository,
+            ingestion_indexer,
+            ingestion_scope,
+            worker_interval,
+            worker_page_size,
+            ingestion_shutdown,
+        )
+        .await
+    });
+
+    let projection_repository = repository.clone();
+    let projection_shutdown = shutdown_rx.clone();
+    tasks.spawn(async move {
+        run_projection_worker(
+            projection_repository,
+            worker_interval,
+            worker_page_size,
+            projection_shutdown,
+        )
+        .await
+    });
+
+    let expiration_repository = repository.clone();
+    let expiration_shutdown = shutdown_rx.clone();
+    tasks.spawn(async move {
+        run_expiration_worker(
+            expiration_repository,
+            worker_interval,
+            worker_page_size,
+            expiration_shutdown,
+        )
+        .await
+    });
+
+    let readiness_repository = repository;
+    let readiness_indexer = Arc::clone(&indexer);
+    let readiness_wallet = Arc::clone(&wallet);
+    let readiness_scope = policy.scope.clone();
+    let readiness_health = health.clone();
+    let readiness_indexer_health = indexer_health;
+    let readiness_wallet_health = wallet_health;
+    let readiness_shutdown = shutdown_rx.clone();
+    tasks.spawn(async move {
+        run_bitcoin_readiness_worker(
+            BitcoinReadinessWorkerContext {
+                repository: readiness_repository,
+                indexer: readiness_indexer,
+                wallet: readiness_wallet,
+                scope: readiness_scope,
+                health: readiness_health,
+                indexer_health: readiness_indexer_health,
+                wallet_health: readiness_wallet_health,
+                interval: worker_interval,
+            },
+            readiness_shutdown,
+        )
+        .await
+    });
+
+    let api_shutdown = shutdown_rx.clone();
+    tasks.spawn(async move {
+        http_support::serve(
+            application_router,
+            &server_config,
+            shutdown_signal(api_shutdown),
+        )
+        .await
+        .map_err(|error| RuntimeError::invariant(error.to_string()))
+    });
+    let metrics_shutdown = shutdown_rx.clone();
+    tasks.spawn(async move {
+        http_support::serve(
+            metrics_router,
+            &metrics_config,
+            shutdown_signal(metrics_shutdown),
+        )
+        .await
+        .map_err(|error| RuntimeError::invariant(error.to_string()))
+    });
+
+    tracing::info!(
+        network = %policy.scope.network,
+        policy_version = policy.version,
+        "Bitcoin Payment Service HTTP runtime and durable workers started"
+    );
+    let termination = tokio::select! {
+        signal = termination_signal() => {
+            signal?;
+            None
+        }
+        task = tasks.join_next() => Some(task),
+    };
+    health.set_ready(false);
+    let _ignored = shutdown_tx.send(true);
+
+    let deadline = tokio::time::sleep(options.shutdown_grace());
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => {
+                tasks.abort_all();
+                break;
+            }
+            task = tasks.join_next(), if !tasks.is_empty() => {
+                match task {
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(error))) => tracing::error!(error = %error, "Bitcoin Payment Service task failed during shutdown"),
+                    Some(Err(error)) => tracing::error!(error = %error, "Bitcoin Payment Service task panicked during shutdown"),
+                    None => break,
+                }
+            }
+            else => break,
+        }
+    }
+
+    match termination {
+        None => Ok(()),
+        Some(Some(Ok(Ok(())))) => Err(RuntimeError::invariant(
+            "a supervised Bitcoin Payment Service task stopped unexpectedly",
+        )),
+        Some(Some(Ok(Err(error)))) => Err(error),
+        Some(Some(Err(error))) => Err(RuntimeError::invariant(format!(
+            "Bitcoin Payment Service task panicked: {error}"
+        ))),
+        Some(None) => Err(RuntimeError::invariant(
+            "Bitcoin Payment Service supervisor has no running tasks",
+        )),
+    }
+}
+
 struct JobWorkerContext {
     repository: Repository,
     indexer: Arc<IndexerClient>,
@@ -406,6 +725,68 @@ async fn run_job_worker(
             };
 
             let result = process_job(
+                &repository,
+                indexer.as_ref(),
+                wallet.as_ref(),
+                policy.as_ref(),
+                &policy.scope,
+                &job,
+            )
+            .await;
+            finish_job_attempt(&repository, job, result).await?;
+        }
+    }
+}
+
+struct BitcoinJobWorkerContext {
+    repository: Repository,
+    indexer: Arc<IndexerClient>,
+    wallet: Arc<BitcoinWalletClient>,
+    policy: Arc<BitcoinPaymentPolicy>,
+    interval: Duration,
+    page_size: usize,
+}
+
+async fn run_bitcoin_job_worker(
+    context: BitcoinJobWorkerContext,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), RuntimeError> {
+    let BitcoinJobWorkerContext {
+        repository,
+        indexer,
+        wallet,
+        policy,
+        interval,
+        page_size,
+    } = context;
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return Ok(()),
+            _ = ticker.tick() => {}
+        }
+
+        for _ in 0..page_size {
+            if *shutdown.borrow() {
+                return Ok(());
+            }
+            let now = unix_timestamp()?;
+            let lease_expires_at = now
+                .checked_add(JOB_LEASE_DURATION.as_secs())
+                .ok_or_else(|| RuntimeError::invariant("job lease timestamp overflowed"))?;
+            let Some(job) = repository
+                .claim_next(ClaimJob {
+                    now,
+                    lease_expires_at,
+                    scan_limit: page_size,
+                })
+                .await?
+            else {
+                break;
+            };
+
+            let result = process_bitcoin_job(
                 &repository,
                 indexer.as_ref(),
                 wallet.as_ref(),
@@ -503,6 +884,64 @@ async fn process_job(
             )
             .await
         }
+        JobPayload::CreateUtxoBatchCollection(_) | JobPayload::RetryUtxoBatchCollection(_) => Err(
+            domain_invariant("Bitcoin collection job reached the Ethereum Payment Service worker"),
+        ),
+    }
+}
+
+async fn process_bitcoin_job(
+    repository: &Repository,
+    indexer: &IndexerClient,
+    wallet: &BitcoinWalletClient,
+    policy: &BitcoinPaymentPolicy,
+    scope: &IndexScope,
+    job: &Job,
+) -> Result<(), DepositError> {
+    match &job.payload {
+        JobPayload::CreateDeposit(payload) => {
+            if &payload.scope != scope {
+                return Err(domain_invariant(
+                    "deposit job scope differs from the running Bitcoin Payment Service scope",
+                ));
+            }
+            if payload.asset != policy.asset {
+                return Err(domain_invariant(
+                    "deposit job asset differs from the active Bitcoin native asset",
+                ));
+            }
+            let coordinator =
+                DepositWatchCoordinator::new(repository, indexer, wallet, scope.clone());
+            let deposit = coordinator
+                .register(RegisterDeposit {
+                    scope: payload.scope.clone(),
+                    id: payload.deposit_id.clone(),
+                    idempotency_key: job.command.client_key.clone(),
+                    user_id: payload.user_id.clone(),
+                    asset: payload.asset.clone(),
+                    expected: payload.expected,
+                    key_purpose: payload.key_purpose.clone(),
+                    expires_at: payload.expires_at,
+                    created_at: payload.created_at,
+                })
+                .await?;
+            if !matches!(deposit.state, DepositState::Active { .. }) {
+                return Err(domain_invariant(
+                    "Bitcoin deposit job completed without an active IX watch",
+                ));
+            }
+            Ok(())
+        }
+        JobPayload::CloseDeposit(payload) => close_deposit_workflow(repository, payload).await,
+        JobPayload::CreateUtxoBatchCollection(_) | JobPayload::RetryUtxoBatchCollection(_) => {
+            bitcoin_collection_executor::process_bitcoin_collection_job(
+                repository, indexer, wallet, policy, scope, job,
+            )
+            .await
+        }
+        JobPayload::CreateCollection(_) | JobPayload::RetryCollection(_) => Err(domain_invariant(
+            "Ethereum collection job reached the Bitcoin Payment Service worker",
+        )),
     }
 }
 
@@ -860,13 +1299,88 @@ async fn run_readiness_worker(
     }
 }
 
+struct BitcoinReadinessWorkerContext {
+    repository: Repository,
+    indexer: Arc<IndexerClient>,
+    wallet: Arc<BitcoinWalletClient>,
+    scope: IndexScope,
+    health: HealthState,
+    indexer_health: HealthState,
+    wallet_health: HealthState,
+    interval: Duration,
+}
+
+async fn run_bitcoin_readiness_worker(
+    context: BitcoinReadinessWorkerContext,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), RuntimeError> {
+    let BitcoinReadinessWorkerContext {
+        repository,
+        indexer,
+        wallet,
+        scope,
+        health,
+        indexer_health,
+        wallet_health,
+        interval,
+    } = context;
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                health.set_ready(false);
+                indexer_health.set_ready(false);
+                wallet_health.set_ready(false);
+                return Ok(());
+            }
+            _ = ticker.tick() => {}
+        }
+        let (indexer_status, wallet_ready) =
+            tokio::join!(indexer.status(&scope), wallet.readiness());
+        let indexer_ready = indexer_status
+            .as_ref()
+            .is_ok_and(|status| bitcoin_indexer_is_ready(status, &scope));
+        let wallet_is_ready = wallet_ready.as_ref().is_ok_and(|ready| *ready);
+        indexer_health.set_ready(indexer_ready);
+        wallet_health.set_ready(wallet_is_ready);
+        let ingestion = repository
+            .consumer_checkpoint(ConsumerCheckpointName::IxIngestion)
+            .await?;
+        let projection = repository
+            .consumer_checkpoint(ConsumerCheckpointName::IxProjection)
+            .await?;
+        let projection_caught_up = ingestion.cursor == projection.cursor;
+        health.set_ready(indexer_ready && wallet_is_ready && projection_caught_up);
+    }
+}
+
+fn bitcoin_indexer_is_ready(status: &SyncStatus, scope: &IndexScope) -> bool {
+    status.scope == *scope
+        && status.phase == SyncPhase::Ready
+        && status.confirmation_policy.minimum_confirmations > 0
+        && status
+            .checkpoint
+            .as_ref()
+            .zip(status.observed_tip.as_ref())
+            .is_some_and(|(checkpoint, observed_tip)| {
+                checkpoint.hash.0.len() == 32
+                    && observed_tip.hash.0.len() == 32
+                    && checkpoint.height <= observed_tip.height
+            })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EffectClass {
     Incoming,
     Collection,
     GasFunding,
     OtherDebit,
+    NetBalanceChange,
 }
+
+type ClassifiedDeposit = (Deposit, EffectClass, Vec<MovementId>, Vec<MovementId>);
+type ClassifiedDeposits = BTreeMap<DepositId, ClassifiedDeposit>;
 
 async fn run_projection_worker(
     repository: Repository,
@@ -892,7 +1406,7 @@ async fn run_projection_worker(
             .await?;
         let mut expected_cursor = checkpoint.cursor;
         for mirrored in page.observations {
-            let Some((affected_deposits, updates, cases)) =
+            let Some((affected_deposits, updates, cases, fee_treatment, utxo_batch_transition)) =
                 classify_projection(&repository, &mirrored).await?
             else {
                 tracing::warn!(
@@ -909,6 +1423,8 @@ async fn run_projection_worker(
                     affected_deposits,
                     ledger_updates: updates,
                     reconciliation_cases: cases,
+                    fee_treatment,
+                    utxo_batch_transition,
                 })
                 .await;
             match projection {
@@ -930,6 +1446,194 @@ fn is_optimistic_conflict(error: &DepositError) -> bool {
     error.kind == DepositErrorKind::Conflict
 }
 
+struct UtxoBatchFactClassification {
+    classified: ClassifiedDeposits,
+    affected_deposits: BTreeSet<DepositId>,
+    transition: Option<UtxoBatchProjectionMutation>,
+}
+
+async fn classify_utxo_batch_fact(
+    repository: &Repository,
+    event: &indexing::ObservationEvent,
+    collection: &Collection,
+    leg: &CollectionLeg,
+    received_at: u64,
+) -> Result<Option<UtxoBatchFactClassification>, DepositError> {
+    if leg.kind != CollectionLegKind::Sweep
+        || collection.participants.is_empty()
+        || leg.allocations.len() != collection.participants.len()
+        || leg.watch_id.is_none()
+        || leg.state.transaction_id() != Some(&event.transaction.transaction_id)
+    {
+        return Ok(None);
+    }
+
+    let mut classified = BTreeMap::new();
+    let mut affected_deposits = BTreeSet::new();
+    let mut participant_addresses = BTreeSet::new();
+    for (participant, allocation) in collection.participants.iter().zip(&leg.allocations) {
+        let deposit_id = &participant.reservation.deposit_id;
+        if &allocation.deposit_id != deposit_id
+            || allocation.asset != collection.asset
+            || allocation.allocated_fee_asset != collection.asset
+            || participant.reservation.asset != collection.asset
+            || participant.reservation.amount != allocation.gross_debit
+        {
+            return Ok(None);
+        }
+        let deposit = repository
+            .deposit(deposit_id)
+            .await?
+            .ok_or_else(|| domain_invariant("UTXO-batch participant deposit is missing"))?;
+        if deposit.user_id != participant.user_id || deposit.asset != collection.asset {
+            return Err(domain_invariant(
+                "UTXO-batch participant differs from its durable deposit",
+            ));
+        }
+        if !participant_addresses.insert(deposit.address.clone()) {
+            return Err(domain_invariant(
+                "UTXO-batch participant addresses must be unique",
+            ));
+        }
+        let movement_ids = event
+            .transaction
+            .movements
+            .iter()
+            .filter(|movement| {
+                movement.kind == MovementKind::Input
+                    && movement.asset == collection.asset
+                    && movement.from.as_ref() == Some(&deposit.address)
+            })
+            .map(|movement| movement.id.clone())
+            .collect::<Vec<_>>();
+        if movement_ids.is_empty() {
+            return Ok(None);
+        }
+        let gross_debit = sum_movement_amounts(event, |movement| {
+            movement.kind == MovementKind::Input
+                && movement.asset == collection.asset
+                && movement.from.as_ref() == Some(&deposit.address)
+        })?;
+        if gross_debit != allocation.gross_debit {
+            return Ok(None);
+        }
+        affected_deposits.insert(deposit.id.clone());
+        classified.insert(
+            deposit.id.clone(),
+            (deposit, EffectClass::Collection, movement_ids, Vec::new()),
+        );
+    }
+
+    let every_input_is_reserved = event.transaction.movements.iter().all(|movement| {
+        movement.kind != MovementKind::Input
+            || (movement.asset == collection.asset
+                && movement
+                    .from
+                    .as_ref()
+                    .is_some_and(|address| participant_addresses.contains(address)))
+    });
+    let outputs = event
+        .transaction
+        .movements
+        .iter()
+        .filter(|movement| movement.kind == MovementKind::Output)
+        .collect::<Vec<_>>();
+    if !every_input_is_reserved
+        || outputs.len() != 1
+        || outputs[0].asset != collection.asset
+        || outputs[0].to.as_ref() != Some(&collection.destination)
+    {
+        return Ok(None);
+    }
+    let master_credit =
+        leg.allocations
+            .iter()
+            .try_fold(AtomicAmount::ZERO, |total, allocation| {
+                total
+                    .checked_add(&allocation.master_credit)
+                    .map_err(|_| domain_invariant("UTXO-batch master-credit total overflowed"))
+            })?;
+    if outputs[0].amount != master_credit {
+        return Ok(None);
+    }
+    let allocated_fee =
+        leg.allocations
+            .iter()
+            .try_fold(AtomicAmount::ZERO, |total, allocation| {
+                total
+                    .checked_add(&allocation.allocated_fee)
+                    .map_err(|_| domain_invariant("UTXO-batch allocated-fee total overflowed"))
+            })?;
+    if !event
+        .transaction
+        .fee
+        .as_ref()
+        .is_some_and(|fee| fee.asset == collection.asset && fee.amount == allocated_fee)
+    {
+        return Ok(None);
+    }
+
+    let transition_at = collection.updated_at.max(received_at);
+    let transition = match &event.transaction.status {
+        TransactionStatus::Pending => {
+            if !matches!(leg.state, CollectionLegState::Broadcast { .. }) {
+                return Ok(None);
+            }
+            None
+        }
+        TransactionStatus::Included { .. } => match &leg.state {
+            CollectionLegState::Broadcast { .. } => None,
+            CollectionLegState::Reorged { .. } => Some(UtxoBatchProjectionTransition::Reincluded {
+                included_at: transition_at,
+            }),
+            _ => return Ok(None),
+        },
+        TransactionStatus::Confirmed { .. } => match &leg.state {
+            CollectionLegState::Broadcast { .. } | CollectionLegState::Reorged { .. } => {
+                Some(UtxoBatchProjectionTransition::Confirmed {
+                    allocations: leg.allocations.clone(),
+                    confirmed_at: transition_at,
+                })
+            }
+            CollectionLegState::Confirmed { .. } => None,
+            _ => return Ok(None),
+        },
+        TransactionStatus::Reorged { .. } => match &leg.state {
+            CollectionLegState::Confirmed { .. } => Some(UtxoBatchProjectionTransition::Reorged {
+                error: SafeCollectionError {
+                    code: "ix_reorged".to_owned(),
+                    message: "Indexer corrected a confirmed Bitcoin collection transaction"
+                        .to_owned(),
+                    retryable: false,
+                },
+                reorged_at: transition_at,
+            }),
+            CollectionLegState::Broadcast { .. } | CollectionLegState::Reorged { .. } => None,
+            _ => return Ok(None),
+        },
+        TransactionStatus::Failed { .. }
+        | TransactionStatus::Dropped
+        | TransactionStatus::Replaced { .. } => {
+            // Bitcoin v1 has no replacement-signing or automatic release path.
+            // Keep the exact outpoints and signed bytes reserved and stop the
+            // projection until an operator resolves the unsupported fact.
+            return Ok(None);
+        }
+    };
+    let transition = transition.map(|transition| UtxoBatchProjectionMutation {
+        collection_id: collection.id.clone(),
+        leg_id: leg.id.clone(),
+        expected: collection_guard(collection, leg),
+        transaction_id: event.transaction.transaction_id.clone(),
+        transition,
+    });
+    Ok(Some(UtxoBatchFactClassification {
+        classified,
+        affected_deposits,
+        transition,
+    }))
+}
+
 async fn classify_projection(
     repository: &Repository,
     mirrored: &MirroredObservation,
@@ -938,13 +1642,17 @@ async fn classify_projection(
         Vec<DepositId>,
         Vec<RecordObservation>,
         Vec<ReconciliationCase>,
+        ProjectionFeeTreatment,
+        Option<UtxoBatchProjectionMutation>,
     )>,
     DepositError,
 > {
     let event = &mirrored.event;
     let transaction_id = &event.transaction.transaction_id;
-    let mut classified = BTreeMap::<DepositId, (Deposit, EffectClass, Vec<MovementId>)>::new();
+    let mut classified = ClassifiedDeposits::new();
     let mut affected_deposits = BTreeSet::<DepositId>::new();
+    let mut fee_included_in_movement = false;
+    let mut utxo_batch_transition = None;
 
     if let Some(reference) = repository.leg_for_transaction(transaction_id).await? {
         let collection = repository
@@ -956,69 +1664,82 @@ async fn classify_projection(
             .iter()
             .find(|leg| leg.id == reference.leg_id)
             .ok_or_else(|| domain_invariant("collection transaction points to a missing leg"))?;
-        let deposit = repository
-            .deposit(&collection.deposit_id)
-            .await?
-            .ok_or_else(|| domain_invariant("collection points to a missing deposit"))?;
-        affected_deposits.insert(deposit.id.clone());
-        if !project_collection_leg_fact(
-            repository,
-            event,
-            &collection,
-            leg,
-            &deposit,
-            mirrored.received_at,
-        )
-        .await?
-        {
-            return Ok(None);
-        }
-        let (class, movements) = match leg.kind {
-            CollectionLegKind::Sweep => (
-                EffectClass::Collection,
-                event
-                    .transaction
-                    .movements
-                    .iter()
-                    .filter(|movement| {
-                        movement.asset == deposit.asset
-                            && movement.from.as_ref() == Some(&deposit.address)
-                    })
-                    .map(|movement| movement.id.clone())
-                    .collect::<Vec<_>>(),
-            ),
-            CollectionLegKind::GasFunding => (
-                EffectClass::GasFunding,
-                event
-                    .transaction
-                    .movements
-                    .iter()
-                    .filter(|movement| {
-                        movement.asset == deposit.asset
-                            && movement.to.as_ref() == Some(&deposit.address)
-                    })
-                    .map(|movement| movement.id.clone())
-                    .collect::<Vec<_>>(),
-            ),
-        };
-        // Token gas funding changes a native balance outside the token
-        // deposit ledger. Its collection leg is still resolved from IX, but
-        // no token-ledger row is appropriate for that event.
-        let deposit_paid_fee = event.transaction.fee.as_ref().is_some_and(|fee| {
-            fee.asset == deposit.asset && fee.payer.as_ref() == Some(&deposit.address)
-        });
-        if !movements.is_empty() || deposit_paid_fee {
-            classified.insert(deposit.id.clone(), (deposit, class, movements));
-        } else if leg.kind == CollectionLegKind::Sweep
-            && !matches!(
-                event.transaction.status,
-                TransactionStatus::Pending
-                    | TransactionStatus::Failed { .. }
-                    | TransactionStatus::Dropped
-                    | TransactionStatus::Replaced { .. }
+        if collection.mode == CollectionMode::UtxoBatch {
+            let Some(batch) =
+                classify_utxo_batch_fact(repository, event, &collection, leg, mirrored.received_at)
+                    .await?
+            else {
+                return Ok(None);
+            };
+            fee_included_in_movement = true;
+            classified = batch.classified;
+            affected_deposits = batch.affected_deposits;
+            utxo_batch_transition = batch.transition;
+        } else {
+            let deposit = repository
+                .deposit(&collection.deposit_id)
+                .await?
+                .ok_or_else(|| domain_invariant("collection points to a missing deposit"))?;
+            affected_deposits.insert(deposit.id.clone());
+            if !project_collection_leg_fact(
+                repository,
+                event,
+                &collection,
+                leg,
+                &deposit,
+                mirrored.received_at,
             )
-        {
-            return Ok(None);
+            .await?
+            {
+                return Ok(None);
+            }
+            let (class, movements) = match leg.kind {
+                CollectionLegKind::Sweep => (
+                    EffectClass::Collection,
+                    event
+                        .transaction
+                        .movements
+                        .iter()
+                        .filter(|movement| {
+                            movement.asset == deposit.asset
+                                && movement.from.as_ref() == Some(&deposit.address)
+                        })
+                        .map(|movement| movement.id.clone())
+                        .collect::<Vec<_>>(),
+                ),
+                CollectionLegKind::GasFunding => (
+                    EffectClass::GasFunding,
+                    event
+                        .transaction
+                        .movements
+                        .iter()
+                        .filter(|movement| {
+                            movement.asset == deposit.asset
+                                && movement.to.as_ref() == Some(&deposit.address)
+                        })
+                        .map(|movement| movement.id.clone())
+                        .collect::<Vec<_>>(),
+                ),
+            };
+            // Token gas funding changes a native balance outside the token
+            // deposit ledger. Its collection leg is still resolved from IX,
+            // but no token-ledger row is appropriate for that event.
+            let deposit_paid_fee = event.transaction.fee.as_ref().is_some_and(|fee| {
+                fee.asset == deposit.asset && fee.payer.as_ref() == Some(&deposit.address)
+            });
+            if !movements.is_empty() || deposit_paid_fee {
+                classified.insert(deposit.id.clone(), (deposit, class, movements, Vec::new()));
+            } else if leg.kind == CollectionLegKind::Sweep
+                && !matches!(
+                    event.transaction.status,
+                    TransactionStatus::Pending
+                        | TransactionStatus::Failed { .. }
+                        | TransactionStatus::Dropped
+                        | TransactionStatus::Replaced { .. }
+                )
+            {
+                return Ok(None);
+            }
         }
     } else {
         for movement in &event.transaction.movements {
@@ -1032,6 +1753,8 @@ async fn classify_projection(
                     deposit,
                     EffectClass::Incoming,
                     movement.id.clone(),
+                    event.transaction.scope.chain.0 == "bitcoin"
+                        && movement.kind == MovementKind::Output,
                 ) {
                     return Ok(None);
                 }
@@ -1046,8 +1769,15 @@ async fn classify_projection(
                     deposit,
                     EffectClass::OtherDebit,
                     movement.id.clone(),
+                    event.transaction.scope.chain.0 == "bitcoin"
+                        && movement.kind == MovementKind::Input,
                 ) {
                     return Ok(None);
+                }
+                if event.transaction.scope.chain.0 == "bitcoin"
+                    && movement.kind == MovementKind::Input
+                {
+                    fee_included_in_movement = true;
                 }
             }
         }
@@ -1058,12 +1788,17 @@ async fn classify_projection(
         {
             affected_deposits.insert(deposit.id.clone());
             match classified.get(&deposit.id) {
-                Some((_existing, EffectClass::OtherDebit, _)) => {}
+                Some((
+                    _existing,
+                    EffectClass::OtherDebit | EffectClass::NetBalanceChange,
+                    _,
+                    _,
+                )) => {}
                 Some(_) => return Ok(None),
                 None => {
                     classified.insert(
                         deposit.id.clone(),
-                        (deposit, EffectClass::OtherDebit, Vec::new()),
+                        (deposit, EffectClass::OtherDebit, Vec::new(), Vec::new()),
                     );
                 }
             }
@@ -1072,12 +1807,12 @@ async fn classify_projection(
 
     let mut updates = Vec::with_capacity(classified.len());
     let mut cases = Vec::new();
-    for (deposit_id, (deposit, class, movement_ids)) in classified {
+    for (deposit_id, (deposit, class, movement_ids, credit_movement_ids)) in classified {
         let head = repository
             .current(&deposit_id)
             .await?
             .ok_or_else(|| domain_invariant("classified deposit has no ledger head"))?;
-        let effect = movement_effect(class, movement_ids);
+        let effect = movement_effect(class, movement_ids, credit_movement_ids);
         let resolved = resolve_runtime_effect(event, &effect)?;
         let next_balances = apply_observation_transition(
             head.balances,
@@ -1085,10 +1820,15 @@ async fn classify_projection(
                 status: event.transaction.status.clone(),
                 previous_status: event.previous_status.clone(),
                 effect: resolved,
-                network_fee: event.transaction.fee.as_ref().and_then(|fee| {
-                    (fee.asset == deposit.asset && fee.payer.as_ref() == Some(&deposit.address))
-                        .then_some(fee.amount)
-                }),
+                network_fee: (!fee_included_in_movement)
+                    .then(|| {
+                        event.transaction.fee.as_ref().and_then(|fee| {
+                            (fee.asset == deposit.asset
+                                && fee.payer.as_ref() == Some(&deposit.address))
+                            .then_some(fee.amount)
+                        })
+                    })
+                    .flatten(),
             },
         )
         .map_err(|error| {
@@ -1096,6 +1836,24 @@ async fn classify_projection(
                 "classified IX event cannot update its ledger: {error}"
             ))
         })?;
+        if matches!(
+            class,
+            EffectClass::OtherDebit | EffectClass::NetBalanceChange
+        ) && let Some(collection_id) =
+            retained_utxo_batch_reservation(repository, &deposit_id).await?
+        {
+            cases.push(ReconciliationCase {
+                id: reserved_spend_reconciliation_case_id(event, &deposit_id),
+                deposit_id: deposit_id.clone(),
+                triggering_event_id: event.id.clone(),
+                reason: ReconciliationReason::ReservedSpendConflict {
+                    collection_id,
+                    transaction_id: event.transaction.transaction_id.clone(),
+                },
+                state: ReconciliationState::Open,
+                created_at: mirrored.received_at,
+            });
+        }
         if head.balances.accounted <= head.balances.confirmed
             && next_balances.accounted > next_balances.confirmed
         {
@@ -1123,7 +1881,44 @@ async fn classify_projection(
         affected_deposits.into_iter().collect(),
         updates,
         cases,
+        if fee_included_in_movement {
+            ProjectionFeeTreatment::IncludedInMovementEffect
+        } else {
+            ProjectionFeeTreatment::Separate
+        },
+        utxo_batch_transition,
     )))
+}
+
+async fn retained_utxo_batch_reservation(
+    repository: &Repository,
+    deposit_id: &DepositId,
+) -> Result<Option<deposits::CollectionId>, DepositError> {
+    let deposit = repository
+        .deposit(deposit_id)
+        .await?
+        .ok_or_else(|| domain_invariant("classified deposit disappeared"))?;
+    let Some(collection) = repository
+        .retained_collection_for(deposit_id, &deposit.asset)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let participant = collection.participant(deposit_id).ok_or_else(|| {
+        domain_invariant("retained collection does not contain its indexed participant")
+    })?;
+    if collection.mode != CollectionMode::UtxoBatch
+        || participant.reservation.asset != deposit.asset
+        || matches!(
+            participant.reservation.state,
+            CollectionReservationState::Released { .. }
+        )
+    {
+        return Err(domain_invariant(
+            "retained Bitcoin ownership index points to an incompatible collection",
+        ));
+    }
+    Ok(Some(collection.id))
 }
 
 async fn project_collection_leg_fact(
@@ -1346,27 +2141,72 @@ fn collection_guard(collection: &Collection, leg: &CollectionLeg) -> CollectionT
 }
 
 fn insert_classification(
-    classifications: &mut BTreeMap<DepositId, (Deposit, EffectClass, Vec<MovementId>)>,
+    classifications: &mut ClassifiedDeposits,
     deposit: Deposit,
     class: EffectClass,
     movement_id: MovementId,
+    allow_net_balance_change: bool,
 ) -> bool {
     match classifications.get_mut(&deposit.id) {
-        Some((_existing, existing_class, movement_ids)) if *existing_class == class => {
+        Some((_existing, existing_class, movement_ids, _credit_movement_ids))
+            if *existing_class == class =>
+        {
             if !movement_ids.contains(&movement_id) {
                 movement_ids.push(movement_id);
             }
             true
         }
+        Some((_existing, EffectClass::NetBalanceChange, debit_movements, credit_movements))
+            if allow_net_balance_change =>
+        {
+            let target = match class {
+                EffectClass::Incoming => credit_movements,
+                EffectClass::OtherDebit => debit_movements,
+                _ => return false,
+            };
+            if !target.contains(&movement_id) {
+                target.push(movement_id);
+            }
+            true
+        }
+        Some((_existing, existing_class, primary_movements, credit_movements))
+            if allow_net_balance_change
+                && matches!(
+                    (*existing_class, class),
+                    (EffectClass::Incoming, EffectClass::OtherDebit)
+                        | (EffectClass::OtherDebit, EffectClass::Incoming)
+                ) =>
+        {
+            if *existing_class == EffectClass::Incoming {
+                *credit_movements = std::mem::take(primary_movements);
+                primary_movements.push(movement_id);
+            } else if !credit_movements.contains(&movement_id) {
+                credit_movements.push(movement_id);
+            }
+            *existing_class = EffectClass::NetBalanceChange;
+            true
+        }
         Some(_) => false,
         None => {
-            classifications.insert(deposit.id.clone(), (deposit, class, vec![movement_id]));
+            let class = if allow_net_balance_change && class == EffectClass::OtherDebit {
+                EffectClass::NetBalanceChange
+            } else {
+                class
+            };
+            classifications.insert(
+                deposit.id.clone(),
+                (deposit, class, vec![movement_id], Vec::new()),
+            );
             true
         }
     }
 }
 
-fn movement_effect(class: EffectClass, movements: Vec<MovementId>) -> LedgerEffect<MovementId> {
+fn movement_effect(
+    class: EffectClass,
+    movements: Vec<MovementId>,
+    credit_movements: Vec<MovementId>,
+) -> LedgerEffect<MovementId> {
     match class {
         EffectClass::Incoming => LedgerEffect::Incoming { movements },
         EffectClass::Collection => LedgerEffect::Collection { movements },
@@ -1374,6 +2214,10 @@ fn movement_effect(class: EffectClass, movements: Vec<MovementId>) -> LedgerEffe
         EffectClass::OtherDebit => LedgerEffect::OtherBalanceChange {
             direction: BalanceDirection::Debit,
             movements,
+        },
+        EffectClass::NetBalanceChange => LedgerEffect::NetBalanceChange {
+            debit_movements: movements,
+            credit_movements,
         },
     }
 }
@@ -1416,6 +2260,13 @@ fn resolve_runtime_effect(
             direction: *direction,
             movements: resolve(movements)?,
         },
+        LedgerEffect::NetBalanceChange {
+            debit_movements,
+            credit_movements,
+        } => LedgerEffect::NetBalanceChange {
+            debit_movements: resolve(debit_movements)?,
+            credit_movements: resolve(credit_movements)?,
+        },
     })
 }
 
@@ -1425,6 +2276,20 @@ fn reconciliation_case_id(
 ) -> ReconciliationCaseId {
     ReconciliationCaseId(format!(
         "reconciliation:{}:{}:{}:{}:{}",
+        event.id.0.len(),
+        event.id.0,
+        event.transaction.revision.0,
+        deposit_id.0.len(),
+        deposit_id.0
+    ))
+}
+
+fn reserved_spend_reconciliation_case_id(
+    event: &indexing::ObservationEvent,
+    deposit_id: &DepositId,
+) -> ReconciliationCaseId {
+    ReconciliationCaseId(format!(
+        "reconciliation:reserved-spend:{}:{}:{}:{}:{}",
         event.id.0.len(),
         event.id.0,
         event.transaction.revision.0,
@@ -1502,11 +2367,24 @@ pub struct ProjectionStatusReport {
 pub async fn reconcile_watches(
     options: &ReconcileOptions,
 ) -> Result<ReconcileReport, RuntimeError> {
+    reconcile_watches_for_scope(options, ethereum_scope(&options.indexer.network)).await
+}
+
+pub async fn reconcile_bitcoin_watches(
+    options: &ReconcileOptions,
+) -> Result<ReconcileReport, RuntimeError> {
+    let scope = validated_bitcoin_indexer_scope(&options.indexer)?;
+    reconcile_watches_for_scope(options, scope).await
+}
+
+async fn reconcile_watches_for_scope(
+    options: &ReconcileOptions,
+    scope: IndexScope,
+) -> Result<ReconcileReport, RuntimeError> {
     options.validate().map_err(RuntimeError::configuration)?;
     let storage = RocksDbStorage::open(&options.database.database_path)?;
     let repository = PersistentPaymentRepository::new(storage);
     let client = IndexerClient::new(&options.indexer)?;
-    let scope = ethereum_scope(&options.indexer.network);
     let no_address_generation = DisabledAddressGeneration;
     let coordinator =
         DepositWatchCoordinator::new(&repository, &client, &no_address_generation, scope);
@@ -1540,11 +2418,24 @@ pub async fn reconcile_watches(
 /// Mirror IX facts and the ingestion cursor atomically without assigning
 /// deposit, accounting, collection, or other Payment Service semantics.
 pub async fn ingest_events(options: &IngestOptions) -> Result<IngestionReport, RuntimeError> {
+    ingest_events_for_scope(options, ethereum_scope(&options.indexer.network)).await
+}
+
+pub async fn ingest_bitcoin_events(
+    options: &IngestOptions,
+) -> Result<IngestionReport, RuntimeError> {
+    let scope = validated_bitcoin_indexer_scope(&options.indexer)?;
+    ingest_events_for_scope(options, scope).await
+}
+
+async fn ingest_events_for_scope(
+    options: &IngestOptions,
+    scope: IndexScope,
+) -> Result<IngestionReport, RuntimeError> {
     options.validate().map_err(RuntimeError::configuration)?;
     let storage = RocksDbStorage::open(&options.database.database_path)?;
     let repository = PersistentPaymentRepository::new(storage);
     let client = IndexerClient::new(&options.indexer)?;
-    let scope = ethereum_scope(&options.indexer.network);
     let checkpoint = repository
         .consumer_checkpoint(ConsumerCheckpointName::IxIngestion)
         .await?;
@@ -1675,6 +2566,30 @@ fn ethereum_scope(network: &str) -> IndexScope {
     }
 }
 
+fn bitcoin_scope(network: &str) -> Result<IndexScope, RuntimeError> {
+    if !matches!(
+        network,
+        "mainnet" | "testnet3" | "testnet4" | "signet" | "regtest"
+    ) {
+        return Err(RuntimeError::configuration(
+            "Bitcoin network must be mainnet, testnet3, testnet4, signet, or regtest",
+        ));
+    }
+    Ok(IndexScope {
+        chain: ChainId("bitcoin".to_owned()),
+        network: network.to_owned(),
+    })
+}
+
+fn validated_bitcoin_indexer_scope(indexer: &IndexerOptions) -> Result<IndexScope, RuntimeError> {
+    if indexer.bearer_token.is_none() {
+        return Err(RuntimeError::configuration(
+            "Bitcoin Indexer Service authentication is required even on loopback",
+        ));
+    }
+    bitcoin_scope(&indexer.network)
+}
+
 fn unix_timestamp() -> Result<u64, RuntimeError> {
     SystemTime::UNIX_EPOCH
         .elapsed()
@@ -1755,19 +2670,29 @@ mod tests {
     use std::collections::HashMap;
 
     use axum::{Json, Router, extract::Query, http::StatusCode, routing::get};
-    use chain_identity::CanonicalAddress;
+    use chain_identity::{CanonicalAddress, CanonicalTransactionId};
     use deposits::{
-        ConsumerCheckpointName, CreateDeposit, CreateDepositWithLedger, IdempotencyKey,
-        ObservationConsumerCheckpoints, UserId,
+        AcceptCollectionBroadcast, AttachCollectionWatch, CollectionId, CollectionLegId,
+        CollectionLegKind, CollectionSpendResource, CollectionSpendResourceEvidence,
+        CollectionSpendResourceId, CommandIdentity, CommandOperation, CommandPrincipal,
+        ConsumerCheckpointName, CreateCollectionLeg, CreateDeposit, CreateDepositWithLedger,
+        CreateJob, CreateUtxoBatchCollection, CreateUtxoBatchCollectionJob,
+        CreateUtxoBatchParticipant, EnsureUser, IdempotencyKey, JobId,
+        ObservationConsumerCheckpoints, PolicyIdentity, RecordSignedCollectionLeg, RequestHash,
+        SignedEnvelopeBytes, UserId, UserStore,
     };
-    use indexing::{BlockHeight, WatchId};
+    use indexing::{
+        BlockHash, BlockHeight, BlockRef, ConfirmationPolicy, ConfirmationProof, MovementKind,
+        NetworkFee, ObservationEvent, ObservationEventId, ObservationRevision, ObservedTransaction,
+        ValueMovement, WatchId,
+    };
     use serde_json::{Value, json};
     use signer::KeyLocator;
     use tempfile::TempDir;
     use tokio::net::TcpListener;
 
     use super::*;
-    use crate::config::{DatabaseOptions, IndexerOptions};
+    use crate::config::{BearerSecret, DatabaseOptions, IndexerOptions};
 
     async fn spawn(router: Router) -> String {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -1792,6 +2717,70 @@ mod tests {
             retry_initial_millis: 0,
             retry_max_millis: 0,
         }
+    }
+
+    #[test]
+    fn bitcoin_maintenance_requires_authentication_and_a_canonical_network() {
+        let mut options = indexer("http://127.0.0.1:8080".to_owned());
+        options.network = "regtest".to_owned();
+        let missing = validated_bitcoin_indexer_scope(&options)
+            .expect_err("Bitcoin maintenance must reject an unauthenticated IX");
+        assert!(missing.to_string().contains("authentication is required"));
+
+        options.bearer_token = Some(
+            "opaque-bitcoin-ix-token"
+                .parse::<BearerSecret>()
+                .expect("test token is valid"),
+        );
+        assert_eq!(
+            validated_bitcoin_indexer_scope(&options)
+                .expect("authenticated canonical Bitcoin scope is valid"),
+            IndexScope {
+                chain: ChainId("bitcoin".to_owned()),
+                network: "regtest".to_owned(),
+            }
+        );
+        options.network = "testnet".to_owned();
+        let noncanonical = validated_bitcoin_indexer_scope(&options)
+            .expect_err("Bitcoin maintenance must reject ambiguous network aliases");
+        assert!(noncanonical.to_string().contains("testnet3"));
+    }
+
+    #[test]
+    fn bitcoin_readiness_requires_canonical_checkpoint_identity() {
+        let scope = IndexScope {
+            chain: ChainId("bitcoin".to_owned()),
+            network: "regtest".to_owned(),
+        };
+        let block = |height, byte| BlockRef {
+            height: BlockHeight(height),
+            hash: BlockHash(vec![byte; 32]),
+            parent_hash: None,
+            timestamp: Some(1_000 + height),
+        };
+        let mut status = SyncStatus {
+            scope: scope.clone(),
+            checkpoint: Some(block(10, 10)),
+            observed_tip: Some(block(11, 11)),
+            confirmation_policy: ConfirmationPolicy {
+                minimum_confirmations: 1,
+                require_chain_finality: false,
+            },
+            phase: SyncPhase::Ready,
+            rebuild_reason: None,
+            halted_reason: None,
+        };
+        assert!(bitcoin_indexer_is_ready(&status, &scope));
+
+        status.checkpoint = None;
+        assert!(!bitcoin_indexer_is_ready(&status, &scope));
+        status.checkpoint = Some(block(12, 12));
+        assert!(!bitcoin_indexer_is_ready(&status, &scope));
+        status.checkpoint = Some(BlockRef {
+            hash: BlockHash(vec![13; 31]),
+            ..block(10, 13)
+        });
+        assert!(!bitcoin_indexer_is_ready(&status, &scope));
     }
 
     fn test_amount(value: u64) -> AtomicAmount {
@@ -1824,6 +2813,462 @@ mod tests {
             },
             ledger_recorded_at: 1,
         }
+    }
+
+    fn bitcoin_test_chain() -> ChainId {
+        ChainId("bitcoin".to_owned())
+    }
+
+    fn bitcoin_test_asset() -> AssetId {
+        AssetId {
+            chain: bitcoin_test_chain(),
+            asset: "native".to_owned(),
+        }
+    }
+
+    fn bitcoin_test_address(value: &str) -> CanonicalAddress {
+        CanonicalAddress {
+            chain: bitcoin_test_chain(),
+            value: value.to_owned(),
+        }
+    }
+
+    fn bitcoin_test_transaction(byte: u8) -> CanonicalTransactionId {
+        CanonicalTransactionId {
+            chain: bitcoin_test_chain(),
+            value: format!("{byte:02x}").repeat(32),
+        }
+    }
+
+    fn bitcoin_test_block(height: u64, byte: u8) -> BlockRef {
+        BlockRef {
+            height: BlockHeight(height),
+            hash: BlockHash(vec![byte; 32]),
+            parent_hash: Some(BlockHash(vec![byte.saturating_sub(1); 32])),
+            timestamp: Some(1_000 + height),
+        }
+    }
+
+    fn bitcoin_test_policy() -> PolicyIdentity {
+        PolicyIdentity {
+            version: "bitcoin-test-v1".to_owned(),
+            digest: [7; 32],
+        }
+    }
+
+    fn bitcoin_test_deposit() -> CreateDepositWithLedger {
+        CreateDepositWithLedger {
+            deposit: CreateDeposit {
+                id: DepositId("bitcoin-deposit".to_owned()),
+                idempotency_key: IdempotencyKey("create-bitcoin-deposit".to_owned()),
+                user_id: UserId("bitcoin-user".to_owned()),
+                asset: bitcoin_test_asset(),
+                address: bitcoin_test_address("bcrt1q-runtime-deposit"),
+                key: KeyLocator::Identifier("opaque-bitcoin-key".to_owned()),
+                key_purpose: "bitcoin-runtime-projection-test".to_owned(),
+                expected: test_amount(1_000),
+                birthday: BlockHeight(1),
+                expires_at: 10_000,
+                created_at: 2,
+            },
+            ledger_recorded_at: 2,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bitcoin_test_observation(
+        id: &str,
+        cursor: u64,
+        transaction_id: CanonicalTransactionId,
+        status: TransactionStatus,
+        previous_status: Option<TransactionStatus>,
+        movements: Vec<ValueMovement>,
+        fee: Option<NetworkFee>,
+    ) -> MirroredObservation {
+        MirroredObservation {
+            event: ObservationEvent {
+                id: ObservationEventId(id.to_owned()),
+                cursor: EventCursor(cursor),
+                watch_ids: vec![WatchId("bitcoin-runtime-watch".to_owned())],
+                previous_status,
+                transaction: ObservedTransaction {
+                    scope: IndexScope {
+                        chain: bitcoin_test_chain(),
+                        network: "regtest".to_owned(),
+                    },
+                    transaction_id,
+                    revision: ObservationRevision(cursor),
+                    status,
+                    movements,
+                    fee,
+                    first_seen_at: 100 + cursor,
+                    observed_at: 100 + cursor,
+                },
+            },
+            received_at: 200 + cursor,
+        }
+    }
+
+    struct BitcoinProjectionFixture {
+        _directory: TempDir,
+        repository: Repository,
+        deposit: Deposit,
+        collection: Collection,
+    }
+
+    async fn bitcoin_projection_fixture()
+    -> Result<BitcoinProjectionFixture, Box<dyn std::error::Error>> {
+        let directory = TempDir::new()?;
+        let repository = Repository::new(RocksDbStorage::open(directory.path())?);
+        let scope = IndexScope {
+            chain: bitcoin_test_chain(),
+            network: "regtest".to_owned(),
+        };
+        let owner = CommandPrincipal("bitcoin-exchange".to_owned());
+        repository
+            .initialize_or_validate(InitializePaymentDatabase {
+                scope,
+                active_policy: bitcoin_test_policy(),
+                initialized_at: 1,
+            })
+            .await?;
+        repository
+            .ensure_user(EnsureUser {
+                id: UserId("bitcoin-user".to_owned()),
+                owner: owner.clone(),
+                first_seen_at: 1,
+            })
+            .await?;
+        let created = repository
+            .create_with_ledger(bitcoin_test_deposit())
+            .await?;
+        let deposit = created.deposit;
+
+        let funding = bitcoin_test_observation(
+            "bitcoin-funding-event",
+            1,
+            bitcoin_test_transaction(0x11),
+            TransactionStatus::Confirmed {
+                block: bitcoin_test_block(10, 10),
+                proof: ConfirmationProof::Depth {
+                    required: 1,
+                    observed: 1,
+                },
+            },
+            None,
+            vec![ValueMovement {
+                id: MovementId("bitcoin-funding-output".to_owned()),
+                asset: bitcoin_test_asset(),
+                amount: test_amount(1_000),
+                from: None,
+                to: Some(deposit.address.clone()),
+                kind: MovementKind::Output,
+            }],
+            None,
+        );
+        repository
+            .mirror_and_advance(MirrorObservation {
+                expected_cursor: None,
+                observation: funding.clone(),
+            })
+            .await?;
+        let funded = repository
+            .project_and_advance(ProjectObservation {
+                expected_cursor: None,
+                through: funding.event.cursor,
+                affected_deposits: vec![deposit.id.clone()],
+                ledger_updates: vec![RecordObservation {
+                    event_id: funding.event.id,
+                    effect: LedgerEffect::Incoming {
+                        movements: vec![MovementId("bitcoin-funding-output".to_owned())],
+                    },
+                    deposit_id: deposit.id.clone(),
+                    expected_head: Some(created.ledger.id),
+                    recorded_at: 10,
+                }],
+                reconciliation_cases: Vec::new(),
+                fee_treatment: ProjectionFeeTreatment::Separate,
+                utxo_batch_transition: None,
+            })
+            .await?;
+        let funded_head = match funded
+            .ledger_results
+            .first()
+            .expect("funding projection has one ledger result")
+        {
+            deposits::ApplyResult::Appended { entry }
+            | deposits::ApplyResult::AlreadyPresent { entry } => entry.id.clone(),
+        };
+
+        let collection_id = CollectionId("bitcoin-batch".to_owned());
+        let job_id = JobId("bitcoin-batch-job".to_owned());
+        repository
+            .create_or_replay(CreateJob {
+                id: job_id.clone(),
+                command: CommandIdentity {
+                    principal: owner.clone(),
+                    operation: CommandOperation::CreateCollection,
+                    client_key: IdempotencyKey("bitcoin-batch-command".to_owned()),
+                    request_hash: RequestHash([9; 32]),
+                },
+                payload: JobPayload::CreateUtxoBatchCollection(CreateUtxoBatchCollectionJob {
+                    collection_id: collection_id.clone(),
+                    deposit_ids: vec![deposit.id.clone()],
+                }),
+                user_owner: owner,
+                policy: bitcoin_test_policy(),
+                created_at: 20,
+            })
+            .await?;
+        let resource = CollectionSpendResource {
+            id: CollectionSpendResourceId {
+                transaction_id: bitcoin_test_transaction(0x11),
+                output_index: 0,
+            },
+            amount: test_amount(1_000),
+            evidence: CollectionSpendResourceEvidence::new(b"runtime-utxo-evidence".to_vec())?,
+        };
+        let created = repository
+            .create_or_replay_utxo_batch(CreateUtxoBatchCollection {
+                id: collection_id,
+                job_id,
+                asset: bitcoin_test_asset(),
+                destination: bitcoin_test_address("bcrt1q-runtime-master"),
+                policy: bitcoin_test_policy(),
+                participants: vec![CreateUtxoBatchParticipant {
+                    user_id: deposit.user_id.clone(),
+                    deposit_id: deposit.id.clone(),
+                    expected_ledger_head: funded_head,
+                    reservation_amount: test_amount(1_000),
+                    spend_resources: vec![resource],
+                }],
+                leg: CreateCollectionLeg {
+                    id: CollectionLegId("bitcoin-sweep".to_owned()),
+                    kind: CollectionLegKind::Sweep,
+                    planned_amount: None,
+                },
+                created_at: 20,
+            })
+            .await?
+            .collection()
+            .clone();
+        let signed = repository
+            .record_signed(RecordSignedCollectionLeg {
+                collection_id: created.id.clone(),
+                leg_id: created.legs[0].id.clone(),
+                expected: collection_guard(&created, &created.legs[0]),
+                expected_transaction_id: bitcoin_test_transaction(0x22),
+                envelope: SignedEnvelopeBytes::new(vec![1, 2, 3, 4])?,
+                allocations: vec![CollectionAllocation {
+                    deposit_id: deposit.id.clone(),
+                    asset: bitcoin_test_asset(),
+                    gross_debit: test_amount(1_000),
+                    master_credit: test_amount(990),
+                    allocated_fee_asset: bitcoin_test_asset(),
+                    allocated_fee: test_amount(10),
+                }],
+                signed_at: 21,
+                expires_at: 10_000,
+            })
+            .await?;
+        let broadcast = repository
+            .accept_broadcast(AcceptCollectionBroadcast {
+                collection_id: signed.id.clone(),
+                leg_id: signed.legs[0].id.clone(),
+                expected: collection_guard(&signed, &signed.legs[0]),
+                transaction_id: bitcoin_test_transaction(0x22),
+                accepted_at: 22,
+            })
+            .await?;
+        let collection = repository
+            .attach_watch(AttachCollectionWatch {
+                collection_id: broadcast.id.clone(),
+                leg_id: broadcast.legs[0].id.clone(),
+                expected: collection_guard(&broadcast, &broadcast.legs[0]),
+                watch_id: WatchId("bitcoin-collection-watch".to_owned()),
+                updated_at: 23,
+            })
+            .await?;
+        Ok(BitcoinProjectionFixture {
+            _directory: directory,
+            repository,
+            deposit,
+            collection,
+        })
+    }
+
+    #[tokio::test]
+    async fn bitcoin_first_inclusion_does_not_double_debit_the_factual_fee()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = bitcoin_projection_fixture().await?;
+        let event = bitcoin_test_observation(
+            "bitcoin-collection-included",
+            2,
+            bitcoin_test_transaction(0x22),
+            TransactionStatus::Included {
+                block: bitcoin_test_block(20, 20),
+                confirmations: 1,
+            },
+            None,
+            vec![
+                ValueMovement {
+                    id: MovementId("bitcoin-collection-input".to_owned()),
+                    asset: bitcoin_test_asset(),
+                    amount: test_amount(1_000),
+                    from: Some(fixture.deposit.address.clone()),
+                    to: None,
+                    kind: MovementKind::Input,
+                },
+                ValueMovement {
+                    id: MovementId("bitcoin-master-output".to_owned()),
+                    asset: bitcoin_test_asset(),
+                    amount: test_amount(990),
+                    from: None,
+                    to: Some(fixture.collection.destination.clone()),
+                    kind: MovementKind::Output,
+                },
+            ],
+            Some(NetworkFee {
+                asset: bitcoin_test_asset(),
+                amount: test_amount(10),
+                payer: Some(fixture.deposit.address.clone()),
+            }),
+        );
+        fixture
+            .repository
+            .mirror_and_advance(MirrorObservation {
+                expected_cursor: Some(EventCursor(1)),
+                observation: event.clone(),
+            })
+            .await?;
+        let Some((affected, updates, cases, fee_treatment, transition)) =
+            classify_projection(&fixture.repository, &event).await?
+        else {
+            panic!("the exact retained Bitcoin collection must classify");
+        };
+        assert_eq!(
+            fee_treatment,
+            ProjectionFeeTreatment::IncludedInMovementEffect
+        );
+        assert!(transition.is_none());
+        fixture
+            .repository
+            .project_and_advance(ProjectObservation {
+                expected_cursor: Some(EventCursor(1)),
+                through: EventCursor(2),
+                affected_deposits: affected,
+                ledger_updates: updates,
+                reconciliation_cases: cases,
+                fee_treatment,
+                utxo_batch_transition: transition,
+            })
+            .await?;
+
+        let ledger = fixture
+            .repository
+            .current(&fixture.deposit.id)
+            .await?
+            .expect("Bitcoin deposit ledger remains open");
+        assert_eq!(ledger.balances.balance, AtomicAmount::ZERO);
+        assert_eq!(ledger.balances.collected, AtomicAmount::ZERO);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_reserved_spend_with_change_projects_net_and_opens_conflict()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = bitcoin_projection_fixture().await?;
+        let event = bitcoin_test_observation(
+            "bitcoin-conflicting-spend",
+            2,
+            bitcoin_test_transaction(0x33),
+            TransactionStatus::Included {
+                block: bitcoin_test_block(20, 20),
+                confirmations: 1,
+            },
+            None,
+            vec![
+                ValueMovement {
+                    id: MovementId("bitcoin-conflict-input".to_owned()),
+                    asset: bitcoin_test_asset(),
+                    amount: test_amount(1_000),
+                    from: Some(fixture.deposit.address.clone()),
+                    to: None,
+                    kind: MovementKind::Input,
+                },
+                ValueMovement {
+                    id: MovementId("bitcoin-conflict-change".to_owned()),
+                    asset: bitcoin_test_asset(),
+                    amount: test_amount(400),
+                    from: None,
+                    to: Some(fixture.deposit.address.clone()),
+                    kind: MovementKind::Output,
+                },
+                ValueMovement {
+                    id: MovementId("bitcoin-conflict-external".to_owned()),
+                    asset: bitcoin_test_asset(),
+                    amount: test_amount(590),
+                    from: None,
+                    to: Some(bitcoin_test_address("bcrt1q-external")),
+                    kind: MovementKind::Output,
+                },
+            ],
+            Some(NetworkFee {
+                asset: bitcoin_test_asset(),
+                amount: test_amount(10),
+                payer: Some(fixture.deposit.address.clone()),
+            }),
+        );
+        fixture
+            .repository
+            .mirror_and_advance(MirrorObservation {
+                expected_cursor: Some(EventCursor(1)),
+                observation: event.clone(),
+            })
+            .await?;
+        let Some((affected, updates, cases, fee_treatment, transition)) =
+            classify_projection(&fixture.repository, &event).await?
+        else {
+            panic!("the conflicting Bitcoin spend must classify conservatively");
+        };
+        assert_eq!(
+            fee_treatment,
+            ProjectionFeeTreatment::IncludedInMovementEffect
+        );
+        assert!(transition.is_none());
+        assert_eq!(cases.len(), 1);
+        assert!(matches!(
+            &cases[0].reason,
+            ReconciliationReason::ReservedSpendConflict { collection_id, transaction_id }
+                if collection_id == &fixture.collection.id
+                    && transaction_id == &event.event.transaction.transaction_id
+        ));
+        fixture
+            .repository
+            .project_and_advance(ProjectObservation {
+                expected_cursor: Some(EventCursor(1)),
+                through: EventCursor(2),
+                affected_deposits: affected,
+                ledger_updates: updates,
+                reconciliation_cases: cases,
+                fee_treatment,
+                utxo_batch_transition: transition,
+            })
+            .await?;
+
+        let ledger = fixture
+            .repository
+            .current(&fixture.deposit.id)
+            .await?
+            .expect("Bitcoin deposit ledger remains open");
+        assert_eq!(ledger.balances.balance, test_amount(400));
+        assert!(
+            fixture
+                .repository
+                .automatic_actions_blocked(&fixture.deposit.id)
+                .await?
+        );
+        Ok(())
     }
 
     #[tokio::test]

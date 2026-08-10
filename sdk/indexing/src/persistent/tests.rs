@@ -12,21 +12,22 @@ use storage::{
 };
 
 use super::{
-    PersistentIndexConfig, PersistentIndexRepository, RawBytesIndexCodec, keys,
+    IndexRecordCodec, PersistentIndexConfig, PersistentIndexRepository, RawBytesIndexCodec, keys,
     record::{PolicyMigrationIdRecordV1, PolicyMigrationRecordV1},
 };
 use crate::{
-    ActivateRebuildCommand, AddressWatchRequest, BeginRebuildCommand, BlockHash, BlockHeight,
-    BlockRef, CleanupGenerationCommand, CleanupGenerationOutcome, CommitBlockCommand,
-    CommitBlockOutcome, CommitRebuildBlockCommand, CommitWatchBackfillCommand,
-    CommitWatchBackfillOutcome, ConfirmationPolicy, ConfirmationProof, EventCursor, IndexErrorKind,
-    IndexRepository, IndexScope, InterpretedBlock, MigrateIndexPolicyCommand,
+    AbortRebuildCommand, ActivateRebuildCommand, AddressWatchRequest, BeginRebuildCommand,
+    BlockHash, BlockHeight, BlockRef, CleanupGenerationCommand, CleanupGenerationOutcome,
+    CommitBlockCommand, CommitBlockOutcome, CommitRebuildBlockCommand, CommitWatchBackfillCommand,
+    CommitWatchBackfillOutcome, ConfirmationPolicy, ConfirmationProof, EventCursor, IndexError,
+    IndexErrorKind, IndexRepository, IndexScope, InterpretedBlock, MigrateIndexPolicyCommand,
     MigrateIndexPolicyOutcome, MovementId, MovementKind, ObservationDraft, ObservationDraftStatus,
-    ObservationEventRequest, PolicyMigrationVersion, PrepareRebuildActivationCommand, RawBlockData,
-    RegisterWatchCommand, RegisterWatchOutcome, RevertTipCommand, RevertTipOutcome, SyncPhase,
-    SyncStatus, TransactionPageRequest, TransactionRequest, TransactionStatus, UnwatchCommand,
-    UnwatchOutcome, ValidateRebuildCommand, ValueMovement, WatchId, WatchRequest, WatchSelector,
-    WatchVersion,
+    ObservationEventRequest, PolicyMigrationVersion, PrepareRebuildActivationCommand,
+    ProjectionBatch, ProjectionGetRequest, ProjectionMutation, ProjectionQuery,
+    ProjectionScanRequest, RawBlockData, RegisterWatchCommand, RegisterWatchOutcome,
+    RevertTipCommand, RevertTipOutcome, SyncPhase, SyncStatus, TransactionPageRequest,
+    TransactionRequest, TransactionStatus, UnwatchCommand, UnwatchOutcome, ValidateRebuildCommand,
+    ValueMovement, WatchId, WatchRequest, WatchSelector, WatchVersion,
 };
 
 #[derive(Clone, Default)]
@@ -186,6 +187,57 @@ impl Storage for MemoryStorage {
 
 type Repository = PersistentIndexRepository<MemoryStorage, RawBytesIndexCodec>;
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ProjectionTestCodec;
+
+impl IndexRecordCodec for ProjectionTestCodec {
+    type Target = Vec<u8>;
+    type Undo = Vec<u8>;
+
+    fn encode_target(&self, target: &Self::Target) -> Result<Vec<u8>, IndexError> {
+        Ok(target.clone())
+    }
+
+    fn decode_target(&self, encoded: &[u8]) -> Result<Self::Target, IndexError> {
+        Ok(encoded.to_vec())
+    }
+
+    fn encode_undo(&self, undo: &Self::Undo) -> Result<Vec<u8>, IndexError> {
+        Ok(undo.clone())
+    }
+
+    fn decode_undo(&self, encoded: &[u8]) -> Result<Self::Undo, IndexError> {
+        Ok(encoded.to_vec())
+    }
+
+    fn rollback_projection(&self, undo: &Self::Undo) -> Result<ProjectionBatch, IndexError> {
+        let mutations = match undo.as_slice() {
+            [1, 1] => vec![
+                ProjectionMutation::Delete {
+                    key: b"address/a/1".to_vec(),
+                },
+                ProjectionMutation::Delete {
+                    key: b"address/a/2".to_vec(),
+                },
+                ProjectionMutation::Delete {
+                    key: b"utxo/1".to_vec(),
+                },
+            ],
+            [1, 2] => vec![ProjectionMutation::Put {
+                key: b"utxo/1".to_vec(),
+                value: b"created".to_vec(),
+            }],
+            [9, 1] => vec![ProjectionMutation::Delete {
+                key: b"conditional/marker".to_vec(),
+            }],
+            _ => Vec::new(),
+        };
+        Ok(ProjectionBatch::new(mutations))
+    }
+}
+
+type ProjectionRepository = PersistentIndexRepository<MemoryStorage, ProjectionTestCodec>;
+
 fn scope() -> IndexScope {
     IndexScope {
         chain: ChainId("ethereum".to_owned()),
@@ -211,6 +263,10 @@ fn config(retention: u64) -> PersistentIndexConfig {
 
 fn make_repository(storage: MemoryStorage, retention: u64) -> Repository {
     PersistentIndexRepository::new(storage, RawBytesIndexCodec, config(retention))
+}
+
+fn make_projection_repository(storage: MemoryStorage, retention: u64) -> ProjectionRepository {
+    PersistentIndexRepository::new(storage, ProjectionTestCodec, config(retention))
 }
 
 fn make_repository_with_policy(
@@ -324,6 +380,7 @@ fn command(
         block: InterpretedBlock {
             block: block_ref(height),
             drafts,
+            projection: ProjectionBatch::default(),
             undo: vec![1, height as u8],
             raw: RawBlockData {
                 block: vec![2, height as u8],
@@ -331,6 +388,17 @@ fn command(
             },
         },
     }
+}
+
+fn command_with_projection(
+    height: u64,
+    expected_checkpoint: Option<BlockRef>,
+    projection: ProjectionBatch,
+    retention: u64,
+) -> CommitBlockCommand<Vec<u8>> {
+    let mut command = command(height, expected_checkpoint, 0, Vec::new(), retention);
+    command.block.projection = projection;
+    command
 }
 
 fn policy_migration(idempotency_key: &str, reason: &str) -> MigrateIndexPolicyCommand {
@@ -451,6 +519,7 @@ fn watches_are_persistent_idempotent_conflict_safe_and_soft_deleted() {
             scope: scope(),
             watch_id,
             inactive_from: BlockHeight(5),
+            expected_checkpoint: None,
         }))
         .expect("soft unwatch succeeds"),
         UnwatchOutcome::Deactivated
@@ -957,6 +1026,42 @@ fn surviving_backfill_inclusion_loses_confirmation_depth_once_on_tip_reorg() {
 }
 
 #[test]
+fn unwatch_retries_when_checkpoint_advances_after_the_caller_snapshot() {
+    let repository = make_repository(MemoryStorage::default(), 50);
+    let watch_id = register_watch(&repository, "unwatch-checkpoint-race");
+    block_on(repository.commit_block(command(1, None, 1, Vec::new(), 50)))
+        .expect("block commits after the caller observed no checkpoint");
+
+    let error = block_on(repository.unwatch(UnwatchCommand {
+        scope: scope(),
+        watch_id: watch_id.clone(),
+        inactive_from: BlockHeight(1),
+        expected_checkpoint: None,
+    }))
+    .expect_err("stale checkpoint must not backdate watch deactivation");
+    assert_eq!(error.kind, IndexErrorKind::Conflict);
+    assert!(error.retryable);
+    assert_eq!(
+        block_on(repository.watches_at(&scope(), BlockHeight(1)))
+            .expect("watch remains active at the committed block")
+            .watches
+            .len(),
+        1
+    );
+
+    assert_eq!(
+        block_on(repository.unwatch(UnwatchCommand {
+            scope: scope(),
+            watch_id,
+            inactive_from: BlockHeight(2),
+            expected_checkpoint: Some(block_ref(1)),
+        }))
+        .expect("retry against the current checkpoint succeeds"),
+        UnwatchOutcome::Deactivated
+    );
+}
+
+#[test]
 fn empty_blocks_append_each_depth_and_confirm_at_twelve_after_reopen() {
     let storage = MemoryStorage::default();
     let repository = make_repository(storage.clone(), 50);
@@ -1081,6 +1186,100 @@ fn revert_response_loss_retry_is_already_reverted_without_duplicate_correction()
 }
 
 #[test]
+fn watch_starting_at_the_current_checkpoint_backfills_that_already_committed_block() {
+    let repository = make_repository(MemoryStorage::default(), 50);
+    block_on(repository.commit_block(command(1, None, 0, Vec::new(), 50)))
+        .expect("checkpoint block commits before watch registration");
+    let registered_at =
+        block_on(repository.checkpoint(&scope())).expect("checkpoint query succeeds");
+    let outcome = block_on(repository.register_watch(RegisterWatchCommand {
+        request: WatchRequest {
+            scope: scope(),
+            selector: WatchSelector::Address(address("0xcheckpoint")),
+            start_height: BlockHeight(1),
+            idempotency_key: "checkpoint-birthday".to_owned(),
+        },
+        target: vec![1, 2, 3],
+        registered_at,
+    }))
+    .expect("checkpoint-height watch registration succeeds");
+    let watch_id = match outcome {
+        RegisterWatchOutcome::Registered(receipt) | RegisterWatchOutcome::Existing(receipt) => {
+            receipt.id
+        }
+    };
+
+    let jobs = block_on(repository.pending_watch_backfills(&scope(), 10))
+        .expect("checkpoint-height watch creates backfill work");
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].watch_id, watch_id);
+    assert_eq!(jobs[0].from_height, BlockHeight(1));
+    assert_eq!(jobs[0].through, block_ref(1));
+}
+
+#[test]
+fn unwatch_conflicts_until_its_historical_backfill_finishes() {
+    let repository = make_repository(MemoryStorage::default(), 50);
+    block_on(repository.commit_block(command(1, None, 0, Vec::new(), 50)))
+        .expect("canonical checkpoint commits before watch registration");
+    let watch_id = match block_on(repository.register_watch(RegisterWatchCommand {
+        request: WatchRequest {
+            scope: scope(),
+            selector: WatchSelector::Address(address("0xpending-backfill")),
+            start_height: BlockHeight(1),
+            idempotency_key: "pending-unwatch".to_owned(),
+        },
+        target: vec![7, 7],
+        registered_at: Some(block_ref(1)),
+    }))
+    .expect("historical watch registers")
+    {
+        RegisterWatchOutcome::Registered(receipt) | RegisterWatchOutcome::Existing(receipt) => {
+            receipt.id
+        }
+    };
+
+    let error = block_on(repository.unwatch(UnwatchCommand {
+        scope: scope(),
+        watch_id: watch_id.clone(),
+        inactive_from: BlockHeight(2),
+        expected_checkpoint: Some(block_ref(1)),
+    }))
+    .expect_err("pending historical projection must keep its watch active");
+    assert_eq!(error.kind, IndexErrorKind::Conflict);
+    assert!(error.retryable);
+    assert_eq!(
+        block_on(repository.watches_at(&scope(), BlockHeight(2)))
+            .expect("watch state remains readable")
+            .watches
+            .len(),
+        1
+    );
+
+    block_on(
+        repository.commit_watch_backfill(CommitWatchBackfillCommand {
+            scope: scope(),
+            watch_id: watch_id.clone(),
+            expected_next_height: BlockHeight(1),
+            expected_checkpoint: block_ref(1),
+            block: block_ref(1),
+            drafts: Vec::new(),
+        }),
+    )
+    .expect("single-height backfill finishes");
+    assert_eq!(
+        block_on(repository.unwatch(UnwatchCommand {
+            scope: scope(),
+            watch_id,
+            inactive_from: BlockHeight(2),
+            expected_checkpoint: Some(block_ref(1)),
+        }))
+        .expect("unwatch succeeds after historical work completes"),
+        UnwatchOutcome::Deactivated
+    );
+}
+
+#[test]
 fn failure_before_commit_leaves_no_partial_checkpoint_or_feed_rows() {
     let storage = MemoryStorage::default();
     let repository = make_repository(storage.clone(), 50);
@@ -1097,6 +1296,746 @@ fn failure_before_commit_leaves_no_partial_checkpoint_or_feed_rows() {
         block_on(repository.commit_block(command(1, None, 0, Vec::new(), 50)))
             .expect("clean retry commits"),
         CommitBlockOutcome::Applied
+    );
+}
+
+#[test]
+fn projection_mutations_commit_scan_and_revert_with_the_canonical_block() {
+    let storage = MemoryStorage::default();
+    let repository = make_projection_repository(storage, 50);
+    let first_projection = ProjectionBatch::new(vec![
+        ProjectionMutation::Put {
+            key: b"address/a/2".to_vec(),
+            value: b"second".to_vec(),
+        },
+        ProjectionMutation::Put {
+            key: b"utxo/1".to_vec(),
+            value: b"created".to_vec(),
+        },
+        ProjectionMutation::Put {
+            key: b"address/a/1".to_vec(),
+            value: b"first".to_vec(),
+        },
+    ]);
+    block_on(repository.commit_block(command_with_projection(1, None, first_projection, 50)))
+        .expect("projection-bearing block commits");
+
+    let value = block_on(repository.projection_get(ProjectionGetRequest {
+        scope: scope(),
+        key: b"utxo/1".to_vec(),
+        expected_snapshot: None,
+    }))
+    .expect("projection point read succeeds");
+    assert_eq!(value.snapshot.generation, crate::RebuildGeneration(0));
+    assert_eq!(value.snapshot.revision, 1);
+    assert_eq!(value.snapshot.checkpoint, Some(block_ref(1)));
+    assert_eq!(value.value, Some(b"created".to_vec()));
+
+    let first_page = block_on(repository.projection_scan(ProjectionScanRequest {
+        scope: scope(),
+        prefix: b"address/a/".to_vec(),
+        after: None,
+        limit: 1,
+    }))
+    .expect("first projection page succeeds");
+    assert_eq!(first_page.snapshot, value.snapshot);
+    assert_eq!(first_page.entries.len(), 1);
+    assert_eq!(first_page.entries[0].key, b"address/a/1".to_vec());
+    let fenced_value = block_on(repository.projection_get(ProjectionGetRequest {
+        scope: scope(),
+        key: b"address/a/1".to_vec(),
+        expected_snapshot: Some(first_page.snapshot.clone()),
+    }))
+    .expect("dependent lookup accepts the scan snapshot");
+    assert_eq!(fenced_value.value, Some(b"first".to_vec()));
+    let cursor = first_page.next.expect("another ordered entry remains");
+    let second_page = block_on(repository.projection_scan(ProjectionScanRequest {
+        scope: scope(),
+        prefix: b"address/a/".to_vec(),
+        after: Some(cursor.clone()),
+        limit: 1,
+    }))
+    .expect("second projection page succeeds");
+    assert_eq!(second_page.entries.len(), 1);
+    assert_eq!(second_page.entries[0].key, b"address/a/2".to_vec());
+    assert!(second_page.next.is_none());
+
+    block_on(repository.commit_block(command_with_projection(
+        2,
+        Some(block_ref(1)),
+        ProjectionBatch::new(vec![ProjectionMutation::Delete {
+            key: b"utxo/1".to_vec(),
+        }]),
+        50,
+    )))
+    .expect("spend projection commits");
+    let stale_lookup = block_on(repository.projection_get(ProjectionGetRequest {
+        scope: scope(),
+        key: b"address/a/1".to_vec(),
+        expected_snapshot: Some(fenced_value.snapshot),
+    }))
+    .expect_err("same-generation checkpoint movement invalidates a dependent lookup");
+    assert_eq!(stale_lookup.kind, IndexErrorKind::Conflict);
+    assert!(stale_lookup.retryable);
+    let stale_cursor = block_on(repository.projection_scan(ProjectionScanRequest {
+        scope: scope(),
+        prefix: b"address/a/".to_vec(),
+        after: Some(cursor),
+        limit: 1,
+    }))
+    .expect_err("same-generation projection movement invalidates a scan cursor");
+    assert_eq!(stale_cursor.kind, IndexErrorKind::Conflict);
+    assert!(stale_cursor.retryable);
+    let spent = block_on(repository.projection_get(ProjectionGetRequest {
+        scope: scope(),
+        key: b"utxo/1".to_vec(),
+        expected_snapshot: None,
+    }))
+    .expect("spent projection read succeeds");
+    assert_eq!(spent.snapshot.revision, 2);
+    assert_eq!(spent.snapshot.checkpoint, Some(block_ref(2)));
+    assert_eq!(spent.value, None);
+
+    block_on(repository.revert_tip(RevertTipCommand {
+        scope: scope(),
+        expected_tip: block_ref(2),
+    }))
+    .expect("spend block reverts");
+    let restored = block_on(repository.projection_get(ProjectionGetRequest {
+        scope: scope(),
+        key: b"utxo/1".to_vec(),
+        expected_snapshot: None,
+    }))
+    .expect("restored projection read succeeds");
+    assert_eq!(restored.snapshot.revision, 3);
+    assert_eq!(restored.snapshot.checkpoint, Some(block_ref(1)));
+    assert_eq!(restored.value, Some(b"created".to_vec()));
+
+    block_on(repository.revert_tip(RevertTipCommand {
+        scope: scope(),
+        expected_tip: block_ref(1),
+    }))
+    .expect("creation block reverts");
+    let removed = block_on(repository.projection_get(ProjectionGetRequest {
+        scope: scope(),
+        key: b"utxo/1".to_vec(),
+        expected_snapshot: None,
+    }))
+    .expect("removed projection read succeeds");
+    assert_eq!(removed.snapshot.revision, 4);
+    assert_eq!(removed.snapshot.checkpoint, None);
+    assert_eq!(removed.value, None);
+    assert!(
+        block_on(repository.projection_scan(ProjectionScanRequest {
+            scope: scope(),
+            prefix: b"address/".to_vec(),
+            after: None,
+            limit: 10,
+        }))
+        .expect("empty projection scan succeeds")
+        .entries
+        .is_empty()
+    );
+}
+
+#[test]
+fn conditional_projection_put_requires_a_fenced_creation_and_reverts_safely() {
+    let absent_repository = make_projection_repository(MemoryStorage::default(), 50);
+    block_on(absent_repository.commit_block(command_with_projection(
+        1,
+        None,
+        ProjectionBatch::new(vec![ProjectionMutation::PutIfPresent {
+            required_key: b"conditional/creation".to_vec(),
+            key: b"conditional/marker".to_vec(),
+            value: b"spent".to_vec(),
+        }]),
+        50,
+    )))
+    .expect("conditional block commits when its required fact is absent");
+    assert_eq!(
+        block_on(absent_repository.projection_get(ProjectionGetRequest {
+            scope: scope(),
+            key: b"conditional/marker".to_vec(),
+            expected_snapshot: None,
+        }))
+        .expect("absent conditional marker reads")
+        .value,
+        None
+    );
+
+    let repository = make_projection_repository(MemoryStorage::default(), 50);
+    block_on(repository.commit_block(command_with_projection(
+        1,
+        None,
+        ProjectionBatch::new(vec![ProjectionMutation::Put {
+            key: b"conditional/creation".to_vec(),
+            value: b"output".to_vec(),
+        }]),
+        50,
+    )))
+    .expect("required creation commits first");
+    let mut conditional = command_with_projection(
+        2,
+        Some(block_ref(1)),
+        ProjectionBatch::new(vec![ProjectionMutation::PutIfPresent {
+            required_key: b"conditional/creation".to_vec(),
+            key: b"conditional/marker".to_vec(),
+            value: b"spent".to_vec(),
+        }]),
+        50,
+    );
+    conditional.block.undo = vec![9, 1];
+    block_on(repository.commit_block(conditional))
+        .expect("conditional marker commits against an existing creation");
+    assert_eq!(
+        block_on(repository.projection_get(ProjectionGetRequest {
+            scope: scope(),
+            key: b"conditional/marker".to_vec(),
+            expected_snapshot: None,
+        }))
+        .expect("materialized conditional marker reads")
+        .value,
+        Some(b"spent".to_vec())
+    );
+
+    block_on(repository.revert_tip(RevertTipCommand {
+        scope: scope(),
+        expected_tip: block_ref(2),
+    }))
+    .expect("conditional marker block reverts");
+    assert_eq!(
+        block_on(repository.projection_get(ProjectionGetRequest {
+            scope: scope(),
+            key: b"conditional/marker".to_vec(),
+            expected_snapshot: None,
+        }))
+        .expect("reverted conditional marker reads")
+        .value,
+        None
+    );
+    assert_eq!(
+        block_on(repository.projection_get(ProjectionGetRequest {
+            scope: scope(),
+            key: b"conditional/creation".to_vec(),
+            expected_snapshot: None,
+        }))
+        .expect("required creation survives marker revert")
+        .value,
+        Some(b"output".to_vec())
+    );
+}
+
+#[test]
+fn conditional_live_spend_then_backfill_reverts_one_shared_marker_safely() {
+    let repository = make_projection_repository(MemoryStorage::default(), 50);
+    block_on(repository.commit_block(command_with_projection(
+        1,
+        None,
+        ProjectionBatch::default(),
+        50,
+    )))
+    .expect("historical creation block commits before watch registration");
+    let mut live_spend = command_with_projection(
+        2,
+        Some(block_ref(1)),
+        ProjectionBatch::new(vec![ProjectionMutation::PutIfPresent {
+            required_key: b"conditional/creation".to_vec(),
+            key: b"conditional/marker".to_vec(),
+            value: b"spent".to_vec(),
+        }]),
+        50,
+    );
+    live_spend.block.undo = vec![9, 1];
+    block_on(repository.commit_block(live_spend))
+        .expect("live conditional spend commits while its creation is absent");
+
+    let watch_id = match block_on(repository.register_watch(RegisterWatchCommand {
+        request: WatchRequest {
+            scope: scope(),
+            selector: WatchSelector::Address(address("0xconditional-backfill")),
+            start_height: BlockHeight(1),
+            idempotency_key: "conditional-backfill-overlap".to_owned(),
+        },
+        target: vec![9, 2],
+        registered_at: Some(block_ref(2)),
+    }))
+    .expect("historical watch registers after the live spend")
+    {
+        RegisterWatchOutcome::Registered(receipt) | RegisterWatchOutcome::Existing(receipt) => {
+            receipt.id
+        }
+    };
+    block_on(repository.commit_watch_backfill_projection(
+        CommitWatchBackfillCommand {
+            scope: scope(),
+            watch_id: watch_id.clone(),
+            expected_next_height: BlockHeight(1),
+            expected_checkpoint: block_ref(2),
+            block: block_ref(1),
+            drafts: Vec::new(),
+        },
+        ProjectionBatch::new(vec![ProjectionMutation::Put {
+            key: b"conditional/creation".to_vec(),
+            value: b"output".to_vec(),
+        }]),
+    ))
+    .expect("historical creation materializes");
+    block_on(repository.commit_watch_backfill_projection(
+        CommitWatchBackfillCommand {
+            scope: scope(),
+            watch_id,
+            expected_next_height: BlockHeight(2),
+            expected_checkpoint: block_ref(2),
+            block: block_ref(2),
+            drafts: Vec::new(),
+        },
+        ProjectionBatch::new(vec![ProjectionMutation::Put {
+            key: b"conditional/marker".to_vec(),
+            value: b"spent".to_vec(),
+        }]),
+    ))
+    .expect("historical spend materializes the marker recorded by live undo");
+
+    block_on(repository.revert_tip(RevertTipCommand {
+        scope: scope(),
+        expected_tip: block_ref(2),
+    }))
+    .expect("shared chain/backfill delete must de-duplicate during reorg");
+    assert_eq!(
+        block_on(repository.projection_get(ProjectionGetRequest {
+            scope: scope(),
+            key: b"conditional/marker".to_vec(),
+            expected_snapshot: None,
+        }))
+        .expect("marker reads after reorg")
+        .value,
+        None
+    );
+    assert_eq!(
+        block_on(repository.projection_get(ProjectionGetRequest {
+            scope: scope(),
+            key: b"conditional/creation".to_vec(),
+            expected_snapshot: None,
+        }))
+        .expect("creation reads after spend reorg")
+        .value,
+        Some(b"output".to_vec())
+    );
+}
+
+#[test]
+fn historical_projection_backfill_is_atomic_order_independent_and_reorg_safe() {
+    let storage = MemoryStorage::default();
+    let repository = make_projection_repository(storage, 50);
+    for height in 1..=3 {
+        block_on(repository.commit_block(command_with_projection(
+            height,
+            (height > 1).then(|| block_ref(height - 1)),
+            ProjectionBatch::default(),
+            50,
+        )))
+        .expect("canonical history commits before the watch is registered");
+    }
+    let watch_id = match block_on(repository.register_watch(RegisterWatchCommand {
+        request: WatchRequest {
+            scope: scope(),
+            selector: WatchSelector::Address(address("0xbackfilled")),
+            start_height: BlockHeight(1),
+            idempotency_key: "projection-backfill".to_owned(),
+        },
+        target: vec![9, 9],
+        registered_at: Some(block_ref(3)),
+    }))
+    .expect("historical projection watch registers")
+    {
+        RegisterWatchOutcome::Registered(receipt) | RegisterWatchOutcome::Existing(receipt) => {
+            receipt.id
+        }
+    };
+
+    block_on(repository.commit_watch_backfill_projection(
+        CommitWatchBackfillCommand {
+            scope: scope(),
+            watch_id: watch_id.clone(),
+            expected_next_height: BlockHeight(1),
+            expected_checkpoint: block_ref(3),
+            block: block_ref(1),
+            drafts: Vec::new(),
+        },
+        ProjectionBatch::new(vec![ProjectionMutation::Put {
+            key: b"backfill/create".to_vec(),
+            value: b"output".to_vec(),
+        }]),
+    ))
+    .expect("historical creation commits with its cursor");
+
+    let conditional = block_on(repository.commit_watch_backfill_projection(
+        CommitWatchBackfillCommand {
+            scope: scope(),
+            watch_id: watch_id.clone(),
+            expected_next_height: BlockHeight(2),
+            expected_checkpoint: block_ref(3),
+            block: block_ref(2),
+            drafts: Vec::new(),
+        },
+        ProjectionBatch::new(vec![ProjectionMutation::PutIfPresent {
+            required_key: b"backfill/create".to_vec(),
+            key: b"backfill/spent".to_vec(),
+            value: b"marker".to_vec(),
+        }]),
+    ))
+    .expect_err("historical backfill must not contain conditional mutations");
+    assert_eq!(conditional.kind, IndexErrorKind::InvalidBlock);
+
+    let destructive = block_on(repository.commit_watch_backfill_projection(
+        CommitWatchBackfillCommand {
+            scope: scope(),
+            watch_id: watch_id.clone(),
+            expected_next_height: BlockHeight(2),
+            expected_checkpoint: block_ref(3),
+            block: block_ref(2),
+            drafts: Vec::new(),
+        },
+        ProjectionBatch::new(vec![ProjectionMutation::Delete {
+            key: b"backfill/create".to_vec(),
+        }]),
+    ))
+    .expect_err("order-sensitive historical deletion must fail closed");
+    assert_eq!(destructive.kind, IndexErrorKind::InvalidBlock);
+
+    block_on(repository.commit_watch_backfill_projection(
+        CommitWatchBackfillCommand {
+            scope: scope(),
+            watch_id: watch_id.clone(),
+            expected_next_height: BlockHeight(2),
+            expected_checkpoint: block_ref(3),
+            block: block_ref(2),
+            drafts: Vec::new(),
+        },
+        ProjectionBatch::new(vec![ProjectionMutation::Put {
+            key: b"backfill/spent".to_vec(),
+            value: b"marker".to_vec(),
+        }]),
+    ))
+    .expect("historical spent marker commits after the rejected deletion");
+    block_on(repository.commit_watch_backfill_projection(
+        CommitWatchBackfillCommand {
+            scope: scope(),
+            watch_id,
+            expected_next_height: BlockHeight(3),
+            expected_checkpoint: block_ref(3),
+            block: block_ref(3),
+            drafts: Vec::new(),
+        },
+        ProjectionBatch::default(),
+    ))
+    .expect("historical backfill finishes");
+
+    let completed_snapshot = block_on(repository.projection_get(ProjectionGetRequest {
+        scope: scope(),
+        key: b"backfill/create".to_vec(),
+        expected_snapshot: None,
+    }))
+    .expect("completed historical projection reads")
+    .snapshot;
+    assert_eq!(completed_snapshot.revision, 6);
+    assert_eq!(completed_snapshot.checkpoint, Some(block_ref(3)));
+
+    for (key, expected) in [
+        (b"backfill/create".as_slice(), b"output".as_slice()),
+        (b"backfill/spent".as_slice(), b"marker".as_slice()),
+    ] {
+        assert_eq!(
+            block_on(repository.projection_get(ProjectionGetRequest {
+                scope: scope(),
+                key: key.to_vec(),
+                expected_snapshot: Some(completed_snapshot.clone()),
+            }))
+            .expect("backfilled projection reads")
+            .value
+            .as_deref(),
+            Some(expected)
+        );
+    }
+
+    block_on(repository.revert_tip(RevertTipCommand {
+        scope: scope(),
+        expected_tip: block_ref(3),
+    }))
+    .expect("tip without historical projection reverts");
+    block_on(repository.revert_tip(RevertTipCommand {
+        scope: scope(),
+        expected_tip: block_ref(2),
+    }))
+    .expect("historical spend-marker block reverts");
+    assert_eq!(
+        block_on(repository.projection_get(ProjectionGetRequest {
+            scope: scope(),
+            key: b"backfill/spent".to_vec(),
+            expected_snapshot: None,
+        }))
+        .expect("spent marker read after reorg")
+        .value,
+        None
+    );
+    let retained_creation = block_on(repository.projection_get(ProjectionGetRequest {
+        scope: scope(),
+        key: b"backfill/create".to_vec(),
+        expected_snapshot: None,
+    }))
+    .expect("creation remains while its block is canonical");
+    assert_eq!(retained_creation.snapshot.revision, 8);
+    assert_eq!(retained_creation.snapshot.checkpoint, Some(block_ref(1)));
+    assert_eq!(retained_creation.value, Some(b"output".to_vec()));
+    block_on(repository.revert_tip(RevertTipCommand {
+        scope: scope(),
+        expected_tip: block_ref(1),
+    }))
+    .expect("historical creation block reverts");
+    let orphaned_creation = block_on(repository.projection_get(ProjectionGetRequest {
+        scope: scope(),
+        key: b"backfill/create".to_vec(),
+        expected_snapshot: None,
+    }))
+    .expect("orphaned historical creation is removed");
+    assert_eq!(orphaned_creation.snapshot.revision, 9);
+    assert_eq!(orphaned_creation.snapshot.checkpoint, None);
+    assert_eq!(orphaned_creation.value, None);
+}
+
+#[test]
+fn projection_changes_are_atomic_and_duplicate_keys_fail_before_commit() {
+    let storage = MemoryStorage::default();
+    let repository = make_projection_repository(storage.clone(), 50);
+    let projected = command_with_projection(
+        1,
+        None,
+        ProjectionBatch::new(vec![ProjectionMutation::Put {
+            key: b"utxo/atomic".to_vec(),
+            value: b"value".to_vec(),
+        }]),
+        50,
+    );
+    storage.fail_before_next_commit();
+    let error = block_on(repository.commit_block(projected))
+        .expect_err("injected atomic commit failure is returned");
+    assert!(error.retryable);
+    assert_eq!(
+        block_on(repository.checkpoint(&scope())).expect("checkpoint read succeeds"),
+        None
+    );
+    assert_eq!(
+        block_on(repository.projection_get(ProjectionGetRequest {
+            scope: scope(),
+            key: b"utxo/atomic".to_vec(),
+            expected_snapshot: None,
+        }))
+        .expect("projection read succeeds")
+        .value,
+        None
+    );
+
+    let duplicate = command_with_projection(
+        1,
+        None,
+        ProjectionBatch::new(vec![
+            ProjectionMutation::Put {
+                key: b"utxo/duplicate".to_vec(),
+                value: b"first".to_vec(),
+            },
+            ProjectionMutation::Delete {
+                key: b"utxo/duplicate".to_vec(),
+            },
+        ]),
+        50,
+    );
+    let error = block_on(repository.commit_block(duplicate))
+        .expect_err("duplicate projection keys are rejected");
+    assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+    assert_eq!(
+        block_on(repository.checkpoint(&scope())).expect("checkpoint remains absent"),
+        None
+    );
+}
+
+#[test]
+fn projection_reads_follow_atomic_generation_activation_and_cleanup() {
+    let storage = MemoryStorage::default();
+    let repository = make_projection_repository(storage.clone(), 50);
+    block_on(repository.commit_block(command_with_projection(
+        1,
+        None,
+        ProjectionBatch::new(vec![
+            ProjectionMutation::Put {
+                key: b"utxo/1".to_vec(),
+                value: b"old-one".to_vec(),
+            },
+            ProjectionMutation::Put {
+                key: b"utxo/2".to_vec(),
+                value: b"old-two".to_vec(),
+            },
+        ]),
+        50,
+    )))
+    .expect("active projection commits");
+    let old_page = block_on(repository.projection_scan(ProjectionScanRequest {
+        scope: scope(),
+        prefix: b"utxo/".to_vec(),
+        after: None,
+        limit: 1,
+    }))
+    .expect("active projection page succeeds");
+    assert_eq!(old_page.snapshot.revision, 1);
+    let old_cursor = old_page.next.expect("active projection has another entry");
+
+    let rebuild = block_on(repository.begin_rebuild(BeginRebuildCommand {
+        scope: scope(),
+        bootstrap_height: BlockHeight(1),
+    }))
+    .expect("rebuild begins");
+    block_on(repository.commit_rebuild_block(CommitRebuildBlockCommand {
+        generation: rebuild.generation,
+        command: command_with_projection(
+            1,
+            None,
+            ProjectionBatch::new(vec![
+                ProjectionMutation::Put {
+                    key: b"utxo/1".to_vec(),
+                    value: b"new-one".to_vec(),
+                },
+                ProjectionMutation::Put {
+                    key: b"utxo/2".to_vec(),
+                    value: b"new-two".to_vec(),
+                },
+            ]),
+            50,
+        ),
+    }))
+    .expect("hidden projection commits");
+    let active_before_activation = block_on(repository.projection_get(ProjectionGetRequest {
+        scope: scope(),
+        key: b"utxo/1".to_vec(),
+        expected_snapshot: None,
+    }))
+    .expect("active projection remains readable");
+    assert_eq!(
+        active_before_activation.snapshot.generation,
+        crate::RebuildGeneration(0)
+    );
+    assert_eq!(active_before_activation.snapshot.revision, 2);
+    assert_eq!(
+        active_before_activation.snapshot.checkpoint,
+        Some(block_ref(1))
+    );
+    assert_eq!(active_before_activation.value, Some(b"old-one".to_vec()));
+
+    block_on(repository.validate_rebuild(ValidateRebuildCommand {
+        scope: scope(),
+        generation: rebuild.generation,
+        expected_checkpoint: block_ref(1),
+    }))
+    .expect("hidden projection validates");
+    block_on(
+        repository.prepare_rebuild_activation(PrepareRebuildActivationCommand {
+            scope: scope(),
+            generation: rebuild.generation,
+            expected_checkpoint: block_ref(1),
+        }),
+    )
+    .expect("hidden projection prepares");
+    block_on(repository.activate_rebuild(ActivateRebuildCommand {
+        scope: scope(),
+        generation: rebuild.generation,
+        expected_checkpoint: block_ref(1),
+    }))
+    .expect("hidden projection activates");
+
+    let active = block_on(repository.projection_get(ProjectionGetRequest {
+        scope: scope(),
+        key: b"utxo/1".to_vec(),
+        expected_snapshot: None,
+    }))
+    .expect("new active projection reads");
+    assert_eq!(active.snapshot.generation, rebuild.generation);
+    assert_eq!(active.snapshot.revision, 3);
+    assert_eq!(active.snapshot.checkpoint, Some(block_ref(1)));
+    assert_eq!(active.value, Some(b"new-one".to_vec()));
+    let cursor_error = block_on(repository.projection_scan(ProjectionScanRequest {
+        scope: scope(),
+        prefix: b"utxo/".to_vec(),
+        after: Some(old_cursor),
+        limit: 1,
+    }))
+    .expect_err("old generation cursor cannot cross activation");
+    assert_eq!(cursor_error.kind, IndexErrorKind::Conflict);
+    assert!(cursor_error.retryable);
+
+    assert!(matches!(
+        block_on(repository.cleanup_generation(CleanupGenerationCommand {
+            scope: scope(),
+            generation: crate::RebuildGeneration(0),
+        }))
+        .expect("old generation cleanup succeeds"),
+        CleanupGenerationOutcome::Removed { records } if records > 0
+    ));
+    assert_eq!(
+        stored_record_count(
+            &storage,
+            keys::projection_prefix(&scope(), crate::RebuildGeneration(0), &[]),
+        ),
+        0
+    );
+    let after_cleanup = block_on(repository.projection_get(ProjectionGetRequest {
+        scope: scope(),
+        key: b"utxo/1".to_vec(),
+        expected_snapshot: None,
+    }))
+    .expect("active projection remains readable after old-generation cleanup");
+    assert_eq!(after_cleanup.snapshot.revision, 4);
+    assert_eq!(
+        stored_record_count(
+            &storage,
+            keys::projection_prefix(&scope(), rebuild.generation, &[]),
+        ),
+        2
+    );
+
+    let aborted = block_on(repository.begin_rebuild(BeginRebuildCommand {
+        scope: scope(),
+        bootstrap_height: BlockHeight(1),
+    }))
+    .expect("another rebuild begins");
+    block_on(repository.commit_rebuild_block(CommitRebuildBlockCommand {
+        generation: aborted.generation,
+        command: command_with_projection(
+            1,
+            None,
+            ProjectionBatch::new(vec![ProjectionMutation::Put {
+                key: b"utxo/aborted".to_vec(),
+                value: b"hidden".to_vec(),
+            }]),
+            50,
+        ),
+    }))
+    .expect("aborted projection initially commits");
+    assert_eq!(
+        stored_record_count(
+            &storage,
+            keys::projection_prefix(&scope(), aborted.generation, &[]),
+        ),
+        1
+    );
+    block_on(repository.abort_rebuild(AbortRebuildCommand {
+        scope: scope(),
+        generation: aborted.generation,
+    }))
+    .expect("rebuild abort succeeds");
+    assert_eq!(
+        stored_record_count(
+            &storage,
+            keys::projection_prefix(&scope(), aborted.generation, &[]),
+        ),
+        0
     );
 }
 

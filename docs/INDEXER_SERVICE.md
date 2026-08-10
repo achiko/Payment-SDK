@@ -1,7 +1,15 @@
 # Ethereum Indexer Service v1
 
-Status: Ethereum IX implementation baseline complete; production PS business
-composition and opt-in real-node execution remain pending.
+Status: Ethereum IX implementation baseline and the current single-scope
+Ethereum PS source composition are complete. Opt-in real-node execution and
+production deployment evidence remain pending.
+
+This document remains the Ethereum-specific runtime contract. Bitcoin uses the
+same generic repository/reorg/rebuild machinery through the chain-specific
+`indexer-worker bitcoin ...` commands, with a canonical UTXO projection and
+explicit deployment policy. See
+[`BITCOIN_SERVICES.md`](./BITCOIN_SERVICES.md) for the Bitcoin Core 31
+prerequisites, configuration, API, and acceptance boundary.
 
 This document fixes the operational and persistence decisions for the first
 real Indexer Service (IX) implementation. The general ownership and accounting
@@ -308,19 +316,20 @@ creates a durable open `PostCreditReorg` reconciliation case, and blocks further
 automatic credit and collection for that deposit. Only an explicit operator
 resolution may close the case.
 
-The backend-independent coordinator and the persistent PS repository implement
-and test these atomic transitions. `apps/api` currently exposes bounded
-maintenance commands to resume `AwaitingWatch` records, mirror IX events, and
-inspect the independent projection backlog. It does not yet expose public
-deposit creation or run a production projection supervisor: those composition
-steps require the approved Wallet Service transport/address adapter and
-concrete PS business classification rules. IX remains independent of
-`sdk/deposits` in either case.
+The backend-independent coordinator and persistent PS repository implement and
+test these atomic transitions. `apps/api` now exposes the authenticated public
+deposit, collection, job, balance, ledger, and observation APIs and runs the
+durable watch-reconciliation, IX-ingestion, business-projection, expiration,
+readiness, and collection/job workers for its one configured Ethereum scope.
+The concrete PS contract and remaining deployment exclusions are documented in
+[`PAYMENT_SERVICE.md`](./PAYMENT_SERVICE.md). IX remains independent of
+`sdk/deposits`.
 
 ## Operations and validation
 
 The Indexer binary provides `serve`, `backup`, `migrate schema`, `migrate
-policy`, `rebuild`, `rebuild-abort`, and old-generation cleanup commands. Both
+policy`, `rebuild`, `rebuild-abort`, and old-generation cleanup commands for
+Ethereum, plus the corresponding nested `bitcoin` command family. Both
 migration modes create and verify the requested backup before mutation. Logs
 and metrics must not contain bearer tokens, RPC authorization, custody values,
 raw signed transactions, or private keys.

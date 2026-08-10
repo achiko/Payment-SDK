@@ -10,8 +10,8 @@ use bitcoin::{
     address::NetworkUnchecked,
     consensus,
     hashes::Hash,
-    key::XOnlyPublicKey,
-    secp256k1::{ecdsa, schnorr},
+    key::{TapTweak, XOnlyPublicKey},
+    secp256k1::{Message, Secp256k1, ecdsa, schnorr},
     sighash::{Prevouts, SighashCache},
     taproot::TapTweakHash,
     transaction::Version,
@@ -102,11 +102,8 @@ impl BitcoinTransactionSigning for BitcoinTransactionCodec {
                 native.input[input_index].witness = witness;
             }
 
-            let id = BitcoinTransactionId(native.compute_txid().to_byte_array());
-            Ok(BitcoinSignedTransaction {
-                id,
-                consensus_bytes: consensus::serialize(&native),
-            })
+            let id = BitcoinTransactionId::from(native.compute_txid());
+            BitcoinSignedTransaction::from_consensus_bytes(id, consensus::serialize(&native))
         })
     }
 }
@@ -123,7 +120,7 @@ fn build_transaction(
     if request.recipients.is_empty() {
         return Err(invalid_transaction("Bitcoin transfer has no recipients"));
     }
-    if request.fee_rate.units_per_weight == 0 {
+    if request.fee_rate.satoshis_per_kvb() == 0 {
         return Err(ChainError {
             kind: ChainErrorKind::FeeUnavailable,
             message: "Bitcoin fee rate must be greater than zero".to_owned(),
@@ -146,26 +143,15 @@ fn build_transaction(
         .collect::<Result<Vec<_>, ChainError>>()?;
     let change_script = checked_address(network, &request.change_address)?.script_pubkey();
 
-    request.available.sort_by(|left, right| {
-        right
-            .value
-            .cmp(&left.value)
-            .then_with(|| left.transaction_id.cmp(&right.transaction_id))
-            .then_with(|| left.output_index.cmp(&right.output_index))
-    });
-
     if request.drain_wallet {
         if request.recipients.len() != 1 {
             return Err(invalid_transaction(
                 "Bitcoin drain transfer requires exactly one recipient",
             ));
         }
+        request.available.sort_by(canonical_outpoint_order);
         let selected_total = sum_utxos(&request.available)?;
-        let fee = predicted_fee(
-            &request.available,
-            &recipient_scripts,
-            request.fee_rate.units_per_weight,
-        )?;
+        let fee = predicted_fee(&request.available, &recipient_scripts, request.fee_rate)?;
         let value = selected_total.checked_sub(fee).ok_or_else(|| {
             insufficient_funds("Bitcoin UTXOs cannot cover the drain transaction fee")
         })?;
@@ -183,6 +169,14 @@ fn build_transaction(
         ));
     }
 
+    request.available.sort_by(|left, right| {
+        right
+            .value
+            .cmp(&left.value)
+            .then_with(|| left.transaction_id.cmp(&right.transaction_id))
+            .then_with(|| left.output_index.cmp(&right.output_index))
+    });
+
     let recipient_total = request.recipients.iter().try_fold(0_u64, |total, output| {
         total
             .checked_add(output.value.0)
@@ -198,11 +192,7 @@ fn build_transaction(
             .ok_or_else(|| invalid_transaction("Bitcoin selected input amount overflowed u64"))?;
         selected.push(utxo);
 
-        let fee_without_change = predicted_fee(
-            &selected,
-            &recipient_scripts,
-            request.fee_rate.units_per_weight,
-        )?;
+        let fee_without_change = predicted_fee(&selected, &recipient_scripts, request.fee_rate)?;
         let required = recipient_total
             .checked_add(fee_without_change)
             .ok_or_else(|| invalid_transaction("Bitcoin amount and fee overflowed u64"))?;
@@ -212,11 +202,7 @@ fn build_transaction(
 
         let mut with_change_scripts = recipient_scripts.clone();
         with_change_scripts.push(change_script.clone());
-        let fee_with_change = predicted_fee(
-            &selected,
-            &with_change_scripts,
-            request.fee_rate.units_per_weight,
-        )?;
+        let fee_with_change = predicted_fee(&selected, &with_change_scripts, request.fee_rate)?;
         let change = selected_total
             .checked_sub(recipient_total)
             .and_then(|value| value.checked_sub(fee_with_change));
@@ -239,6 +225,13 @@ fn build_transaction(
         ))
     })?;
     Ok(unsigned(request.signing_operation_id, selected, outputs))
+}
+
+fn canonical_outpoint_order(left: &BitcoinUtxo, right: &BitcoinUtxo) -> std::cmp::Ordering {
+    BitcoinTransactionId(left.transaction_id)
+        .to_string()
+        .cmp(&BitcoinTransactionId(right.transaction_id).to_string())
+        .then_with(|| left.output_index.cmp(&right.output_index))
 }
 
 fn unsigned(
@@ -265,7 +258,7 @@ fn unsigned(
 fn predicted_fee(
     inputs: &[BitcoinUtxo],
     output_scripts: &[ScriptBuf],
-    units_per_weight: u64,
+    fee_rate: crate::SatoshisPerKvb,
 ) -> Result<u64, ChainError> {
     let transaction = Transaction {
         version: Version::TWO,
@@ -301,9 +294,17 @@ fn predicted_fee(
         .checked_add(SEGWIT_MARKER_FLAG_WEIGHT)
         .and_then(|weight| weight.checked_add(satisfaction_weight))
         .ok_or_else(|| invalid_transaction("Bitcoin transaction weight overflowed u64"))?;
-    weight
-        .checked_mul(units_per_weight)
-        .ok_or_else(|| invalid_transaction("Bitcoin transaction fee overflowed u64"))
+    let virtual_size = weight.div_ceil(4);
+    fee_for_vsize(fee_rate, virtual_size)
+}
+
+fn fee_for_vsize(fee_rate: crate::SatoshisPerKvb, virtual_size: u64) -> Result<u64, ChainError> {
+    let numerator = u128::from(fee_rate.satoshis_per_kvb())
+        .checked_mul(u128::from(virtual_size))
+        .and_then(|value| value.checked_add(999))
+        .ok_or_else(|| invalid_transaction("Bitcoin transaction fee overflowed u128"))?;
+    u64::try_from(numerator / 1_000)
+        .map_err(|_| invalid_transaction("Bitcoin transaction fee overflowed u64"))
 }
 
 fn native_transaction(
@@ -404,6 +405,14 @@ impl BitcoinInputSigningContext<'_> {
         let signature = ecdsa::Signature::from_der(&signature.bytes).map_err(|error| {
             signer_error_message(format!("invalid DER Bitcoin signature: {error}"))
         })?;
+        let message = Message::from_digest(sighash.to_byte_array());
+        Secp256k1::verification_only()
+            .verify_ecdsa(&message, &signature, &public_key.0)
+            .map_err(|_| {
+                signer_error_message(format!(
+                    "Bitcoin signer returned an ECDSA signature that failed cryptographic verification for input {input_index}"
+                ))
+            })?;
         let signature = bitcoin::ecdsa::Signature {
             signature,
             sighash_type,
@@ -473,6 +482,14 @@ impl BitcoinInputSigningContext<'_> {
         let signature = schnorr::Signature::from_slice(&signature.bytes).map_err(|error| {
             signer_error_message(format!("invalid raw Bitcoin Schnorr signature: {error}"))
         })?;
+        let (output_key, _) = public_key.tap_tweak(&secp, None);
+        let message = Message::from_digest(sighash.to_byte_array());
+        secp.verify_schnorr(&signature, &message, output_key.as_x_only_public_key())
+            .map_err(|_| {
+                signer_error_message(format!(
+                    "Bitcoin signer returned a Schnorr signature that failed cryptographic verification for input {input_index}"
+                ))
+            })?;
         let signature = bitcoin::taproot::Signature {
             signature,
             sighash_type,
@@ -598,11 +615,57 @@ fn signer_error_message(message: impl Into<String>) -> ChainError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SatoshisPerKvb;
     use crate::{BitcoinAddressGenerator, BitcoinAddressKind, BitcoinGenerateAddress};
     use chain_contract::DepositAddressGenerator;
     use futures_executor::block_on;
     use signer_local::LocalSigner;
-    use transaction_utxo::FeeRate;
+
+    struct FaultySigner<'a> {
+        public_key_signer: &'a LocalSigner,
+        signature_signer: &'a LocalSigner,
+        replacement_key: Option<signer::KeyLocator>,
+        alter_digest: bool,
+    }
+
+    impl Signer for FaultySigner<'_> {
+        fn capabilities(&self) -> signer::SignerCapabilities {
+            self.signature_signer.capabilities()
+        }
+
+        fn status<'a>(
+            &'a self,
+        ) -> signer::BoxFuture<'a, Result<signer::SignerStatus, signer::SignerError>> {
+            self.signature_signer.status()
+        }
+
+        fn public_key<'a>(
+            &'a self,
+            key: &'a signer::KeyLocator,
+            curve: Curve,
+            format: PublicKeyFormat,
+        ) -> signer::BoxFuture<'a, Result<signer::PublicKey, signer::SignerError>> {
+            self.public_key_signer.public_key(key, curve, format)
+        }
+
+        fn sign<'a>(
+            &'a self,
+            mut request: SignRequest,
+        ) -> signer::BoxFuture<'a, Result<signer::Signature, signer::SignerError>> {
+            Box::pin(async move {
+                if self.alter_digest
+                    && let SignablePayload::Digest(digest) = &mut request.payload
+                    && let Some(first) = digest.bytes.first_mut()
+                {
+                    *first ^= 1;
+                }
+                if let Some(replacement_key) = &self.replacement_key {
+                    request.key = replacement_key.clone();
+                }
+                self.signature_signer.sign(request).await
+            })
+        }
+    }
 
     fn operation(value: impl Into<String>) -> OperationId {
         OperationId::new(value).expect("test operation ID must be valid")
@@ -625,12 +688,17 @@ mod tests {
         .expect("test Bitcoin address should be generated")
     }
 
-    fn build_and_sign(
+    fn build_transfer(
+        signer: &LocalSigner,
         kind: BitcoinAddressKind,
-    ) -> (UnsignedBitcoinTransaction, BitcoinSignedTransaction) {
-        let signer = LocalSigner::ephemeral_for_testing();
-        let source = generated_address(&signer, kind, "source");
-        let recipient = generated_address(&signer, BitcoinAddressKind::SegwitV0, "recipient");
+        purpose: &str,
+    ) -> UnsignedBitcoinTransaction {
+        let source = generated_address(signer, kind, &format!("{purpose}-source"));
+        let recipient = generated_address(
+            signer,
+            BitcoinAddressKind::SegwitV0,
+            &format!("{purpose}-recipient"),
+        );
         let source_script = checked_address(BitcoinNetwork::Regtest, &source.address)
             .expect("source address should parse")
             .script_pubkey();
@@ -639,9 +707,9 @@ mod tests {
             BitcoinAddressKind::Taproot => 67,
         };
         let codec = BitcoinTransactionCodec::new(BitcoinNetwork::Regtest);
-        let unsigned = codec
+        codec
             .build(BitcoinBuildRequest {
-                signing_operation_id: operation("sign-bitcoin-transfer"),
+                signing_operation_id: operation(format!("sign-{purpose}")),
                 available: vec![BitcoinUtxo {
                     transaction_id: [11; 32],
                     output_index: 1,
@@ -655,40 +723,203 @@ mod tests {
                     value: Satoshi(20_000),
                 }],
                 change_address: source.address,
-                fee_rate: FeeRate {
-                    units_per_weight: 1,
-                },
+                fee_rate: SatoshisPerKvb::new(1_000),
                 drain_wallet: false,
             })
-            .expect("Bitcoin transfer should build");
-        let signed =
-            block_on(codec.sign(unsigned.clone(), &signer)).expect("Bitcoin transfer should sign");
+            .expect("Bitcoin transfer should build")
+    }
+
+    fn build_and_sign(
+        kind: BitcoinAddressKind,
+    ) -> (UnsignedBitcoinTransaction, BitcoinSignedTransaction) {
+        let signer = LocalSigner::ephemeral_for_testing();
+        let unsigned = build_transfer(&signer, kind, "bitcoin-transfer");
+        let signed = block_on(
+            BitcoinTransactionCodec::new(BitcoinNetwork::Regtest).sign(unsigned.clone(), &signer),
+        )
+        .expect("Bitcoin transfer should sign");
         (unsigned, signed)
+    }
+
+    fn signing_error(signer: &dyn Signer, unsigned: UnsignedBitcoinTransaction) -> ChainError {
+        block_on(BitcoinTransactionCodec::new(BitcoinNetwork::Regtest).sign(unsigned, signer))
+            .expect_err("a cryptographically invalid custody signature must fail")
     }
 
     #[test]
     fn builds_and_signs_native_segwit_transfer() {
         let (unsigned, signed) = build_and_sign(BitcoinAddressKind::SegwitV0);
-        let native: Transaction = consensus::deserialize(&signed.consensus_bytes)
+        let native: Transaction = consensus::deserialize(signed.consensus_bytes())
             .expect("signed Bitcoin transaction should decode");
+        let output_total = unsigned
+            .outputs
+            .iter()
+            .map(|output| output.value.0)
+            .sum::<u64>();
 
         assert_eq!(native.input.len(), 1);
         assert_eq!(native.input[0].witness.len(), 2);
         assert_eq!(native.output.len(), 2);
-        assert_eq!(signed.id.0, native.compute_txid().to_byte_array());
+        assert_eq!(signed.id().0, native.compute_txid().to_byte_array());
+        assert_eq!(50_000 - output_total, 141);
         assert_eq!(unsigned.sighash_type, SighashType::All);
     }
 
     #[test]
     fn builds_and_signs_taproot_key_path_transfer() {
-        let (_, signed) = build_and_sign(BitcoinAddressKind::Taproot);
-        let native: Transaction = consensus::deserialize(&signed.consensus_bytes)
+        let (unsigned, signed) = build_and_sign(BitcoinAddressKind::Taproot);
+        let native: Transaction = consensus::deserialize(signed.consensus_bytes())
             .expect("signed Taproot transaction should decode");
+        let output_total = unsigned
+            .outputs
+            .iter()
+            .map(|output| output.value.0)
+            .sum::<u64>();
 
         assert_eq!(native.input.len(), 1);
         assert_eq!(native.input[0].witness.len(), 1);
         assert_eq!(native.input[0].witness[0].len(), 65);
-        assert_eq!(signed.id.0, native.compute_txid().to_byte_array());
+        assert_eq!(signed.id().0, native.compute_txid().to_byte_array());
+        assert_eq!(50_000 - output_total, 143);
+    }
+
+    #[test]
+    fn drain_inputs_use_canonical_transaction_id_and_output_index_order() {
+        let signer = LocalSigner::ephemeral_for_testing();
+        let source = generated_address(&signer, BitcoinAddressKind::SegwitV0, "drain-source");
+        let recipient = generated_address(&signer, BitcoinAddressKind::SegwitV0, "drain-recipient");
+        let script_pubkey = checked_address(BitcoinNetwork::Regtest, &source.address)
+            .expect("source address should parse")
+            .script_pubkey()
+            .into_bytes();
+        let available = vec![
+            BitcoinUtxo {
+                transaction_id: [0x22; 32],
+                output_index: 0,
+                value: Satoshi(70_000),
+                script_pubkey: script_pubkey.clone(),
+                satisfaction_weight: 109,
+                key: source.key.clone(),
+            },
+            BitcoinUtxo {
+                transaction_id: [0x11; 32],
+                output_index: 9,
+                value: Satoshi(20_000),
+                script_pubkey: script_pubkey.clone(),
+                satisfaction_weight: 109,
+                key: source.key.clone(),
+            },
+            BitcoinUtxo {
+                transaction_id: [0x11; 32],
+                output_index: 2,
+                value: Satoshi(30_000),
+                script_pubkey,
+                satisfaction_weight: 109,
+                key: source.key,
+            },
+        ];
+
+        let unsigned = BitcoinTransactionCodec::new(BitcoinNetwork::Regtest)
+            .build(BitcoinBuildRequest {
+                signing_operation_id: operation("canonical-drain-inputs"),
+                available,
+                recipients: vec![BitcoinOutput {
+                    address: recipient.address,
+                    value: Satoshi(0),
+                }],
+                change_address: source.address,
+                fee_rate: SatoshisPerKvb::new(1_000),
+                drain_wallet: true,
+            })
+            .expect("full-drain transaction should build");
+
+        assert_eq!(
+            unsigned
+                .inputs
+                .iter()
+                .map(|input| (input.utxo.transaction_id, input.utxo.output_index))
+                .collect::<Vec<_>>(),
+            vec![([0x11; 32], 2), ([0x11; 32], 9), ([0x22; 32], 0)]
+        );
+        assert_eq!(unsigned.outputs.len(), 1);
+    }
+
+    #[test]
+    fn rejects_p2wpkh_signature_for_wrong_digest() {
+        let signer = LocalSigner::ephemeral_for_testing();
+        let unsigned = build_transfer(&signer, BitcoinAddressKind::SegwitV0, "wrong-p2wpkh-digest");
+        let faulty = FaultySigner {
+            public_key_signer: &signer,
+            signature_signer: &signer,
+            replacement_key: None,
+            alter_digest: true,
+        };
+
+        let error = signing_error(&faulty, unsigned);
+
+        assert_eq!(error.kind, ChainErrorKind::Signer);
+        assert!(error.message.contains("ECDSA signature"));
+        assert!(error.message.contains("cryptographic verification"));
+    }
+
+    #[test]
+    fn rejects_p2wpkh_signature_from_wrong_signing_key() {
+        let owner = LocalSigner::ephemeral_for_testing();
+        let attacker = LocalSigner::ephemeral_for_testing();
+        let unsigned = build_transfer(&owner, BitcoinAddressKind::SegwitV0, "wrong-p2wpkh-key");
+        let attacker_key =
+            generated_address(&attacker, BitcoinAddressKind::SegwitV0, "p2wpkh-attacker").key;
+        let faulty = FaultySigner {
+            public_key_signer: &owner,
+            signature_signer: &attacker,
+            replacement_key: Some(attacker_key),
+            alter_digest: false,
+        };
+
+        let error = signing_error(&faulty, unsigned);
+
+        assert_eq!(error.kind, ChainErrorKind::Signer);
+        assert!(error.message.contains("ECDSA signature"));
+        assert!(error.message.contains("cryptographic verification"));
+    }
+
+    #[test]
+    fn rejects_p2tr_signature_for_wrong_digest() {
+        let signer = LocalSigner::ephemeral_for_testing();
+        let unsigned = build_transfer(&signer, BitcoinAddressKind::Taproot, "wrong-p2tr-digest");
+        let faulty = FaultySigner {
+            public_key_signer: &signer,
+            signature_signer: &signer,
+            replacement_key: None,
+            alter_digest: true,
+        };
+
+        let error = signing_error(&faulty, unsigned);
+
+        assert_eq!(error.kind, ChainErrorKind::Signer);
+        assert!(error.message.contains("Schnorr signature"));
+        assert!(error.message.contains("cryptographic verification"));
+    }
+
+    #[test]
+    fn rejects_p2tr_signature_from_wrong_signing_key() {
+        let owner = LocalSigner::ephemeral_for_testing();
+        let attacker = LocalSigner::ephemeral_for_testing();
+        let unsigned = build_transfer(&owner, BitcoinAddressKind::Taproot, "wrong-p2tr-key");
+        let attacker_key =
+            generated_address(&attacker, BitcoinAddressKind::Taproot, "p2tr-attacker").key;
+        let faulty = FaultySigner {
+            public_key_signer: &owner,
+            signature_signer: &attacker,
+            replacement_key: Some(attacker_key),
+            alter_digest: false,
+        };
+
+        let error = signing_error(&faulty, unsigned);
+
+        assert_eq!(error.kind, ChainErrorKind::Signer);
+        assert!(error.message.contains("Schnorr signature"));
+        assert!(error.message.contains("cryptographic verification"));
     }
 
     #[test]
@@ -716,13 +947,39 @@ mod tests {
                     value: Satoshi(10_000),
                 }],
                 change_address: source.address,
-                fee_rate: FeeRate {
-                    units_per_weight: 1,
-                },
+                fee_rate: SatoshisPerKvb::new(1_000),
                 drain_wallet: false,
             })
             .expect_err("duplicate UTXOs must fail");
 
         assert_eq!(error.kind, ChainErrorKind::InvalidTransaction);
+    }
+
+    #[test]
+    fn fee_rate_uses_vsize_and_rounds_up_to_a_satoshi() {
+        assert_eq!(
+            fee_for_vsize(SatoshisPerKvb::new(1_000), 141)
+                .expect("one satoshi per vbyte should calculate"),
+            141
+        );
+        assert_eq!(
+            fee_for_vsize(SatoshisPerKvb::new(1_001), 141)
+                .expect("fractional satoshi fee should round up"),
+            142
+        );
+        assert_eq!(
+            fee_for_vsize(SatoshisPerKvb::new(1), 141)
+                .expect("a positive sub-satoshi-per-vbyte rate should calculate"),
+            1
+        );
+    }
+
+    #[test]
+    fn fee_calculation_rejects_u64_overflow() {
+        let error = fee_for_vsize(SatoshisPerKvb::new(u64::MAX), 1_001)
+            .expect_err("fee above the satoshi representation must fail");
+
+        assert_eq!(error.kind, ChainErrorKind::InvalidTransaction);
+        assert!(error.message.contains("fee overflowed u64"));
     }
 }

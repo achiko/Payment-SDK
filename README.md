@@ -1,36 +1,55 @@
 # Payment SDK services and chain-native execution
 
 This workspace combines contract-first boundaries with concrete Ethereum v1
-service slices. It contains a stateless Bitcoin/Ethereum Wallet Service library,
-an authenticated stateless Ethereum Wallet HTTP runtime, a durable Ethereum
-Indexer Service, and a single-network Ethereum Payment Service backed by its own
-RocksDB database. A loopback-only ephemeral custody process supports disposable
-local development. PS and IX never open or write each other's storage.
+and Bitcoin block-only v1 service slices. It contains a stateless
+Bitcoin/Ethereum Wallet Service library, authenticated chain-specific Wallet
+HTTP runtimes, durable Ethereum and Bitcoin Indexer Service modes, and a
+single-network Payment Service mode for Ethereum or native Bitcoin, each backed
+by its own RocksDB database. A loopback-only ephemeral custody process supports
+disposable local development. PS and IX never open or write each other's
+storage.
 
 The implemented wallet capabilities are:
 
 - Ethereum EOA generation, balances, EIP-1559 build/sign/broadcast/receipt,
   native collection, and ERC-20 gas requirements plus one-transfer collection;
-- Bitcoin native SegWit v0 and Taproot address generation, deterministic UTXO
-  funding, chain-native signing, balances, receipts, and batched collection;
+- Bitcoin native SegWit v0 and Taproot address generation, exact caller-selected
+  UTXO validation, chain-native signing, canonical IX-backed balances, Core
+  preflight/broadcast/receipts, and batched collection attribution;
 - a generic `wallet_worker::WalletService` facade that shares one injected
   custody backend between provisioning and signing without owning persistence;
-- an Ethereum Wallet HTTP process using the concrete Ethereum JSON-RPC adapter
-  and authenticated remote key-provisioning/signing adapter;
-- an Ethereum IX process with durable watches, canonical checkpoints,
-  observations, revisions, reorg recovery, and a cursor feed; and
+- chain-specific Ethereum and Bitcoin Wallet HTTP modes using concrete node/IX
+  adapters and an authenticated remote key-provisioning/signing adapter;
+- Ethereum and Bitcoin IX process modes with durable watches, canonical
+  checkpoints, observations, revisions, reorg recovery, and a cursor feed;
+- a Bitcoin IX canonical UTXO projection with generation/revision/checkpoint
+  snapshot pagination and atomic connect, spend, rollback, rebuild, and cleanup
+  behavior;
 - an Ethereum PS process with authenticated APIs, durable jobs, deposit/watch
   recovery, IX mirroring, business projection, absolute ledgers, typed
-  reconciliation, and native/ERC-20 collection workflows.
+  reconciliation, and native/ERC-20 collection workflows;
+- a nested Bitcoin PS mode with strict policy binding, P2WPKH/P2TR deposits,
+  same-principal multi-deposit jobs, atomic exact-outpoint reservations,
+  deterministic shared-fee allocation, retained signed bytes, and block-only
+  confirmation/reorg projection. V1 permits only one Bitcoin collection
+  aggregate per deposit; later receipts remain watched/accounted but cannot
+  start another collection.
 
 `signer-local` and `apps/custody` are deliberately ephemeral and not production
 custody. `signer-remote` supplies the hardened client contract, but durable
 custody and secret storage remain external deployment responsibilities. The
 checked-in code does not by itself prove a live production deployment:
 production custody integration, operational TLS configuration, monitoring,
-automated Anvil acceptance, and real-node evidence remain separate work.
-Ethereum PS v1 deliberately excludes HA and multi-network ownership in one
-process/database.
+automated Anvil acceptance, and real-node evidence remain separate work. The
+Bitcoin Core 31 disposable-regtest acceptance scenario has not been run on this
+checkout because the required Core binary is unavailable; source and
+deterministic tests are not a substitute for that operational evidence. The
+checked-in [`manual procedure`](./docs/manual-bitcoin-regtest/README.md) remains
+unexecuted and does not change that status.
+Both PS modes deliberately exclude HA and multi-network ownership in one
+process/database. Bitcoin PS source and deterministic coverage do not prove a
+live Core-backed deployment, and no live/funded Bitcoin broadcast was performed
+as part of this implementation.
 
 The previous experimental workspace is preserved under [`old/`](./old). The
 current workspace is organized by architectural ownership:
@@ -53,9 +72,11 @@ The principal documents are:
 - [`docs/SYSTEM_REQUIREMENTS.md`](./docs/SYSTEM_REQUIREMENTS.md): canonical consolidated requirements and Mermaid flows;
 - [`ARCHITECTURE.md`](./ARCHITECTURE.md): ownership and dependency rules;
 - [`docs/CONTRACTS.md`](./docs/CONTRACTS.md): how the current traits compose;
-- [`docs/INDEXING.md`](./docs/INDEXING.md): proposed indexing and reorg flow;
+- [`docs/INDEXING.md`](./docs/INDEXING.md): implemented indexing and reorg model;
 - [`docs/INDEXER_SERVICE.md`](./docs/INDEXER_SERVICE.md): concrete Ethereum IX v1 runtime;
-- [`docs/WALLET_SERVICE.md`](./docs/WALLET_SERVICE.md): concrete stateless Ethereum WS runtime;
+- [`docs/WALLET_SERVICE.md`](./docs/WALLET_SERVICE.md): concrete stateless Ethereum and Bitcoin WS runtimes;
+- [`docs/BITCOIN_SERVICES.md`](./docs/BITCOIN_SERVICES.md): Bitcoin Core 31 prerequisites, chain-specific IX/WS/PS configuration, APIs, ownership, policy, and acceptance status;
+- [`docs/manual-bitcoin-regtest/README.md`](./docs/manual-bitcoin-regtest/README.md): unexecuted, opt-in Core 31 regtest acceptance commands and evidence matrix;
 - [`docs/WALLET_SERVICE_USAGE.md`](./docs/WALLET_SERVICE_USAGE.md): step-by-step native ETH and ERC-20 Rust library usage;
 - [`docs/PAYMENT_SERVICE.md`](./docs/PAYMENT_SERVICE.md): concrete Ethereum PS v1 runtime and API;
 - [`docs/manual-local-stack/README.md`](./docs/manual-local-stack/README.md): manual Anvil, IX, custody, WS, and PS startup using one private `.env` file;
@@ -63,6 +84,7 @@ The principal documents are:
 - [`docs/PAYMENT_SERVICE_POSTMAN.md`](./docs/PAYMENT_SERVICE_POSTMAN.md): Postman import, variables, safe manual smoke flow, and mutation gates;
 - [`docs/PAYMENT_SERVICE.postman_collection.json`](./docs/PAYMENT_SERVICE.postman_collection.json): importable Payment Service Postman collection;
 - [`docs/PAYMENT_SERVICE_AGENT_RUNBOOK.md`](./docs/PAYMENT_SERVICE_AGENT_RUNBOOK.md): safe local PS startup and evidence checklist for agent handoffs;
+- [`payment_sdk_demo/README.md`](./payment_sdk_demo/README.md): offline Bitcoin wallet and Payment Service samples plus the environment-backed Bitcoin indexer sample;
 - [`docs/FEATURE_VALIDATION.md`](./docs/FEATURE_VALIDATION.md): original PS/WS/IX feature traceability and corrections;
 - [`docs/RESEARCH.md`](./docs/RESEARCH.md): upstream type and architecture findings;
 - [`docs/REQUIREMENTS.md`](./docs/REQUIREMENTS.md): decisions still required before implementation;

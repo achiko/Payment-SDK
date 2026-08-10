@@ -57,7 +57,10 @@ pub(crate) async fn process_collection_job(
         JobPayload::RetryCollection(payload) => {
             prepare_explicit_retry(repository, job, payload).await?
         }
-        JobPayload::CreateDeposit(_) | JobPayload::CloseDeposit(_) => {
+        JobPayload::CreateDeposit(_)
+        | JobPayload::CloseDeposit(_)
+        | JobPayload::CreateUtxoBatchCollection(_)
+        | JobPayload::RetryUtxoBatchCollection(_) => {
             return Err(invalid(
                 "non-collection job reached the collection executor",
             ));
@@ -430,6 +433,7 @@ async fn sign_and_persist(
             expected,
             expected_transaction_id: transaction_id,
             envelope,
+            allocations: Vec::new(),
             signed_at,
             // This is a cleanup hint, not an authorization boundary. Exact
             // signed bytes remain recoverable until broadcast is accepted.
@@ -684,7 +688,10 @@ async fn another_gas_funding_transaction_is_in_flight(
             let collection_id = match job.payload {
                 JobPayload::CreateCollection(payload) => payload.collection_id,
                 JobPayload::RetryCollection(payload) => payload.collection_id,
-                JobPayload::CreateDeposit(_) | JobPayload::CloseDeposit(_) => continue,
+                JobPayload::CreateDeposit(_)
+                | JobPayload::CloseDeposit(_)
+                | JobPayload::CreateUtxoBatchCollection(_)
+                | JobPayload::RetryUtxoBatchCollection(_) => continue,
             };
             if &collection_id == current_collection_id || !inspected.insert(collection_id.clone()) {
                 continue;

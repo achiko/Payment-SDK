@@ -505,6 +505,7 @@ impl WalletSigner for EnvironmentEthereumSigner {
         SignerCapabilities {
             curves: vec![Curve::Secp256k1],
             schemes: vec![SignatureScheme::EcdsaSecp256k1],
+            key_tweaks: Vec::new(),
             can_sign_messages: false,
             can_sign_digests: true,
             requires_user_interaction: false,

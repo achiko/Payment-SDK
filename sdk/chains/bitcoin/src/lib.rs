@@ -3,6 +3,7 @@
 mod address;
 mod collection;
 mod indexer;
+mod production_wallet;
 mod rpc;
 mod transaction;
 mod wallet;
@@ -13,13 +14,23 @@ pub use collection::{
     BitcoinCollectionSource,
 };
 pub use indexer::{
-    BitcoinBlock, BitcoinBlockInterpreter, BitcoinIndexEvent, BitcoinUndo, BitcoinWatchTarget,
+    BitcoinBlock, BitcoinBlockInterpreter, BitcoinCoreBlockSource, BitcoinIndexEvent,
+    BitcoinIndexRecordCodec, BitcoinIndexRpc, BitcoinIndexSourceConfig, BitcoinIndexedOutput,
+    BitcoinIndexingCapabilities, BitcoinOutPoint, BitcoinProjectionKey, BitcoinUndo,
+    BitcoinUtxoKey, BitcoinUtxoProjection, BitcoinWatchTarget,
 };
-pub use rpc::{BitcoinRpc, BitcoinRpcUtxo};
+pub use production_wallet::{BitcoinNodePolicy, BitcoinProductionWallet};
+pub use rpc::{
+    BITCOIN_CORE_MAX_FEE_RATE_SATOSHIS_PER_KVB, BitcoinCoreClient, BitcoinCoreConfig,
+    BitcoinCoreNodeStatus, BitcoinNodeRpc, BitcoinPreflight, BitcoinRpc, BitcoinRpcUtxo,
+    BitcoinUtxoSet, BitcoinUtxoSource, format_bitcoin_block_hash, parse_bitcoin_block_hash,
+};
 pub use transaction::{
-    BitcoinBuildRequest, BitcoinInput, BitcoinOutput, BitcoinReceipt, BitcoinSignedTransaction,
+    BitcoinBuildRequest, BitcoinInput, BitcoinOutput, BitcoinReceipt, BitcoinSignedInputInspection,
+    BitcoinSignedOutputInspection, BitcoinSignedTransaction, BitcoinSignedTransactionInspection,
     BitcoinTransactionBuilder, BitcoinTransactionCodec, BitcoinTransactionId,
-    BitcoinTransactionSigning, BitcoinUtxo, SighashType, UnsignedBitcoinTransaction,
+    BitcoinTransactionSigning, BitcoinUtxo, SatoshisPerKvb, SighashType,
+    UnsignedBitcoinTransaction,
 };
 pub use wallet::{
     BitcoinAddressGenerator, BitcoinAddressKind, BitcoinGenerateAddress, BitcoinNetwork,

@@ -7,14 +7,32 @@ edition = "2024"
 name = "indexer"
 path = "src/indexer.rs"
 
+[[bin]]
+name = "bitcoin-wallet"
+path = "src/bitcoin_wallet.rs"
+
+[[bin]]
+name = "bitcoin-indexer"
+path = "src/bitcoin_indexer.rs"
+
+[[bin]]
+name = "bitcoin-payment-service"
+path = "src/bitcoin_payment_service.rs"
+
 [dependencies]
 wallet-worker = { path = "../apps/wallet" }
+chain-bitcoin = { path = "../sdk/chains/bitcoin" }
+chain-contract = { path = "../sdk/chains/contract" }
 chain-ethereum = { path = "../sdk/chains/ethereum" }
+chain-identity = { path = "../sdk/chains/identity" }
+deposits = { path = "../sdk/deposits" }
+indexing = { path = "../sdk/indexing" }
 signer = { path = "../sdk/signing/contract" }
 signer-local = { path = "../sdk/signing/local" }
 payment-http = { package = "http", path = "../packages/http" }
 indexer-worker = { path = "../apps/indexer" }
+storage-rocksdb = { path = "../sdk/storage/rocksdb" }
 
+tempfile = "=3.27.0"
 tokio = { version = "=1.49.0", features = ["macros", "rt-multi-thread"] }
-
-reqwest = { version = "=0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+dotenvy = "=0.15.7"

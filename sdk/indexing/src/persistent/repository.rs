@@ -10,12 +10,13 @@ use storage::{
 use super::{
     BASE_GENERATION, IndexRecordCodec, PersistentIndexRepository, keys,
     record::{
-        self, BlockRefRecordV1, BundleChangeRecordV1, BundleRecordV1, ChainValueRecordV1,
-        CounterRecordV1, CurrentObservationRecordV1, EventIdRecordV1, EventRecordV1,
-        ObservationRecordV1, PendingConfirmationRecordV1, PolicyMigrationIdRecordV1,
-        PolicyMigrationRecordV1, RebuildStateRecordV1, RepositoryMetaRecordV1, SyncStatusRecordV1,
-        WatchBackfillAppliedHeightRecordV1, WatchBackfillAppliedRecordV1, WatchBackfillRecordV1,
-        WatchIdempotencyRecordV1, WatchRecordV1,
+        self, BackfillProjectionRollbackRecordV1, BlockRefRecordV1, BundleChangeRecordV1,
+        BundleRecordV1, ChainValueRecordV1, CounterRecordV1, CurrentObservationRecordV1,
+        EventIdRecordV1, EventRecordV1, ObservationRecordV1, PendingConfirmationRecordV1,
+        PolicyMigrationIdRecordV1, PolicyMigrationRecordV1, RebuildStateRecordV1,
+        RepositoryMetaRecordV1, SyncStatusRecordV1, WatchBackfillAppliedHeightRecordV1,
+        WatchBackfillAppliedRecordV1, WatchBackfillRecordV1, WatchIdempotencyRecordV1,
+        WatchRecordV1,
     },
 };
 use crate::{
@@ -26,11 +27,13 @@ use crate::{
     IndexRepository, IndexScope, MigrateIndexPolicyCommand, MigrateIndexPolicyOutcome,
     ObservationDraft, ObservationDraftStatus, ObservationEventPage, ObservationEventRequest,
     ObservationRevision, ObservedTransaction, PolicyMigrationVersion,
-    PrepareRebuildActivationCommand, RebuildGeneration, RebuildPhase, RebuildReason, RebuildState,
-    RegisterWatchCommand, RegisterWatchOutcome, RevertTipCommand, RevertTipOutcome, SyncPhase,
-    SyncStatus, TransactionPage, TransactionPageRequest, TransactionRequest, TransactionStatus,
-    UnwatchCommand, UnwatchOutcome, ValidateRebuildCommand, WatchBackfill, WatchId, WatchReceipt,
-    WatchSelector, WatchSnapshot, WatchTarget, WatchVersion,
+    PrepareRebuildActivationCommand, ProjectionBatch, ProjectionCursor, ProjectionEntry,
+    ProjectionGetRequest, ProjectionGetResponse, ProjectionMutation, ProjectionPage,
+    ProjectionQuery, ProjectionScanRequest, ProjectionSnapshot, RebuildGeneration, RebuildPhase,
+    RebuildReason, RebuildState, RegisterWatchCommand, RegisterWatchOutcome, RevertTipCommand,
+    RevertTipOutcome, SyncPhase, SyncStatus, TransactionPage, TransactionPageRequest,
+    TransactionRequest, TransactionStatus, UnwatchCommand, UnwatchOutcome, ValidateRebuildCommand,
+    WatchBackfill, WatchId, WatchReceipt, WatchSelector, WatchSnapshot, WatchTarget, WatchVersion,
 };
 
 const RECORD_FORMAT_VERSION: u16 = 1;
@@ -243,6 +246,22 @@ where
             .transpose()
     }
 
+    async fn get_projection_record(
+        &self,
+        key: &Key,
+    ) -> Result<Option<Versioned<Vec<u8>>>, IndexError> {
+        self.storage
+            .get(&keys::namespace(), key)
+            .await
+            .map_err(Self::storage_error)
+            .map(|stored| {
+                stored.map(|stored| Versioned {
+                    value: stored.value.0,
+                    version: stored.version,
+                })
+            })
+    }
+
     async fn scan_records<T: Decode<()>>(
         &self,
         prefix: Vec<u8>,
@@ -397,6 +416,137 @@ where
         });
     }
 
+    async fn append_projection_batch(
+        &self,
+        batch: &mut WriteBatch,
+        generation: RebuildGeneration,
+        projection: &ProjectionBatch,
+        invalid_kind: IndexErrorKind,
+    ) -> Result<(), IndexError> {
+        let mut keys_seen = BTreeSet::new();
+        for mutation in &projection.mutations {
+            if !keys_seen.insert(mutation.key()) {
+                return Err(IndexError::new(
+                    invalid_kind,
+                    "projection batch contains a duplicate relative key",
+                    false,
+                ));
+            }
+            let target_key = keys::projection(&self.config.scope, generation, mutation.key());
+            let current_target = self.get_projection_record(&target_key).await?;
+            Self::condition_for(batch, target_key.clone(), current_target.as_ref());
+            match mutation {
+                ProjectionMutation::Put { value, .. } => {
+                    batch.operations.push(Operation::Put {
+                        namespace: keys::namespace(),
+                        key: target_key,
+                        value: Value(value.clone()),
+                    });
+                }
+                ProjectionMutation::PutIfPresent {
+                    required_key,
+                    value,
+                    ..
+                } => {
+                    if required_key.as_slice() == mutation.key() {
+                        return Err(IndexError::new(
+                            invalid_kind,
+                            "conditional projection target must differ from its required key",
+                            false,
+                        ));
+                    }
+                    let required_key =
+                        keys::projection(&self.config.scope, generation, required_key);
+                    let required = self.get_projection_record(&required_key).await?;
+                    Self::condition_for(batch, required_key, required.as_ref());
+                    if required.is_some() {
+                        batch.operations.push(Operation::Put {
+                            namespace: keys::namespace(),
+                            key: target_key,
+                            value: Value(value.clone()),
+                        });
+                    }
+                }
+                ProjectionMutation::Delete { .. } => Self::delete(batch, target_key),
+            }
+        }
+        Ok(())
+    }
+
+    async fn append_projection_revision(&self, batch: &mut WriteBatch) -> Result<u64, IndexError> {
+        let key = keys::projection_revision(&self.config.scope);
+        let current = self.counter(&key).await?;
+        let next = current.as_ref().map_or(Ok(1), |revision| {
+            revision.value.value.checked_add(1).ok_or_else(|| {
+                IndexError::new(
+                    IndexErrorKind::Storage,
+                    "projection revision is exhausted",
+                    false,
+                )
+            })
+        })?;
+        Self::condition_for(batch, key.clone(), current.as_ref());
+        Self::put(batch, key, &CounterRecordV1 { value: next })?;
+        Ok(next)
+    }
+
+    /// Applies historical projection discoveries without depending on
+    /// chronological execution relative to the live sync loop.
+    ///
+    /// A historical adapter must represent both creation and consumption as
+    /// disjoint immutable facts (`Put`). An identical existing value is an
+    /// idempotent no-op (for example, a second watch of the same address); a
+    /// conflicting value or a destructive `Delete` fails closed. The returned
+    /// keys are exactly those first introduced by this commit and therefore
+    /// need supplemental deletion if the retained canonical block is reverted.
+    async fn append_backfill_projection(
+        &self,
+        batch: &mut WriteBatch,
+        generation: RebuildGeneration,
+        projection: &ProjectionBatch,
+    ) -> Result<Vec<Vec<u8>>, IndexError> {
+        let mut keys_seen = BTreeSet::new();
+        let mut introduced = Vec::new();
+        for mutation in &projection.mutations {
+            if !keys_seen.insert(mutation.key()) {
+                return Err(IndexError::new(
+                    IndexErrorKind::InvalidBlock,
+                    "historical projection batch contains a duplicate relative key",
+                    false,
+                ));
+            }
+            let ProjectionMutation::Put { key, value } = mutation else {
+                return Err(IndexError::new(
+                    IndexErrorKind::InvalidBlock,
+                    "historical projection backfill must use unconditional order-independent put facts",
+                    false,
+                ));
+            };
+            let physical_key = keys::projection(&self.config.scope, generation, key);
+            let current = self.get_projection_record(&physical_key).await?;
+            match current {
+                Some(current) if current.value == *value => {}
+                Some(_) => {
+                    return Err(IndexError::new(
+                        IndexErrorKind::Storage,
+                        "historical projection conflicts with an existing canonical value",
+                        false,
+                    ));
+                }
+                None => {
+                    Self::condition_for::<Vec<u8>>(batch, physical_key.clone(), None);
+                    batch.operations.push(Operation::Put {
+                        namespace: keys::namespace(),
+                        key: physical_key,
+                        value: Value(value.clone()),
+                    });
+                    introduced.push(key.clone());
+                }
+            }
+        }
+        Ok(introduced)
+    }
+
     async fn active_generation_record(
         &self,
     ) -> Result<Option<Versioned<CounterRecordV1>>, IndexError> {
@@ -408,6 +558,40 @@ where
         self.active_generation_record().await.map(|record| {
             RebuildGeneration(record.map_or(BASE_GENERATION.0, |record| record.value.value))
         })
+    }
+
+    async fn projection_snapshot(&self) -> Result<ProjectionSnapshot, IndexError> {
+        let active = self.active_generation_record().await?;
+        let generation = RebuildGeneration(
+            active
+                .as_ref()
+                .map_or(BASE_GENERATION.0, |active| active.value.value),
+        );
+        let revision = self
+            .counter(&keys::projection_revision(&self.config.scope))
+            .await?
+            .map_or(0, |revision| revision.value.value);
+        let checkpoint = self
+            .generation_checkpoint(generation)
+            .await?
+            .map(|checkpoint| record::block_from_record(checkpoint.value));
+        Ok(ProjectionSnapshot {
+            generation,
+            revision,
+            checkpoint,
+        })
+    }
+
+    fn ensure_projection_snapshot(
+        expected: &ProjectionSnapshot,
+        actual: &ProjectionSnapshot,
+        message: &'static str,
+    ) -> Result<(), IndexError> {
+        if expected == actual {
+            Ok(())
+        } else {
+            Err(IndexError::new(IndexErrorKind::Conflict, message, true))
+        }
     }
 
     async fn generation_checkpoint(
@@ -618,7 +802,18 @@ where
         &'a self,
         command: CommitWatchBackfillCommand,
     ) -> crate::BoxFuture<'a, Result<CommitWatchBackfillOutcome, IndexError>> {
-        Box::pin(async move { self.apply_watch_backfill(command).await })
+        Box::pin(async move {
+            self.apply_watch_backfill(command, ProjectionBatch::default())
+                .await
+        })
+    }
+
+    fn commit_watch_backfill_projection<'a>(
+        &'a self,
+        command: CommitWatchBackfillCommand,
+        projection: ProjectionBatch,
+    ) -> crate::BoxFuture<'a, Result<CommitWatchBackfillOutcome, IndexError>> {
+        Box::pin(async move { self.apply_watch_backfill(command, projection).await })
     }
 
     fn register_watch<'a>(
@@ -778,7 +973,7 @@ where
             Self::put(&mut batch, watch_key, &watch)?;
             if let Some(through) = checkpoint
                 .as_ref()
-                .filter(|checkpoint| command.request.start_height.0 < checkpoint.value.height)
+                .filter(|checkpoint| command.request.start_height.0 <= checkpoint.value.height)
             {
                 let backfill_key = keys::watch_backfill(&self.config.scope, &watch_id.0);
                 Self::condition_for::<WatchBackfillRecordV1>(
@@ -814,6 +1009,24 @@ where
             self.check_scope(&command.scope)?;
             self.verify_metadata().await?;
             self.ensure_semantic_available().await?;
+            let active = self.active_generation_record().await?;
+            let generation = RebuildGeneration(
+                active
+                    .as_ref()
+                    .map_or(BASE_GENERATION.0, |active| active.value.value),
+            );
+            let checkpoint_key = keys::canonical_checkpoint(&self.config.scope, generation);
+            let checkpoint = self.get_record::<BlockRefRecordV1>(&checkpoint_key).await?;
+            let current_checkpoint = checkpoint
+                .as_ref()
+                .map(|checkpoint| record::block_from_record(checkpoint.value.clone()));
+            if current_checkpoint != command.expected_checkpoint {
+                return Err(IndexError::new(
+                    IndexErrorKind::Conflict,
+                    "canonical checkpoint changed before watch deactivation",
+                    true,
+                ));
+            }
             let watch_key = keys::watch(&self.config.scope, &command.watch_id.0);
             let watch = self
                 .get_record::<WatchRecordV1>(&watch_key)
@@ -823,6 +1036,18 @@ where
                 })?;
             if watch.value.inactive_from.is_some() {
                 return Ok(UnwatchOutcome::AlreadyInactive);
+            }
+            let backfill_key = keys::watch_backfill(&self.config.scope, &command.watch_id.0);
+            if self
+                .get_record::<WatchBackfillRecordV1>(&backfill_key)
+                .await?
+                .is_some()
+            {
+                return Err(IndexError::new(
+                    IndexErrorKind::Conflict,
+                    "watch cannot become inactive while historical backfill is pending",
+                    true,
+                ));
             }
             if command.inactive_from.0 < watch.value.start_height {
                 return Err(IndexError::new(
@@ -844,9 +1069,16 @@ where
             Self::condition_for(&mut batch, watch_key.clone(), Some(&watch));
             Self::condition_for(
                 &mut batch,
+                keys::active_generation(&self.config.scope),
+                active.as_ref(),
+            );
+            Self::condition_for(&mut batch, checkpoint_key, checkpoint.as_ref());
+            Self::condition_for(
+                &mut batch,
                 watch_version_key.clone(),
                 watch_version.as_ref(),
             );
+            Self::condition_for::<WatchBackfillRecordV1>(&mut batch, backfill_key, None);
             Self::put(&mut batch, watch_key, &updated)?;
             Self::put(
                 &mut batch,
@@ -1002,6 +1234,132 @@ where
         command: CleanupGenerationCommand,
     ) -> crate::BoxFuture<'a, Result<CleanupGenerationOutcome, IndexError>> {
         Box::pin(async move { self.remove_generation(command).await })
+    }
+}
+
+impl<S, C> ProjectionQuery for PersistentIndexRepository<S, C>
+where
+    S: Storage,
+    C: IndexRecordCodec,
+{
+    fn projection_get<'a>(
+        &'a self,
+        request: ProjectionGetRequest,
+    ) -> crate::BoxFuture<'a, Result<ProjectionGetResponse, IndexError>> {
+        Box::pin(async move {
+            self.check_scope(&request.scope)?;
+            self.verify_metadata().await?;
+            self.ensure_semantic_available().await?;
+
+            let snapshot = self.projection_snapshot().await?;
+            if let Some(expected) = &request.expected_snapshot {
+                Self::ensure_projection_snapshot(
+                    expected,
+                    &snapshot,
+                    "projection changed before the dependent lookup",
+                )?;
+            }
+            let key = keys::projection(&request.scope, snapshot.generation, &request.key);
+            let value = self
+                .get_projection_record(&key)
+                .await?
+                .map(|record| record.value);
+            let after = self.projection_snapshot().await?;
+            Self::ensure_projection_snapshot(
+                &snapshot,
+                &after,
+                "projection changed during the lookup",
+            )?;
+
+            Ok(ProjectionGetResponse { snapshot, value })
+        })
+    }
+
+    fn projection_scan<'a>(
+        &'a self,
+        request: ProjectionScanRequest,
+    ) -> crate::BoxFuture<'a, Result<ProjectionPage, IndexError>> {
+        Box::pin(async move {
+            self.check_scope(&request.scope)?;
+            self.verify_metadata().await?;
+            self.ensure_semantic_available().await?;
+            Self::validate_query_limit(request.limit)?;
+
+            let snapshot = self.projection_snapshot().await?;
+            if let Some(after) = &request.after {
+                Self::ensure_projection_snapshot(
+                    &after.snapshot,
+                    &snapshot,
+                    "projection cursor belongs to a snapshot that is no longer current",
+                )?;
+                if !after.key.starts_with(&request.prefix) {
+                    return Err(IndexError::new(
+                        IndexErrorKind::InvalidRequest,
+                        "projection cursor does not match the requested prefix",
+                        false,
+                    ));
+                }
+            }
+
+            let base_prefix = keys::projection_prefix(&request.scope, snapshot.generation, &[]);
+            let physical_prefix =
+                keys::projection_prefix(&request.scope, snapshot.generation, &request.prefix);
+            let page = self
+                .storage
+                .scan(ScanRequest {
+                    namespace: keys::namespace(),
+                    prefix: physical_prefix,
+                    after: request.after.as_ref().map(|cursor| {
+                        keys::projection(&request.scope, snapshot.generation, &cursor.key)
+                    }),
+                    limit: request.limit,
+                })
+                .await
+                .map_err(Self::storage_error)?;
+
+            let relative_key = |key: Key| {
+                key.0
+                    .strip_prefix(base_prefix.as_slice())
+                    .map(<[u8]>::to_vec)
+                    .ok_or_else(|| {
+                        IndexError::new(
+                            IndexErrorKind::Storage,
+                            "projection scan returned a key outside its generation prefix",
+                            false,
+                        )
+                    })
+            };
+            let entries = page
+                .entries
+                .into_iter()
+                .map(|(key, stored)| {
+                    Ok(ProjectionEntry {
+                        key: relative_key(key)?,
+                        value: stored.value.0,
+                    })
+                })
+                .collect::<Result<Vec<_>, IndexError>>()?;
+            let next = page
+                .next
+                .map(relative_key)
+                .transpose()?
+                .map(|key| ProjectionCursor {
+                    snapshot: snapshot.clone(),
+                    key,
+                });
+            let after = self.projection_snapshot().await?;
+            Self::ensure_projection_snapshot(
+                &snapshot,
+                &after,
+                "projection changed during the scan",
+            )?;
+
+            Ok(ProjectionPage {
+                snapshot,
+                entries,
+                next,
+            })
+        })
     }
 }
 
@@ -1637,6 +1995,14 @@ where
             )?;
         }
 
+        self.append_projection_batch(
+            &mut batch,
+            generation,
+            &command.block.projection,
+            IndexErrorKind::InvalidBlock,
+        )
+        .await?;
+
         let encoded_undo = self.codec.encode_undo(&command.block.undo)?;
         let bundle = BundleRecordV1 {
             block: record::block_to_record(&command.block.block),
@@ -1691,6 +2057,10 @@ where
                 &mut batch,
                 keys::bundle(&self.config.scope, generation, anchor_height),
             );
+            Self::delete(
+                &mut batch,
+                keys::backfill_projection_rollback(&self.config.scope, generation, anchor_height),
+            );
             if let Some(pruned_height) = anchor_height.0.checked_sub(1) {
                 Self::delete(
                     &mut batch,
@@ -1710,6 +2080,8 @@ where
             next_rebuild.checkpoint = Some(record::block_to_record(&command.block.block));
             Self::put(&mut batch, rebuild_key, &next_rebuild)?;
         }
+
+        self.append_projection_revision(&mut batch).await?;
 
         self.storage
             .commit(batch)
@@ -1788,10 +2160,61 @@ where
                 false,
             ));
         }
-        // Decoding is deliberate even though repository-owned change records
-        // perform the generic projection rollback. It detects a chain-codec or
-        // on-disk undo incompatibility before any canonical state is changed.
-        drop(self.codec.decode_undo(&bundle.value.encoded_undo)?);
+        // Decoding detects a chain-codec or on-disk undo incompatibility before
+        // any canonical state is changed. The codec may also derive inverse
+        // opaque projection changes from the decoded chain-owned undo.
+        let decoded_undo = self.codec.decode_undo(&bundle.value.encoded_undo)?;
+        let mut rollback_projection = self.codec.rollback_projection(&decoded_undo)?;
+        let backfill_rollback_key = keys::backfill_projection_rollback(
+            &self.config.scope,
+            generation,
+            command.expected_tip.height,
+        );
+        let backfill_rollback = self
+            .get_record::<BackfillProjectionRollbackRecordV1>(&backfill_rollback_key)
+            .await?;
+        if let Some(backfill_rollback) = &backfill_rollback {
+            if record::block_from_record(backfill_rollback.value.block.clone())
+                != command.expected_tip
+            {
+                return Err(IndexError::new(
+                    IndexErrorKind::Storage,
+                    "historical projection rollback record does not match the canonical tip",
+                    false,
+                ));
+            }
+            let mut rollback_keys = rollback_projection
+                .mutations
+                .iter()
+                .map(ProjectionMutation::key)
+                .map(<[u8]>::to_vec)
+                .collect::<BTreeSet<_>>();
+            if rollback_keys.len() != rollback_projection.mutations.len() {
+                return Err(IndexError::new(
+                    IndexErrorKind::Storage,
+                    "chain projection rollback contains duplicate keys",
+                    false,
+                ));
+            }
+            for key in &backfill_rollback.value.relative_keys {
+                if !rollback_keys.insert(key.clone()) {
+                    let is_same_delete = rollback_projection.mutations.iter().any(|mutation| {
+                        matches!(mutation, ProjectionMutation::Delete { key: existing } if existing == key)
+                    });
+                    if !is_same_delete {
+                        return Err(IndexError::new(
+                            IndexErrorKind::Storage,
+                            "chain and historical projection rollback overlap is not an identical delete",
+                            false,
+                        ));
+                    }
+                    continue;
+                }
+                rollback_projection
+                    .mutations
+                    .push(ProjectionMutation::Delete { key: key.clone() });
+            }
+        }
 
         let prior_checkpoint = bundle
             .value
@@ -1811,6 +2234,21 @@ where
         Self::condition_for(&mut batch, checkpoint_key.clone(), checkpoint.as_ref());
         Self::condition_for(&mut batch, canonical_key.clone(), Some(&canonical));
         Self::condition_for(&mut batch, bundle_key.clone(), Some(&bundle));
+        Self::condition_for(
+            &mut batch,
+            backfill_rollback_key.clone(),
+            backfill_rollback.as_ref(),
+        );
+        self.append_projection_batch(
+            &mut batch,
+            generation,
+            &rollback_projection,
+            IndexErrorKind::Storage,
+        )
+        .await?;
+        if backfill_rollback.is_some() {
+            Self::delete(&mut batch, backfill_rollback_key);
+        }
 
         let event_counter_key = keys::event_counter(&self.config.scope);
         let event_counter = if bundle.value.changes.is_empty() {
@@ -1965,6 +2403,7 @@ where
             Some(prior) => Self::put(&mut batch, checkpoint_key, &record::block_to_record(prior))?,
             None => Self::delete(&mut batch, checkpoint_key),
         }
+        self.append_projection_revision(&mut batch).await?;
         self.storage
             .commit(batch)
             .await
@@ -2111,6 +2550,7 @@ where
     async fn apply_watch_backfill(
         &self,
         command: CommitWatchBackfillCommand,
+        projection: ProjectionBatch,
     ) -> Result<CommitWatchBackfillOutcome, IndexError> {
         self.check_scope(&command.scope)?;
         self.verify_metadata().await?;
@@ -2490,6 +2930,10 @@ where
             None,
         );
 
+        let introduced_projection_keys = self
+            .append_backfill_projection(&mut batch, generation, &projection)
+            .await?;
+
         self.extend_backfill_confirmation_undo(
             &mut batch,
             generation,
@@ -2524,6 +2968,47 @@ where
             if updated != bundle.value {
                 Self::condition_for(&mut batch, bundle_key.clone(), Some(&bundle));
                 Self::put(&mut batch, bundle_key, &updated)?;
+            }
+
+            if !introduced_projection_keys.is_empty() {
+                let rollback_key = keys::backfill_projection_rollback(
+                    &self.config.scope,
+                    generation,
+                    command.block.height,
+                );
+                let rollback = self
+                    .get_record::<BackfillProjectionRollbackRecordV1>(&rollback_key)
+                    .await?;
+                let mut rollback_value = rollback.as_ref().map_or_else(
+                    || BackfillProjectionRollbackRecordV1 {
+                        block: record::block_to_record(&command.block),
+                        relative_keys: Vec::new(),
+                    },
+                    |rollback| rollback.value.clone(),
+                );
+                if record::block_from_record(rollback_value.block.clone()) != command.block {
+                    return Err(IndexError::new(
+                        IndexErrorKind::Storage,
+                        "historical projection rollback record belongs to another block",
+                        false,
+                    ));
+                }
+                let mut rollback_keys = rollback_value
+                    .relative_keys
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                if rollback_keys.len() != rollback_value.relative_keys.len() {
+                    return Err(IndexError::new(
+                        IndexErrorKind::Storage,
+                        "historical projection rollback record contains duplicate keys",
+                        false,
+                    ));
+                }
+                rollback_keys.extend(introduced_projection_keys);
+                rollback_value.relative_keys = rollback_keys.into_iter().collect();
+                Self::condition_for(&mut batch, rollback_key.clone(), rollback.as_ref());
+                Self::put(&mut batch, rollback_key, &rollback_value)?;
             }
         }
 
@@ -2638,6 +3123,7 @@ where
             }
             None => Self::delete(&mut batch, job_key),
         }
+        self.append_projection_revision(&mut batch).await?;
         self.storage
             .commit(batch)
             .await
@@ -3964,6 +4450,7 @@ where
             status_key,
             &record::sync_status_to_record(&status),
         )?;
+        self.append_projection_revision(&mut batch).await?;
         self.storage
             .commit(batch)
             .await
@@ -4007,6 +4494,7 @@ where
             Self::delete(&mut batch, key);
         }
         Self::delete(&mut batch, rebuild_key);
+        self.append_projection_revision(&mut batch).await?;
         self.storage
             .commit(batch)
             .await
@@ -4098,6 +4586,7 @@ where
         for key in keys_to_delete {
             Self::delete(&mut batch, key);
         }
+        self.append_projection_revision(&mut batch).await?;
         self.storage
             .commit(batch)
             .await

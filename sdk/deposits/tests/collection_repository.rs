@@ -95,6 +95,7 @@ async fn create_and_broadcast(
             expected: guard(&created, 0),
             expected_transaction_id: transaction_id.clone(),
             envelope: SignedEnvelopeBytes::new(vec![1, 2, 3, 4])?,
+            allocations: Vec::new(),
             signed_at: 110,
             expires_at: 1_000,
         })
@@ -192,6 +193,7 @@ async fn signed_envelope_and_transaction_attribution_survive_restart_before_broa
                 expected: guard(&created, 0),
                 expected_transaction_id: tx.clone(),
                 envelope: SignedEnvelopeBytes::new(vec![9, 8, 7])?,
+                allocations: Vec::new(),
                 signed_at: 110,
                 expires_at: 1_000,
             })
@@ -290,6 +292,7 @@ async fn optimistic_state_and_confirmation_attribution_are_enforced()
             expected: guard(&created, 0),
             expected_transaction_id: tx.clone(),
             envelope: SignedEnvelopeBytes::new(vec![4, 5, 6])?,
+            allocations: Vec::new(),
             signed_at: 110,
             expires_at: 1_000,
         })

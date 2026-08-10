@@ -3,9 +3,9 @@ use reqwest::{Method, StatusCode, redirect::Policy};
 use serde::{Serialize, de::DeserializeOwned};
 use signer::{
     BoxFuture, ChildIndex, Curve, DerivationPath, Digest, KeyLocator, KeyProvisionRequest,
-    KeyProvisioner, KeyTweak, OperationId, ProvisionedKey, PublicKey, PublicKeyFormat, SignRequest,
-    SignablePayload, Signature, SignatureEncoding, SignatureScheme, Signer, SignerCapabilities,
-    SignerError, SignerErrorKind, SignerStatus, UserInteraction,
+    KeyProvisioner, KeyTweak, KeyTweakKind, OperationId, ProvisionedKey, PublicKey,
+    PublicKeyFormat, SignRequest, SignablePayload, Signature, SignatureEncoding, SignatureScheme,
+    Signer, SignerCapabilities, SignerError, SignerErrorKind, SignerStatus, UserInteraction,
 };
 use std::{fmt, time::Duration};
 
@@ -54,6 +54,7 @@ impl RemoteSignerClient {
             capabilities: SignerCapabilities {
                 curves: Vec::new(),
                 schemes: Vec::new(),
+                key_tweaks: Vec::new(),
                 can_sign_messages: false,
                 can_sign_digests: false,
                 requires_user_interaction: false,
@@ -165,6 +166,11 @@ impl RemoteSignerClient {
                 .into_iter()
                 .map(signature_scheme_from_wire)
                 .collect(),
+            key_tweaks: response
+                .key_tweaks
+                .into_iter()
+                .map(key_tweak_kind_from_wire)
+                .collect(),
             can_sign_messages: response.can_sign_messages,
             can_sign_digests: response.can_sign_digests,
             requires_user_interaction: response.requires_user_interaction,
@@ -255,6 +261,12 @@ impl RemoteSignerClient {
             error: protocol_error("remote custody returned an invalid JSON response"),
             retryable: false,
         })
+    }
+}
+
+const fn key_tweak_kind_from_wire(value: wire::KeyTweakKind) -> KeyTweakKind {
+    match value {
+        wire::KeyTweakKind::Secp256k1Add => KeyTweakKind::Secp256k1Add,
     }
 }
 

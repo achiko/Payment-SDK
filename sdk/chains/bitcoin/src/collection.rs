@@ -1,7 +1,6 @@
-use crate::{BitcoinAddress, Satoshi};
+use crate::{BitcoinAddress, Satoshi, SatoshisPerKvb};
 use indexing::BlockHeight;
 use signer::{KeyLocator, OperationId};
-use transaction_utxo::FeeRate;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BitcoinCollectionSource {
@@ -17,7 +16,7 @@ pub struct BitcoinBatchCollectionRequest {
     pub sources: Vec<BitcoinCollectionSource>,
     pub destination: BitcoinAddress,
     pub minimum_confirmations: u64,
-    pub fee_rate: Option<FeeRate>,
+    pub fee_rate: Option<SatoshisPerKvb>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

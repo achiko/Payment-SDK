@@ -23,11 +23,18 @@ own blocks and transactions.
   transaction facts by transaction ID or address.
 - [`ObservationEventSource`](../sdk/indexing/src/service.rs) provides durable,
   cursor-based replay independent of its push/poll transport.
+- [`ProjectionQuery`](../sdk/indexing/src/projection.rs) exposes a chain-owned,
+  generation/revision/checkpoint-fenced opaque projection without leaking
+  physical storage keys.
 - [`ObservationDraft`](../sdk/indexing/src/observation.rs) carries interpreted
   facts before the repository assigns revisions, IDs, and feed cursors.
 
 The approved Ethereum v1 configuration is detailed in
 [`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md). It processes no mempool state.
+Bitcoin v1 is also block-only. It consumes an unpruned Bitcoin Core 31 source,
+requires a synchronized transaction index, resolves every input previous
+output, and materializes watched canonical UTXOs in the same atomic commit as
+the block, undo, observations, feed rows, and checkpoint.
 
 ## Address registration
 
@@ -66,8 +73,8 @@ repeated idempotency key after step 5.
 6. Verify height and parent hash connect to the persisted checkpoint.
 7. Load watches active at that height.
 8. Ask the concrete chain interpreter for events and undo information.
-9. Atomically persist block identity, chain-native effects, undo data,
-   normalized observations, and the new checkpoint.
+9. Atomically persist block identity, chain-native projection effects, undo
+   data, normalized observations, and the new checkpoint.
 10. Recompute confirmation depth for previously included watched transactions.
 11. Append every changed transaction revision to IX's event feed in the same
     atomic operation as its current state.
@@ -144,6 +151,14 @@ replacement handling.
 Bitcoin watches scripts/addresses, indexes created outputs and spent
 outpoints, and derives balance from canonical unspent outputs. Input relevance
 requires resolving the previous outputs being spent.
+
+Bitcoin v1 assigns stable movements independently: `txid:vin:index` for each
+input and `txid:vout:index` for each output. Fees require every spent output and
+are calculated as the checked input sum minus output sum. A transaction is
+never collapsed into a fabricated single sender-to-recipient movement. The
+projection retains immutable creation values and records spends as separate
+markers. Reorg undo removes orphaned markers to expose the retained creation
+again, while orphaned creations are removed.
 
 Ethereum has several distinct sources of value movement:
 

@@ -1,10 +1,10 @@
-//! WS composition root: authenticated stateless Ethereum chain operations.
+//! WS composition root: authenticated stateless Ethereum or Bitcoin operations.
 
 mod config;
 mod runtime;
 
 use clap::Parser;
-use config::{Cli, Command};
+use config::{BitcoinCommand, Cli, Command};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -17,5 +17,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     match Cli::parse().command {
         Command::Serve(options) => runtime::serve(options).await,
+        Command::Bitcoin(options) => match options.command {
+            BitcoinCommand::Serve(options) => runtime::serve_bitcoin(options).await,
+        },
     }
 }

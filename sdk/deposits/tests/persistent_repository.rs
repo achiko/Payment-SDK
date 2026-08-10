@@ -11,15 +11,16 @@ use bincode::Encode;
 use chain_identity::{AssetId, AtomicAmount, CanonicalAddress, CanonicalTransactionId, ChainId};
 use deposits::{
     AccountingCommand, AppendObservation, ApplyResult, AwaitingWatchPageRequest, CloseDeposit,
-    CommandIdentity, CommandOperation, CommandPrincipal, ConsumerCheckpointName, CreateDeposit,
-    CreateDepositWithLedger, DepositBalances, DepositErrorKind, DepositId,
+    CollectionId, CommandIdentity, CommandOperation, CommandPrincipal, ConsumerCheckpointName,
+    CreateDeposit, CreateDepositWithLedger, DepositBalances, DepositErrorKind, DepositId,
     DepositIndexRebuildRequest, DepositLedger, DepositObservationLogRequest, DepositPageRequest,
     DepositState, DepositStateKind, DepositStore, IdempotencyKey, LEGACY_DEPOSIT_KEY_PURPOSE,
     LedgerEffect, LedgerEntryCause, LedgerEntryId, LedgerPageRequest, MirrorObservation,
     MirrorOutcome, MirroredObservation, ObservationConsumerCheckpoints, ObservationEventLog,
-    PersistentPaymentRepository, ProjectObservation, ProjectionId, ReconciliationCase,
-    ReconciliationCaseId, ReconciliationDecision, ReconciliationReason, ReconciliationState,
-    ReconciliationStore, RecordObservation, RequestHash, ResolveReconciliation, UserId,
+    PersistentPaymentRepository, ProjectObservation, ProjectionFeeTreatment, ProjectionId,
+    ReconciliationCase, ReconciliationCaseId, ReconciliationDecision, ReconciliationReason,
+    ReconciliationState, ReconciliationStore, RecordObservation, RequestHash,
+    ResolveReconciliation, UserId,
 };
 use indexing::{
     BlockHash, BlockHeight, BlockRef, ConfirmationProof, EventCursor, IndexScope, MovementId,
@@ -1176,6 +1177,8 @@ async fn post_credit_reorg_projection_opens_and_resolves_a_blocking_case()
                 recorded_at: 1_020,
             }],
             reconciliation_cases: Vec::new(),
+            fee_treatment: ProjectionFeeTreatment::Separate,
+            utxo_batch_transition: None,
         })
         .await?
         .ledger_results
@@ -1272,6 +1275,8 @@ async fn post_credit_reorg_projection_opens_and_resolves_a_blocking_case()
             recorded_at: 1_032,
         }],
         reconciliation_cases: vec![reconciliation.clone()],
+        fee_treatment: ProjectionFeeTreatment::Separate,
+        utxo_batch_transition: None,
     };
 
     let result = repository.project_and_advance(projection.clone()).await?;
@@ -1638,6 +1643,8 @@ async fn rocksdb_projects_included_confirmed_reorged_and_reincluded_revisions_on
                 recorded_at: 2_001,
             }],
             reconciliation_cases: Vec::new(),
+            fee_treatment: ProjectionFeeTreatment::Separate,
+            utxo_batch_transition: None,
         })
         .await?;
     let included_entry = match &included_result.ledger_results[0] {
@@ -1694,6 +1701,8 @@ async fn rocksdb_projects_included_confirmed_reorged_and_reincluded_revisions_on
                 recorded_at: 2_002,
             }],
             reconciliation_cases: Vec::new(),
+            fee_treatment: ProjectionFeeTreatment::Separate,
+            utxo_batch_transition: None,
         })
         .await?;
     let confirmed_entry = match &confirmed_result.ledger_results[0] {
@@ -1751,6 +1760,8 @@ async fn rocksdb_projects_included_confirmed_reorged_and_reincluded_revisions_on
                 recorded_at: 2_004,
             }],
             reconciliation_cases: Vec::new(),
+            fee_treatment: ProjectionFeeTreatment::Separate,
+            utxo_batch_transition: None,
         })
         .await?;
     let reorged_entry = match &reorged_result.ledger_results[0] {
@@ -1799,6 +1810,8 @@ async fn rocksdb_projects_included_confirmed_reorged_and_reincluded_revisions_on
             recorded_at: 2_005,
         }],
         reconciliation_cases: Vec::new(),
+        fee_treatment: ProjectionFeeTreatment::Separate,
+        utxo_batch_transition: None,
     };
     let reincluded_result = repository
         .project_and_advance(reincluded_command.clone())
@@ -1819,6 +1832,275 @@ async fn rocksdb_projects_included_confirmed_reorged_and_reincluded_revisions_on
             .as_slice(),
         [ApplyResult::AlreadyPresent { .. }]
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn input_output_net_projection_handles_debit_credit_zero_and_atomic_conflict_case()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let created = repository.create_with_ledger(create_deposit()).await?;
+    let deposit_address = created.deposit.address.clone();
+
+    let funding = observation_revision(
+        "net-funding",
+        1,
+        "net-funding-tx",
+        1,
+        included_status(),
+        None,
+        vec![ValueMovement {
+            id: MovementId("net-funding-output".to_owned()),
+            asset: asset(),
+            amount: amount(100),
+            from: None,
+            to: Some(deposit_address.clone()),
+            kind: MovementKind::Output,
+        }],
+    );
+    repository
+        .mirror_and_advance(MirrorObservation {
+            expected_cursor: None,
+            observation: funding.clone(),
+        })
+        .await?;
+    let funded = repository
+        .project_and_advance(ProjectObservation {
+            expected_cursor: None,
+            through: EventCursor(1),
+            affected_deposits: vec![created.deposit.id.clone()],
+            ledger_updates: vec![RecordObservation {
+                event_id: funding.event.id,
+                effect: LedgerEffect::Incoming {
+                    movements: vec![MovementId("net-funding-output".to_owned())],
+                },
+                deposit_id: created.deposit.id.clone(),
+                expected_head: Some(created.ledger.id),
+                recorded_at: 3_001,
+            }],
+            reconciliation_cases: Vec::new(),
+            fee_treatment: ProjectionFeeTreatment::Separate,
+            utxo_batch_transition: None,
+        })
+        .await?;
+    let mut head = match &funded.ledger_results[0] {
+        ApplyResult::Appended { entry } => entry.clone(),
+        ApplyResult::AlreadyPresent { .. } => panic!("funding must append"),
+    };
+    assert_eq!(head.balances.balance, amount(100));
+
+    let collection_included = observation_revision_with_fee(
+        "input-collection",
+        2,
+        "input-collection-tx",
+        1,
+        included_status(),
+        None,
+        vec![ValueMovement {
+            id: MovementId("input-collection-debit".to_owned()),
+            asset: asset(),
+            amount: amount(20),
+            from: Some(deposit_address.clone()),
+            to: None,
+            kind: MovementKind::Input,
+        }],
+        Some(network_fee(5, deposit_address.clone(), asset())),
+    );
+    repository
+        .mirror_and_advance(MirrorObservation {
+            expected_cursor: Some(EventCursor(1)),
+            observation: collection_included.clone(),
+        })
+        .await?;
+    let collection_outcome = repository
+        .project_and_advance(ProjectObservation {
+            expected_cursor: Some(EventCursor(1)),
+            through: EventCursor(2),
+            affected_deposits: vec![created.deposit.id.clone()],
+            ledger_updates: vec![RecordObservation {
+                event_id: collection_included.event.id,
+                effect: LedgerEffect::Collection {
+                    movements: vec![MovementId("input-collection-debit".to_owned())],
+                },
+                deposit_id: created.deposit.id.clone(),
+                expected_head: Some(head.id),
+                recorded_at: 3_002,
+            }],
+            reconciliation_cases: Vec::new(),
+            fee_treatment: ProjectionFeeTreatment::IncludedInMovementEffect,
+            utxo_batch_transition: None,
+        })
+        .await?;
+    head = match &collection_outcome.ledger_results[0] {
+        ApplyResult::Appended { entry } => entry.clone(),
+        ApplyResult::AlreadyPresent { .. } => panic!("input collection must append"),
+    };
+    assert_eq!(head.balances.balance, amount(80));
+    assert!(matches!(
+        &head.cause,
+        LedgerEntryCause::Observation {
+            network_fee: None,
+            ..
+        }
+    ));
+
+    let debit = observation_revision_with_fee(
+        "net-debit",
+        3,
+        "conflicting-spend",
+        1,
+        included_status(),
+        None,
+        vec![
+            ValueMovement {
+                id: MovementId("net-debit-input".to_owned()),
+                asset: asset(),
+                amount: amount(100),
+                from: Some(deposit_address.clone()),
+                to: None,
+                kind: MovementKind::Input,
+            },
+            ValueMovement {
+                id: MovementId("net-debit-return".to_owned()),
+                asset: asset(),
+                amount: amount(40),
+                from: None,
+                to: Some(deposit_address.clone()),
+                kind: MovementKind::Output,
+            },
+        ],
+        Some(network_fee(10, deposit_address.clone(), asset())),
+    );
+    repository
+        .mirror_and_advance(MirrorObservation {
+            expected_cursor: Some(EventCursor(2)),
+            observation: debit.clone(),
+        })
+        .await?;
+    let conflict_case = ReconciliationCase {
+        id: ReconciliationCaseId("reserved-spend-conflict".to_owned()),
+        deposit_id: created.deposit.id.clone(),
+        triggering_event_id: debit.event.id.clone(),
+        reason: ReconciliationReason::ReservedSpendConflict {
+            collection_id: CollectionId("retained-collection".to_owned()),
+            transaction_id: debit.event.transaction.transaction_id.clone(),
+        },
+        state: ReconciliationState::Open,
+        created_at: 3_002,
+    };
+    let debit_outcome = repository
+        .project_and_advance(ProjectObservation {
+            expected_cursor: Some(EventCursor(2)),
+            through: EventCursor(3),
+            affected_deposits: vec![created.deposit.id.clone()],
+            ledger_updates: vec![RecordObservation {
+                event_id: debit.event.id,
+                effect: LedgerEffect::NetBalanceChange {
+                    debit_movements: vec![MovementId("net-debit-input".to_owned())],
+                    credit_movements: vec![MovementId("net-debit-return".to_owned())],
+                },
+                deposit_id: created.deposit.id.clone(),
+                expected_head: Some(head.id),
+                recorded_at: 3_002,
+            }],
+            reconciliation_cases: vec![conflict_case.clone()],
+            fee_treatment: ProjectionFeeTreatment::IncludedInMovementEffect,
+            utxo_batch_transition: None,
+        })
+        .await?;
+    assert_eq!(debit_outcome.checkpoint.cursor, Some(EventCursor(3)));
+    assert_eq!(
+        debit_outcome.reconciliation_cases,
+        vec![conflict_case.clone()]
+    );
+    assert_eq!(
+        repository.case(&conflict_case.id).await?,
+        Some(conflict_case)
+    );
+    head = match &debit_outcome.ledger_results[0] {
+        ApplyResult::Appended { entry } => entry.clone(),
+        ApplyResult::AlreadyPresent { .. } => panic!("net debit must append"),
+    };
+    assert_eq!(head.balances.balance, amount(20));
+    assert!(matches!(
+        &head.cause,
+        LedgerEntryCause::Observation {
+            movement_ids,
+            network_fee: None,
+            ..
+        } if movement_ids == &vec![
+            MovementId("net-debit-input".to_owned()),
+            MovementId("net-debit-return".to_owned()),
+        ]
+    ));
+
+    for (cursor, event_id, txid, input, output, expected_balance) in [
+        (4, "net-credit", "net-credit-tx", 10, 50, 60),
+        (5, "net-zero", "net-zero-tx", 25, 25, 60),
+    ] {
+        let input_id = MovementId(format!("{event_id}-input"));
+        let output_id = MovementId(format!("{event_id}-return"));
+        let event = observation_revision_with_fee(
+            event_id,
+            cursor,
+            txid,
+            1,
+            included_status(),
+            None,
+            vec![
+                ValueMovement {
+                    id: input_id.clone(),
+                    asset: asset(),
+                    amount: amount(input),
+                    from: Some(deposit_address.clone()),
+                    to: None,
+                    kind: MovementKind::Input,
+                },
+                ValueMovement {
+                    id: output_id.clone(),
+                    asset: asset(),
+                    amount: amount(output),
+                    from: None,
+                    to: Some(deposit_address.clone()),
+                    kind: MovementKind::Output,
+                },
+            ],
+            Some(network_fee(1, deposit_address.clone(), asset())),
+        );
+        repository
+            .mirror_and_advance(MirrorObservation {
+                expected_cursor: Some(EventCursor(cursor - 1)),
+                observation: event.clone(),
+            })
+            .await?;
+        let outcome = repository
+            .project_and_advance(ProjectObservation {
+                expected_cursor: Some(EventCursor(cursor - 1)),
+                through: EventCursor(cursor),
+                affected_deposits: vec![created.deposit.id.clone()],
+                ledger_updates: vec![RecordObservation {
+                    event_id: event.event.id,
+                    effect: LedgerEffect::NetBalanceChange {
+                        debit_movements: vec![input_id],
+                        credit_movements: vec![output_id],
+                    },
+                    deposit_id: created.deposit.id.clone(),
+                    expected_head: Some(head.id),
+                    recorded_at: 3_000 + cursor,
+                }],
+                reconciliation_cases: Vec::new(),
+                fee_treatment: ProjectionFeeTreatment::IncludedInMovementEffect,
+                utxo_batch_transition: None,
+            })
+            .await?;
+        head = match &outcome.ledger_results[0] {
+            ApplyResult::Appended { entry } => entry.clone(),
+            ApplyResult::AlreadyPresent { .. } => panic!("net change must append"),
+        };
+        assert_eq!(head.balances.balance, amount(expected_balance));
+        assert_eq!(outcome.checkpoint.cursor, Some(EventCursor(cursor)));
+    }
     Ok(())
 }
 

@@ -4,9 +4,14 @@
 //! IX facts durably, reports the independent projection cursor, and leaves
 //! deposit/collection/accounting classification to a configured PS workflow.
 
+mod active_policy;
 mod api;
 mod api_error;
 mod auth;
+mod bitcoin_collection_executor;
+mod bitcoin_fee_allocation;
+mod bitcoin_policy;
+mod bitcoin_wallet_client;
 mod collection_executor;
 mod commands;
 mod config;
@@ -17,7 +22,7 @@ mod runtime;
 pub mod wallet_client;
 
 use clap::Parser;
-use config::{Cli, Command};
+use config::{BitcoinCommand, Cli, Command};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -70,6 +75,39 @@ async fn run(cli: Cli) -> Result<(), runtime::RuntimeError> {
                 report.more_pending
             );
         }
+        Command::Bitcoin(options) => match options.command {
+            BitcoinCommand::Serve(options) => runtime::serve_bitcoin(options).await?,
+            BitcoinCommand::Backup(options) => runtime::backup(options).await?,
+            BitcoinCommand::Migrate(options) => runtime::migrate_bitcoin(options).await?,
+            BitcoinCommand::ReconcileWatches(options) => {
+                let report = runtime::reconcile_bitcoin_watches(&options).await?;
+                println!(
+                    "reconcile_batches={} activated={} bounded_work_remaining={}",
+                    report.batches, report.activated, report.exhausted
+                );
+            }
+            BitcoinCommand::IngestEvents(options) => {
+                let report = runtime::ingest_bitcoin_events(&options).await?;
+                println!(
+                    "ingestion_pages={} appended={} duplicates={} cursor={} bounded_work_remaining={}",
+                    report.pages,
+                    report.appended,
+                    report.duplicates,
+                    cursor_text(report.checkpoint),
+                    report.exhausted
+                );
+            }
+            BitcoinCommand::ProjectionStatus(options) => {
+                let report = runtime::projection_status(&options).await?;
+                println!(
+                    "ingestion_cursor={} projection_cursor={} pending_sample={} more_pending={} classification_configured=true",
+                    cursor_text(report.ingestion_cursor),
+                    cursor_text(report.projection_cursor),
+                    report.pending_sample,
+                    report.more_pending
+                );
+            }
+        },
     }
     Ok(())
 }

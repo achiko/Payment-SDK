@@ -3,6 +3,8 @@
 For step-by-step startup, configuration, the complete curl request catalog,
 lifecycle workflows, and maintenance commands, see
 [`PAYMENT_SERVICE_USAGE.md`](./PAYMENT_SERVICE_USAGE.md).
+The separately scoped native-Bitcoin mode is documented in
+[`BITCOIN_SERVICES.md`](./BITCOIN_SERVICES.md).
 
 `apps/api` is the Payment Service (PS) composition root. It owns users,
 deposits, command idempotency, the append-only IX mirror, business

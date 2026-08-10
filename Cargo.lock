@@ -980,9 +980,12 @@ version = "0.1.0"
 dependencies = [
  "bitcoin",
  "chain-contract",
+ "chain-identity",
  "futures-executor",
+ "futures-util",
  "indexing",
  "json-rpc",
+ "serde_json",
  "signer",
  "signer-local",
  "transaction-utxo",
@@ -1434,6 +1437,12 @@ dependencies = [
  "quote",
  "syn 3.0.3",
 ]
+
+[[package]]
+name = "dotenvy"
+version = "0.15.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "dunce"
@@ -2081,6 +2090,8 @@ name = "indexer-worker"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bitcoin",
+ "chain-bitcoin",
  "chain-ethereum",
  "chain-identity",
  "clap",
@@ -2096,6 +2107,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -2566,6 +2578,8 @@ name = "payment-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bitcoin",
+ "chain-bitcoin",
  "chain-ethereum",
  "chain-identity",
  "clap",
@@ -2593,12 +2607,19 @@ dependencies = [
 name = "payment_sdk_demo"
 version = "0.1.0"
 dependencies = [
+ "chain-bitcoin",
+ "chain-contract",
  "chain-ethereum",
+ "chain-identity",
+ "deposits",
+ "dotenvy",
  "http 0.1.0",
  "indexer-worker",
- "reqwest",
+ "indexing",
  "signer",
  "signer-local",
+ "storage-rocksdb",
+ "tempfile",
  "tokio",
  "wallet-worker",
 ]
@@ -4215,6 +4236,7 @@ dependencies = [
  "hex",
  "http 0.1.0",
  "indexing",
+ "json-rpc",
  "reqwest",
  "serde",
  "serde_json",
@@ -4226,7 +4248,6 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
- "transaction-utxo",
  "uuid",
  "zeroize",
 ]

@@ -24,10 +24,12 @@ use crate::{
     LedgerObservationTransition, LedgerPage, LedgerPageRequest, MirrorObservation, MirrorOutcome,
     MirroredObservation, ObservationConsumerCheckpoints, ObservationEventLog,
     ObservationLedgerEffect, ObservationLogPage, ObservationLogRequest, OpenLedger,
-    ProjectObservation, ProjectionId, ProjectionOutcome, ReconciliationCase, ReconciliationCaseId,
-    ReconciliationDecision, ReconciliationPage, ReconciliationPageRequest, ReconciliationReason,
-    ReconciliationResolution, ReconciliationState, ReconciliationStore, RecordObservation,
-    RequestHash, ResolveReconciliation, UserId, apply_observation_transition,
+    ProjectObservation, ProjectUtxoBatchCollection, ProjectionFeeTreatment, ProjectionId,
+    ProjectionOutcome, ReconciliationCase, ReconciliationCaseId, ReconciliationDecision,
+    ReconciliationPage, ReconciliationPageRequest, ReconciliationReason, ReconciliationResolution,
+    ReconciliationState, ReconciliationStore, RecordObservation, RequestHash,
+    ResolveReconciliation, UserId, UtxoBatchProjectionMutation, UtxoBatchProjectionOutcome,
+    UtxoBatchProjectionTransition, apply_observation_transition,
 };
 
 const RECORD_VERSION: u16 = 1;
@@ -1141,6 +1143,11 @@ enum ReconciliationReasonRecordV1 {
         accounted: [u8; 32],
         corrected_confirmed: [u8; 32],
     },
+    ReservedSpendConflict {
+        collection_id: String,
+        transaction_chain: String,
+        transaction_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Decode, Encode, PartialEq, Eq)]
@@ -1179,6 +1186,17 @@ impl TryFrom<ReconciliationRecordV1> for ReconciliationCase {
                 } => ReconciliationReason::PostCreditReorg {
                     accounted: AtomicAmount(accounted),
                     corrected_confirmed: AtomicAmount(corrected_confirmed),
+                },
+                ReconciliationReasonRecordV1::ReservedSpendConflict {
+                    collection_id,
+                    transaction_chain,
+                    transaction_id,
+                } => ReconciliationReason::ReservedSpendConflict {
+                    collection_id: crate::CollectionId(collection_id),
+                    transaction_id: CanonicalTransactionId {
+                        chain: ChainId(transaction_chain),
+                        value: transaction_id,
+                    },
                 },
             },
             state: match value.state {
@@ -1335,6 +1353,14 @@ impl TryFrom<&ReconciliationCase> for ReconciliationRecordV2 {
                 accounted: accounted.0,
                 corrected_confirmed: corrected_confirmed.0,
             },
+            ReconciliationReason::ReservedSpendConflict {
+                collection_id,
+                transaction_id,
+            } => ReconciliationReasonRecordV1::ReservedSpendConflict {
+                collection_id: collection_id.0.clone(),
+                transaction_chain: transaction_id.chain.0.clone(),
+                transaction_id: transaction_id.value.clone(),
+            },
         };
         let state = match &value.state {
             ReconciliationState::Open => ReconciliationStateRecordV2::Open,
@@ -1391,6 +1417,17 @@ impl TryFrom<ReconciliationRecordV2> for ReconciliationCase {
                 } => ReconciliationReason::PostCreditReorg {
                     accounted: AtomicAmount(accounted),
                     corrected_confirmed: AtomicAmount(corrected_confirmed),
+                },
+                ReconciliationReasonRecordV1::ReservedSpendConflict {
+                    collection_id,
+                    transaction_chain,
+                    transaction_id,
+                } => ReconciliationReason::ReservedSpendConflict {
+                    collection_id: crate::CollectionId(collection_id),
+                    transaction_id: CanonicalTransactionId {
+                        chain: ChainId(transaction_chain),
+                        value: transaction_id,
+                    },
                 },
             },
             state: match value.state {
@@ -1643,6 +1680,27 @@ where
             .await?
             .ok_or_else(|| storage_error("PS ledger head points to a missing immutable entry"))?;
         Ok(Some((entry, stored_head)))
+    }
+
+    pub(crate) async fn expected_ledger_head_condition(
+        &self,
+        deposit_id: &DepositId,
+        expected_head: &LedgerEntryId,
+    ) -> Result<Condition, DepositError> {
+        let (head, stored) = self
+            .stored_head(deposit_id)
+            .await?
+            .ok_or_else(|| not_found("collection participant ledger is not open"))?;
+        if &head.id != expected_head {
+            return Err(conflict(
+                "collection participant expected ledger head does not match current head",
+            ));
+        }
+        Ok(Condition::Version {
+            namespace: ledger_head_ns(),
+            key: key_text(&deposit_id.0),
+            expected: stored.version,
+        })
     }
 
     async fn reconciliation_generation_change(
@@ -2498,24 +2556,9 @@ where
                 .reconciliation_generation_change(&command.deposit_id)
                 .await?;
 
-            let reservation_key = crate::persistent_collections::reservation_key(
-                &command.deposit_id,
-                &deposit.asset,
-            )?;
-            if self
-                .storage
-                .get(
-                    &crate::persistent_collections::active_reservation_ns(),
-                    &reservation_key,
-                )
-                .await
-                .map_err(map_storage)?
-                .is_some()
-            {
-                return Err(invalid_state(
-                    "deposit cannot close while a collection reservation is active",
-                ));
-            }
+            let reservation_fence = self
+                .prepare_deposit_close_reservation_fence(&command.deposit_id, &deposit.asset)
+                .await?;
             let (collection_condition, collection_operation) = self
                 .collection_eligibility_generation_change(&command.deposit_id, &deposit.asset)
                 .await?;
@@ -2532,91 +2575,93 @@ where
             };
             deposit.state = DepositState::Closed;
 
+            let mut conditions = vec![
+                Condition::Version {
+                    namespace: deposit_ns(),
+                    key: key_text(&command.deposit_id.0),
+                    expected: deposit_stored.version,
+                },
+                Condition::Version {
+                    namespace: ledger_head_ns(),
+                    key: key_text(&command.deposit_id.0),
+                    expected: head_stored.version,
+                },
+                Condition::Missing {
+                    namespace: closed_deposit_watch_ns(),
+                    key: closed_watch_key.clone(),
+                },
+                Condition::Missing {
+                    namespace: deposit_state_ns(),
+                    key: closed_state_key.clone(),
+                },
+                Condition::Missing {
+                    namespace: user_deposit_state_ns(),
+                    key: closed_user_state_key.clone(),
+                },
+                reconciliation_condition,
+                collection_condition,
+            ];
+            conditions.extend(reservation_fence.conditions);
+
+            let mut operations = vec![
+                Operation::Put {
+                    namespace: deposit_ns(),
+                    key: key_text(&command.deposit_id.0),
+                    value: encode(&DepositRecordV2::from(&deposit))?,
+                },
+                // Rewriting the same head ID increments its storage
+                // version, invalidating a projection that read the zero
+                // head before this close committed.
+                Operation::Put {
+                    namespace: ledger_head_ns(),
+                    key: key_text(&command.deposit_id.0),
+                    value: encode(&IdRecordV1 {
+                        version: RECORD_VERSION,
+                        id: head.id.0,
+                    })?,
+                },
+                Operation::Delete {
+                    namespace: deposit_state_ns(),
+                    key: state_deposit_key(previous_kind, &command.deposit_id)?,
+                },
+                Operation::Delete {
+                    namespace: user_deposit_state_ns(),
+                    key: user_state_deposit_key(
+                        &deposit.user_id,
+                        previous_kind,
+                        &command.deposit_id,
+                    )?,
+                },
+                Operation::Put {
+                    namespace: deposit_state_ns(),
+                    key: closed_state_key,
+                    value: encode(&index)?,
+                },
+                Operation::Put {
+                    namespace: user_deposit_state_ns(),
+                    key: closed_user_state_key,
+                    value: encode(&index)?,
+                },
+                // Keep the durable watch relationship after closure.
+                // Late transfers remain visible; a future explicit IX
+                // cutoff protocol can use this retained identifier.
+                Operation::Put {
+                    namespace: closed_deposit_watch_ns(),
+                    key: closed_watch_key,
+                    value: encode(&IdRecordV1 {
+                        version: RECORD_VERSION,
+                        id: retained_watch.0,
+                    })?,
+                },
+                reconciliation_operation,
+                collection_operation,
+            ];
+            operations.extend(reservation_fence.operations);
+
             self.storage
                 .commit(WriteBatch {
-                    conditions: vec![
-                        Condition::Version {
-                            namespace: deposit_ns(),
-                            key: key_text(&command.deposit_id.0),
-                            expected: deposit_stored.version,
-                        },
-                        Condition::Version {
-                            namespace: ledger_head_ns(),
-                            key: key_text(&command.deposit_id.0),
-                            expected: head_stored.version,
-                        },
-                        Condition::Missing {
-                            namespace: crate::persistent_collections::active_reservation_ns(),
-                            key: reservation_key,
-                        },
-                        Condition::Missing {
-                            namespace: closed_deposit_watch_ns(),
-                            key: closed_watch_key.clone(),
-                        },
-                        Condition::Missing {
-                            namespace: deposit_state_ns(),
-                            key: closed_state_key.clone(),
-                        },
-                        Condition::Missing {
-                            namespace: user_deposit_state_ns(),
-                            key: closed_user_state_key.clone(),
-                        },
-                        reconciliation_condition,
-                        collection_condition,
-                    ],
-                    operations: vec![
-                        Operation::Put {
-                            namespace: deposit_ns(),
-                            key: key_text(&command.deposit_id.0),
-                            value: encode(&DepositRecordV2::from(&deposit))?,
-                        },
-                        // Rewriting the same head ID increments its storage
-                        // version, invalidating a projection that read the zero
-                        // head before this close committed.
-                        Operation::Put {
-                            namespace: ledger_head_ns(),
-                            key: key_text(&command.deposit_id.0),
-                            value: encode(&IdRecordV1 {
-                                version: RECORD_VERSION,
-                                id: head.id.0,
-                            })?,
-                        },
-                        Operation::Delete {
-                            namespace: deposit_state_ns(),
-                            key: state_deposit_key(previous_kind, &command.deposit_id)?,
-                        },
-                        Operation::Delete {
-                            namespace: user_deposit_state_ns(),
-                            key: user_state_deposit_key(
-                                &deposit.user_id,
-                                previous_kind,
-                                &command.deposit_id,
-                            )?,
-                        },
-                        Operation::Put {
-                            namespace: deposit_state_ns(),
-                            key: closed_state_key,
-                            value: encode(&index)?,
-                        },
-                        Operation::Put {
-                            namespace: user_deposit_state_ns(),
-                            key: closed_user_state_key,
-                            value: encode(&index)?,
-                        },
-                        // Keep the durable watch relationship after closure.
-                        // Late transfers remain visible; a future explicit IX
-                        // cutoff protocol can use this retained identifier.
-                        Operation::Put {
-                            namespace: closed_deposit_watch_ns(),
-                            key: closed_watch_key,
-                            value: encode(&IdRecordV1 {
-                                version: RECORD_VERSION,
-                                id: retained_watch.0,
-                            })?,
-                        },
-                        reconciliation_operation,
-                        collection_operation,
-                    ],
+                    conditions,
+                    operations,
                 })
                 .await
                 .map_err(map_storage)?;
@@ -2816,6 +2861,66 @@ fn resolved_movement_amounts(
         .collect()
 }
 
+fn resolved_net_balance_change(
+    event: &ObservationEvent,
+    deposit: &Deposit,
+    debit_movements: &[MovementId],
+    credit_movements: &[MovementId],
+) -> Result<(Vec<AtomicAmount>, Vec<AtomicAmount>), DepositError> {
+    if debit_movements.is_empty() || credit_movements.is_empty() {
+        return Err(invalid(
+            "net balance change requires both debit and credit movements",
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut resolve = |movement_id: &MovementId,
+                       expected_kind: MovementKind,
+                       expected_address: &CanonicalAddress,
+                       debit: bool|
+     -> Result<AtomicAmount, DepositError> {
+        if !seen.insert(movement_id.clone()) {
+            return Err(invalid(
+                "net balance change contains a duplicate movement ID",
+            ));
+        }
+        let mut matches = event
+            .transaction
+            .movements
+            .iter()
+            .filter(|movement| movement.id == *movement_id);
+        let movement = matches
+            .next()
+            .ok_or_else(|| invalid("net balance change references a missing IX movement"))?;
+        if matches.next().is_some() {
+            return Err(invalid(
+                "mirrored IX event contains a duplicate movement ID",
+            ));
+        }
+        if movement.asset != deposit.asset
+            || movement.kind != expected_kind
+            || if debit {
+                movement.from.as_ref() != Some(expected_address)
+            } else {
+                movement.to.as_ref() != Some(expected_address)
+            }
+        {
+            return Err(invalid(
+                "net balance change movement does not match the deposit direction, asset, or address",
+            ));
+        }
+        Ok(movement.amount)
+    };
+    let debits = debit_movements
+        .iter()
+        .map(|movement_id| resolve(movement_id, MovementKind::Input, &deposit.address, true))
+        .collect::<Result<Vec<_>, _>>()?;
+    let credits = credit_movements
+        .iter()
+        .map(|movement_id| resolve(movement_id, MovementKind::Output, &deposit.address, false))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((debits, credits))
+}
+
 fn resolved_network_fee(event: &ObservationEvent, deposit: &Deposit) -> Option<AtomicAmount> {
     event
         .transaction
@@ -2823,6 +2928,84 @@ fn resolved_network_fee(event: &ObservationEvent, deposit: &Deposit) -> Option<A
         .as_ref()
         .filter(|fee| fee.asset == deposit.asset && fee.payer.as_ref() == Some(&deposit.address))
         .map(|fee| fee.amount)
+}
+
+fn validate_input_debit_movements(
+    event: &ObservationEvent,
+    deposit: &Deposit,
+    movement_ids: &[MovementId],
+) -> Result<(), DepositError> {
+    if movement_ids.is_empty() {
+        return Err(invalid(
+            "input-derived fee treatment requires at least one debit movement",
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for movement_id in movement_ids {
+        if !seen.insert(movement_id) {
+            return Err(invalid(
+                "input-derived fee treatment contains a duplicate movement ID",
+            ));
+        }
+        let mut matches = event
+            .transaction
+            .movements
+            .iter()
+            .filter(|movement| movement.id == *movement_id);
+        let movement = matches.next().ok_or_else(|| {
+            invalid("input-derived fee treatment references a missing IX movement")
+        })?;
+        if matches.next().is_some()
+            || movement.asset != deposit.asset
+            || movement.kind != MovementKind::Input
+            || movement.from.as_ref() != Some(&deposit.address)
+        {
+            return Err(invalid(
+                "input-derived fee treatment requires factual inputs from the projected deposit",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn projection_network_fee(
+    event: &ObservationEvent,
+    deposit: &Deposit,
+    effect: &ObservationLedgerEffect,
+    treatment: ProjectionFeeTreatment,
+) -> Result<Option<AtomicAmount>, DepositError> {
+    match treatment {
+        ProjectionFeeTreatment::Separate => Ok(resolved_network_fee(event, deposit)),
+        ProjectionFeeTreatment::IncludedInMovementEffect => {
+            match effect {
+                LedgerEffect::Collection { movements } => {
+                    validate_input_debit_movements(event, deposit, movements)?;
+                }
+                LedgerEffect::NetBalanceChange {
+                    debit_movements, ..
+                } => {
+                    validate_input_debit_movements(event, deposit, debit_movements)?;
+                }
+                _ if resolved_network_fee(event, deposit).is_some() => {
+                    return Err(invalid(
+                        "fee-paying deposit requires an input-derived effect when the fee is included in movements",
+                    ));
+                }
+                _ => return Ok(None),
+            }
+            event
+                .transaction
+                .fee
+                .as_ref()
+                .filter(|fee| fee.asset == deposit.asset)
+                .ok_or_else(|| {
+                    invalid(
+                        "input-derived fee treatment requires a factual fee in the deposit asset",
+                    )
+                })?;
+            Ok(None)
+        }
+    }
 }
 
 fn resolved_effect(
@@ -2847,6 +3030,17 @@ fn resolved_effect(
             direction: *direction,
             movements: resolved_movement_amounts(event, deposit, movements)?,
         },
+        LedgerEffect::NetBalanceChange {
+            debit_movements,
+            credit_movements,
+        } => {
+            let (debits, credits) =
+                resolved_net_balance_change(event, deposit, debit_movements, credit_movements)?;
+            LedgerEffect::NetBalanceChange {
+                debit_movements: debits,
+                credit_movements: credits,
+            }
+        }
     })
 }
 
@@ -2879,7 +3073,12 @@ fn projection_entry(
             observation_revision: event.transaction.revision,
             status: event.transaction.status.clone(),
             kind: command.effect.kind(),
-            movement_ids: command.effect.movements().to_vec(),
+            movement_ids: command
+                .effect
+                .movement_references()
+                .into_iter()
+                .cloned()
+                .collect(),
             network_fee,
         },
         balances,
@@ -3071,7 +3270,11 @@ where
                 &mirrored.event,
                 &expected_head,
                 resolved_effect(&mirrored.event, &deposit, &command.effect)?,
-                resolved_network_fee(&mirrored.event, &deposit),
+                if matches!(command.effect, LedgerEffect::NetBalanceChange { .. }) {
+                    None
+                } else {
+                    resolved_network_fee(&mirrored.event, &deposit)
+                },
             )?;
             let projection_id = ProjectionId::for_observation(
                 &mirrored.event.id,
@@ -3798,6 +4001,13 @@ where
                     "every projected ledger update and reconciliation case must identify an affected deposit",
                 ));
             }
+            if command.utxo_batch_transition.is_some()
+                && command.fee_treatment != ProjectionFeeTreatment::IncludedInMovementEffect
+            {
+                return Err(invalid(
+                    "UTXO-batch projection must treat its factual fee as included in input movements",
+                ));
+            }
             let ledger_update_deposits = command
                 .ledger_updates
                 .iter()
@@ -3842,7 +4052,12 @@ where
                         &mirrored.event,
                         &expected_head,
                         resolved_effect(&mirrored.event, &deposit, &update.effect)?,
-                        resolved_network_fee(&mirrored.event, &deposit),
+                        projection_network_fee(
+                            &mirrored.event,
+                            &deposit,
+                            &update.effect,
+                            command.fee_treatment,
+                        )?,
                     )?;
                     let projection_id = ProjectionId::for_observation(
                         &mirrored.event.id,
@@ -3898,6 +4113,84 @@ where
                     {
                         return Err(conflict(
                             "projection retry changed a deposit observation attribution",
+                        ));
+                    }
+                }
+                if let Some(mutation) = &command.utxo_batch_transition {
+                    let collection = self
+                        .validate_utxo_batch_projection_replay(
+                            &mutation.collection_id,
+                            &mutation.leg_id,
+                            &mutation.transaction_id,
+                            &mutation.transition,
+                        )
+                        .await?;
+                    let participant_deposits = collection
+                        .participants
+                        .iter()
+                        .map(|participant| participant.reservation.deposit_id.clone())
+                        .collect::<Vec<_>>();
+                    let ledger_deposits = command
+                        .ledger_updates
+                        .iter()
+                        .map(|update| update.deposit_id.clone())
+                        .collect::<Vec<_>>();
+                    if command.affected_deposits != participant_deposits
+                        || ledger_deposits != participant_deposits
+                    {
+                        return Err(conflict(
+                            "UTXO-batch projection retry changed participant coverage",
+                        ));
+                    }
+                    let event_id = command
+                        .ledger_updates
+                        .first()
+                        .map(|update| &update.event_id)
+                        .ok_or_else(|| {
+                            conflict("UTXO-batch projection retry omitted participant ledgers")
+                        })?;
+                    let event = self
+                        .observation(event_id)
+                        .await?
+                        .ok_or_else(|| storage_error("UTXO-batch projection event is missing"))?;
+                    let status_matches = matches!(
+                        (&mutation.transition, &event.event.transaction.status),
+                        (
+                            UtxoBatchProjectionTransition::Reincluded { .. },
+                            TransactionStatus::Included { .. }
+                        ) | (
+                            UtxoBatchProjectionTransition::Confirmed { .. },
+                            TransactionStatus::Confirmed { .. }
+                        ) | (
+                            UtxoBatchProjectionTransition::Reorged { .. },
+                            TransactionStatus::Reorged { .. }
+                        )
+                    );
+                    if event.event.transaction.transaction_id != mutation.transaction_id
+                        || !status_matches
+                    {
+                        return Err(conflict(
+                            "UTXO-batch projection retry changed its mirrored IX fact",
+                        ));
+                    }
+                    let fee = event.event.transaction.fee.as_ref().ok_or_else(|| {
+                        conflict("UTXO-batch projection retry lost its factual network fee")
+                    })?;
+                    let allocated_fee = collection
+                        .legs
+                        .iter()
+                        .find(|leg| leg.id == mutation.leg_id)
+                        .ok_or_else(|| storage_error("UTXO-batch retry leg disappeared"))?
+                        .allocations
+                        .iter()
+                        .try_fold(AtomicAmount::ZERO, |total, allocation| {
+                            total.checked_add(&allocation.allocated_fee).map_err(|_| {
+                                conflict("UTXO-batch retry allocated fee total overflows")
+                            })
+                        })?;
+                    if fee.asset != collection.asset || fee.amount != allocated_fee {
+                        return Err(conflict(
+                            "UTXO-batch projection retry changed factual fee attribution",
                         ));
                     }
                 }
@@ -3984,7 +4277,12 @@ where
                     &event.event,
                     &head,
                     resolved_effect(&event.event, &deposit, &update.effect)?,
-                    resolved_network_fee(&event.event, &deposit),
+                    projection_network_fee(
+                        &event.event,
+                        &deposit,
+                        &update.effect,
+                        command.fee_treatment,
+                    )?,
                 )?;
                 conditions.extend([
                     Condition::Missing {
@@ -4068,14 +4366,28 @@ where
                         "projection reconciliation case must be open and reference its IX event",
                     ));
                 }
-                let ReconciliationReason::PostCreditReorg {
-                    accounted,
-                    corrected_confirmed,
-                } = &case.reason;
-                if accounted <= corrected_confirmed {
-                    return Err(invalid(
-                        "post-credit reorg case requires accounted to exceed corrected confirmed",
-                    ));
+                match &case.reason {
+                    ReconciliationReason::PostCreditReorg {
+                        accounted,
+                        corrected_confirmed,
+                    } if accounted <= corrected_confirmed => {
+                        return Err(invalid(
+                            "post-credit reorg case requires accounted to exceed corrected confirmed",
+                        ));
+                    }
+                    ReconciliationReason::ReservedSpendConflict {
+                        collection_id,
+                        transaction_id,
+                    } if collection_id.0.is_empty()
+                        || transaction_id.chain.0.is_empty()
+                        || transaction_id.value.is_empty() =>
+                    {
+                        return Err(invalid(
+                            "reserved-spend conflict requires collection and transaction identity",
+                        ));
+                    }
+                    ReconciliationReason::PostCreditReorg { .. }
+                    | ReconciliationReason::ReservedSpendConflict { .. } => {}
                 }
                 if self.case(&case.id).await?.is_some() {
                     return Err(conflict(
@@ -4115,6 +4427,86 @@ where
                     },
                 ]);
             }
+            if let Some(mutation) = &command.utxo_batch_transition {
+                let prepared = self
+                    .prepare_utxo_batch_projection_transition(
+                        &mutation.collection_id,
+                        &mutation.leg_id,
+                        &mutation.expected,
+                        &mutation.transaction_id,
+                        &mutation.transition,
+                    )
+                    .await?;
+                let participant_deposits = prepared
+                    .collection
+                    .participants
+                    .iter()
+                    .map(|participant| participant.reservation.deposit_id.clone())
+                    .collect::<Vec<_>>();
+                let ledger_deposits = command
+                    .ledger_updates
+                    .iter()
+                    .map(|update| update.deposit_id.clone())
+                    .collect::<Vec<_>>();
+                if command.affected_deposits != participant_deposits
+                    || ledger_deposits != participant_deposits
+                {
+                    return Err(invalid(
+                        "UTXO-batch projection must atomically cover every participant in canonical order",
+                    ));
+                }
+                if event.event.transaction.transaction_id != mutation.transaction_id {
+                    return Err(conflict(
+                        "UTXO-batch projection event identifies another transaction",
+                    ));
+                }
+                let status_matches = matches!(
+                    (&mutation.transition, &event.event.transaction.status),
+                    (
+                        UtxoBatchProjectionTransition::Reincluded { .. },
+                        TransactionStatus::Included { .. }
+                    ) | (
+                        UtxoBatchProjectionTransition::Confirmed { .. },
+                        TransactionStatus::Confirmed { .. }
+                    ) | (
+                        UtxoBatchProjectionTransition::Reorged { .. },
+                        TransactionStatus::Reorged { .. }
+                    )
+                );
+                if !status_matches {
+                    return Err(invalid(
+                        "UTXO-batch collection transition does not match mirrored IX status",
+                    ));
+                }
+                let fee = event.event.transaction.fee.as_ref().ok_or_else(|| {
+                    invalid("UTXO-batch projection requires the factual Bitcoin network fee")
+                })?;
+                if fee.asset != prepared.collection.asset {
+                    return Err(invalid(
+                        "UTXO-batch factual network fee asset differs from collection asset",
+                    ));
+                }
+                let allocated_fee = prepared
+                    .collection
+                    .legs
+                    .iter()
+                    .find(|leg| leg.id == mutation.leg_id)
+                    .ok_or_else(|| storage_error("UTXO-batch projection leg disappeared"))?
+                    .allocations
+                    .iter()
+                    .try_fold(AtomicAmount::ZERO, |total, allocation| {
+                        total.checked_add(&allocation.allocated_fee).map_err(|_| {
+                            invalid("UTXO-batch allocated network fee total overflows")
+                        })
+                    })?;
+                if allocated_fee != fee.amount {
+                    return Err(conflict(
+                        "UTXO-batch allocated fee differs from mirrored factual network fee",
+                    ));
+                }
+                conditions.extend(prepared.conditions);
+                operations.extend(prepared.operations);
+            }
             operations.push(Operation::Put {
                 namespace: consumer_checkpoint_ns(),
                 key: checkpoint_key(ConsumerCheckpointName::IxProjection),
@@ -4140,6 +4532,41 @@ where
             })
         })
     }
+
+    fn project_utxo_batch_and_advance<'a>(
+        &'a self,
+        command: ProjectUtxoBatchCollection,
+    ) -> BoxFuture<'a, Result<UtxoBatchProjectionOutcome, DepositError>> {
+        Box::pin(async move {
+            if command.projection.utxo_batch_transition.is_some() {
+                return Err(invalid(
+                    "semantic UTXO-batch command must not contain a nested collection transition",
+                ));
+            }
+            let mutation = UtxoBatchProjectionMutation {
+                collection_id: command.collection_id,
+                leg_id: command.leg_id,
+                expected: command.expected,
+                transaction_id: command.transaction_id,
+                transition: command.transition,
+            };
+            let mut projection_command = command.projection;
+            projection_command.utxo_batch_transition = Some(mutation.clone());
+            let projection = self.project_and_advance(projection_command).await?;
+            let collection = self
+                .validate_utxo_batch_projection_replay(
+                    &mutation.collection_id,
+                    &mutation.leg_id,
+                    &mutation.transaction_id,
+                    &mutation.transition,
+                )
+                .await?;
+            Ok(UtxoBatchProjectionOutcome {
+                projection,
+                collection,
+            })
+        })
+    }
 }
 
 fn validate_open_reconciliation(case: &ReconciliationCase) -> Result<(), DepositError> {
@@ -4159,6 +4586,18 @@ fn validate_open_reconciliation(case: &ReconciliationCase) -> Result<(), Deposit
         } if accounted > corrected_confirmed => Ok(()),
         ReconciliationReason::PostCreditReorg { .. } => Err(invalid(
             "post-credit reorg requires accounted to exceed corrected confirmed",
+        )),
+        ReconciliationReason::ReservedSpendConflict {
+            collection_id,
+            transaction_id,
+        } if !collection_id.0.is_empty()
+            && !transaction_id.chain.0.is_empty()
+            && !transaction_id.value.is_empty() =>
+        {
+            Ok(())
+        }
+        ReconciliationReason::ReservedSpendConflict { .. } => Err(invalid(
+            "reserved-spend conflict requires collection and transaction identity",
         )),
     }
 }

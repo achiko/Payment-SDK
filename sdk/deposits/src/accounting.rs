@@ -83,6 +83,14 @@ pub enum LedgerEffect<T> {
         direction: BalanceDirection,
         movements: Vec<T>,
     },
+    /// A factual mixed spend/return whose inputs and outputs are both visible
+    /// at the same deposit. The repository resolves both sets from the mirror;
+    /// the pure ledger applies their checked absolute net in either direction,
+    /// or appends an unchanged snapshot when they are equal.
+    NetBalanceChange {
+        debit_movements: Vec<T>,
+        credit_movements: Vec<T>,
+    },
 }
 
 impl<T> LedgerEffect<T> {
@@ -92,10 +100,15 @@ impl<T> LedgerEffect<T> {
             Self::Incoming { .. } => LedgerObservationKind::Incoming,
             Self::Collection { .. } => LedgerObservationKind::Collection,
             Self::GasFunding { .. } => LedgerObservationKind::GasFunding,
-            Self::OtherBalanceChange { .. } => LedgerObservationKind::OtherBalanceChange,
+            Self::OtherBalanceChange { .. } | Self::NetBalanceChange { .. } => {
+                LedgerObservationKind::OtherBalanceChange
+            }
         }
     }
 
+    /// Returns the primary movement set. For [`Self::NetBalanceChange`]
+    /// this is the debit set; use [`Self::movement_references`] when every
+    /// stable IX pointer is required.
     #[must_use]
     pub fn movements(&self) -> &[T] {
         match self {
@@ -103,6 +116,23 @@ impl<T> LedgerEffect<T> {
             | Self::Collection { movements }
             | Self::GasFunding { movements }
             | Self::OtherBalanceChange { movements, .. } => movements,
+            Self::NetBalanceChange {
+                debit_movements, ..
+            } => debit_movements,
+        }
+    }
+
+    #[must_use]
+    pub fn movement_references(&self) -> Vec<&T> {
+        match self {
+            Self::Incoming { movements }
+            | Self::Collection { movements }
+            | Self::GasFunding { movements }
+            | Self::OtherBalanceChange { movements, .. } => movements.iter().collect(),
+            Self::NetBalanceChange {
+                debit_movements,
+                credit_movements,
+            } => debit_movements.iter().chain(credit_movements).collect(),
         }
     }
 }
@@ -228,20 +258,77 @@ fn is_terminal(status: &TransactionStatus) -> bool {
 fn movement_total(
     effect: &LedgerEffect<AtomicAmount>,
 ) -> Result<Option<AtomicAmount>, LedgerTransitionError> {
-    let Some((first, rest)) = effect.movements().split_first() else {
+    fn sum(amounts: &[AtomicAmount]) -> Result<Option<AtomicAmount>, LedgerTransitionError> {
+        let Some((first, rest)) = amounts.split_first() else {
+            return Ok(None);
+        };
+        rest.iter()
+            .try_fold(*first, |total, amount| {
+                total
+                    .checked_add(amount)
+                    .map_err(|source| LedgerTransitionError::Arithmetic {
+                        field: LedgerBalanceField::Balance,
+                        operation: LedgerArithmeticOperation::Add,
+                        source,
+                    })
+            })
+            .map(Some)
+    }
+
+    let LedgerEffect::NetBalanceChange {
+        debit_movements,
+        credit_movements,
+    } = effect
+    else {
+        return sum(effect.movements());
+    };
+    let Some(debits) = sum(debit_movements)? else {
         return Ok(None);
     };
-    rest.iter()
-        .try_fold(*first, |total, amount| {
-            total
-                .checked_add(amount)
-                .map_err(|source| LedgerTransitionError::Arithmetic {
-                    field: LedgerBalanceField::Balance,
-                    operation: LedgerArithmeticOperation::Add,
-                    source,
-                })
-        })
-        .map(Some)
+    let credits = sum(credit_movements)?.unwrap_or(AtomicAmount::ZERO);
+    let net = debits
+        .checked_sub(&credits)
+        .or_else(|_| credits.checked_sub(&debits))
+        .map_err(|source| LedgerTransitionError::Arithmetic {
+            field: LedgerBalanceField::Balance,
+            operation: LedgerArithmeticOperation::Subtract,
+            source,
+        })?;
+    Ok(Some(net))
+}
+
+fn net_balance_direction(
+    effect: &LedgerEffect<AtomicAmount>,
+) -> Result<Option<BalanceDirection>, LedgerTransitionError> {
+    let LedgerEffect::NetBalanceChange {
+        debit_movements,
+        credit_movements,
+    } = effect
+    else {
+        return Ok(None);
+    };
+    let sum = |amounts: &[AtomicAmount]| {
+        amounts
+            .iter()
+            .try_fold(AtomicAmount::ZERO, |total, amount| {
+                total
+                    .checked_add(amount)
+                    .map_err(|source| LedgerTransitionError::Arithmetic {
+                        field: LedgerBalanceField::Balance,
+                        operation: LedgerArithmeticOperation::Add,
+                        source,
+                    })
+            })
+    };
+    let debits = sum(debit_movements)?;
+    let credits = sum(credit_movements)?;
+    if debits == credits {
+        Ok(None)
+    } else if debits.checked_sub(&credits).is_ok() {
+        Ok(Some(BalanceDirection::Debit))
+    } else {
+        Ok(Some(BalanceDirection::Credit))
+    }
 }
 
 fn update_field(
@@ -272,11 +359,11 @@ fn inverse(operation: LedgerArithmeticOperation) -> LedgerArithmeticOperation {
 fn contribution_operations(
     effect: &LedgerEffect<AtomicAmount>,
     phase: CanonicalPhase,
-) -> Vec<(LedgerBalanceField, LedgerArithmeticOperation)> {
+) -> Result<Vec<(LedgerBalanceField, LedgerArithmeticOperation)>, LedgerTransitionError> {
     use LedgerArithmeticOperation::{Add, Subtract};
     use LedgerBalanceField::{Balance, Collected, Confirmed, Received};
 
-    match (effect, phase) {
+    let operations = match (effect, phase) {
         (_, CanonicalPhase::Absent) => Vec::new(),
         (LedgerEffect::Incoming { .. }, CanonicalPhase::Included) => {
             vec![(Received, Add), (Balance, Add)]
@@ -307,7 +394,16 @@ fn contribution_operations(
             },
             CanonicalPhase::Included | CanonicalPhase::Confirmed,
         ) => vec![(Balance, Subtract)],
-    }
+        (
+            LedgerEffect::NetBalanceChange { .. },
+            CanonicalPhase::Included | CanonicalPhase::Confirmed,
+        ) => match net_balance_direction(effect)? {
+            Some(BalanceDirection::Credit) => vec![(Balance, Add)],
+            Some(BalanceDirection::Debit) => vec![(Balance, Subtract)],
+            None => Vec::new(),
+        },
+    };
+    Ok(operations)
 }
 
 fn network_fee_operations(
@@ -385,7 +481,7 @@ pub fn apply_observation_transition(
     if let Some(previous_status) = transition.previous_status.as_ref() {
         if let Some(amount) = movement_total.as_ref() {
             let removal =
-                contribution_operations(&transition.effect, canonical_phase(previous_status))
+                contribution_operations(&transition.effect, canonical_phase(previous_status))?
                     .into_iter()
                     .map(|(field, operation)| (field, inverse(operation)));
             apply_operations(&mut next, amount, removal)?;
@@ -401,7 +497,7 @@ pub fn apply_observation_transition(
         apply_operations(
             &mut next,
             amount,
-            contribution_operations(&transition.effect, canonical_phase(&transition.status)),
+            contribution_operations(&transition.effect, canonical_phase(&transition.status))?,
         )?;
     }
     if let Some(network_fee) = transition.network_fee.as_ref() {

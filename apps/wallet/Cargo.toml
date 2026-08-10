@@ -13,6 +13,8 @@ chain-ethereum = { path = "../../sdk/chains/ethereum" }
 clap = { version = "=4.5.50", features = ["derive", "env"] }
 hex.workspace = true
 http-support = { package = "http", path = "../../packages/http" }
+indexing = { path = "../../sdk/indexing" }
+json-rpc = { path = "../../packages/json-rpc" }
 reqwest.workspace = true
 serde = { version = "=1.0.219", features = ["derive"] }
 serde_json.workspace = true
@@ -29,10 +31,8 @@ alloy-primitives.workspace = true
 alloy-signer.workspace = true
 alloy-signer-local.workspace = true
 futures-executor.workspace = true
-indexing = { path = "../../sdk/indexing" }
 signer-local = { path = "../../sdk/signing/local" }
 tower = { version = "=0.5.2", features = ["util"] }
-transaction-utxo = { path = "../../sdk/transactions/utxo" }
 zeroize.workspace = true
 
 [lints]

@@ -101,30 +101,39 @@ and exposes address generation, balances, unsigned construction, signing,
 broadcast, receipt reads, requirements, and one-shot collection. It has no
 storage dependency and does not own PS/IX workflow state.
 
-[`BitcoinWallet`](../sdk/chains/bitcoin/src/wallet.rs) implements the complete
-capability set for native Bitcoin over an injected `BitcoinRpc`. Its native
-codec performs deterministic largest-first selection, dust/change/fee checks,
-RBF inputs, P2WPKH signing, Taproot key-path signing, and batched collection
-attribution.
+[`BitcoinProductionWallet`](../sdk/chains/bitcoin/src/production_wallet.rs)
+implements the reusable native Bitcoin capabilities over separately injected
+`BitcoinNodeRpc` and `BitcoinUtxoSource` boundaries. The production node side is
+Bitcoin Core 31; the production UTXO side is the authenticated IX projection.
+Its native codec performs dust/change/fee checks, RBF-sequence construction,
+P2WPKH signing, Taproot key-path signing, and exact-input validation. The
+runnable service composes collection requirement and exact-selection behavior
+in [`BitcoinOperations`](../apps/wallet/src/bitcoin_operations.rs). The combined
+[`BitcoinWallet`](../sdk/chains/bitcoin/src/wallet.rs) and `BitcoinRpc` remain
+compatibility boundaries only.
 
 [`EthereumWallet`](../sdk/chains/ethereum/src/wallet.rs) implements the complete
 capability set for native ETH and ERC-20 assets over an injected `EthereumRpc`.
 Its codec produces EIP-1559 envelopes and verifies the recovered sender;
 collection calculates native maximum gas cost and encodes ERC-20 `transfer`.
 
-[`apps/wallet`](../apps/wallet) now composes the production Ethereum HTTP RPC
-adapter and remote custody adapter behind an authenticated versioned HTTP API.
-Signing and collection preparation return a canonical transaction ID plus the
-exact opaque signed envelope without broadcasting. The separate broadcast
-operation validates the expected envelope hash before submitting the same
-bytes. This lets PS durably record an envelope before the external side effect.
+[`apps/wallet`](../apps/wallet) composes chain-specific Ethereum or Bitcoin
+runtime modes, production RPC/IX clients, and the remote custody adapter behind
+authenticated versioned HTTP APIs. Signing and collection preparation return a
+canonical transaction ID plus the exact opaque signed bytes without
+broadcasting. The separate broadcast operation validates the expected hash
+before submitting the same bytes. This lets PS durably record a transaction
+before the external side effect.
 The generic `Collector<C>` convenience operation remains compatible by
 preparing and then broadcasting within one stateless call.
 
 The process has no storage dependency. Its health routes are detail-free;
 readiness is enabled only after RPC chain-identity and custody capability/status
-probes succeed, and is disabled before graceful shutdown. The concrete wire
-contract and deployment settings are documented in
+probes succeed; Bitcoin also requires authenticated IX readiness/network status
+and verifies the IX checkpoint against Core. Readiness is startup-latched in the
+current WS runtime and is disabled before graceful shutdown, so later dependency
+failures can surface on operations without clearing `/health/ready`. The
+concrete wire contract and deployment settings are documented in
 [`WALLET_SERVICE.md`](./WALLET_SERVICE.md).
 
 ## PS deposit and accounting contracts
@@ -146,7 +155,8 @@ payment semantics to IX facts:
 - [`CollectionStore`](../sdk/deposits/src/collection.rs) persists account, UTXO
   batch, and token-with-gas collection legs across restarts.
 
-The Ethereum v1 implementation adds the remaining PS-owned durable contracts:
+The PS implementation adds the remaining durable contracts used by both
+chain-specific runtime modes:
 
 - [`UserStore`](../sdk/deposits/src/user.rs) stores only opaque exchange-owned
   user identity and ownership association;
@@ -156,8 +166,8 @@ The Ethereum v1 implementation adds the remaining PS-owned durable contracts:
   post-credit cases and typed `ReverseCredit`, `AcceptLiability`, or
   `ExternalDebtRecorded` decisions; and
 - [`PaymentDatabaseMetadataStore`](../sdk/deposits/src/metadata.rs) binds a PS
-  store to its owner, schema, Ethereum scope, and policy identity and exposes
-  the explicit semantic migration contract.
+  store to its owner, schema, one chain/network scope, and policy identity and
+  exposes the explicit semantic migration contract.
 
 [`PersistentPaymentRepository`](../sdk/deposits/src/persistent.rs) implements
 these boundaries over injected `Storage`. Mirroring commits the immutable IX
@@ -165,19 +175,30 @@ fact and ingestion cursor together. Business projection commits all ledger
 updates, reconciliation cases, affected-deposit observation-index rows, and the
 projection cursor together. The index deliberately includes relevant facts such
 as ERC-20 gas funding even when that fact does not change the token ledger.
+UTXO-batch projection performs the retained leg/reservation transition and all
+participant ledger/index/reconciliation updates in that same physical write.
+Opaque spend-resource indexes enforce exact-source uniqueness without importing
+Bitcoin types into `deposits`. Bitcoin v1 also retains the collection ownership
+index after confirmation, so a deposit has at most one UTXO-batch collection
+aggregate. Later facts remain projectable, but another collection requires a
+future multi-reservation/archival contract. UTXO-batch v1 deliberately rejects
+the generic fail-leg/reservation-release operations; an unsigned required batch
+remains active and retryable until a future explicit cancellation contract.
 
 [`apps/api`](../apps/api) composes that repository with RocksDB, authenticated
-IX and WS HTTP clients, a required Ethereum policy, public/admin HTTP routes,
-and supervised job, watch-reconciliation, ingestion, projection, expiration,
-collection, readiness, and maintenance workers. It inspects exact signed
-EIP-1559 envelopes in `chain-ethereum` before persistence/broadcast so the
-configured numeric chain ID and gas/fee ceilings are enforced without moving
-Ethereum parsing into the PS domain.
+chain-specific IX and WS HTTP clients, a required Ethereum or Bitcoin policy,
+public/admin HTTP routes, and supervised job, watch-reconciliation, ingestion,
+projection, expiration, collection, readiness, and maintenance workers. It
+inspects exact signed EIP-1559 envelopes in `chain-ethereum` or finalized raw
+transactions in `chain-bitcoin` before persistence/broadcast, enforcing the
+active chain's identity, selection, output, and fee bounds without moving chain
+parsing into the PS domain. `payment-api bitcoin` is a separate CLI namespace
+and always owns a Bitcoin-only database.
 
 The `payment-api migrate` composition creates and verifies a physical RocksDB
 backup before invoking semantic validation. It checks PS ownership and record
 references, rebuilds deposit association and deposit-observation indexes, and
-only then binds schema v2, the selected Ethereum scope, and active policy.
+only then binds schema v2, the selected chain scope, and active policy.
 Normal serving refuses old, unbound, IX-owned, or mismatched databases.
 
 IX and concrete chain crates do not depend on `deposits`.
@@ -195,6 +216,8 @@ separate:
   `txs(address)` semantics;
 - [`ObservationEventSource`](../sdk/indexing/src/service.rs) exposes a durable,
   cursor-based at-least-once event feed;
+- [`ProjectionQuery`](../sdk/indexing/src/projection.rs) exposes the active
+  generation of a chain-owned opaque materialized projection;
 - [`ObservedTransaction`](../sdk/indexing/src/observation.rs) contains only
   chain facts, including multiple movements, fee, status, and revision.
 
@@ -202,14 +225,16 @@ The same contracts can be adapted to in-process calls, HTTP, queues, polling,
 or WebSockets without changing their semantics. The first persistent
 implementation uses one composite `IndexRepository`: block/undo state,
 checkpoint movement, current observations, immutable revisions, confirmation
-advancement, and feed rows are one atomic command boundary. Interpreters return
-`ObservationDraft` values and never allocate repository revisions or cursors.
+advancement, chain projection changes, and feed rows are one atomic command
+boundary. Interpreters return `ObservationDraft` and opaque projection mutation
+values and never allocate repository revisions or cursors.
 
 [`apps/indexer`](../apps/indexer) exports `IndexerService` and
-`IndexerServiceConfig` for applications that host the complete Ethereum v1 IX
-runtime in-process. The facade composes the same Ethereum source, RocksDB
-repository, worker supervisor, HTTP API, and metrics listener as the
-`indexer-worker` binary. It does not replace the semantic observation
+`IndexerServiceConfig` for Ethereum and `BitcoinIndexerService` with
+`BitcoinIndexerServiceConfig` for Bitcoin. Each facade composes the same
+chain-native source/interpreter, RocksDB repository, worker supervisor, HTTP
+API, and metrics listener as its `indexer-worker` command. It does not replace
+the semantic observation
 contracts, add PS meanings to facts, permit another database writer, or make
 multiple IX instances safe inside one process. Embedded callers may provide
 their own shutdown future and must provide the process Prometheus adapter
@@ -220,6 +245,11 @@ For Ethereum v1, HTTP polling is canonical and optional `newHeads` only wakes
 reconciliation. The public status phase is explicit, depth 12 is confirmation
 policy rather than consensus finality, and rollback retention is 50 bundles
 plus one predecessor anchor. See [`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md).
+
+For Bitcoin block-only v1, Core polling is canonical, confirmation depth and
+rollback retention are required configuration, and every watched creation or
+spent-marker mutation is atomic with its block, inverse undo, observations,
+feed rows, and checkpoint. Input and output movements remain independent facts.
 
 ## UTXO construction
 

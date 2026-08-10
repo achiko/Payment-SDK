@@ -1,5 +1,9 @@
-use std::{fmt, num::NonZeroU32, time::Duration};
+use std::{collections::BTreeSet, fmt, num::NonZeroU32, time::Duration};
 
+use chain_bitcoin::{
+    BitcoinAddress, BitcoinNetwork, BitcoinOutPoint, BitcoinTransactionId, Satoshi,
+    format_bitcoin_block_hash, parse_bitcoin_block_hash,
+};
 use chain_identity::{AssetId, AtomicAmount, CanonicalAddress, CanonicalTransactionId, ChainId};
 use deposits::{BoxFuture, DepositIndexerClient};
 use indexing::{
@@ -56,7 +60,7 @@ impl IndexerClient {
         after: Option<EventCursor>,
         limit: usize,
     ) -> Result<EventPage, IndexError> {
-        ensure_ethereum_scope(scope)?;
+        wire_chain(scope)?;
         if limit == 0 || limit > 1_000 {
             return Err(invalid_request(
                 "Indexer event page size must be between 1 and 1000",
@@ -74,7 +78,7 @@ impl IndexerClient {
         let events: Vec<ObservationEvent> = dto
             .events
             .into_iter()
-            .map(EventDto::try_into)
+            .map(EventDto::into_value)
             .collect::<Result<Vec<_>, _>>()?;
         for event in &events {
             if event.transaction.scope != *scope {
@@ -105,10 +109,10 @@ impl IndexerClient {
     }
 
     async fn status_request(&self, scope: &IndexScope) -> Result<SyncStatus, IndexError> {
-        ensure_ethereum_scope(scope)?;
-        let url = self.route(&["v1", "scopes", "ethereum", &scope.network, "status"])?;
+        wire_chain(scope)?;
+        let url = self.route(&["v1", "scopes", &scope.chain.0, &scope.network, "status"])?;
         let dto: StatusDto = self.send_json(Method::GET, url, None::<&()>).await?;
-        let result: SyncStatus = dto.try_into()?;
+        let result = dto.into_value(scope)?;
         if result.scope != *scope {
             return Err(protocol_error(
                 "Indexer status response belongs to another scope",
@@ -118,7 +122,9 @@ impl IndexerClient {
     }
 
     async fn watch_request(&self, request: WatchRequest) -> Result<WatchReceipt, IndexError> {
-        ensure_ethereum_scope(&request.scope)?;
+        wire_chain(&request.scope)?;
+        let expected_selector = request.selector.clone();
+        let expected_start_height = request.start_height;
         let selector_chain = match &request.selector {
             WatchSelector::Address(address) => &address.chain,
             WatchSelector::Transaction(transaction) => &transaction.chain,
@@ -130,10 +136,18 @@ impl IndexerClient {
                 false,
             ));
         }
+        match &request.selector {
+            WatchSelector::Address(address) => {
+                validate_address(&request.scope, &address.value, "watch.selector")?;
+            }
+            WatchSelector::Transaction(transaction) => {
+                validate_transaction(&request.scope.chain, &transaction.value, "watch.selector")?;
+            }
+        }
         let url = self.route(&[
             "v1",
             "scopes",
-            "ethereum",
+            &request.scope.chain.0,
             &request.scope.network,
             "watches",
         ])?;
@@ -149,13 +163,69 @@ impl IndexerClient {
             idempotency_key: request.idempotency_key,
         };
         let dto: WatchDto = self.send_json(Method::POST, url, Some(&body)).await?;
-        let result: WatchReceipt = dto.try_into()?;
-        if result.scope != request.scope {
+        let result = dto.into_value(&request.scope)?;
+        if result.scope != request.scope
+            || result.selector != expected_selector
+            || result.start_height != expected_start_height
+        {
             return Err(protocol_error(
-                "Indexer watch response belongs to another scope",
+                "Indexer watch response differs from the requested scope, selector, or start height",
             ));
         }
         Ok(result)
+    }
+
+    /// Reads one snapshot-fenced page from Bitcoin IX's canonical UTXO
+    /// projection. The opaque continuation cursor binds later pages to the
+    /// same generation, revision, checkpoint, and relative storage key.
+    pub async fn bitcoin_utxos(
+        &self,
+        scope: &IndexScope,
+        address: &BitcoinAddress,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<BitcoinUtxoPage, IndexError> {
+        let network = match wire_chain(scope)? {
+            WireChain::Bitcoin(network) => network,
+            WireChain::Ethereum => {
+                return Err(IndexError::new(
+                    IndexErrorKind::ScopeMismatch,
+                    "Bitcoin UTXO lookup requires a Bitcoin scope",
+                    false,
+                ));
+            }
+        };
+        if limit == 0 || limit > 1_000 {
+            return Err(invalid_request(
+                "Bitcoin UTXO page size must be between 1 and 1000",
+            ));
+        }
+        let canonical = BitcoinAddress::parse_for_network(&address.0, network)
+            .map_err(|_| invalid_request("Bitcoin UTXO address is invalid for the scope"))?;
+        if canonical != *address {
+            return Err(invalid_request("Bitcoin UTXO address is not canonical"));
+        }
+        if after.is_some_and(str::is_empty) {
+            return Err(invalid_request("Bitcoin UTXO continuation cursor is empty"));
+        }
+        let mut url = self.route(&[
+            "v1",
+            "scopes",
+            "bitcoin",
+            &scope.network,
+            "addresses",
+            &address.0,
+            "utxos",
+        ])?;
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(cursor) = after {
+                query.append_pair("after", cursor);
+            }
+            query.append_pair("limit", &limit.to_string());
+        }
+        let dto: BitcoinUtxoPageDto = self.send_json(Method::GET, url, None::<&()>).await?;
+        dto.into_value(scope, address)
     }
 
     fn route(&self, segments: &[&str]) -> Result<Url, IndexError> {
@@ -280,15 +350,71 @@ pub struct EventPage {
     pub next_cursor: Option<EventCursor>,
 }
 
-fn ensure_ethereum_scope(scope: &IndexScope) -> Result<(), IndexError> {
-    if scope.chain.0 != "ethereum" || scope.network.trim().is_empty() {
-        Err(IndexError::new(
+/// Canonical IX projection identity returned with every Bitcoin UTXO page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BitcoinUtxoSnapshot {
+    pub generation: u64,
+    pub revision: u64,
+    pub checkpoint: BlockRef,
+}
+
+/// One exact unspent Bitcoin output returned by IX.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BitcoinUtxo {
+    pub outpoint: BitcoinOutPoint,
+    pub value: Satoshi,
+    pub script_pubkey: Vec<u8>,
+    pub address: BitcoinAddress,
+    pub created_height: BlockHeight,
+    pub coinbase: bool,
+    pub confirmations: u64,
+}
+
+/// One bounded page of canonical Bitcoin UTXOs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BitcoinUtxoPage {
+    pub snapshot: BitcoinUtxoSnapshot,
+    pub outputs: Vec<BitcoinUtxo>,
+    pub next: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WireChain {
+    Ethereum,
+    Bitcoin(BitcoinNetwork),
+}
+
+fn wire_chain(scope: &IndexScope) -> Result<WireChain, IndexError> {
+    if scope.network.trim().is_empty() {
+        return Err(IndexError::new(
             IndexErrorKind::ScopeMismatch,
-            "PS Indexer client is configured only for one Ethereum network",
+            "Indexer scope network must not be empty",
             false,
-        ))
-    } else {
-        Ok(())
+        ));
+    }
+    match scope.chain.0.as_str() {
+        "ethereum" => Ok(WireChain::Ethereum),
+        "bitcoin" => bitcoin_network(&scope.network).map(WireChain::Bitcoin),
+        _ => Err(IndexError::new(
+            IndexErrorKind::ScopeMismatch,
+            "PS Indexer client supports only Ethereum or Bitcoin scopes",
+            false,
+        )),
+    }
+}
+
+fn bitcoin_network(network: &str) -> Result<BitcoinNetwork, IndexError> {
+    match network {
+        "mainnet" => Ok(BitcoinNetwork::Mainnet),
+        "testnet3" => Ok(BitcoinNetwork::Testnet3),
+        "testnet4" => Ok(BitcoinNetwork::Testnet4),
+        "signet" => Ok(BitcoinNetwork::Signet),
+        "regtest" => Ok(BitcoinNetwork::Regtest),
+        _ => Err(IndexError::new(
+            IndexErrorKind::ScopeMismatch,
+            "Bitcoin Indexer scope has an unknown network",
+            false,
+        )),
     }
 }
 
@@ -423,26 +549,36 @@ struct StatusDto {
     halted_reason: Option<String>,
 }
 
-impl TryFrom<StatusDto> for SyncStatus {
-    type Error = IndexError;
-
-    fn try_from(value: StatusDto) -> Result<Self, Self::Error> {
-        Ok(Self {
-            scope: value.scope.try_into()?,
-            checkpoint: value.checkpoint.map(BlockDto::try_into).transpose()?,
-            observed_tip: value.observed_tip.map(BlockDto::try_into).transpose()?,
+impl StatusDto {
+    fn into_value(self, expected_scope: &IndexScope) -> Result<SyncStatus, IndexError> {
+        let scope: IndexScope = self.scope.try_into()?;
+        if scope != *expected_scope {
+            return Err(protocol_error(
+                "Indexer status response belongs to another scope",
+            ));
+        }
+        Ok(SyncStatus {
+            scope: scope.clone(),
+            checkpoint: self
+                .checkpoint
+                .map(|block| block.into_value(&expected_scope.chain))
+                .transpose()?,
+            observed_tip: self
+                .observed_tip
+                .map(|block| block.into_value(&expected_scope.chain))
+                .transpose()?,
             confirmation_policy: ConfirmationPolicy {
                 minimum_confirmations: parse_decimal(
-                    &value.confirmation_depth,
+                    &self.confirmation_depth,
                     "confirmation_depth",
                 )?,
                 require_chain_finality: false,
             },
-            phase: parse_phase(&value.phase)?,
+            phase: parse_phase(&self.phase)?,
             // The v1 wire API exposes only the operator-facing reason string,
             // not the typed retained-height fields required by RebuildReason.
             rebuild_reason: None,
-            halted_reason: value.halted_reason,
+            halted_reason: self.halted_reason,
         })
     }
 }
@@ -475,21 +611,16 @@ struct BlockDto {
     timestamp: Option<String>,
 }
 
-impl TryFrom<BlockDto> for BlockRef {
-    type Error = IndexError;
-
-    fn try_from(value: BlockDto) -> Result<Self, Self::Error> {
-        Ok(Self {
-            height: BlockHeight(parse_decimal(&value.height, "block.height")?),
-            hash: BlockHash(parse_fixed::<32>(&value.hash, "block.hash")?.to_vec()),
-            parent_hash: value
+impl BlockDto {
+    fn into_value(self, chain: &ChainId) -> Result<BlockRef, IndexError> {
+        Ok(BlockRef {
+            height: BlockHeight(parse_decimal(&self.height, "block.height")?),
+            hash: parse_block_hash(chain, &self.hash, "block.hash")?,
+            parent_hash: self
                 .parent_hash
-                .map(|hash| {
-                    parse_fixed::<32>(&hash, "block.parent_hash")
-                        .map(|bytes| BlockHash(bytes.to_vec()))
-                })
+                .map(|hash| parse_block_hash(chain, &hash, "block.parent_hash"))
                 .transpose()?,
-            timestamp: value
+            timestamp: self
                 .timestamp
                 .map(|timestamp| parse_decimal(&timestamp, "block.timestamp"))
                 .transpose()?,
@@ -508,26 +639,33 @@ struct WatchDto {
     confirmation_depth: String,
 }
 
-impl TryFrom<WatchDto> for WatchReceipt {
-    type Error = IndexError;
-
-    fn try_from(value: WatchDto) -> Result<Self, Self::Error> {
-        if value.id.trim().is_empty() {
+impl WatchDto {
+    fn into_value(self, expected_scope: &IndexScope) -> Result<WatchReceipt, IndexError> {
+        if self.id.trim().is_empty() {
             return Err(protocol_error("Indexer returned an empty watch ID"));
         }
-        Ok(Self {
-            id: WatchId(value.id),
-            scope: value.scope.try_into()?,
-            selector: value.selector.try_into()?,
-            start_height: BlockHeight(parse_decimal(&value.start_height, "start_height")?),
-            registered_at: value.registered_at.map(BlockDto::try_into).transpose()?,
-            inactive_from: value
+        let scope: IndexScope = self.scope.try_into()?;
+        if scope != *expected_scope {
+            return Err(protocol_error(
+                "Indexer watch response belongs to another scope",
+            ));
+        }
+        Ok(WatchReceipt {
+            id: WatchId(self.id),
+            scope,
+            selector: self.selector.into_value(expected_scope)?,
+            start_height: BlockHeight(parse_decimal(&self.start_height, "start_height")?),
+            registered_at: self
+                .registered_at
+                .map(|block| block.into_value(&expected_scope.chain))
+                .transpose()?,
+            inactive_from: self
                 .inactive_from
                 .map(|height| parse_decimal(&height, "inactive_from").map(BlockHeight))
                 .transpose()?,
             confirmation_policy: ConfirmationPolicy {
                 minimum_confirmations: parse_decimal(
-                    &value.confirmation_depth,
+                    &self.confirmation_depth,
                     "confirmation_depth",
                 )?,
                 require_chain_finality: false,
@@ -543,23 +681,20 @@ enum SelectorResponseDto {
     Transaction(String),
 }
 
-impl TryFrom<SelectorResponseDto> for WatchSelector {
-    type Error = IndexError;
-
-    fn try_from(value: SelectorResponseDto) -> Result<Self, Self::Error> {
-        let chain = ChainId("ethereum".to_owned());
-        match value {
+impl SelectorResponseDto {
+    fn into_value(self, scope: &IndexScope) -> Result<WatchSelector, IndexError> {
+        match self {
             SelectorResponseDto::Address(address) => {
-                validate_address(&address, "watch.selector")?;
-                Ok(Self::Address(CanonicalAddress {
-                    chain,
+                validate_address(scope, &address, "watch.selector")?;
+                Ok(WatchSelector::Address(CanonicalAddress {
+                    chain: scope.chain.clone(),
                     value: address,
                 }))
             }
             SelectorResponseDto::Transaction(transaction) => {
-                validate_transaction(&transaction, "watch.selector")?;
-                Ok(Self::Transaction(CanonicalTransactionId {
-                    chain,
+                validate_transaction(&scope.chain, &transaction, "watch.selector")?;
+                Ok(WatchSelector::Transaction(CanonicalTransactionId {
+                    chain: scope.chain.clone(),
                     value: transaction,
                 }))
             }
@@ -582,24 +717,24 @@ struct EventDto {
     transaction: TransactionDto,
 }
 
-impl TryFrom<EventDto> for ObservationEvent {
-    type Error = IndexError;
-
-    fn try_from(value: EventDto) -> Result<Self, Self::Error> {
-        if value.id.trim().is_empty() || value.watch_ids.iter().any(|id| id.trim().is_empty()) {
+impl EventDto {
+    fn into_value(self) -> Result<ObservationEvent, IndexError> {
+        if self.id.trim().is_empty() || self.watch_ids.iter().any(|id| id.trim().is_empty()) {
             return Err(protocol_error(
                 "Indexer event contains an empty event or watch ID",
             ));
         }
-        Ok(Self {
-            id: ObservationEventId(value.id),
-            cursor: EventCursor(parse_decimal(&value.cursor, "event.cursor")?),
-            watch_ids: value.watch_ids.into_iter().map(WatchId).collect(),
-            previous_status: value
+        let scope: IndexScope = self.transaction.scope.clone().try_into()?;
+        wire_chain(&scope)?;
+        Ok(ObservationEvent {
+            id: ObservationEventId(self.id),
+            cursor: EventCursor(parse_decimal(&self.cursor, "event.cursor")?),
+            watch_ids: self.watch_ids.into_iter().map(WatchId).collect(),
+            previous_status: self
                 .previous_status
-                .map(TransactionStatusDto::try_into)
+                .map(|status| status.into_value(&scope.chain))
                 .transpose()?,
-            transaction: value.transaction.try_into()?,
+            transaction: self.transaction.into_value()?,
         })
     }
 }
@@ -616,30 +751,29 @@ struct TransactionDto {
     observed_at: String,
 }
 
-impl TryFrom<TransactionDto> for ObservedTransaction {
-    type Error = IndexError;
-
-    fn try_from(value: TransactionDto) -> Result<Self, Self::Error> {
-        let scope: IndexScope = value.scope.try_into()?;
+impl TransactionDto {
+    fn into_value(self) -> Result<ObservedTransaction, IndexError> {
+        let scope: IndexScope = self.scope.try_into()?;
+        wire_chain(&scope)?;
         let chain = scope.chain.clone();
-        validate_transaction(&value.transaction_id, "transaction_id")?;
-        let movements = value
+        validate_transaction(&chain, &self.transaction_id, "transaction_id")?;
+        let movements = self
             .movements
             .into_iter()
-            .map(|movement| movement.into_value(&scope.chain))
+            .map(|movement| movement.into_value(&scope))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
+        Ok(ObservedTransaction {
             transaction_id: CanonicalTransactionId {
                 chain: scope.chain.clone(),
-                value: value.transaction_id,
+                value: self.transaction_id,
             },
-            scope,
-            revision: ObservationRevision(parse_decimal(&value.revision, "revision")?),
-            status: value.status.try_into()?,
+            scope: scope.clone(),
+            revision: ObservationRevision(parse_decimal(&self.revision, "revision")?),
+            status: self.status.into_value(&chain)?,
             movements,
-            fee: value.fee.map(|fee| fee.into_value(chain)).transpose()?,
-            first_seen_at: parse_decimal(&value.first_seen_at, "first_seen_at")?,
-            observed_at: parse_decimal(&value.observed_at, "observed_at")?,
+            fee: self.fee.map(|fee| fee.into_value(&scope)).transpose()?,
+            first_seen_at: parse_decimal(&self.first_seen_at, "first_seen_at")?,
+            observed_at: parse_decimal(&self.observed_at, "observed_at")?,
         })
     }
 }
@@ -669,16 +803,14 @@ enum TransactionStatusDto {
     },
 }
 
-impl TryFrom<TransactionStatusDto> for TransactionStatus {
-    type Error = IndexError;
-
-    fn try_from(value: TransactionStatusDto) -> Result<Self, Self::Error> {
-        match value {
+impl TransactionStatusDto {
+    fn into_value(self, chain: &ChainId) -> Result<TransactionStatus, IndexError> {
+        match self {
             TransactionStatusDto::Pending | TransactionStatusDto::Dropped => Err(protocol_error(
                 "v1 PS ingestion rejects non-canonical mempool status",
             )),
             TransactionStatusDto::Replaced { by } => {
-                validate_transaction(&by, "replacement transaction")?;
+                validate_transaction(chain, &by, "replacement transaction")?;
                 Err(protocol_error(
                     "v1 PS ingestion rejects non-canonical mempool status",
                 ))
@@ -686,20 +818,20 @@ impl TryFrom<TransactionStatusDto> for TransactionStatus {
             TransactionStatusDto::Included {
                 block,
                 confirmations,
-            } => Ok(Self::Included {
-                block: block.try_into()?,
+            } => Ok(TransactionStatus::Included {
+                block: block.into_value(chain)?,
                 confirmations: parse_decimal(&confirmations, "confirmations")?,
             }),
-            TransactionStatusDto::Confirmed { block, proof } => Ok(Self::Confirmed {
-                block: block.try_into()?,
+            TransactionStatusDto::Confirmed { block, proof } => Ok(TransactionStatus::Confirmed {
+                block: block.into_value(chain)?,
                 proof: proof.try_into()?,
             }),
-            TransactionStatusDto::Failed { block, reason } => Ok(Self::Failed {
-                block: block.map(BlockDto::try_into).transpose()?,
+            TransactionStatusDto::Failed { block, reason } => Ok(TransactionStatus::Failed {
+                block: block.map(|block| block.into_value(chain)).transpose()?,
                 reason,
             }),
-            TransactionStatusDto::Reorged { previous_block } => Ok(Self::Reorged {
-                previous_block: previous_block.try_into()?,
+            TransactionStatusDto::Reorged { previous_block } => Ok(TransactionStatus::Reorged {
+                previous_block: previous_block.into_value(chain)?,
             }),
         }
     }
@@ -744,7 +876,7 @@ struct MovementDto {
 }
 
 impl MovementDto {
-    fn into_value(self, chain: &ChainId) -> Result<ValueMovement, IndexError> {
+    fn into_value(self, scope: &IndexScope) -> Result<ValueMovement, IndexError> {
         if self.id.trim().is_empty() || self.asset.trim().is_empty() {
             return Err(protocol_error(
                 "Indexer movement contains an empty ID or asset",
@@ -763,21 +895,47 @@ impl MovementDto {
             }
             _ => return Err(protocol_error("Indexer movement kind is unknown")),
         };
+        let wire_chain = wire_chain(scope)?;
+        if matches!(wire_chain, WireChain::Bitcoin(_))
+            && (self.asset != "native"
+                || !matches!(kind, MovementKind::Input | MovementKind::Output))
+        {
+            return Err(protocol_error(
+                "Bitcoin Indexer movement must be a native input or output",
+            ));
+        }
+        if matches!(wire_chain, WireChain::Ethereum)
+            && matches!(kind, MovementKind::Input | MovementKind::Output)
+        {
+            return Err(protocol_error(
+                "Ethereum Indexer movement cannot use Bitcoin input/output kinds",
+            ));
+        }
+        let from = self
+            .from
+            .map(|address| canonical_address(scope, address, "movement.from"))
+            .transpose()?;
+        let to = self
+            .to
+            .map(|address| canonical_address(scope, address, "movement.to"))
+            .transpose()?;
+        if matches!(wire_chain, WireChain::Bitcoin(_))
+            && ((kind == MovementKind::Input && to.is_some())
+                || (kind == MovementKind::Output && from.is_some()))
+        {
+            return Err(protocol_error(
+                "Bitcoin Indexer movement has an inconsistent input/output direction",
+            ));
+        }
         Ok(ValueMovement {
             id: MovementId(self.id),
             asset: AssetId {
-                chain: chain.clone(),
+                chain: scope.chain.clone(),
                 asset: self.asset,
             },
             amount: parse_amount(&self.amount, "movement.amount")?,
-            from: self
-                .from
-                .map(|address| canonical_address(chain, address, "movement.from"))
-                .transpose()?,
-            to: self
-                .to
-                .map(|address| canonical_address(chain, address, "movement.to"))
-                .transpose()?,
+            from,
+            to,
             kind,
         })
     }
@@ -791,32 +949,173 @@ struct FeeDto {
 }
 
 impl FeeDto {
-    fn into_value(self, chain: ChainId) -> Result<NetworkFee, IndexError> {
+    fn into_value(self, scope: &IndexScope) -> Result<NetworkFee, IndexError> {
         if self.asset.trim().is_empty() {
             return Err(protocol_error("Indexer fee contains an empty asset"));
         }
+        if matches!(wire_chain(scope)?, WireChain::Bitcoin(_)) && self.asset != "native" {
+            return Err(protocol_error(
+                "Bitcoin Indexer fee must use the native asset",
+            ));
+        }
         Ok(NetworkFee {
             asset: AssetId {
-                chain: chain.clone(),
+                chain: scope.chain.clone(),
                 asset: self.asset,
             },
             amount: parse_amount(&self.amount, "fee.amount")?,
             payer: self
                 .payer
-                .map(|address| canonical_address(&chain, address, "fee.payer"))
+                .map(|address| canonical_address(scope, address, "fee.payer"))
                 .transpose()?,
         })
     }
 }
 
+#[derive(Deserialize)]
+struct BitcoinUtxoPageDto {
+    generation: String,
+    revision: String,
+    checkpoint: Option<BlockDto>,
+    outputs: Vec<BitcoinUtxoDto>,
+    next: Option<String>,
+}
+
+impl BitcoinUtxoPageDto {
+    fn into_value(
+        self,
+        scope: &IndexScope,
+        expected_address: &BitcoinAddress,
+    ) -> Result<BitcoinUtxoPage, IndexError> {
+        let network = match wire_chain(scope)? {
+            WireChain::Bitcoin(network) => network,
+            WireChain::Ethereum => {
+                return Err(protocol_error(
+                    "Bitcoin IX returned a UTXO page for an Ethereum scope",
+                ));
+            }
+        };
+        let checkpoint = self
+            .checkpoint
+            .ok_or_else(|| protocol_error("Bitcoin IX UTXO page has no checkpoint"))?
+            .into_value(&scope.chain)?;
+        let snapshot = BitcoinUtxoSnapshot {
+            generation: parse_canonical_decimal(&self.generation, "Bitcoin UTXO generation")?,
+            revision: parse_canonical_decimal(&self.revision, "Bitcoin UTXO revision")?,
+            checkpoint,
+        };
+        let mut outpoints = BTreeSet::new();
+        let outputs = self
+            .outputs
+            .into_iter()
+            .map(|output| {
+                let output = output.into_value(network, &snapshot, expected_address)?;
+                if !outpoints.insert(output.outpoint) {
+                    return Err(protocol_error(
+                        "Bitcoin IX UTXO page contains a duplicate outpoint",
+                    ));
+                }
+                Ok(output)
+            })
+            .collect::<Result<Vec<_>, IndexError>>()?;
+        if self.next.as_ref().is_some_and(String::is_empty) {
+            return Err(protocol_error(
+                "Bitcoin IX UTXO page contains an empty continuation cursor",
+            ));
+        }
+        Ok(BitcoinUtxoPage {
+            snapshot,
+            outputs,
+            next: self.next,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct BitcoinUtxoDto {
+    transaction_id: String,
+    output_index: String,
+    value_sats: String,
+    script_pubkey: String,
+    address: String,
+    created_height: String,
+    coinbase: bool,
+    confirmations: String,
+}
+
+impl BitcoinUtxoDto {
+    fn into_value(
+        self,
+        network: BitcoinNetwork,
+        snapshot: &BitcoinUtxoSnapshot,
+        expected_address: &BitcoinAddress,
+    ) -> Result<BitcoinUtxo, IndexError> {
+        let transaction_id =
+            parse_bitcoin_transaction_id(&self.transaction_id, "Bitcoin UTXO transaction_id")?;
+        let output_index = parse_canonical_u32(&self.output_index, "Bitcoin UTXO output_index")?;
+        let value = Satoshi(parse_canonical_decimal(
+            &self.value_sats,
+            "Bitcoin UTXO value_sats",
+        )?);
+        let script_pubkey = parse_canonical_hex(&self.script_pubkey, "Bitcoin UTXO script_pubkey")?;
+        let address = BitcoinAddress::parse_for_network(&self.address, network)
+            .map_err(|_| protocol_error("Bitcoin IX UTXO address is invalid for its scope"))?;
+        if address.0 != self.address || &address != expected_address {
+            return Err(protocol_error(
+                "Bitcoin IX UTXO belongs to a different or non-canonical address",
+            ));
+        }
+        let expected_script = address
+            .script_pubkey_for_network(network)
+            .map_err(|_| protocol_error("Bitcoin IX UTXO address script could not be derived"))?;
+        if script_pubkey != expected_script.as_bytes() {
+            return Err(protocol_error(
+                "Bitcoin IX UTXO script does not match its address",
+            ));
+        }
+        let created_height = BlockHeight(parse_canonical_decimal(
+            &self.created_height,
+            "Bitcoin UTXO created_height",
+        )?);
+        let confirmations =
+            parse_canonical_decimal(&self.confirmations, "Bitcoin UTXO confirmations")?;
+        let expected_confirmations = snapshot
+            .checkpoint
+            .height
+            .0
+            .checked_sub(created_height.0)
+            .and_then(|depth| depth.checked_add(1))
+            .ok_or_else(|| {
+                protocol_error("Bitcoin IX UTXO creation height exceeds its checkpoint")
+            })?;
+        if confirmations != expected_confirmations {
+            return Err(protocol_error(
+                "Bitcoin IX UTXO confirmation count does not match its checkpoint",
+            ));
+        }
+        Ok(BitcoinUtxo {
+            outpoint: BitcoinOutPoint {
+                transaction_id,
+                output_index,
+            },
+            value,
+            script_pubkey,
+            address,
+            created_height,
+            coinbase: self.coinbase,
+            confirmations,
+        })
+    }
+}
+
 fn canonical_address(
-    chain: &ChainId,
+    scope: &IndexScope,
     value: String,
     field: &str,
 ) -> Result<CanonicalAddress, IndexError> {
-    validate_address(&value, field)?;
+    validate_address(scope, &value, field)?;
     Ok(CanonicalAddress {
-        chain: chain.clone(),
+        chain: scope.chain.clone(),
         value,
     })
 }
@@ -845,12 +1144,106 @@ fn parse_amount(input: &str, field: &str) -> Result<AtomicAmount, IndexError> {
     parse_fixed::<32>(input, field).map(AtomicAmount)
 }
 
-fn validate_address(input: &str, field: &str) -> Result<(), IndexError> {
-    parse_fixed::<20>(input, field).map(|_| ())
+fn validate_address(scope: &IndexScope, input: &str, field: &str) -> Result<(), IndexError> {
+    match wire_chain(scope)? {
+        WireChain::Ethereum => parse_fixed::<20>(input, field).map(|_| ()),
+        WireChain::Bitcoin(network) => {
+            let address = BitcoinAddress::parse_for_network(input, network).map_err(|_| {
+                protocol_error(format!("Indexer {field} is not a valid Bitcoin address"))
+            })?;
+            if address.0 != input {
+                return Err(protocol_error(format!(
+                    "Indexer {field} is not a canonical Bitcoin address"
+                )));
+            }
+            Ok(())
+        }
+    }
 }
 
-fn validate_transaction(input: &str, field: &str) -> Result<(), IndexError> {
-    parse_fixed::<32>(input, field).map(|_| ())
+fn validate_transaction(chain: &ChainId, input: &str, field: &str) -> Result<(), IndexError> {
+    match chain.0.as_str() {
+        "ethereum" => parse_fixed::<32>(input, field).map(|_| ()),
+        "bitcoin" => parse_bitcoin_transaction_id(input, field).map(|_| ()),
+        _ => Err(IndexError::new(
+            IndexErrorKind::ScopeMismatch,
+            "Indexer transaction belongs to an unsupported chain",
+            false,
+        )),
+    }
+}
+
+fn parse_block_hash(chain: &ChainId, input: &str, field: &str) -> Result<BlockHash, IndexError> {
+    match chain.0.as_str() {
+        "ethereum" => parse_fixed::<32>(input, field).map(|bytes| BlockHash(bytes.to_vec())),
+        "bitcoin" => {
+            let hash = parse_bitcoin_block_hash(input).map_err(|_| {
+                protocol_error(format!("Indexer {field} is not a Bitcoin block hash"))
+            })?;
+            let canonical = format_bitcoin_block_hash(&hash)
+                .map_err(|_| protocol_error(format!("Indexer {field} could not be formatted")))?;
+            if canonical != input {
+                return Err(protocol_error(format!(
+                    "Indexer {field} is not a canonical Bitcoin block hash"
+                )));
+            }
+            Ok(hash)
+        }
+        _ => Err(IndexError::new(
+            IndexErrorKind::ScopeMismatch,
+            "Indexer block belongs to an unsupported chain",
+            false,
+        )),
+    }
+}
+
+fn parse_bitcoin_transaction_id(
+    input: &str,
+    field: &str,
+) -> Result<BitcoinTransactionId, IndexError> {
+    let id = input
+        .parse::<BitcoinTransactionId>()
+        .map_err(|_| protocol_error(format!("Indexer {field} is not a Bitcoin transaction ID")))?;
+    if id.to_string() != input {
+        return Err(protocol_error(format!(
+            "Indexer {field} is not a canonical Bitcoin transaction ID"
+        )));
+    }
+    Ok(id)
+}
+
+fn parse_canonical_decimal(input: &str, field: &str) -> Result<u64, IndexError> {
+    let value = parse_decimal(input, field)?;
+    if value.to_string() != input {
+        return Err(protocol_error(format!(
+            "Indexer {field} is not a canonical decimal string"
+        )));
+    }
+    Ok(value)
+}
+
+fn parse_canonical_u32(input: &str, field: &str) -> Result<u32, IndexError> {
+    let value = parse_canonical_decimal(input, field)?;
+    u32::try_from(value).map_err(|_| protocol_error(format!("Indexer {field} exceeds u32")))
+}
+
+fn parse_canonical_hex(input: &str, field: &str) -> Result<Vec<u8>, IndexError> {
+    let hexadecimal = input
+        .strip_prefix("0x")
+        .ok_or_else(|| protocol_error(format!("Indexer {field} is missing its 0x prefix")))?;
+    if hexadecimal.is_empty() || hexadecimal.len() % 2 != 0 {
+        return Err(protocol_error(format!(
+            "Indexer {field} has an invalid byte length"
+        )));
+    }
+    let decoded = hex::decode(hexadecimal)
+        .map_err(|_| protocol_error(format!("Indexer {field} contains invalid hexadecimal")))?;
+    if format!("0x{}", hex::encode(&decoded)) != input {
+        return Err(protocol_error(format!(
+            "Indexer {field} is not canonical lowercase hexadecimal"
+        )));
+    }
+    Ok(decoded)
 }
 
 fn parse_fixed<const N: usize>(input: &str, field: &str) -> Result<[u8; N], IndexError> {
@@ -883,6 +1276,7 @@ mod tests {
         http::{HeaderMap, StatusCode as AxumStatusCode},
         routing::{get, post},
     };
+    use bitcoin::{Address, CompressedPublicKey, Network, PublicKey};
     use serde_json::{Value, json};
     use tokio::net::TcpListener;
 
@@ -1015,6 +1409,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bitcoin_status_watch_events_and_utxos_match_wire_contract() {
+        async fn status() -> (AxumStatusCode, Json<Value>) {
+            (
+                AxumStatusCode::OK,
+                Json(json!({
+                    "scope": {"chain": "bitcoin", "network": "regtest"},
+                    "phase": "ready",
+                    "checkpoint": bitcoin_block_json(42),
+                    "observed_tip": bitcoin_block_json(43),
+                    "confirmation_depth": "6",
+                    "rebuild_reason": null,
+                    "halted_reason": null
+                })),
+            )
+        }
+
+        async fn watch(Json(body): Json<Value>) -> (AxumStatusCode, Json<Value>) {
+            let address = bitcoin_test_address();
+            assert_eq!(body["selector"]["type"], "address");
+            assert_eq!(body["selector"]["value"], address.0);
+            (
+                AxumStatusCode::OK,
+                Json(json!({
+                    "id": "bitcoin-watch-1",
+                    "scope": {"chain": "bitcoin", "network": "regtest"},
+                    "selector": {"type": "address", "value": address.0},
+                    "start_height": "42",
+                    "registered_at": bitcoin_block_json(42),
+                    "inactive_from": null,
+                    "confirmation_depth": "6"
+                })),
+            )
+        }
+
+        async fn events() -> (AxumStatusCode, Json<Value>) {
+            (
+                AxumStatusCode::OK,
+                Json(json!({
+                    "events": [bitcoin_event_json()],
+                    "next_cursor": "7"
+                })),
+            )
+        }
+
+        async fn utxos() -> (AxumStatusCode, Json<Value>) {
+            let address = bitcoin_test_address();
+            let script = address
+                .script_pubkey_for_network(BitcoinNetwork::Regtest)
+                .expect("test address must produce a script");
+            (
+                AxumStatusCode::OK,
+                Json(json!({
+                    "generation": "7",
+                    "revision": "9",
+                    "checkpoint": bitcoin_block_json(42),
+                    "outputs": [{
+                        "transaction_id": "22".repeat(32),
+                        "output_index": "1",
+                        "value_sats": "75000",
+                        "script_pubkey": format!("0x{}", hex::encode(script.as_bytes())),
+                        "address": address.0,
+                        "created_height": "40",
+                        "coinbase": false,
+                        "confirmations": "3"
+                    }],
+                    "next": null
+                })),
+            )
+        }
+
+        let endpoint = spawn(
+            Router::new()
+                .route("/v1/scopes/bitcoin/regtest/status", get(status))
+                .route("/v1/scopes/bitcoin/regtest/watches", post(watch))
+                .route("/v1/events", get(events))
+                .route(
+                    "/v1/scopes/bitcoin/regtest/addresses/{address}/utxos",
+                    get(utxos),
+                ),
+        )
+        .await;
+        let client = IndexerClient::new(&options(endpoint, None)).expect("client must build");
+        let scope = bitcoin_scope();
+        let address = bitcoin_test_address();
+
+        let status = client.status(&scope).await.expect("status must decode");
+        assert_eq!(status.scope, scope);
+        assert_eq!(status.confirmation_policy.minimum_confirmations, 6);
+
+        let receipt = client
+            .watch(WatchRequest {
+                scope: scope.clone(),
+                selector: WatchSelector::Address(CanonicalAddress {
+                    chain: scope.chain.clone(),
+                    value: address.0.clone(),
+                }),
+                start_height: BlockHeight(42),
+                idempotency_key: "bitcoin-deposit-1".to_owned(),
+            })
+            .await
+            .expect("Bitcoin watch must decode");
+        assert_eq!(receipt.id, WatchId("bitcoin-watch-1".to_owned()));
+
+        let events = client
+            .events(&scope, None, 10)
+            .await
+            .expect("Bitcoin events must decode");
+        assert_eq!(events.next_cursor, Some(EventCursor(7)));
+        assert_eq!(
+            events.events[0].transaction.transaction_id.value,
+            "22".repeat(32)
+        );
+        assert_eq!(
+            events.events[0].transaction.movements[0].kind,
+            MovementKind::Input
+        );
+
+        let page = client
+            .bitcoin_utxos(&scope, &address, None, 10)
+            .await
+            .expect("Bitcoin UTXOs must decode");
+        assert_eq!(page.snapshot.generation, 7);
+        assert_eq!(page.snapshot.revision, 9);
+        assert_eq!(page.snapshot.checkpoint.height, BlockHeight(42));
+        assert_eq!(page.outputs.len(), 1);
+        assert_eq!(page.outputs[0].outpoint.output_index, 1);
+        assert_eq!(page.outputs[0].value, Satoshi(75_000));
+        assert_eq!(page.outputs[0].confirmations, 3);
+        assert_eq!(page.outputs[0].address, address);
+        assert_eq!(page.next, None);
+    }
+
+    #[tokio::test]
     async fn retry_is_bounded_and_client_debug_is_redacted() {
         async fn flaky(State(attempts): State<Arc<AtomicUsize>>) -> (AxumStatusCode, Json<Value>) {
             let attempt = attempts.fetch_add(1, Ordering::AcqRel);
@@ -1089,6 +1616,69 @@ mod tests {
             "hash": format!("0x{}", "11".repeat(32)),
             "parent_hash": format!("0x{}", "10".repeat(32)),
             "timestamp": "1000"
+        })
+    }
+
+    fn bitcoin_scope() -> IndexScope {
+        IndexScope {
+            chain: ChainId("bitcoin".to_owned()),
+            network: "regtest".to_owned(),
+        }
+    }
+
+    fn bitcoin_block_json(height: u64) -> Value {
+        json!({
+            "height": height.to_string(),
+            "hash": "11".repeat(32),
+            "parent_hash": "10".repeat(32),
+            "timestamp": "1000"
+        })
+    }
+
+    fn bitcoin_test_address() -> BitcoinAddress {
+        let public_key = PublicKey::from_slice(&[
+            0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce,
+            0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81,
+            0x5b, 0x16, 0xf8, 0x17, 0x98,
+        ])
+        .expect("test public key must parse");
+        let compressed =
+            CompressedPublicKey::try_from(public_key).expect("test key must be compressed");
+        BitcoinAddress(Address::p2wpkh(&compressed, Network::Regtest).to_string())
+    }
+
+    fn bitcoin_event_json() -> Value {
+        let address = bitcoin_test_address();
+        json!({
+            "id": "bitcoin-event-1",
+            "cursor": "7",
+            "watch_ids": ["bitcoin-watch-1"],
+            "previous_status": null,
+            "transaction": {
+                "scope": {"chain": "bitcoin", "network": "regtest"},
+                "transaction_id": "22".repeat(32),
+                "revision": "1",
+                "status": {
+                    "kind": "included",
+                    "block": bitcoin_block_json(42),
+                    "confirmations": "1"
+                },
+                "movements": [{
+                    "id": format!("{}:vin:0", "22".repeat(32)),
+                    "asset": "native",
+                    "amount": format!("0x{}", "00".repeat(32)),
+                    "from": address.0.clone(),
+                    "to": null,
+                    "kind": "input"
+                }],
+                "fee": {
+                    "asset": "native",
+                    "amount": format!("0x{}", "00".repeat(32)),
+                    "payer": address.0
+                },
+                "first_seen_at": "1000",
+                "observed_at": "1001"
+            }
         })
     }
 

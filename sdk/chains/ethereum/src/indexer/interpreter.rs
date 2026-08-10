@@ -87,6 +87,7 @@ impl EthereumBlockInterpreter {
         receipt: &ParsedReceipt,
         movements: &[ValueMovement],
         watches: &[WatchTarget<EthereumWatchTarget>],
+        height: indexing::BlockHeight,
     ) -> Result<Vec<WatchId>, IndexError> {
         let mut touched_addresses = BTreeSet::from([transaction.from]);
         if let Some(to) = transaction.to {
@@ -108,6 +109,9 @@ impl EthereumBlockInterpreter {
         let mut ids = BTreeSet::new();
         for watch in watches {
             self.validate_watch(watch)?;
+            if !watch.is_active_at(height) {
+                continue;
+            }
             let matched = match &watch.target {
                 EthereumWatchTarget::Address(address) => touched_addresses.contains(&address.0),
                 EthereumWatchTarget::Transaction(transaction_id) => {
@@ -174,7 +178,13 @@ impl BlockInterpreter for EthereumBlockInterpreter {
             } else {
                 Vec::new()
             };
-            let watch_ids = self.watch_ids(transaction, receipt, &movements, watches)?;
+            let watch_ids = self.watch_ids(
+                transaction,
+                receipt,
+                &movements,
+                watches,
+                block.reference.height,
+            )?;
             if watch_ids.is_empty() {
                 continue;
             }
@@ -202,6 +212,7 @@ impl BlockInterpreter for EthereumBlockInterpreter {
         Ok(InterpretedBlock {
             block: block.reference.clone(),
             drafts,
+            projection: indexing::ProjectionBatch::default(),
             undo: EthereumUndo {
                 affected_transactions,
             },

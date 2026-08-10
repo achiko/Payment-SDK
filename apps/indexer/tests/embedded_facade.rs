@@ -1,4 +1,7 @@
-use indexer_worker::{IndexerService, IndexerServiceConfig};
+use chain_bitcoin::BitcoinNetwork;
+use indexer_worker::{
+    BitcoinIndexerService, BitcoinIndexerServiceConfig, IndexerService, IndexerServiceConfig,
+};
 
 fn config() -> IndexerServiceConfig {
     IndexerServiceConfig::new(
@@ -9,6 +12,24 @@ fn config() -> IndexerServiceConfig {
         format!("0x{}", "11".repeat(32)),
         "http://127.0.0.1:8545",
     )
+}
+
+#[test]
+fn bitcoin_facade_is_constructible_without_runtime_side_effects() {
+    let mut config = BitcoinIndexerServiceConfig::new(
+        "bitcoin-indexer.db",
+        BitcoinNetwork::Regtest,
+        0,
+        2,
+        100,
+        "22".repeat(32),
+        "http://127.0.0.1:18443",
+    );
+    config.rpc_headers = vec!["authorization=Basic hidden".to_owned()];
+    config.bearer_token = Some("indexer-hidden".to_owned());
+
+    let _service = BitcoinIndexerService::new(config)
+        .expect("valid Bitcoin facade config must construct without runtime effects");
 }
 
 #[test]

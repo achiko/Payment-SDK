@@ -1,9 +1,9 @@
 use crate::{
     AddressWatchRequest, BlockHeight, BlockRef, BoxFuture, CommitBlockCommand, ConfirmationPolicy,
     EventCursor, IndexError, IndexScope, ObservationDraft, ObservationEventPage,
-    ObservationEventRequest, ObservedTransaction, RegisterWatchCommand, RegisterWatchOutcome,
-    SyncStatus, TransactionPage, TransactionPageRequest, TransactionRequest, UnwatchCommand,
-    UnwatchOutcome, WatchBackfill, WatchId, WatchReceipt, WatchSnapshot,
+    ObservationEventRequest, ObservedTransaction, ProjectionBatch, RegisterWatchCommand,
+    RegisterWatchOutcome, SyncStatus, TransactionPage, TransactionPageRequest, TransactionRequest,
+    UnwatchCommand, UnwatchOutcome, WatchBackfill, WatchId, WatchReceipt, WatchSnapshot,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -118,10 +118,11 @@ pub enum MigrateIndexPolicyOutcome {
 
 /// Composite semantic repository for one Indexer Service database.
 ///
-/// Implementations must commit a block's raw payload, undo bundle, current
-/// observations, immutable revisions, feed events, confirmation transitions,
-/// checkpoint, and retention pruning atomically. Revision and cursor allocation
-/// therefore never occurs in the interpreter or worker.
+/// Implementations must commit a block's raw payload, undo bundle, opaque
+/// chain projection, current observations, immutable revisions, feed events,
+/// confirmation transitions, checkpoint, and retention pruning atomically.
+/// Revision and cursor allocation therefore never occurs in the interpreter
+/// or worker.
 pub trait IndexRepository: Send + Sync {
     type Target: Clone + Send + Sync + 'static;
     type Undo: Clone + Send + Sync + 'static;
@@ -160,6 +161,31 @@ pub trait IndexRepository: Send + Sync {
         &'a self,
         command: CommitWatchBackfillCommand,
     ) -> BoxFuture<'a, Result<CommitWatchBackfillOutcome, IndexError>>;
+
+    /// Commits order-independent chain projection facts discovered by one
+    /// historical watch alongside the ordinary observation backfill.
+    ///
+    /// The default preserves repositories that do not materialize a chain
+    /// projection. Persistent repositories override this method so newly
+    /// discovered projection keys and their retained rollback data share the
+    /// same atomic commit as the backfill cursor and observation revisions.
+    fn commit_watch_backfill_projection<'a>(
+        &'a self,
+        command: CommitWatchBackfillCommand,
+        projection: ProjectionBatch,
+    ) -> BoxFuture<'a, Result<CommitWatchBackfillOutcome, IndexError>> {
+        if projection.is_empty() {
+            self.commit_watch_backfill(command)
+        } else {
+            Box::pin(async move {
+                Err(IndexError::new(
+                    crate::IndexErrorKind::InvalidBlock,
+                    "this index repository does not support historical projection backfill",
+                    false,
+                ))
+            })
+        }
+    }
 
     /// `(scope, idempotency_key)` is unique. The same payload returns
     /// `Existing`; a changed payload returns `IndexErrorKind::Conflict`.

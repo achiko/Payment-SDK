@@ -105,6 +105,7 @@ async fn capabilities(
             wire::SignatureScheme::EcdsaSecp256k1,
             wire::SignatureScheme::SchnorrSecp256k1,
         ],
+        key_tweaks: vec![wire::KeyTweakKind::Secp256k1Add],
         can_sign_messages: true,
         can_sign_digests: true,
         requires_user_interaction: false,
@@ -308,6 +309,10 @@ async fn authenticated_client_implements_provision_sign_lookup_and_readiness() {
 
     let capabilities = client.capabilities();
     assert_eq!(capabilities.curves, vec![Curve::Secp256k1]);
+    assert_eq!(
+        capabilities.key_tweaks,
+        vec![signer::KeyTweakKind::Secp256k1Add]
+    );
     assert!(capabilities.can_sign_messages);
     assert!(capabilities.can_sign_digests);
     assert_eq!(

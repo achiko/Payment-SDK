@@ -167,8 +167,13 @@ where
             return Ok(durable_status);
         }
 
-        let observed_tip = self.source.tip().await.map_err(IndexError::from)?;
         let mut checkpoint = self.repository.checkpoint(&self.config.scope).await?;
+        // Fail closed before the first external read. If the source is down,
+        // a previously persisted Ready phase must not remain queryable while
+        // this reconciliation attempt waits to retry.
+        self.publish_status(SyncPhase::Reconciling, checkpoint.clone(), None, None, None)
+            .await?;
+        let observed_tip = self.source.tip().await.map_err(IndexError::from)?;
         self.publish_status(
             SyncPhase::Reconciling,
             checkpoint.clone(),
