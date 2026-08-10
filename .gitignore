@@ -1,6 +1,5 @@
 # Rust build output
 /target/
-/old/target/
 
 # macOS
 .DS_Store
@@ -28,10 +27,9 @@ logs/
 *.sqlite
 *.sqlite3
 
-# Reference repositories are local research material. Their exact revisions are
-# recorded in reference/README.md rather than vendored into this repository.
-/reference/*
-!/reference/README.md
+# Recoverable previous design and local upstream research material
+/old
+/reference
 
 /anvil_blocks
 /tmp
