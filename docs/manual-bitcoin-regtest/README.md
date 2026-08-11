@@ -1,10 +1,13 @@
 # Manual Bitcoin Core 31 regtest acceptance
 
-Status: extended acceptance procedure. The simpler
-[`global_trusted` Payment Service happy path](./PAYMENT_HAPPY_PATH.md) was
-manually exercised on 2026-08-11 against Bitcoin Core 31.1. The strict-mode,
-P2TR, restart/replay, controlled-reorg, restoration, and re-inclusion matrix in
-this document remains pending until one run records every assertion below.
+Status: preserved diagnostic fallback. The repository-owned
+[`automated system-acceptance suite`](../../tests/bitcoin-regtest-acceptance/README.md)
+passed all eight strict/global-trusted executions on 2026-08-11 against exact
+Bitcoin Core 31.1.0. Use this longer manual procedure to inspect individual
+IX/custody/WS transitions when diagnosing a failure; it is no longer the
+primary acceptance runner. The simpler
+[`global_trusted` Payment Service happy path](./PAYMENT_HAPPY_PATH.md) was also
+manually exercised on 2026-08-11.
 
 This procedure exercises the composed Bitcoin Indexer Service (IX), ephemeral
 development custody, and stateless Wallet Service (WS) against one disposable
@@ -12,10 +15,10 @@ Bitcoin Core 31 regtest node. It covers P2WPKH and P2TR, `Included` to
 `Confirmed`, signing before broadcast, exact-byte broadcast, batch collection,
 restart/replay, forced rollback, UTXO restoration, and re-inclusion.
 
-It does not exercise the implemented Bitcoin PS mode, a public network,
-production custody, organic proof-of-work competition, mempool replacement/drop
-tracking, or production deployment monitoring. A complete Bitcoin PS
-operational acceptance run must supplement this guide with
+This manual procedure does not exercise the implemented Bitcoin PS mode, a
+public network, production custody, organic proof-of-work competition, mempool
+replacement/drop tracking, or production deployment monitoring. A complete
+Bitcoin PS operational acceptance run must supplement this guide with
 `payment-api bitcoin serve`, deposits, the explicit `deposit_ids` batch,
 restart/replay, and PS projection evidence described in
 [`../BITCOIN_SERVICES.md`](../BITCOIN_SERVICES.md). `invalidateblock` below
@@ -1045,9 +1048,10 @@ Mark an item passed only from the command and stored evidence named above.
 | UTXO restoration | Every collection input returns to the block-only IX projection during rollback |
 | Re-inclusion | Same txid enters a different block, receives a later Included revision, and becomes Confirmed again |
 
-This matrix and the final locked Rust validation commands are separate. Neither
-one may be inferred from the other. Until every row passes on Core 31, keep the
-TODO and feature-validation status pending.
+This manual matrix and the final locked Rust validation commands are separate.
+Neither one may be inferred from the other. Current composed acceptance comes
+from the automated suite's eight isolated Core 31.1 executions; these rows
+remain the step-by-step diagnostic equivalent.
 
 ## 16. Stop processes and remove only the marked run root
 
@@ -1092,6 +1096,6 @@ find "$BTC_REAL_RUN_ROOT" -depth -mindepth 1 -delete
 rmdir "$BTC_REAL_RUN_ROOT"
 ```
 
-After a successful real-node run, report the exact Core 31 version and sanitized
-evidence in the implementation handoff. Only then may the disposable-regtest
-acceptance item be changed from pending to passed.
+After a manual real-node run, report the exact Core 31 version and sanitized
+evidence in the implementation handoff. Do not copy cookies, tokens, key
+locators, or signed transaction bytes from the private run root.

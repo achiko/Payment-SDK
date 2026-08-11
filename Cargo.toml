@@ -23,6 +23,7 @@ members = [
     "packages/http",
     "packages/telemetry",
     "payment_sdk_demo",
+    "tests/bitcoin-regtest-acceptance",
 ]
 exclude = ["old", "reference"]
 resolver = "3"

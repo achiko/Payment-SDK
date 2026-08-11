@@ -3,6 +3,11 @@
 Status: manually exercised on 2026-08-11 with Bitcoin Core 31.1 in
 `global_trusted` authentication mode.
 
+The repository-owned
+[`automated system-acceptance suite`](../../tests/bitcoin-regtest-acceptance/README.md)
+is the primary repeatable check and passed all eight strict/global-trusted
+executions on the same date. This short guide remains a diagnostic walkthrough.
+
 This is the short, manual walkthrough for the successful path:
 
 ```text
@@ -688,4 +693,5 @@ claim acceptance for:
 - custody durability; or
 - any public network or production deployment.
 
-Use the extended acceptance guide and focused tests for those cases.
+Use the automated suite for repeatable acceptance and the extended manual guide
+for step-by-step diagnosis of those cases.

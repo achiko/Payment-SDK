@@ -376,6 +376,24 @@ where
             })
             .transpose()?
             .unwrap_or(0);
+        let in_active_chain = result
+            .get("in_active_chain")
+            .map(|value| {
+                value.as_bool().ok_or_else(|| {
+                    source_error("Bitcoin receipt active-chain flag is not a boolean", true)
+                })
+            })
+            .transpose()?;
+        // With txindex enabled, Core can still return a transaction from an
+        // orphaned block after that transaction has also been removed from the
+        // mempool. That historical lookup is not evidence of current
+        // submission and must not suppress an exact-envelope rebroadcast.
+        if confirmations < 0
+            || in_active_chain == Some(false)
+            || (confirmations == 0 && result.contains_key("blockhash"))
+        {
+            return Ok(None);
+        }
         let included_in = if confirmations > 0 {
             let hash = required_string(&result, "blockhash", "Bitcoin receipt block hash")?;
             let expected_block_hash = parse_bitcoin_block_hash(&hash)?;
@@ -1224,6 +1242,30 @@ mod tests {
             .expect_err("inactive block receipt must fail closed");
         assert!(error.retryable);
         assert!(error.message.contains("canonical chain"));
+    }
+
+    #[test]
+    fn receipt_treats_a_noncanonical_txindex_hit_as_absent() {
+        let signed = signed_transaction();
+        let mut replies = readiness_replies();
+        replies.push(success(
+            "getrawtransaction",
+            serde_json::json!({
+                "txid": signed.id().to_string(),
+                "blockhash": format!("{:064x}", 7),
+                "confirmations": 0
+            }),
+        ));
+        let core = block_on(BitcoinCoreClient::connect(
+            ScriptedClient::new(replies),
+            config(),
+        ))
+        .expect("valid scripted Core node must connect");
+
+        assert_eq!(
+            block_on(core.receipt(&signed.id())).expect("receipt lookup must succeed"),
+            None
+        );
     }
 
     #[test]

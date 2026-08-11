@@ -1699,6 +1699,14 @@ async fn classify_utxo_batch_fact(
             CollectionLegState::Reorged { .. } => Some(UtxoBatchProjectionTransition::Reincluded {
                 included_at: transition_at,
             }),
+            // IX rolls back a confirmation before it rolls back the block
+            // that first included the transaction. A PS that was offline for
+            // both revisions must advance through Confirmed -> Included so it
+            // can consume the following Included -> Reorged revision. The
+            // observation projection reverses confirmation-qualified
+            // accounting here; the durable leg remains Confirmed until the
+            // subsequent Reorged fact changes its lifecycle state.
+            CollectionLegState::Confirmed { .. } => None,
             _ => return Ok(None),
         },
         TransactionStatus::Confirmed { .. } => match &leg.state {
@@ -2817,12 +2825,12 @@ mod tests {
     use deposits::{
         AcceptCollectionBroadcast, AttachCollectionWatch, CollectionId, CollectionLegId,
         CollectionLegKind, CollectionSpendResource, CollectionSpendResourceEvidence,
-        CollectionSpendResourceId, CommandIdentity, CommandOperation, CommandPrincipal,
-        ConsumerCheckpointName, CreateCollectionLeg, CreateDeposit, CreateDepositWithLedger,
-        CreateJob, CreateUtxoBatchCollection, CreateUtxoBatchCollectionJob,
-        CreateUtxoBatchParticipant, EnsureUser, IdempotencyKey, JobId,
-        ObservationConsumerCheckpoints, PolicyIdentity, RecordSignedCollectionLeg, RequestHash,
-        SignedEnvelopeBytes, UserId, UserStore,
+        CollectionSpendResourceId, CollectionState, CommandIdentity, CommandOperation,
+        CommandPrincipal, ConsumerCheckpointName, CreateCollectionLeg, CreateDeposit,
+        CreateDepositWithLedger, CreateJob, CreateUtxoBatchCollection,
+        CreateUtxoBatchCollectionJob, CreateUtxoBatchParticipant, EnsureUser, IdempotencyKey,
+        JobId, ObservationConsumerCheckpoints, PolicyIdentity, RecordSignedCollectionLeg,
+        RequestHash, SignedEnvelopeBytes, UserId, UserStore,
     };
     use indexing::{
         BlockHash, BlockHeight, BlockRef, ConfirmationPolicy, ConfirmationProof, MovementKind,
@@ -3389,6 +3397,37 @@ mod tests {
         })
     }
 
+    async fn mirror_and_project_bitcoin_event(
+        repository: &Repository,
+        expected_cursor: EventCursor,
+        event: &MirroredObservation,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        repository
+            .mirror_and_advance(MirrorObservation {
+                expected_cursor: Some(expected_cursor),
+                observation: event.clone(),
+            })
+            .await?;
+        let Some((affected, updates, cases, fee_treatment, transition)) =
+            classify_projection(repository, event).await?
+        else {
+            return Err("the retained Bitcoin collection event must classify".into());
+        };
+        let has_transition = transition.is_some();
+        repository
+            .project_and_advance(ProjectObservation {
+                expected_cursor: Some(expected_cursor),
+                through: event.event.cursor,
+                affected_deposits: affected,
+                ledger_updates: updates,
+                reconciliation_cases: cases,
+                fee_treatment,
+                utxo_batch_transition: transition,
+            })
+            .await?;
+        Ok(has_transition)
+    }
+
     #[tokio::test]
     async fn bitcoin_first_inclusion_does_not_double_debit_the_factual_fee()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3463,6 +3502,154 @@ mod tests {
             .expect("Bitcoin deposit ledger remains open");
         assert_eq!(ledger.balances.balance, AtomicAmount::ZERO);
         assert_eq!(ledger.balances.collected, AtomicAmount::ZERO);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bitcoin_offline_projection_replays_confirmed_included_reorged_in_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = bitcoin_projection_fixture().await?;
+        let transaction_id = bitcoin_test_transaction(0x22);
+        let movements = vec![
+            ValueMovement {
+                id: MovementId("bitcoin-collection-input".to_owned()),
+                asset: bitcoin_test_asset(),
+                amount: test_amount(1_000),
+                from: Some(fixture.deposit.address.clone()),
+                to: None,
+                kind: MovementKind::Input,
+            },
+            ValueMovement {
+                id: MovementId("bitcoin-master-output".to_owned()),
+                asset: bitcoin_test_asset(),
+                amount: test_amount(990),
+                from: None,
+                to: Some(fixture.collection.destination.clone()),
+                kind: MovementKind::Output,
+            },
+        ];
+        let fee = Some(NetworkFee {
+            asset: bitcoin_test_asset(),
+            amount: test_amount(10),
+            payer: Some(fixture.deposit.address.clone()),
+        });
+        let included_status = TransactionStatus::Included {
+            block: bitcoin_test_block(20, 20),
+            confirmations: 1,
+        };
+        let confirmed_status = TransactionStatus::Confirmed {
+            block: bitcoin_test_block(20, 20),
+            proof: ConfirmationProof::Depth {
+                required: 2,
+                observed: 2,
+            },
+        };
+        let included = bitcoin_test_observation(
+            "bitcoin-collection-included",
+            2,
+            transaction_id.clone(),
+            included_status.clone(),
+            None,
+            movements.clone(),
+            fee.clone(),
+        );
+        assert!(
+            !mirror_and_project_bitcoin_event(&fixture.repository, EventCursor(1), &included,)
+                .await?
+        );
+        let confirmed = bitcoin_test_observation(
+            "bitcoin-collection-confirmed",
+            3,
+            transaction_id.clone(),
+            confirmed_status.clone(),
+            Some(included_status.clone()),
+            movements.clone(),
+            fee.clone(),
+        );
+        assert!(
+            mirror_and_project_bitcoin_event(&fixture.repository, EventCursor(2), &confirmed,)
+                .await?
+        );
+        assert_eq!(
+            fixture
+                .repository
+                .collection(&fixture.collection.id)
+                .await?
+                .expect("collection remains durable")
+                .state,
+            CollectionState::Completed
+        );
+
+        // Core/IX unwind confirmation depth before orphaning the inclusion
+        // block. Both revisions can be waiting when PS comes back online.
+        let confirmation_rollback = bitcoin_test_observation(
+            "bitcoin-collection-confirmation-rollback",
+            4,
+            transaction_id.clone(),
+            included_status.clone(),
+            Some(confirmed_status),
+            movements.clone(),
+            fee.clone(),
+        );
+        assert!(
+            !mirror_and_project_bitcoin_event(
+                &fixture.repository,
+                EventCursor(3),
+                &confirmation_rollback,
+            )
+            .await?
+        );
+        let after_confirmation_rollback = fixture
+            .repository
+            .current(&fixture.deposit.id)
+            .await?
+            .expect("Bitcoin deposit ledger remains open");
+        assert_eq!(
+            after_confirmation_rollback.balances.collected,
+            AtomicAmount::ZERO
+        );
+        assert_eq!(
+            fixture
+                .repository
+                .collection(&fixture.collection.id)
+                .await?
+                .expect("collection remains durable")
+                .state,
+            CollectionState::Completed
+        );
+
+        let reorged = bitcoin_test_observation(
+            "bitcoin-collection-reorged",
+            5,
+            transaction_id,
+            TransactionStatus::Reorged {
+                previous_block: bitcoin_test_block(20, 20),
+            },
+            Some(included_status),
+            movements,
+            fee,
+        );
+        assert!(
+            mirror_and_project_bitcoin_event(&fixture.repository, EventCursor(4), &reorged,)
+                .await?
+        );
+        let reorged_collection = fixture
+            .repository
+            .collection(&fixture.collection.id)
+            .await?
+            .expect("collection remains durable");
+        assert_eq!(reorged_collection.state, CollectionState::Reorged);
+        assert!(matches!(
+            reorged_collection.legs[0].state,
+            CollectionLegState::Reorged { .. }
+        ));
+        let reorged_ledger = fixture
+            .repository
+            .current(&fixture.deposit.id)
+            .await?
+            .expect("Bitcoin deposit ledger remains open");
+        assert_eq!(reorged_ledger.balances.collected, AtomicAmount::ZERO);
+        assert_eq!(reorged_ledger.balances.balance, test_amount(1_000));
         Ok(())
     }
 

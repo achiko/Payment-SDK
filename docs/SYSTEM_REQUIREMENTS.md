@@ -14,9 +14,11 @@ single-network Ethereum and Bitcoin Payment Service v1 runtimes are implemented
 in source. Code and acceptance tests, not trait presence or documentation,
 determine which parts are complete. A loopback-only ephemeral custody adapter
 supports disposable local development. This is not production
-deployment evidence: durable production custody, automated Anvil and Bitcoin
-Core 31 acceptance, HA, and multi-network PS ownership remain external,
-unvalidated, or excluded. The service runbooks are
+deployment evidence: durable production custody, automated Anvil acceptance,
+HA, and multi-network PS ownership remain external, unvalidated, or excluded.
+The repository-owned Bitcoin Core 31.1 regtest system-acceptance suite passed
+all eight isolated strict/global-trusted executions on 2026-08-11. The service
+runbooks are
 [`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md),
 [`WALLET_SERVICE.md`](./WALLET_SERVICE.md),
 [`BITCOIN_SERVICES.md`](./BITCOIN_SERVICES.md), and
@@ -864,7 +866,10 @@ Bitcoin PS block-only v1 makes these additional selections:
 These decisions are recorded in
 [`../TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md`](../TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md).
 Their source implementation and deterministic evidence are not composed Core 31
-or production-runtime acceptance evidence.
+or production-runtime acceptance evidence by themselves. The separate opt-in
+[`Bitcoin regtest system-acceptance suite`](../tests/bitcoin-regtest-acceptance/README.md)
+provides the bounded composed Core 31.1 evidence; it is still not production
+deployment evidence.
 
 ### 8.5 ERC-20/token collection with gas
 
@@ -1112,8 +1117,8 @@ boundary. Its mandatory versioned policy selects one Bitcoin network, native
 BTC, P2WPKH or P2TR deposit addresses, TTL, master destination, collection and
 spend-confirmation minimums, fee-rate and absolute-fee ceilings, and batch
 limits. The runnable mode is selected through `payment-api bitcoin`; its source
-and deterministic coverage do not satisfy the still-pending Core 31 regtest
-acceptance scenario.
+and deterministic coverage are supplemented by the passing automated Core 31.1
+regtest system-acceptance suite.
 
 ## 12. Operational and security requirements
 
@@ -1366,9 +1371,12 @@ Ethereum v1 source slices does not make that evidence automatic.
 Bitcoin PS deterministic and real-store acceptance includes atomic overlapping-
 outpoint rejection, all-or-nothing multi-deposit projection, exact-envelope
 retention/reorg recovery, deterministic fee allocation, and same-principal
-cross-user authorization. Operational acceptance still requires the composed
-disposable Bitcoin Core 31 regtest scenario; source and repository tests do not
-satisfy that live-node criterion.
+cross-user authorization. The composed disposable Bitcoin Core 31.1 criterion
+is satisfied by the opt-in automated suite's eight strict/global-trusted live
+executions: P2WPKH/P2TR signing, restart/replay, controlled reorg with identical-
+txid re-inclusion, and exact-outpoint reservation contention. Source and
+repository tests remain separate evidence and do not substitute for that live
+run.
 
 ## 16. Related documents
 
@@ -1379,4 +1387,6 @@ satisfy that live-node criterion.
 - [`RESEARCH.md`](./RESEARCH.md) — Alloy, BDK, Blockbook, NBXplorer,
   BTCPay, SHKeeper, Trezor, and Solana findings.
 - [`REQUIREMENTS.md`](./REQUIREMENTS.md) — compact open-decision checklist.
-- [`../TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md`](../TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md) — implemented Bitcoin PS v1 decisions and pending Core 31 operational acceptance.
+- [`../TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md`](../TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md) — implemented Bitcoin PS v1 decisions.
+- [`../tests/bitcoin-regtest-acceptance/README.md`](../tests/bitcoin-regtest-acceptance/README.md) — automated Bitcoin Core 31.1 operational acceptance and its evidence boundary.
+- [`manual-bitcoin-regtest/README.md`](./manual-bitcoin-regtest/README.md) — preserved manual diagnostic fallback.

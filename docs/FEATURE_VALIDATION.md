@@ -21,16 +21,15 @@ bytes, and all-participant projection. Neither Wallet HTTP mode owns a database.
 This is still not evidence of a production deployment. A loopback-only
 ephemeral custody adapter now exists, but external durable custody, automated
 Anvil acceptance, HA, and multi-network ownership in a single PS store remain
-absent or deliberately excluded. A Bitcoin Core 31.1 disposable-regtest
-Payment Service happy path was manually exercised on 2026-08-11 in
-global-trusted mode; its reproducible steps and bounded evidence are recorded
-in the
-[`manual happy-path guide`](./manual-bitcoin-regtest/PAYMENT_HAPPY_PATH.md).
-That run does not prove the pending strict-mode, P2TR, restart, reorg,
-restoration, re-inclusion, or complete composed failure-window matrix in the
-[`extended procedure`](./manual-bitcoin-regtest/README.md), even though the
-repository command applies a Bitcoin batch's
-collection/ledger/reconciliation/cursor effects atomically.
+absent or deliberately excluded. The repository-owned
+[`Bitcoin Core 31.1 regtest system-acceptance suite`](../tests/bitcoin-regtest-acceptance/README.md)
+passed all eight isolated executions on 2026-08-11: signing, restart/replay,
+controlled reorg/re-inclusion, and exact-outpoint reservation in both strict
+and global-trusted authentication modes. The
+[`manual happy path`](./manual-bitcoin-regtest/PAYMENT_HAPPY_PATH.md) and
+[`extended manual procedure`](./manual-bitcoin-regtest/README.md) remain
+diagnostic fallbacks. This bounded evidence does not prove production custody,
+public-network behavior, HA, or the complete future crash/outage matrix.
 
 The original document is accepted with five corrections required for safety:
 
@@ -270,7 +269,7 @@ recoverable.
 | Build/sign/broadcast | chain transaction capabilities | Bitcoin SegWit/Taproot and Ethereum EIP-1559 implemented with separate non-broadcasting sign and exact-byte broadcast APIs |
 | Wallet/account collection | `Collector<C>`, PS collection executor | Native Ethereum durable reservation/sign/broadcast/watch workflow implemented |
 | BTC batched collection | Bitcoin collection request + attribution | Same-principal multi-deposit job, fenced complete-UTXO selection, atomic exact-outpoint reservation, stateless signing, fee allocation, exact-byte persistence/broadcast, watch, and block-only projection implemented |
-| Bitcoin PS v1 decision record | `TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md` | Implemented: one native-BTC scope, same-principal full-drain/no-change batches, mandatory ceilings, retained exact bytes, same-txid re-inclusion, and block-only exclusions; live Core 31 acceptance pending |
+| Bitcoin PS v1 decision record | `TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md` | Implemented: one native-BTC scope, same-principal full-drain/no-change batches, mandatory ceilings, retained exact bytes, same-txid re-inclusion, and block-only exclusions; automated Core 31.1 acceptance passed in both authentication modes |
 | ERC-20 prefund then sweep | PS collection legs + Ethereum requirement | PS persists planned gas funding, waits for its IX confirmation, then advances the token sweep |
 | Retry pending broadcasts | signed-envelope record + `CollectionLegState` | Exact envelope persists before broadcast; replay verifies hash and attaches an idempotent IX watch |
 | Fee and chain policy | Chain-native signed-transaction inspection + PS policy | Ethereum chain/gas/fee ceilings and Bitcoin exact-input/output/vsize/rate/absolute-fee bounds enforced before collection broadcast |
@@ -390,14 +389,11 @@ Source structure and deterministic tests cannot establish:
 - webhook/event delivery authentication;
 - correctness of reorg inverses not covered by deterministic or real-node
   tests;
-- the complete PS crash-window, restart, and collection workflow test matrix;
+- broadcast-response loss, crashes around envelope persistence/watch
+  registration, dependency outages, duplicate replay delivery, lease recovery,
+  and reorgs beyond retained undo depth;
 - automated, repeatable PS/WS/IX Anvil end-to-end acceptance;
 - the composed IX service against a live Ethereum node;
-- the composed Bitcoin IX/WS/PS services against the pinned Bitcoin Core 31
-  regtest node in strict mode, including P2TR, restart, controlled reorg, UTXO
-  restoration, and re-inclusion; the global-trusted happy path passed, while
-  the extended procedure remains documented in
-  [`manual-bitcoin-regtest/README.md`](./manual-bitcoin-regtest/README.md); and
 - the checked-in Kurtosis/Disruptoor scenario, which remains opt-in and has not
   been executed as part of ordinary Rust validation.
 
@@ -409,9 +405,9 @@ policies and fixes Core 31, unpruned history, synchronized txindex, P2WPKH/P2TR,
 raw finalized transactions, and an IX-owned canonical UTXO projection. It does
 not claim mempool/RBF/drop/replacement coverage. Bitcoin PS block-only v1 now
 has a concrete source/runtime and deterministic repository/HTTP/workflow
-coverage, but no Core 31 operational acceptance evidence. Its behavior is one
-native-BTC scope per database, same-principal cross-user full-drain/no-change
-batches,
+coverage plus passing Core 31.1 operational acceptance for the eight isolated
+strict/global-trusted scenarios described above. Its behavior is one native-BTC
+scope per database, same-principal cross-user full-drain/no-change batches,
 atomic exact-outpoint reservations, proportional largest-remainder fee
 allocation, mandatory financial limits, retained same bytes across broadcast/
 reorg, and same-txid re-inclusion without replacement signing. That retained
