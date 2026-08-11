@@ -5,6 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use http_support::AuthenticationMode;
 use signer::{
     Curve, Digest, KeyLocator, KeyProvisionRequest, KeyProvisioner, OperationId, PublicKeyFormat,
     SignRequest, SignablePayload, SignatureEncoding, SignatureScheme, Signer, SignerErrorKind,
@@ -26,13 +27,27 @@ use std::{
 
 const SECRET: &str = "test-custody-secret";
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct TestState {
+    authentication_mode: Arc<Mutex<AuthenticationMode>>,
     authorization: Arc<Mutex<Vec<String>>>,
     operations: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     provision_attempts: Arc<AtomicUsize>,
     sign_attempts: Arc<AtomicUsize>,
     public_key_attempts: Arc<AtomicUsize>,
+}
+
+impl Default for TestState {
+    fn default() -> Self {
+        Self {
+            authentication_mode: Arc::new(Mutex::new(AuthenticationMode::Strict)),
+            authorization: Arc::default(),
+            operations: Arc::default(),
+            provision_attempts: Arc::default(),
+            sign_attempts: Arc::default(),
+            public_key_attempts: Arc::default(),
+        }
+    }
 }
 
 struct TestServer {
@@ -94,12 +109,27 @@ async fn connect(
         .expect("test client must connect")
 }
 
+async fn connect_global(endpoint: &str) -> Result<RemoteSignerClient, signer::SignerError> {
+    let endpoint = RemoteSignerEndpoint::new(endpoint).expect("test endpoint must be valid");
+    RemoteSignerClient::connect(RemoteSignerConfig::global_trusted(endpoint)).await
+}
+
+fn reported_authentication_mode(state: &TestState) -> String {
+    state
+        .authentication_mode
+        .lock()
+        .expect("test authentication-mode lock must be available")
+        .as_str()
+        .to_owned()
+}
+
 async fn capabilities(
     State(state): State<TestState>,
     headers: HeaderMap,
 ) -> Json<wire::CapabilitiesResponse> {
     record_auth(&state, &headers);
     Json(wire::CapabilitiesResponse {
+        authentication_mode: reported_authentication_mode(&state),
         curves: vec![wire::Curve::Secp256k1],
         schemes: vec![
             wire::SignatureScheme::EcdsaSecp256k1,
@@ -118,6 +148,7 @@ async fn readiness(
 ) -> Json<wire::ReadinessResponse> {
     record_auth(&state, &headers);
     Json(wire::ReadinessResponse {
+        authentication_mode: reported_authentication_mode(&state),
         status: wire::ReadinessStatus::Available,
     })
 }
@@ -359,6 +390,82 @@ async fn authenticated_client_implements_provision_sign_lookup_and_readiness() {
 }
 
 #[tokio::test]
+async fn global_trusted_client_omits_authorization_headers() {
+    let state = TestState::default();
+    *state
+        .authentication_mode
+        .lock()
+        .expect("test authentication-mode lock must be available") =
+        AuthenticationMode::GlobalTrusted;
+    let server = spawn_server(state.clone()).await;
+    let client = connect_global(&server.endpoint)
+        .await
+        .expect("matching global-trusted client must connect");
+
+    assert_eq!(
+        client.status().await.expect("readiness should succeed"),
+        SignerStatus::Available
+    );
+    let authorization = state
+        .authorization
+        .lock()
+        .expect("test authorization lock must be available");
+    assert!(!authorization.is_empty());
+    assert!(authorization.iter().all(|value| value == "[missing]"));
+}
+
+#[tokio::test]
+async fn capability_and_readiness_mode_mismatches_fail_closed() {
+    let global_state = TestState::default();
+    *global_state
+        .authentication_mode
+        .lock()
+        .expect("test authentication-mode lock must be available") =
+        AuthenticationMode::GlobalTrusted;
+    let global_server = spawn_server(global_state).await;
+    let endpoint =
+        RemoteSignerEndpoint::new(&global_server.endpoint).expect("test endpoint must be valid");
+    let strict_config = RemoteSignerConfig::new(
+        endpoint,
+        BearerSecret::new(SECRET).expect("test bearer secret must be valid"),
+    );
+    let strict_error = RemoteSignerClient::connect(strict_config)
+        .await
+        .expect_err("strict client must reject global custody");
+    assert_eq!(strict_error.kind, SignerErrorKind::Other);
+    assert!(strict_error.message.contains("authentication mode"));
+
+    let strict_state = TestState::default();
+    let strict_server = spawn_server(strict_state.clone()).await;
+    let client = connect(
+        &strict_server.endpoint,
+        Duration::from_secs(1),
+        16 * 1024,
+        1,
+    )
+    .await;
+    *strict_state
+        .authentication_mode
+        .lock()
+        .expect("test authentication-mode lock must be available") =
+        AuthenticationMode::GlobalTrusted;
+    let readiness_error = client
+        .status()
+        .await
+        .expect_err("readiness mode mismatch must fail closed");
+    assert_eq!(readiness_error.kind, SignerErrorKind::Other);
+    assert!(readiness_error.message.contains("authentication mode"));
+
+    let operation_error = client
+        .sign(sign_request("mode-drift-sign"))
+        .await
+        .expect_err("mode drift must fail before the signing request");
+    assert_eq!(operation_error.kind, SignerErrorKind::Other);
+    assert!(operation_error.message.contains("authentication mode"));
+    assert_eq!(strict_state.sign_attempts.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
 async fn operation_replay_is_stable_and_changed_content_maps_to_conflict() {
     let state = TestState::default();
     let server = spawn_server(state.clone()).await;
@@ -446,6 +553,12 @@ async fn debug_output_redacts_endpoint_bearer_and_operation_ids() {
     let config_debug = format!("{config:?}");
     assert!(!config_debug.contains(&server.endpoint));
     assert!(!config_debug.contains(SECRET));
+
+    let global_endpoint =
+        RemoteSignerEndpoint::new(&server.endpoint).expect("endpoint must be valid");
+    let global_debug = format!("{:?}", RemoteSignerConfig::global_trusted(global_endpoint));
+    assert!(global_debug.contains("GlobalTrusted"));
+    assert!(!global_debug.contains(SECRET));
 
     let client = RemoteSignerClient::connect(config)
         .await

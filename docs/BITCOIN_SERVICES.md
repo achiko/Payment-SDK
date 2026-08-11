@@ -1,13 +1,13 @@
 # Bitcoin Wallet, Indexer, and Payment Service: block-only v1
 
 Status: Bitcoin Wallet, Indexer, and Payment Service are implemented in source
-with deterministic coverage. This is not real-node acceptance evidence. The
-composed disposable Bitcoin Core 31 regtest scenario remains pending because a
-Core 31 binary is not available in the current development environment. No
-funded-network operation is part of this runbook. The IX/WS opt-in procedure is
-checked in separately as the
-[`manual Core 31 regtest acceptance guide`](./manual-bitcoin-regtest/README.md);
-the existence of that guide is not evidence that it passed.
+with deterministic coverage. A disposable Bitcoin Core 31.1 global-trusted PS
+happy path was manually exercised on 2026-08-11 and is recorded in the
+[`manual happy-path guide`](./manual-bitcoin-regtest/PAYMENT_HAPPY_PATH.md).
+That evidence is not production acceptance: strict mode, P2TR, restart/replay,
+controlled reorg, UTXO restoration, and re-inclusion remain pending in the
+[`extended Core 31 regtest guide`](./manual-bitcoin-regtest/README.md). No
+funded public-network operation is part of either runbook.
 
 This document is the operational contract for the implemented Bitcoin modes of
 `indexer-worker` (IX), `wallet-worker` (WS), and `payment-api` (PS). The
@@ -176,6 +176,13 @@ database; every PS command points only at its exclusive PS path.
 Bitcoin confirmation and rollback policy have no defaults. Every Bitcoin
 deployment supplies both values explicitly.
 
+`STRICT_AUTHENTICATION_MODE` is also required for IX, WS, custody, PS, and
+their repo-owned clients. Exact `true` preserves bearer-protected service
+boundaries. Exact `false` omits those bearers and grants every reachable caller
+one global-trusted principal; it is not identity isolation. Bitcoin Core
+Authorization and any vendor custody authentication remain mandatory and
+independent in both modes.
+
 | Environment variable | Requirement |
 |---|---|
 | `IX_DATABASE_PATH` | Exclusive RocksDB directory for this Bitcoin scope |
@@ -188,14 +195,15 @@ deployment supplies both values explicitly.
 | `IX_RPC_HEADERS` | Comma-delimited `name=value` headers containing exactly one `authorization` entry |
 | `IX_RPC_TIMEOUT_SECONDS` | Per-request Core timeout in seconds; defaults to 15 |
 | `IX_RPC_MAX_RESPONSE_BYTES` | Per-response Core bound; defaults to 256 MiB. IX ingests verbosity-2 blocks, resolves each external transaction once with at most four Core calls in flight, and retains only compact value/address prevout facts rather than amplified verbosity-3 scripts |
-| `IX_BEARER_TOKEN` | Required non-empty bearer token for every Bitcoin `/v1` route, including loopback deployments |
+| `IX_BEARER_TOKEN` | Required non-empty bearer token in strict mode; ignored in global-trusted mode |
 
 `IX_HTTP_BIND`, `IX_METRICS_BIND`, `IX_POLL_SECONDS`, `IX_READY_MAX_LAG`, and
 `IX_READY_MAX_AGE_SECONDS` retain the general IX defaults. The metrics listener
 must remain loopback. A non-loopback API bind additionally requires
 `IX_UPSTREAM_TLS_TERMINATED=true`; TLS must terminate at a trusted upstream.
-Programmatic `BitcoinIndexerServiceConfig` composition must likewise set one
-Core authorization header and the IX bearer token before validation.
+Programmatic `BitcoinIndexerServiceConfig` composition must likewise select a
+mode and set one Core authorization header; strict mode additionally requires
+the IX bearer before validation.
 
 IX is ready only when its repository phase is `ready`, canonical lag is within
 the configured maximum, and recent reconciliation is within the configured
@@ -212,11 +220,14 @@ age. Startup Core checks are necessary but do not make an out-of-date IX ready.
 | `WS_BITCOIN_CORE_RPC_AUTHORIZATION` | Optional dedicated Authorization value; after combining header inputs, exactly one Authorization header is required |
 | `WS_BITCOIN_IX_URL` | Bitcoin IX base URL; loopback HTTP or non-loopback HTTPS |
 | `WS_BITCOIN_IX_HEADERS` | Optional comma-delimited repeatable IX headers; must not duplicate Authorization |
-| `WS_BITCOIN_IX_BEARER_TOKEN` | Required bearer value accepted by Bitcoin IX |
+| `WS_BITCOIN_IX_BEARER_TOKEN` | Strict-mode bearer value accepted by Bitcoin IX |
 | `WS_BITCOIN_MINIMUM_CONFIRMATIONS` | Explicit nonzero spend policy; no default |
 | `WS_BITCOIN_MAX_SATOSHIS_PER_KVB` | Explicit nonzero signing and broadcast fee-rate ceiling, at most Core's `100000000` sat/kvB limit; no default |
-| `WS_CUSTODY_URL` / `WS_CUSTODY_BEARER_TOKEN` | Authenticated remote custody endpoint and credential |
-| `WS_BEARER_TOKEN` | Required bearer token for all WS operation routes |
+| `WS_CUSTODY_URL` | Custody endpoint origin |
+| `WS_CUSTODY_AUTHENTICATION_POLICY` | Exact `repository_mode_matched` (follows the repo-wide mode) or `independent_strict` (always requires strict custody); defaults fail-closed to repository matching |
+| `WS_CUSTODY_BEARER_TOKEN` | Required in repo-wide strict mode and whenever the custody policy is `independent_strict` |
+| `WS_BEARER_TOKEN` | Required bearer token for operation routes in strict mode |
+| `WS_METRICS_BIND` | Loopback-only metrics listener; defaults to `127.0.0.1:9092` |
 
 `WS_BITCOIN_IX_BEARER_TOKEN` is a copy of the secret accepted by the IX
 process, not a reference that WS can resolve from another process's
@@ -269,10 +280,9 @@ The complete disposable real-node procedure is in the
 
 ## PS configuration and strict policy
 
-Bitcoin PS talks only to authenticated IX and WS endpoints; it does not open the
-IX database or call Core directly. Its endpoint/network/policy scope checks fail
-closed before the HTTP listener starts. Bitcoin requires IX bearer
-authentication even on loopback.
+Bitcoin PS talks only to mode-matched IX and WS endpoints; it does not open the
+IX database or call Core directly. Its authentication, endpoint, network, and
+policy scope checks fail closed before the HTTP listener starts.
 
 | Environment variable | Requirement |
 |---|---|
@@ -280,9 +290,9 @@ authentication even on loopback.
 | `PS_POLICY_PATH` | Regular file containing the strict Bitcoin policy below; maximum 1 MiB |
 | `PS_INDEXER_URL` | Bitcoin IX origin; loopback HTTP or non-loopback HTTPS, with no credentials/path/query/fragment |
 | `PS_INDEXER_NETWORK` | Canonical name matching the policy: `mainnet`, `testnet3`, `testnet4`, `signet`, or `regtest` |
-| `PS_INDEXER_BEARER_TOKEN` | Required Bitcoin IX bearer token, including on loopback |
-| `PS_WALLET_URL` / `PS_WALLET_BEARER_TOKEN` | Authenticated Bitcoin WS origin and required bearer token |
-| `PS_API_BEARER_TOKEN` / `PS_ADMIN_BEARER_TOKEN` | Required, distinct ordinary and administrator credentials |
+| `PS_INDEXER_BEARER_TOKEN` | Required Bitcoin IX bearer token in strict mode |
+| `PS_WALLET_URL` / `PS_WALLET_BEARER_TOKEN` | Bitcoin WS origin and strict-mode bearer token |
+| `PS_API_BEARER_TOKEN` / `PS_ADMIN_BEARER_TOKEN` | Required, distinct credentials in strict mode; unused for authorization in global-trusted mode |
 | `PS_HTTP_BIND` | API bind; defaults to `127.0.0.1:8081`. A non-loopback bind requires `PS_TLS_TERMINATED_UPSTREAM=true` |
 | `PS_METRICS_BIND` | Loopback-only metrics bind; defaults to `127.0.0.1:9091` |
 
@@ -326,13 +336,15 @@ the active file in place while serving.
 Commented PS settings are included in [`.env.example`](../.env.example). That
 file is a template only. The direct offline `bitcoin-wallet` and
 `bitcoin-payment-service` demos require no `.env`; only the Core-backed indexer
-demo needs environment configuration.
+demo needs explicitly exported environment configuration. No demo binary
+auto-loads a `.env` file.
 
 ## IX HTTP surface
 
-Every `/v1` request requires `Authorization: Bearer ...`. Health endpoints are
-unauthenticated and sanitized. The metrics route is served only by the separate
-loopback metrics listener.
+In strict mode every `/v1` request requires `Authorization: Bearer ...`; in
+global-trusted mode the header is ignored. Health endpoints are public and
+sanitized, with readiness exposing the selected mode. The metrics route is
+served only by the separate loopback metrics listener.
 
 | Method and path | Semantics |
 |---|---|
@@ -347,7 +359,9 @@ loopback metrics listener.
 | `GET /health/ready` | Sanitized readiness only |
 | `GET /metrics` | Prometheus output on the configured loopback metrics listener |
 
-A watch body contains `selector`, `start_height`, and `idempotency_key`.
+A watch body contains `selector`, `start_height`, and an `idempotency_key` that
+is mandatory in strict mode and optional in global-trusted mode. IX returns the
+effective key when it generates one.
 Selectors are `{"type":"address","value":"..."}` or
 `{"type":"transaction","value":"..."}`. Reusing an idempotency key with a
 different selector or height conflicts.
@@ -382,8 +396,9 @@ bytes and discarded before accumulation.
 
 ## WS HTTP surface
 
-All operation routes use strict `POST application/json`, reject unknown fields,
-and require the configured WS bearer token.
+All operation routes use strict `POST application/json` and reject unknown
+fields. Strict mode requires the configured WS bearer; global-trusted mode
+ignores Authorization.
 
 | Path | Request and response contract |
 |---|---|
@@ -395,7 +410,7 @@ and require the configured WS bearer token.
 | `/v1/bitcoin/transactions/broadcast` | Request `expected_transaction_id` and exact `raw_transaction`; validates their consensus relationship, preflights, then submits unchanged bytes |
 | `/v1/bitcoin/receipts` | Request one txid; returns the current Core lookup; a Core-known mempool/conflicted transaction can have `confirmations=0` and no block reference, while RPC not-found returns `null` |
 | `/health/live` | Unauthenticated, detail-free process liveness |
-| `/health/ready` | Unauthenticated, detail-free readiness |
+| `/health/ready` | Unauthenticated readiness plus sanitized authentication mode |
 
 An exact transfer input contains `transaction_id`, decimal-string
 `output_index`, decimal-string `value_satoshis`, canonical `0x`-prefixed
@@ -414,12 +429,13 @@ request or response bodies for signing and broadcast routes.
 
 ## PS HTTP surface and Bitcoin request shapes
 
-Bitcoin PS reuses the authenticated `/v1` deposit, balance, ledger,
+Bitcoin PS reuses the mode-aware `/v1` deposit, balance, ledger,
 observation, collection, job, accounting, reconciliation, and administrator
 routes documented for PS in [`PAYMENT_SERVICE.md`](./PAYMENT_SERVICE.md). Bodies
-remain strict JSON, mutations require `Idempotency-Key`, ordinary and
-administrator credentials are separate, and large atomic values are decimal
-strings. Bitcoin-specific create-deposit input is:
+remain strict JSON. Strict mode requires `Idempotency-Key` and separate
+ordinary/administrator credentials. Global-trusted mode generates a missing
+key and gives its single principal both route families. Large atomic values are
+decimal strings. Bitcoin-specific create-deposit input is:
 
 ```json
 {

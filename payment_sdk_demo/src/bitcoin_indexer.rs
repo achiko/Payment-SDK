@@ -1,9 +1,8 @@
-mod env_file;
-
 use std::{env, error::Error, fmt, net::SocketAddr, path::PathBuf, str::FromStr};
 
 use chain_bitcoin::BitcoinNetwork;
 use indexer_worker::{BitcoinIndexerService, BitcoinIndexerServiceConfig, PrometheusTelemetry};
+use payment_http::AuthenticationMode;
 
 const DEFAULT_NETWORK: &str = "regtest";
 const DEFAULT_DATABASE_PATH: &str = "./tmp/bitcoin-indexer-demo-db";
@@ -32,7 +31,8 @@ struct DemoConfig {
     rpc_timeout_seconds: u64,
     http_bind: SocketAddr,
     metrics_bind: SocketAddr,
-    indexer_bearer_token: String,
+    authentication_mode: AuthenticationMode,
+    indexer_bearer_token: Option<String>,
     poll_seconds: u64,
     ready_max_lag: u64,
     ready_max_age_seconds: u64,
@@ -40,6 +40,12 @@ struct DemoConfig {
 
 impl DemoConfig {
     fn from_env() -> Result<Self, DemoConfigError> {
+        let authentication_mode =
+            parse_authentication_mode(&required_env("STRICT_AUTHENTICATION_MODE")?)?;
+        let indexer_bearer_token = match authentication_mode {
+            AuthenticationMode::Strict => Some(required_env("DEMO_BITCOIN_IX_BEARER_TOKEN")?),
+            AuthenticationMode::GlobalTrusted => None,
+        };
         Ok(Self {
             network: parse_network(&env_or_default("DEMO_BITCOIN_NETWORK", DEFAULT_NETWORK)?)?,
             database_path: PathBuf::from(env_or_default(
@@ -70,7 +76,8 @@ impl DemoConfig {
                 "DEMO_BITCOIN_INDEXER_METRICS_BIND",
                 DEFAULT_METRICS_BIND,
             )?,
-            indexer_bearer_token: required_env("DEMO_BITCOIN_IX_BEARER_TOKEN")?,
+            authentication_mode,
+            indexer_bearer_token,
             poll_seconds: read_positive_u64_env("DEMO_BITCOIN_POLL_SECONDS", DEFAULT_POLL_SECONDS)?,
             ready_max_lag: read_u64_env("DEMO_BITCOIN_READY_MAX_LAG", DEFAULT_READY_MAX_LAG)?,
             ready_max_age_seconds: read_positive_u64_env(
@@ -89,12 +96,13 @@ impl DemoConfig {
             self.reorg_retention,
             self.expected_genesis_hash,
             self.core_rpc_url,
+            self.authentication_mode,
         );
         config.rpc_headers = vec![format!("authorization={}", self.core_authorization)];
         config.rpc_timeout_seconds = self.rpc_timeout_seconds;
         config.http_bind = self.http_bind;
         config.metrics_bind = self.metrics_bind;
-        config.bearer_token = Some(self.indexer_bearer_token);
+        config.bearer_token = self.indexer_bearer_token;
         config.poll_seconds = self.poll_seconds;
         config.ready_max_lag = self.ready_max_lag;
         config.ready_max_age_seconds = self.ready_max_age_seconds;
@@ -161,6 +169,12 @@ fn parse_network(value: &str) -> Result<BitcoinNetwork, DemoConfigError> {
     }
 }
 
+fn parse_authentication_mode(value: &str) -> Result<AuthenticationMode, DemoConfigError> {
+    value.parse().map_err(|_| {
+        DemoConfigError::new("STRICT_AUTHENTICATION_MODE must be exactly true or false")
+    })
+}
+
 fn read_u64_env(name: &'static str, default: &'static str) -> Result<u64, DemoConfigError> {
     parse_u64(name, &env_or_default(name, default)?)
 }
@@ -200,8 +214,6 @@ fn read_socket_addr_env(
 
 #[tokio::main]
 async fn main() -> MainResult<()> {
-    env_file::load_demo_env()?;
-
     let demo = DemoConfig::from_env()?;
     println!(
         "Starting block-only Bitcoin indexer sample for {} (API {}, metrics {})",
@@ -243,5 +255,20 @@ mod tests {
             error.to_string(),
             "environment variable DEMO_VALUE must be an unsigned decimal integer"
         );
+    }
+
+    #[test]
+    fn parses_only_exact_authentication_mode_values() {
+        assert_eq!(
+            parse_authentication_mode("true"),
+            Ok(AuthenticationMode::Strict)
+        );
+        assert_eq!(
+            parse_authentication_mode("false"),
+            Ok(AuthenticationMode::GlobalTrusted)
+        );
+        for invalid in ["TRUE", "False", "1", " true", "true ", ""] {
+            assert!(parse_authentication_mode(invalid).is_err());
+        }
     }
 }

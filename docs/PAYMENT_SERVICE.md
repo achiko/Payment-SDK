@@ -17,16 +17,25 @@ IX event feed. Run a separate process and database for another network.
 
 ## HTTP contract
 
-All operation routes use `/v1`, strict JSON, bounded bodies, and bearer
-authentication. Atomic amounts and large integers are unsigned decimal
-strings. Ethereum addresses and transaction IDs are canonical lowercase
-`0x`-prefixed hexadecimal. Non-loopback listeners require an explicit assertion
-that a trusted upstream terminates TLS.
+All operation routes use `/v1`, strict JSON, and bounded bodies.
+`STRICT_AUTHENTICATION_MODE` is required and accepts exactly lowercase `true`
+or `false`. Atomic amounts and large integers are unsigned decimal strings.
+Ethereum addresses and transaction IDs are canonical lowercase `0x`-prefixed
+hexadecimal. Non-loopback listeners require an explicit assertion that a
+trusted upstream terminates TLS in either mode.
 
-The ordinary exchange credential can use deposit, job, balance, ledger,
+Strict mode requires distinct ordinary and administrator credentials. The
+ordinary exchange credential can use deposit, job, balance, ledger,
 observation, and collection routes. The administrator credential can also use
 those routes and is required for accounting, reconciliation, and status routes.
 An ordinary credential receives `403` on administrator routes.
+
+Global-trusted mode ignores Authorization for authorization and maps every
+reachable caller to one stable principal with ordinary and administrator
+authority. This is a deployment trust decision, not identity isolation or
+multi-tenancy. PS persists the selected principal-scope mode and refuses to
+reinterpret a populated role-scoped database as global-trusted without a
+future principal-aware migration.
 
 | Method and path | Result |
 |---|---|
@@ -47,10 +56,19 @@ An ordinary credential receives `403` on administrator routes.
 | `POST /v1/reconciliations/{id}/resolve` | Administrator-only typed resolution: reverse credit, accept liability, or record external debt. |
 | `GET /v1/admin/status` | Policy identity, dependency readiness, ingestion/projection lag, and bounded job backlog. |
 
-Mutations require `Idempotency-Key`. The durable identity is the authenticated
+Strict-mode mutations require `Idempotency-Key`. In global-trusted mode an
+omitted key is generated as UUIDv7 before effects and returned in the response
+header (and accepted-job body). The durable identity is the effective
 principal, semantic operation, client key, and request hash. Exact replay
 returns the original IDs/result. Reusing a key for different content returns
-`409`.
+`409`. A caller that loses the whole generated response cannot identify a
+subsequent retry, so retry-safe clients should continue to supply stable keys.
+
+PS readiness, administrator status, structured startup output, and
+`payment_sdk_strict_authentication_mode{service="payment-service"}` expose the
+sanitized posture. PS refuses readiness when IX or WS reports a missing or
+mismatched mode and never downgrades after an authentication or transport
+failure.
 
 Errors use a stable safe envelope:
 
@@ -183,8 +201,9 @@ validates service ownership, Ethereum scope, journals, mirrored events,
 consumer cursors, users, jobs, collections, reservations, transaction indexes,
 and reconciliation references; rebuilds deposit association and
 deposit-to-observation indexes; and only then atomically binds/upgrades the
-database metadata to schema v2 and the active policy. Normal `serve` fails
-closed on an old, unbound, IX-owned, or scope/policy-mismatched store.
+database metadata to schema v4, the active policy, and the explicit
+principal-scope mode. Normal `serve` fails closed on an old, unbound, IX-owned,
+scope/policy-mismatched, or authentication-mode-mismatched store.
 
 Migration requires an explicit operator-supplied network for legacy rows that
 did not persist network identity. Stop every process using the database before

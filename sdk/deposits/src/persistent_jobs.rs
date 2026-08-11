@@ -16,11 +16,12 @@ use crate::{
     JobPageRequest, JobPayload, JobResource, JobState, JobStore, MigratePaymentDatabase,
     PAYMENT_DOMAIN_SCHEMA_VERSION, PAYMENT_SERVICE_OWNER, PaymentDatabaseMetadata,
     PaymentDatabaseMetadataStore, PaymentDatabaseMigrationReport, PersistentPaymentRepository,
-    PolicyIdentity, RequestHash, RetryCollectionJob, RetryUtxoBatchCollectionJob, TransitionJob,
-    User, UserId, UserStore,
+    PolicyIdentity, PrincipalScopeMode, RequestHash, RetryCollectionJob,
+    RetryUtxoBatchCollectionJob, TransitionJob, User, UserId, UserStore,
 };
 
 const RECORD_VERSION: u16 = 1;
+const DATABASE_METADATA_RECORD_VERSION: u16 = 2;
 const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PAGE_SIZE: usize = 1_000;
 
@@ -207,25 +208,67 @@ struct DatabaseMetadataRecordV1 {
     initialized_at: u64,
 }
 
-impl From<&PaymentDatabaseMetadata> for DatabaseMetadataRecordV1 {
+#[derive(Clone, Copy, Debug, Decode, Encode, PartialEq, Eq)]
+enum PrincipalScopeModeRecordV1 {
+    RoleScoped,
+    GlobalTrusted,
+}
+
+impl From<PrincipalScopeMode> for PrincipalScopeModeRecordV1 {
+    fn from(value: PrincipalScopeMode) -> Self {
+        match value {
+            PrincipalScopeMode::RoleScoped => Self::RoleScoped,
+            PrincipalScopeMode::GlobalTrusted => Self::GlobalTrusted,
+        }
+    }
+}
+
+impl From<PrincipalScopeModeRecordV1> for PrincipalScopeMode {
+    fn from(value: PrincipalScopeModeRecordV1) -> Self {
+        match value {
+            PrincipalScopeModeRecordV1::RoleScoped => Self::RoleScoped,
+            PrincipalScopeModeRecordV1::GlobalTrusted => Self::GlobalTrusted,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Decode, Encode, PartialEq, Eq)]
+struct DatabaseMetadataRecordV2 {
+    record_version: u16,
+    service_owner: String,
+    domain_schema_version: u16,
+    scope: ScopeRecordV1,
+    active_policy_version: String,
+    active_policy_digest: [u8; 32],
+    initialized_at: u64,
+    principal_scope_mode: PrincipalScopeModeRecordV1,
+}
+
+impl From<&PaymentDatabaseMetadata> for DatabaseMetadataRecordV2 {
     fn from(value: &PaymentDatabaseMetadata) -> Self {
         Self {
-            record_version: RECORD_VERSION,
+            record_version: DATABASE_METADATA_RECORD_VERSION,
             service_owner: value.service_owner.clone(),
             domain_schema_version: value.domain_schema_version,
             scope: ScopeRecordV1::from(&value.scope),
             active_policy_version: value.active_policy.version.clone(),
             active_policy_digest: value.active_policy.digest,
             initialized_at: value.initialized_at,
+            principal_scope_mode: value.principal_scope_mode.into(),
         }
     }
 }
 
-impl TryFrom<DatabaseMetadataRecordV1> for PaymentDatabaseMetadata {
+impl TryFrom<DatabaseMetadataRecordV2> for PaymentDatabaseMetadata {
     type Error = DepositError;
 
-    fn try_from(value: DatabaseMetadataRecordV1) -> Result<Self, Self::Error> {
-        ensure_version(value.record_version)?;
+    fn try_from(value: DatabaseMetadataRecordV2) -> Result<Self, Self::Error> {
+        if value.record_version != DATABASE_METADATA_RECORD_VERSION {
+            return Err(storage_error(format!(
+                "unsupported PS database metadata record version {}",
+                value.record_version
+            )));
+        }
         Ok(Self {
             service_owner: value.service_owner,
             domain_schema_version: value.domain_schema_version,
@@ -234,9 +277,48 @@ impl TryFrom<DatabaseMetadataRecordV1> for PaymentDatabaseMetadata {
                 version: value.active_policy_version,
                 digest: value.active_policy_digest,
             },
+            principal_scope_mode: value.principal_scope_mode.into(),
             initialized_at: value.initialized_at,
         })
     }
+}
+
+#[derive(Clone, Debug)]
+struct StoredDatabaseMetadata {
+    metadata: PaymentDatabaseMetadata,
+    value: StoredValue,
+    principal_scope_bound: bool,
+}
+
+fn decode_database_metadata(stored: &StoredValue) -> Result<StoredDatabaseMetadata, DepositError> {
+    if let Ok(record) = decode::<DatabaseMetadataRecordV2>(stored) {
+        return Ok(StoredDatabaseMetadata {
+            metadata: record.try_into()?,
+            value: stored.clone(),
+            principal_scope_bound: true,
+        });
+    }
+
+    let record = decode::<DatabaseMetadataRecordV1>(stored)?;
+    ensure_version(record.record_version)?;
+    Ok(StoredDatabaseMetadata {
+        metadata: PaymentDatabaseMetadata {
+            service_owner: record.service_owner,
+            domain_schema_version: record.domain_schema_version,
+            scope: record.scope.into(),
+            active_policy: PolicyIdentity {
+                version: record.active_policy_version,
+                digest: record.active_policy_digest,
+            },
+            // Legacy metadata predates the binding. This value is used only by
+            // the explicit migration path, which independently tracks that the
+            // binding was absent.
+            principal_scope_mode: PrincipalScopeMode::RoleScoped,
+            initialized_at: record.initialized_at,
+        },
+        value: stored.clone(),
+        principal_scope_bound: false,
+    })
 }
 
 impl From<&User> for UserRecordV1 {
@@ -907,12 +989,16 @@ fn validate_migration_command(command: &MigratePaymentDatabase) -> Result<(), De
     Ok(())
 }
 
-fn expected_metadata(command: InitializePaymentDatabase) -> PaymentDatabaseMetadata {
+fn expected_metadata(
+    command: InitializePaymentDatabase,
+    principal_scope_mode: PrincipalScopeMode,
+) -> PaymentDatabaseMetadata {
     PaymentDatabaseMetadata {
         service_owner: PAYMENT_SERVICE_OWNER.to_owned(),
         domain_schema_version: PAYMENT_DOMAIN_SCHEMA_VERSION,
         scope: command.scope,
         active_policy: command.active_policy,
+        principal_scope_mode,
         initialized_at: command.initialized_at,
     }
 }
@@ -941,6 +1027,11 @@ fn validate_persisted_metadata(
     if persisted.active_policy != expected.active_policy {
         return Err(conflict(
             "Payment Service database is bound to a different active policy",
+        ));
+    }
+    if persisted.principal_scope_mode != expected.principal_scope_mode {
+        return Err(conflict(
+            "Payment Service database is bound to a different principal-scope mode",
         ));
     }
     Ok(persisted)
@@ -995,25 +1086,25 @@ where
 
     async fn stored_database_metadata_with_value(
         &self,
-    ) -> Result<Option<(PaymentDatabaseMetadata, StoredValue)>, DepositError> {
+    ) -> Result<Option<StoredDatabaseMetadata>, DepositError> {
         self.storage()
             .get(&database_metadata_ns(), &database_metadata_key())
             .await
             .map_err(map_storage)?
-            .map(|stored| {
-                let metadata = decode::<DatabaseMetadataRecordV1>(&stored)?.try_into()?;
-                Ok((metadata, stored))
-            })
+            .map(|stored| decode_database_metadata(&stored))
             .transpose()
     }
 
     async fn stored_database_metadata(
         &self,
     ) -> Result<Option<PaymentDatabaseMetadata>, DepositError> {
-        Ok(self
-            .stored_database_metadata_with_value()
-            .await?
-            .map(|(metadata, _)| metadata))
+        match self.stored_database_metadata_with_value().await? {
+            Some(stored) if !stored.principal_scope_bound => Err(conflict(
+                "Payment Service database principal-scope mode requires explicit metadata migration",
+            )),
+            Some(stored) => Ok(Some(stored.metadata)),
+            None => Ok(None),
+        }
     }
 
     async fn namespace_has_records(&self, namespace: Namespace) -> Result<bool, DepositError> {
@@ -1031,9 +1122,11 @@ where
             .is_empty())
     }
 
-    async fn has_unbound_ps_records(&self) -> Result<bool, DepositError> {
-        // A missing owner record alongside any semantic PS state represents an
-        // older database and must go through the explicit migration workflow.
+    async fn has_principal_scoped_ps_records(&self) -> Result<bool, DepositError> {
+        // These authoritative rows and indexes all imply pre-existing
+        // role-scoped identities. The deposit-index completion marker is
+        // deliberately excluded: it is derived, contains no principal, and
+        // may survive an interrupted validation of an otherwise empty store.
         for namespace in [
             "ps.v1.deposit",
             "ps.v1.deposit_address",
@@ -1043,7 +1136,6 @@ where
             "ps.v1.user_deposit",
             "ps.v1.deposit_state",
             "ps.v1.user_deposit_state",
-            "ps.v1.deposit_index_metadata",
             "ps.v1.ledger_head",
             "ps.v1.ledger_entry",
             "ps.v1.projection",
@@ -1076,6 +1168,17 @@ where
             }
         }
         Ok(false)
+    }
+
+    async fn has_unbound_ps_records(&self) -> Result<bool, DepositError> {
+        // Normal startup also treats a lone derived completion marker as an
+        // unbound database, so only the explicit migration workflow may
+        // validate and adopt it.
+        if self.has_principal_scoped_ps_records().await? {
+            return Ok(true);
+        }
+        self.namespace_has_records(ns("ps.v1.deposit_index_metadata"))
+            .await
     }
 
     pub(crate) async fn migration_users(
@@ -1412,13 +1515,14 @@ impl<S> PaymentDatabaseMetadataStore for PersistentPaymentRepository<S>
 where
     S: Storage,
 {
-    fn initialize_or_validate<'a>(
+    fn initialize_or_validate_principal_scope<'a>(
         &'a self,
         command: InitializePaymentDatabase,
+        principal_scope_mode: PrincipalScopeMode,
     ) -> BoxFuture<'a, Result<PaymentDatabaseMetadata, DepositError>> {
         Box::pin(async move {
             validate_metadata_command(&command)?;
-            let expected = expected_metadata(command);
+            let expected = expected_metadata(command, principal_scope_mode);
             // Bound PS metadata does not make a mixed-owner database safe.
             // Re-check IX ownership on every startup before the metadata fast path.
             if self.namespace_has_records(ix_semantic_ns()).await? {
@@ -1453,7 +1557,7 @@ where
                     operations: vec![Operation::Put {
                         namespace: database_metadata_ns(),
                         key: database_metadata_key(),
-                        value: encode(&DatabaseMetadataRecordV1::from(&expected))?,
+                        value: encode(&DatabaseMetadataRecordV2::from(&expected))?,
                     }],
                 })
                 .await
@@ -1476,18 +1580,20 @@ where
         Box::pin(async move { self.stored_database_metadata().await })
     }
 
-    fn migrate_and_bind<'a>(
+    fn migrate_and_bind_principal_scope<'a>(
         &'a self,
         command: MigratePaymentDatabase,
+        principal_scope_mode: PrincipalScopeMode,
     ) -> BoxFuture<'a, Result<PaymentDatabaseMigrationReport, DepositError>> {
         Box::pin(async move {
             validate_migration_command(&command)?;
             let stored_metadata = self.stored_database_metadata_with_value().await?;
             let previous_domain_schema_version = stored_metadata
                 .as_ref()
-                .map(|(metadata, _)| metadata.domain_schema_version);
+                .map(|stored| stored.metadata.domain_schema_version);
 
-            if let Some((metadata, _)) = &stored_metadata {
+            if let Some(stored) = &stored_metadata {
+                let metadata = &stored.metadata;
                 if metadata.service_owner != PAYMENT_SERVICE_OWNER {
                     return Err(conflict(format!(
                         "database is owned by {}, not Payment Service",
@@ -1510,6 +1616,13 @@ where
                         "Payment Service database is bound to a different Indexer scope",
                     ));
                 }
+                if stored.principal_scope_bound
+                    && metadata.principal_scope_mode != principal_scope_mode
+                {
+                    return Err(conflict(
+                        "Payment Service database principal-scope mode cannot change without a principal-aware migration",
+                    ));
+                }
                 if metadata.domain_schema_version == PAYMENT_DOMAIN_SCHEMA_VERSION
                     && metadata.active_policy != command.active_policy
                 {
@@ -1525,6 +1638,17 @@ where
                 ));
             }
 
+            if principal_scope_mode == PrincipalScopeMode::GlobalTrusted
+                && stored_metadata
+                    .as_ref()
+                    .is_none_or(|stored| !stored.principal_scope_bound)
+                && self.has_principal_scoped_ps_records().await?
+            {
+                return Err(conflict(
+                    "global-trusted principal scope may bind only a new or verified-empty database",
+                ));
+            }
+
             let validation =
                 crate::migration::validate_and_rebuild(self, &command.scope, command.page_size)
                     .await?;
@@ -1533,16 +1657,17 @@ where
                 domain_schema_version: PAYMENT_DOMAIN_SCHEMA_VERSION,
                 scope: command.scope,
                 active_policy: command.active_policy,
+                principal_scope_mode,
                 initialized_at: stored_metadata
                     .as_ref()
-                    .map_or(command.migrated_at, |(metadata, _)| metadata.initialized_at),
+                    .map_or(command.migrated_at, |stored| stored.metadata.initialized_at),
             };
 
             let metadata_condition = match &stored_metadata {
-                Some((_, stored)) => Condition::Version {
+                Some(stored) => Condition::Version {
                     namespace: database_metadata_ns(),
                     key: database_metadata_key(),
-                    expected: stored.version,
+                    expected: stored.value.version,
                 },
                 None => Condition::Missing {
                     namespace: database_metadata_ns(),
@@ -1561,7 +1686,7 @@ where
                     operations: vec![Operation::Put {
                         namespace: database_metadata_ns(),
                         key: database_metadata_key(),
-                        value: encode(&DatabaseMetadataRecordV1::from(&expected))?,
+                        value: encode(&DatabaseMetadataRecordV2::from(&expected))?,
                     }],
                 })
                 .await

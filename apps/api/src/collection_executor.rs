@@ -29,6 +29,11 @@ use crate::{
 type Repository = PersistentPaymentRepository<RocksDbStorage>;
 
 const COLLECTION_SCAN_PAGE_SIZE: usize = 1_000;
+// These exact prefixes are the durable v1 domain encoding. Keep their bytes
+// unchanged for replay compatibility; a future version must use new prefixes.
+const COLLECTION_OPERATION_ID_DOMAIN_V1: &str = "ps-collection";
+const COLLECTION_LEG_ID_DOMAIN_V1: &str = "leg";
+const COLLECTION_WATCH_IDEMPOTENCY_DOMAIN_V1: &str = "ps-collection-watch";
 
 /// Executes or resumes one durable Ethereum collection command.
 ///
@@ -729,7 +734,7 @@ fn stable_operation_id(
     attempt: u32,
 ) -> Result<OperationId, DepositError> {
     OperationId::new(format!(
-        "ps-collection-{}",
+        "{COLLECTION_OPERATION_ID_DOMAIN_V1}-{}",
         digest_hex(&[
             collection_id.0.as_bytes(),
             purpose.as_bytes(),
@@ -741,14 +746,14 @@ fn stable_operation_id(
 
 fn stable_leg_id(collection_id: &CollectionId, purpose: &str) -> CollectionLegId {
     CollectionLegId(format!(
-        "leg-{}",
+        "{COLLECTION_LEG_ID_DOMAIN_V1}-{}",
         digest_hex(&[collection_id.0.as_bytes(), purpose.as_bytes()])
     ))
 }
 
 fn watch_idempotency_key(collection_id: &CollectionId, leg_id: &CollectionLegId) -> String {
     format!(
-        "ps-collection-watch-{}",
+        "{COLLECTION_WATCH_IDEMPOTENCY_DOMAIN_V1}-{}",
         digest_hex(&[collection_id.0.as_bytes(), leg_id.0.as_bytes()])
     )
 }
@@ -1100,17 +1105,24 @@ mod tests {
     }
 
     #[test]
-    fn operation_and_watch_identities_are_stable_and_bounded() {
+    fn collection_child_identity_v1_bytes_are_frozen_and_bounded() {
         let collection = CollectionId("collection-1".to_owned());
         let leg = stable_leg_id(&collection, "sweep");
+        assert_eq!(
+            leg.0,
+            "leg-d5ca2c919c7b51b941c4d881643092e46f3331dcf7ad98a1e42c125fb1fab51c"
+        );
         assert_eq!(
             stable_operation_id(&collection, "sweep", 1)
                 .expect("operation ID must be valid")
                 .as_str(),
-            stable_operation_id(&collection, "sweep", 1)
-                .expect("operation ID must be stable")
-                .as_str()
+            "ps-collection-40758b0a5dde3d8f17914d13b9339f9184be0904aeaab4e331727bca3693529c"
         );
-        assert!(watch_idempotency_key(&collection, &leg).len() < 256);
+        let watch_idempotency_key = watch_idempotency_key(&collection, &leg);
+        assert_eq!(
+            watch_idempotency_key,
+            "ps-collection-watch-8b1f435abd15fcde184eb9d3671137ea35953877d9a568545c876e210b34959d"
+        );
+        assert!(watch_idempotency_key.len() < 256);
     }
 }

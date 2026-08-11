@@ -1054,18 +1054,43 @@ Ethereum PS v1 exposes internal exchange-backend JSON/HTTP operations for:
 Commands that can outlive one request SHOULD return durable job IDs.
 
 Ethereum PS v1 uses `/v1`, strict JSON, unsigned decimal strings for atomic
-amounts, bounded cursor pagination, and separate ordinary and administrator
-bearer credentials. The administrator credential MAY use ordinary routes; the
-ordinary credential MUST receive `403` on administrator routes. Non-loopback
-listeners require trusted upstream TLS termination. Webhooks are excluded.
+amounts, and bounded cursor pagination. `STRICT_AUTHENTICATION_MODE` is a
+required global deployment value for every repo-owned HTTP service and matching
+client. It accepts exactly lowercase `true` or `false`; a missing, empty,
+whitespace-padded, or otherwise different value MUST fail startup.
 
-Every external mutation MUST carry `Idempotency-Key`. PS scopes it by the
-authenticated principal and semantic operation and stores a hash of the
-canonical request meaning. Exact replay returns the original resource/job IDs;
-reuse for different content returns `409`. Server-owned IDs are
-lowercase-prefixed UUIDv7 values. Long-running create-deposit, close-deposit,
-create-collection, and retry-collection commands return `202` and a durable
-job in `queued`, `running`, `waiting_retry`, `succeeded`, or `failed` state.
+When the value is `true`, PS requires separate ordinary and administrator
+bearer credentials. The administrator credential MAY use ordinary routes; the
+ordinary credential MUST receive `403` on administrator routes. WS, IX, and the
+repo-owned development custody adapter likewise require their configured
+service bearer. Every external PS mutation MUST carry `Idempotency-Key`.
+
+When the value is `false`, every caller that can reach a repo-owned service is
+one stable global-trusted principal. Authorization headers are ignored for
+authorization, ordinary and administrator PS routes are both available, and
+repo-owned bearer variables are not required. This is a deployment-wide trust
+decision, not anonymous multi-tenancy or identity isolation. External
+HSM/KMS/custody, node RPC, chain validation, policy, and durable repository
+idempotency remain independently enforced. Non-loopback listeners require
+trusted upstream TLS termination in both modes. Webhooks are excluded.
+PS database metadata MUST bind the corresponding principal-scope mode. Legacy
+unbound data that contains principal-scoped records may migrate only to
+role-scoped strict ownership. An explicitly verified-empty legacy store may be
+bound to global-trusted ownership. A populated database MUST NOT switch between
+role-scoped and global-trusted ownership without a future principal-aware
+migration.
+
+In global-trusted mode an omitted external mutation identity is replaced by a
+UUIDv7 before any external effect and returned to the caller. Losing that whole
+response makes a later request indistinguishable from an intentionally new
+command, so retry-safe callers SHOULD still supply and reuse an identity.
+In both modes PS scopes the effective identity by principal and semantic
+operation and stores a hash of the canonical request meaning. Exact replay
+returns the original resource/job IDs; reuse for different content returns
+`409`. Server-owned IDs are lowercase-prefixed UUIDv7 values. Long-running
+create-deposit, close-deposit, create-collection, and retry-collection commands
+return `202` and a durable job in `queued`, `running`, `waiting_retry`,
+`succeeded`, or `failed` state.
 
 The Ethereum v1 deployment unit is one PS process with exclusive ownership of
 one PS RocksDB path, one Ethereum `IndexScope`, one active policy identity, and
@@ -1078,9 +1103,10 @@ thresholds, gas-funder limit, and ceilings for gas limit, maximum fee per gas,
 priority fee per gas, and maximum total fee. These values have no permissive
 financial defaults.
 
-Bitcoin PS block-only v1 implements `/v1`, strict JSON, bounded cursor pagination,
-separate ordinary/administrator credentials, mutation idempotency, and durable
-jobs. Its batch collection command explicitly identifies multiple deposits and
+Bitcoin PS block-only v1 implements `/v1`, strict JSON, bounded cursor
+pagination, the same global authentication-mode contract, mutation
+idempotency, and durable jobs. Its batch collection command explicitly
+identifies multiple deposits and
 may cross user IDs only within one authenticated exchange-principal ownership
 boundary. Its mandatory versioned policy selects one Bitcoin network, native
 BTC, P2WPKH or P2TR deposit addresses, TTL, master destination, collection and
@@ -1096,6 +1122,13 @@ acceptance scenario.
   the explicit IX cursor.
 - Logs MUST NOT contain private keys, seed phrases, raw signer secrets, or
   unredacted custody credentials.
+- Every repo-owned service MUST expose its sanitized authentication mode in
+  structured startup output, public readiness/status, and a persistent metric.
+  Global-trusted mode MUST emit one high-severity startup warning and MUST NOT
+  log one warning per request.
+- A repo-owned client MUST reject a missing or mismatched remote authentication
+  mode as a nonretryable configuration failure. It MUST NOT downgrade after a
+  `401`, connection failure, or missing status field.
 - Chain/node capabilities MUST be detected explicitly.
 - Ethereum internal native transfer completeness MUST NOT be claimed without a
   supported trace source and retention guarantee.

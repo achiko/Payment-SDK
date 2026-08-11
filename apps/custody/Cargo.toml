@@ -12,6 +12,7 @@ http-support = { package = "http", path = "../../packages/http" }
 signer = { path = "../../sdk/signing/contract" }
 signer-local = { path = "../../sdk/signing/local" }
 signer-remote = { path = "../../sdk/signing/remote" }
+telemetry = { path = "../../packages/telemetry" }
 tokio = { workspace = true, features = ["net", "signal", "sync", "time"] }
 tracing = "=0.1.41"
 tracing-subscriber = { version = "=0.3.20", features = ["env-filter", "fmt", "json"] }

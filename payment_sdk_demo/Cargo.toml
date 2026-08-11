@@ -35,4 +35,3 @@ storage-rocksdb = { path = "../sdk/storage/rocksdb" }
 
 tempfile = "=3.27.0"
 tokio = { version = "=1.49.0", features = ["macros", "rt-multi-thread"] }
-dotenvy = "=0.15.7"

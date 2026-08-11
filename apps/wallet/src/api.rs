@@ -14,6 +14,7 @@ use chain_ethereum::{
     EthereumSignedTransaction, EthereumTransactionId, EthereumTransferRequest, Wei,
 };
 use chain_identity::AtomicAmount;
+use http_support::AuthenticationMode;
 use serde::{Deserialize, Serialize};
 use signer::{ChildIndex, DerivationPath, KeyLocator, OperationId};
 use uuid::Uuid;
@@ -77,7 +78,16 @@ pub trait EthereumWalletOperations: Send + Sync {
     ) -> OperationFuture<'a, Result<Option<EthereumReceipt>, ChainError>>;
 }
 
-pub fn router(operations: Arc<dyn EthereumWalletOperations>) -> Router {
+#[derive(Clone)]
+struct ApiState {
+    operations: Arc<dyn EthereumWalletOperations>,
+    authentication_mode: AuthenticationMode,
+}
+
+pub fn router(
+    operations: Arc<dyn EthereumWalletOperations>,
+    authentication_mode: AuthenticationMode,
+) -> Router {
     Router::new()
         .route(ADDRESS_PATH, post(generate_address))
         .route(BALANCE_PATH, post(balance))
@@ -88,31 +98,38 @@ pub fn router(operations: Arc<dyn EthereumWalletOperations>) -> Router {
         .route(SIGN_ERC20_COLLECTION_PATH, post(sign_erc20_collection))
         .route(BROADCAST_PATH, post(broadcast))
         .route(RECEIPT_PATH, post(receipt))
-        .with_state(operations)
+        .with_state(ApiState {
+            operations,
+            authentication_mode,
+        })
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GenerateAddressRequest {
-    operation_id: String,
+    operation_id: Option<String>,
     asset: AssetDto,
     key_purpose: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 struct GenerateAddressResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation_id: Option<String>,
     address: String,
     key_locator: KeyLocatorDto,
 }
 
 async fn generate_address(
-    State(operations): State<Arc<dyn EthereumWalletOperations>>,
+    State(state): State<ApiState>,
     payload: Result<Json<GenerateAddressRequest>, JsonRejection>,
 ) -> ApiResult<Json<GenerateAddressResponse>> {
     let request = json_payload(payload)?;
-    let operation_id = operation_id(&request.operation_id)?;
+    let (operation_id, effective_operation_id) =
+        effective_operation_id(request.operation_id.as_deref(), state.authentication_mode)?;
     validate_key_purpose(&request.key_purpose)?;
-    let generated = operations
+    let generated = state
+        .operations
         .generate_address(
             request.asset.into_asset()?,
             operation_id,
@@ -121,6 +138,7 @@ async fn generate_address(
         .await
         .map_err(ApiError::from_chain)?;
     Ok(Json(GenerateAddressResponse {
+        operation_id: effective_operation_id,
         address: generated.address.to_string(),
         key_locator: KeyLocatorDto::from(generated.key),
     }))
@@ -141,11 +159,12 @@ struct BalanceResponse {
 }
 
 async fn balance(
-    State(operations): State<Arc<dyn EthereumWalletOperations>>,
+    State(state): State<ApiState>,
     payload: Result<Json<BalanceRequest>, JsonRejection>,
 ) -> ApiResult<Json<BalanceResponse>> {
     let request = json_payload(payload)?;
-    let result = operations
+    let result = state
+        .operations
         .balance(
             request.asset.into_asset()?,
             canonical_address(&request.address)?,
@@ -162,7 +181,7 @@ async fn balance(
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SignNativeTransferRequest {
-    operation_id: String,
+    operation_id: Option<String>,
     key_locator: KeyLocatorDto,
     from: String,
     to: String,
@@ -170,28 +189,34 @@ struct SignNativeTransferRequest {
 }
 
 async fn sign_native_transfer(
-    State(operations): State<Arc<dyn EthereumWalletOperations>>,
+    State(state): State<ApiState>,
     payload: Result<Json<SignNativeTransferRequest>, JsonRejection>,
 ) -> ApiResult<Json<SignedTransactionResponse>> {
     let request = json_payload(payload)?;
+    let (operation_id, effective_operation_id) =
+        effective_operation_id(request.operation_id.as_deref(), state.authentication_mode)?;
     let transfer = EthereumTransferRequest::native(
-        operation_id(&request.operation_id)?,
+        operation_id,
         request.key_locator.into_locator()?,
         canonical_address(&request.from)?,
         canonical_address(&request.to)?,
         decimal_wei(&request.value, "value")?,
     );
-    let signed = operations
+    let signed = state
+        .operations
         .sign_transfer(EthereumAsset::Native, transfer)
         .await
         .map_err(ApiError::from_chain)?;
-    Ok(Json(SignedTransactionResponse::from(signed)))
+    Ok(Json(SignedTransactionResponse::new(
+        effective_operation_id,
+        signed,
+    )))
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SignErc20TransferRequest {
-    operation_id: String,
+    operation_id: Option<String>,
     key_locator: KeyLocatorDto,
     token: String,
     from: String,
@@ -200,24 +225,30 @@ struct SignErc20TransferRequest {
 }
 
 async fn sign_erc20_transfer(
-    State(operations): State<Arc<dyn EthereumWalletOperations>>,
+    State(state): State<ApiState>,
     payload: Result<Json<SignErc20TransferRequest>, JsonRejection>,
 ) -> ApiResult<Json<SignedTransactionResponse>> {
     let request = json_payload(payload)?;
+    let (operation_id, effective_operation_id) =
+        effective_operation_id(request.operation_id.as_deref(), state.authentication_mode)?;
     let token = canonical_address(&request.token)?;
     let transfer = EthereumTransferRequest::erc20(
-        operation_id(&request.operation_id)?,
+        operation_id,
         request.key_locator.into_locator()?,
         canonical_address(&request.from)?,
         token.clone(),
         canonical_address(&request.to)?,
         decimal_wei(&request.amount, "amount")?,
     );
-    let signed = operations
+    let signed = state
+        .operations
         .sign_transfer(EthereumAsset::Erc20(token), transfer)
         .await
         .map_err(ApiError::from_chain)?;
-    Ok(Json(SignedTransactionResponse::from(signed)))
+    Ok(Json(SignedTransactionResponse::new(
+        effective_operation_id,
+        signed,
+    )))
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -228,16 +259,20 @@ struct CollectionRequirementsRequest {
 }
 
 async fn collection_requirements(
-    State(operations): State<Arc<dyn EthereumWalletOperations>>,
+    State(state): State<ApiState>,
     payload: Result<Json<CollectionRequirementsRequest>, JsonRejection>,
 ) -> ApiResult<Json<CollectionRequirementsResponse>> {
     let request = json_payload(payload)?;
-    let (asset, request) = request.collection.into_collection()?;
-    let requirements = operations
+    let (asset, request, operation_id) = request
+        .collection
+        .into_collection(state.authentication_mode)?;
+    let requirements = state
+        .operations
         .collection_requirements(asset, request)
         .await
         .map_err(ApiError::from_chain)?;
     Ok(Json(CollectionRequirementsResponse {
+        operation_id,
         requirements: requirements
             .into_iter()
             .map(CollectionRequirementDto::from)
@@ -245,8 +280,10 @@ async fn collection_requirements(
     }))
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 struct CollectionRequirementsResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation_id: Option<String>,
     requirements: Vec<CollectionRequirementDto>,
 }
 
@@ -282,34 +319,40 @@ impl From<EthereumCollectionRequirement> for CollectionRequirementDto {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativeCollectionRequest {
-    operation_id: String,
+    operation_id: Option<String>,
     key_locator: KeyLocatorDto,
     from: String,
     destination: String,
 }
 
 async fn sign_native_collection(
-    State(operations): State<Arc<dyn EthereumWalletOperations>>,
+    State(state): State<ApiState>,
     payload: Result<Json<NativeCollectionRequest>, JsonRejection>,
 ) -> ApiResult<Json<PreparedCollectionResponse>> {
     let request = json_payload(payload)?;
+    let (operation_id, effective_operation_id) =
+        effective_operation_id(request.operation_id.as_deref(), state.authentication_mode)?;
     let request = EthereumCollectionRequest::Native {
-        signing_operation_id: operation_id(&request.operation_id)?,
+        signing_operation_id: operation_id,
         from: canonical_address(&request.from)?,
         key: request.key_locator.into_locator()?,
         destination: canonical_address(&request.destination)?,
     };
-    let prepared = operations
+    let prepared = state
+        .operations
         .prepare_collection(EthereumAsset::Native, request)
         .await
         .map_err(ApiError::from_chain)?;
-    Ok(Json(PreparedCollectionResponse::from(prepared)))
+    Ok(Json(PreparedCollectionResponse::new(
+        effective_operation_id,
+        prepared,
+    )))
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Erc20CollectionRequest {
-    operation_id: String,
+    operation_id: Option<String>,
     key_locator: KeyLocatorDto,
     token: String,
     from: String,
@@ -318,13 +361,15 @@ struct Erc20CollectionRequest {
 }
 
 async fn sign_erc20_collection(
-    State(operations): State<Arc<dyn EthereumWalletOperations>>,
+    State(state): State<ApiState>,
     payload: Result<Json<Erc20CollectionRequest>, JsonRejection>,
 ) -> ApiResult<Json<PreparedCollectionResponse>> {
     let request = json_payload(payload)?;
+    let (operation_id, effective_operation_id) =
+        effective_operation_id(request.operation_id.as_deref(), state.authentication_mode)?;
     let token = canonical_address(&request.token)?;
     let collection = EthereumCollectionRequest::Token {
-        signing_operation_id: operation_id(&request.operation_id)?,
+        signing_operation_id: operation_id,
         token: token.clone(),
         from: canonical_address(&request.from)?,
         key: request.key_locator.into_locator()?,
@@ -335,15 +380,21 @@ async fn sign_erc20_collection(
             .map(|amount| decimal_wei(amount, "amount"))
             .transpose()?,
     };
-    let prepared = operations
+    let prepared = state
+        .operations
         .prepare_collection(EthereumAsset::Erc20(token), collection)
         .await
         .map_err(ApiError::from_chain)?;
-    Ok(Json(PreparedCollectionResponse::from(prepared)))
+    Ok(Json(PreparedCollectionResponse::new(
+        effective_operation_id,
+        prepared,
+    )))
 }
 
 #[derive(Clone, Serialize)]
 struct SignedTransactionResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation_id: Option<String>,
     transaction_id: String,
     signed_envelope: String,
 }
@@ -352,15 +403,17 @@ impl std::fmt::Debug for SignedTransactionResponse {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SignedTransactionResponse")
+            .field("operation_id", &"[REDACTED]")
             .field("transaction_id", &self.transaction_id)
             .field("signed_envelope", &"[REDACTED]")
             .finish()
     }
 }
 
-impl From<EthereumSignedTransaction> for SignedTransactionResponse {
-    fn from(transaction: EthereumSignedTransaction) -> Self {
+impl SignedTransactionResponse {
+    fn new(operation_id: Option<String>, transaction: EthereumSignedTransaction) -> Self {
         Self {
+            operation_id,
             transaction_id: transaction.id.to_string(),
             signed_envelope: hex_prefixed(&transaction.envelope),
         }
@@ -369,6 +422,8 @@ impl From<EthereumSignedTransaction> for SignedTransactionResponse {
 
 #[derive(Clone, Serialize)]
 struct PreparedCollectionResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation_id: Option<String>,
     transaction_id: String,
     signed_envelope: String,
     attribution: Vec<CollectionAttributionDto>,
@@ -378,6 +433,7 @@ impl std::fmt::Debug for PreparedCollectionResponse {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PreparedCollectionResponse")
+            .field("operation_id", &"[REDACTED]")
             .field("transaction_id", &self.transaction_id)
             .field("signed_envelope", &"[REDACTED]")
             .field("attribution", &self.attribution)
@@ -385,10 +441,11 @@ impl std::fmt::Debug for PreparedCollectionResponse {
     }
 }
 
-impl From<EthereumPreparedCollection> for PreparedCollectionResponse {
-    fn from(prepared: EthereumPreparedCollection) -> Self {
-        let transaction = SignedTransactionResponse::from(prepared.transaction);
+impl PreparedCollectionResponse {
+    fn new(operation_id: Option<String>, prepared: EthereumPreparedCollection) -> Self {
+        let transaction = SignedTransactionResponse::new(operation_id, prepared.transaction);
         Self {
+            operation_id: transaction.operation_id,
             transaction_id: transaction.transaction_id,
             signed_envelope: transaction.signed_envelope,
             attribution: prepared
@@ -440,7 +497,7 @@ struct BroadcastResponse {
 }
 
 async fn broadcast(
-    State(operations): State<Arc<dyn EthereumWalletOperations>>,
+    State(state): State<ApiState>,
     payload: Result<Json<BroadcastRequest>, JsonRejection>,
 ) -> ApiResult<Json<BroadcastResponse>> {
     let request = json_payload(payload)?;
@@ -452,7 +509,8 @@ async fn broadcast(
             "signed envelope does not match the expected transaction ID",
         )
     })?;
-    let id = operations
+    let id = state
+        .operations
         .broadcast(signed)
         .await
         .map_err(ApiError::from_chain)?;
@@ -489,12 +547,13 @@ struct BlockRefDto {
 }
 
 async fn receipt(
-    State(operations): State<Arc<dyn EthereumWalletOperations>>,
+    State(state): State<ApiState>,
     payload: Result<Json<ReceiptRequest>, JsonRejection>,
 ) -> ApiResult<Json<ReceiptResponse>> {
     let request = json_payload(payload)?;
     let id = transaction_id(&request.transaction_id)?;
-    let receipt = operations
+    let receipt = state
+        .operations
         .receipt(id.clone())
         .await
         .map_err(ApiError::from_chain)?;
@@ -517,13 +576,13 @@ async fn receipt(
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum CollectionRequestDto {
     Native {
-        operation_id: String,
+        operation_id: Option<String>,
         key_locator: KeyLocatorDto,
         from: String,
         destination: String,
     },
     Erc20 {
-        operation_id: String,
+        operation_id: Option<String>,
         key_locator: KeyLocatorDto,
         token: String,
         from: String,
@@ -533,22 +592,30 @@ enum CollectionRequestDto {
 }
 
 impl CollectionRequestDto {
-    fn into_collection(self) -> ApiResult<(EthereumAsset, EthereumCollectionRequest)> {
+    fn into_collection(
+        self,
+        authentication_mode: AuthenticationMode,
+    ) -> ApiResult<(EthereumAsset, EthereumCollectionRequest, Option<String>)> {
         match self {
             Self::Native {
                 operation_id: id,
                 key_locator,
                 from,
                 destination,
-            } => Ok((
-                EthereumAsset::Native,
-                EthereumCollectionRequest::Native {
-                    signing_operation_id: operation_id(&id)?,
-                    from: canonical_address(&from)?,
-                    key: key_locator.into_locator()?,
-                    destination: canonical_address(&destination)?,
-                },
-            )),
+            } => {
+                let (operation_id, effective_operation_id) =
+                    effective_operation_id(id.as_deref(), authentication_mode)?;
+                Ok((
+                    EthereumAsset::Native,
+                    EthereumCollectionRequest::Native {
+                        signing_operation_id: operation_id,
+                        from: canonical_address(&from)?,
+                        key: key_locator.into_locator()?,
+                        destination: canonical_address(&destination)?,
+                    },
+                    effective_operation_id,
+                ))
+            }
             Self::Erc20 {
                 operation_id: id,
                 key_locator,
@@ -557,11 +624,13 @@ impl CollectionRequestDto {
                 destination,
                 amount,
             } => {
+                let (operation_id, effective_operation_id) =
+                    effective_operation_id(id.as_deref(), authentication_mode)?;
                 let token = canonical_address(&token)?;
                 Ok((
                     EthereumAsset::Erc20(token.clone()),
                     EthereumCollectionRequest::Token {
-                        signing_operation_id: operation_id(&id)?,
+                        signing_operation_id: operation_id,
                         token,
                         from: canonical_address(&from)?,
                         key: key_locator.into_locator()?,
@@ -571,6 +640,7 @@ impl CollectionRequestDto {
                             .map(|amount| decimal_wei(amount, "amount"))
                             .transpose()?,
                     },
+                    effective_operation_id,
                 ))
             }
         }
@@ -781,6 +851,26 @@ fn operation_id(value: &str) -> ApiResult<OperationId> {
             "operation_id must be a non-empty opaque value without whitespace",
         )
     })
+}
+
+fn effective_operation_id(
+    value: Option<&str>,
+    authentication_mode: AuthenticationMode,
+) -> ApiResult<(OperationId, Option<String>)> {
+    let (value, generated) = match value {
+        Some(value) => (value.to_owned(), false),
+        None if authentication_mode == AuthenticationMode::GlobalTrusted => {
+            (format!("ws-operation-{}", Uuid::now_v7()), true)
+        }
+        None => {
+            return Err(ApiError::bad_request(
+                "invalid_operation_id",
+                "operation_id is required in strict authentication mode",
+            ));
+        }
+    };
+    let operation_id = operation_id(&value)?;
+    Ok((operation_id, generated.then_some(value)))
 }
 
 fn validate_key_purpose(value: &str) -> ApiResult<()> {
@@ -1001,18 +1091,30 @@ mod tests {
         fake: Arc<FakeOperations>,
         ready: bool,
         max_body: usize,
+        authentication_mode: AuthenticationMode,
     ) -> (Router, HealthState) {
         let health = HealthState::new(ready);
+        let bearer_token = match authentication_mode {
+            AuthenticationMode::Strict => {
+                Some(BearerToken::new("wallet-secret").expect("test token must be valid"))
+            }
+            AuthenticationMode::GlobalTrusted => None,
+        };
         let config = HttpServerConfig::new(
             "127.0.0.1:8082".parse().expect("test bind must parse"),
             TransportSecurity::PlaintextLoopback,
-            Some(BearerToken::new("wallet-secret").expect("test token must be valid")),
+            bearer_token,
             RequestLimits::new(max_body, 10, 10).expect("test limits must be valid"),
-        );
+        )
+        .with_authentication_mode(authentication_mode);
         let operations: Arc<dyn EthereumWalletOperations> = fake;
         (
-            service_router(router(operations), &config, health.clone())
-                .expect("test router must compose"),
+            service_router(
+                router(operations, authentication_mode),
+                &config,
+                health.clone(),
+            )
+            .expect("test router must compose"),
             health,
         )
     }
@@ -1027,6 +1129,15 @@ mod tests {
             .expect("test request must build")
     }
 
+    fn json_request_without_auth(path: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("test request must build")
+    }
+
     async fn body_json(response: Response) -> Value {
         let bytes = to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -1035,12 +1146,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routes_require_authentication_but_health_is_detail_free_and_public() {
+    async fn routes_require_authentication_while_public_readiness_reports_mode() {
         let fake = Arc::new(FakeOperations {
             broadcasts: AtomicUsize::new(0),
             prepared: AtomicUsize::new(0),
         });
-        let (router, health) = test_router(fake, false, 4096);
+        let (router, health) = test_router(fake, false, 4096, AuthenticationMode::Strict);
         let unauthorized = router
             .clone()
             .oneshot(
@@ -1077,6 +1188,7 @@ mod tests {
             .await
             .expect("router must answer");
         assert_eq!(ready.status(), StatusCode::OK);
+        assert_eq!(body_json(ready).await["authentication_mode"], "strict");
     }
 
     #[tokio::test]
@@ -1085,7 +1197,7 @@ mod tests {
             broadcasts: AtomicUsize::new(0),
             prepared: AtomicUsize::new(0),
         });
-        let (router, _) = test_router(fake, true, 4096);
+        let (router, _) = test_router(fake, true, 4096, AuthenticationMode::Strict);
         let response = router
             .oneshot(json_request(
                 ADDRESS_PATH,
@@ -1111,12 +1223,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn operation_id_is_optional_only_in_global_trusted_mode_and_is_returned() {
+        let global_fake = Arc::new(FakeOperations {
+            broadcasts: AtomicUsize::new(0),
+            prepared: AtomicUsize::new(0),
+        });
+        let (global_router, _) =
+            test_router(global_fake, true, 4096, AuthenticationMode::GlobalTrusted);
+        let global_response = global_router
+            .oneshot(json_request_without_auth(
+                ADDRESS_PATH,
+                json!({
+                    "asset": { "kind": "native" },
+                    "key_purpose": "deposit:global"
+                }),
+            ))
+            .await
+            .expect("router must answer");
+        assert_eq!(global_response.status(), StatusCode::OK);
+        let body = body_json(global_response).await;
+        let generated = body["operation_id"]
+            .as_str()
+            .expect("response must return the effective operation ID");
+        let uuid = generated
+            .strip_prefix("ws-operation-")
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .expect("generated operation ID must contain a UUID");
+        assert_eq!(uuid.get_version_num(), 7);
+
+        let strict_fake = Arc::new(FakeOperations {
+            broadcasts: AtomicUsize::new(0),
+            prepared: AtomicUsize::new(0),
+        });
+        let (strict_router, _) = test_router(strict_fake, true, 4096, AuthenticationMode::Strict);
+        let strict_response = strict_router
+            .oneshot(json_request(
+                ADDRESS_PATH,
+                json!({
+                    "asset": { "kind": "native" },
+                    "key_purpose": "deposit:strict"
+                }),
+            ))
+            .await
+            .expect("router must answer");
+        assert_eq!(strict_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(strict_response).await["code"],
+            "invalid_operation_id"
+        );
+    }
+
+    #[tokio::test]
     async fn signing_and_collection_preparation_do_not_broadcast() {
         let fake = Arc::new(FakeOperations {
             broadcasts: AtomicUsize::new(0),
             prepared: AtomicUsize::new(0),
         });
-        let (router, _) = test_router(Arc::clone(&fake), true, 4096);
+        let (router, _) = test_router(Arc::clone(&fake), true, 4096, AuthenticationMode::Strict);
         let sign = router
             .clone()
             .oneshot(json_request(
@@ -1155,7 +1318,7 @@ mod tests {
             broadcasts: AtomicUsize::new(0),
             prepared: AtomicUsize::new(0),
         });
-        let (router, _) = test_router(fake, true, 128);
+        let (router, _) = test_router(fake, true, 128, AuthenticationMode::Strict);
         let invalid = router
             .clone()
             .oneshot(json_request(
@@ -1189,7 +1352,10 @@ mod tests {
 
     #[test]
     fn signed_envelope_dtos_redact_debug_output() {
-        let signed = SignedTransactionResponse::from(FakeOperations::signed());
+        let signed = SignedTransactionResponse::new(
+            Some("operation-redacted-test".to_owned()),
+            FakeOperations::signed(),
+        );
         assert!(!format!("{signed:?}").contains("0x020102"));
         let broadcast = BroadcastRequest {
             expected_transaction_id: signed.transaction_id,

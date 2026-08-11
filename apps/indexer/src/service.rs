@@ -8,6 +8,7 @@ use crate::{
     runtime,
 };
 use chain_bitcoin::BitcoinNetwork;
+use http::AuthenticationMode;
 use telemetry::PrometheusTelemetry;
 
 const DEFAULT_CONFIRMATION_DEPTH: u64 = 12;
@@ -46,6 +47,7 @@ pub struct IndexerServiceConfig {
     pub rpc_timeout_seconds: u64,
     pub http_bind: SocketAddr,
     pub metrics_bind: SocketAddr,
+    pub authentication_mode: AuthenticationMode,
     pub bearer_token: Option<String>,
     pub upstream_tls_terminated: bool,
     pub poll_seconds: u64,
@@ -64,6 +66,7 @@ impl IndexerServiceConfig {
         expected_chain_id: u64,
         expected_genesis_hash: impl Into<String>,
         rpc_http_url: impl Into<String>,
+        authentication_mode: AuthenticationMode,
     ) -> Self {
         Self {
             database_path: database_path.into(),
@@ -78,6 +81,7 @@ impl IndexerServiceConfig {
             rpc_timeout_seconds: DEFAULT_RPC_TIMEOUT_SECONDS,
             http_bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_HTTP_PORT)),
             metrics_bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_METRICS_PORT)),
+            authentication_mode,
             bearer_token: None,
             upstream_tls_terminated: false,
             poll_seconds: DEFAULT_POLL_SECONDS,
@@ -106,6 +110,7 @@ impl IndexerServiceConfig {
             },
             http_bind: self.http_bind,
             metrics_bind: self.metrics_bind,
+            authentication_mode: self.authentication_mode,
             bearer_token: self.bearer_token,
             upstream_tls_terminated: self.upstream_tls_terminated,
             poll_seconds: self.poll_seconds,
@@ -144,6 +149,7 @@ pub struct BitcoinIndexerServiceConfig {
     pub rpc_max_response_bytes: usize,
     pub http_bind: SocketAddr,
     pub metrics_bind: SocketAddr,
+    pub authentication_mode: AuthenticationMode,
     pub bearer_token: Option<String>,
     pub upstream_tls_terminated: bool,
     pub poll_seconds: u64,
@@ -164,6 +170,7 @@ impl BitcoinIndexerServiceConfig {
         reorg_retention: u64,
         expected_genesis_hash: impl Into<String>,
         rpc_http_url: impl Into<String>,
+        authentication_mode: AuthenticationMode,
     ) -> Self {
         Self {
             database_path: database_path.into(),
@@ -178,6 +185,7 @@ impl BitcoinIndexerServiceConfig {
             rpc_max_response_bytes: DEFAULT_BITCOIN_RPC_MAX_RESPONSE_BYTES,
             http_bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_HTTP_PORT)),
             metrics_bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_METRICS_PORT)),
+            authentication_mode,
             bearer_token: None,
             upstream_tls_terminated: false,
             poll_seconds: DEFAULT_POLL_SECONDS,
@@ -206,6 +214,7 @@ impl BitcoinIndexerServiceConfig {
             },
             http_bind: self.http_bind,
             metrics_bind: self.metrics_bind,
+            authentication_mode: self.authentication_mode,
             bearer_token: self.bearer_token,
             upstream_tls_terminated: self.upstream_tls_terminated,
             poll_seconds: self.poll_seconds,
@@ -317,6 +326,7 @@ mod tests {
             31_337,
             format!("0x{}", "11".repeat(32)),
             "http://127.0.0.1:8545",
+            AuthenticationMode::GlobalTrusted,
         )
     }
 
@@ -362,6 +372,7 @@ mod tests {
             100,
             "22".repeat(32),
             "http://127.0.0.1:18443",
+            AuthenticationMode::Strict,
         );
         config.rpc_headers = vec!["authorization=Basic hidden".to_owned()];
         config.bearer_token = Some("indexer-hidden".to_owned());
@@ -397,7 +408,18 @@ mod tests {
     }
 
     #[test]
-    fn bitcoin_service_requires_authenticated_api_and_core() {
+    fn strict_services_require_api_authentication_while_core_auth_is_always_required() {
+        let mut strict_ethereum = config();
+        strict_ethereum.authentication_mode = AuthenticationMode::Strict;
+        let error = match IndexerService::new(strict_ethereum) {
+            Ok(_) => panic!("strict Ethereum IX without API authentication must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "Indexer Service bearer token is required in strict authentication mode"
+        );
+
         let mut missing_api_auth = bitcoin_config();
         missing_api_auth.bearer_token = None;
         let error = match BitcoinIndexerService::new(missing_api_auth) {
@@ -406,10 +428,12 @@ mod tests {
         };
         assert_eq!(
             error.to_string(),
-            "Bitcoin Indexer Service requires a bearer token"
+            "Indexer Service bearer token is required in strict authentication mode"
         );
 
         let mut missing_core_auth = bitcoin_config();
+        missing_core_auth.authentication_mode = AuthenticationMode::GlobalTrusted;
+        missing_core_auth.bearer_token = None;
         missing_core_auth.rpc_headers.clear();
         let error = match BitcoinIndexerService::new(missing_core_auth) {
             Ok(_) => panic!("Bitcoin IX without Core authentication must be rejected"),
@@ -419,5 +443,48 @@ mod tests {
             error.to_string(),
             "Bitcoin Core RPC requires an authorization header"
         );
+    }
+
+    #[test]
+    fn global_trusted_services_accept_missing_api_bearers() {
+        let mut ethereum = config();
+        ethereum.bearer_token = Some("ignored bearer with whitespace".to_owned());
+        IndexerService::new(ethereum)
+            .expect("global-trusted Ethereum IX must not require an API bearer");
+
+        let mut bitcoin = bitcoin_config();
+        bitcoin.authentication_mode = AuthenticationMode::GlobalTrusted;
+        bitcoin.bearer_token = None;
+        BitcoinIndexerService::new(bitcoin)
+            .expect("global-trusted Bitcoin IX must not require an API bearer");
+    }
+
+    #[test]
+    fn global_trusted_non_loopback_service_still_requires_upstream_tls() {
+        let mut config = config();
+        config.http_bind = SocketAddr::from(([0, 0, 0, 0], 8080));
+
+        let error = match IndexerService::new(config) {
+            Ok(_) => panic!("non-loopback global-trusted IX must require upstream TLS"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "a non-loopback API bind requires trusted upstream TLS"
+        );
+    }
+
+    #[test]
+    fn strict_bearer_validation_does_not_expose_the_configured_value() {
+        let secret = "do-not-print this bearer";
+        let mut strict = config();
+        strict.authentication_mode = AuthenticationMode::Strict;
+        strict.bearer_token = Some(secret.to_owned());
+
+        let error = match IndexerService::new(strict) {
+            Ok(_) => panic!("strict IX must reject a malformed bearer"),
+            Err(error) => error,
+        };
+        assert!(!error.to_string().contains(secret));
     }
 }

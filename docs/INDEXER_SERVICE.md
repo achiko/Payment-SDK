@@ -50,6 +50,7 @@ The CLI and library runtime require these values on first boot:
 | HTTP RPC URL | The single authoritative canonical source |
 | Bootstrap height | Earliest supported watch birthday |
 | IX database path | Must be exclusive to this scope/process |
+| `STRICT_AUTHENTICATION_MODE` | Exact required `true`/`false`; strict requires `IX_BEARER_TOKEN` even on loopback |
 
 Defaults are confirmation depth `12`, rollback retention `50`, HTTP polling
 every five seconds, RPC timeout 15 seconds, ready lag at most two blocks, and a
@@ -278,21 +279,33 @@ cursors and other large integers are decimal strings. Atomic amounts are
 }
 ```
 
-If configured, bearer authentication protects every `/v1` route. A non-loopback
-bind refuses startup without a bearer token. Health endpoints are unauthenticated
-and sanitized. Built-in TLS and token hot reload are not in v1; non-loopback
-traffic must stay private or terminate TLS at a trusted proxy, and token
-rotation requires restart.
+`STRICT_AUTHENTICATION_MODE` is required and accepts exactly lowercase `true`
+or `false`. Strict mode requires the IX bearer for every `/v1` route, including
+loopback. Global-trusted mode omits repo-owned bearer authorization and grants
+every reachable caller the same authority; it is not identity isolation.
+Liveness remains detail-free, while public readiness and `/v1` status expose
+only the sanitized mode. Built-in TLS and token hot reload are not in v1;
+non-loopback traffic requires a trusted TLS-terminating proxy in either mode,
+and strict token rotation requires restart.
 
 Readiness requires phase `Ready`, lag no greater than two blocks, and a
 successful canonical reconciliation in the preceding 30 seconds. Liveness only
 reports that the process and supervisor are running.
 
+Direct watch registration keeps repository idempotency mandatory. In strict
+mode the HTTP request must provide its key. In global-trusted mode IX generates
+a UUIDv7 when omitted, persists it before returning, and reports the effective
+identity in the response header and body. Retry-safe callers should still
+provide and reuse their own value because a wholly lost generated response
+cannot identify a later retry.
+
 The loopback Prometheus listener reports checkpoint, remote tip, lag, worker
 phase, published event-feed head, reconciliation/backfill outcomes, source-call
 outcomes and durations, block-commit outcomes and latency, exact or
 beyond-retention reorg depth, and WebSocket enabled/connected/reconnect/failure
-state. Metric labels contain the network slug only; RPC URLs, authorization,
+state. It also reports
+`payment_sdk_strict_authentication_mode{service="indexer"}`. Metric labels
+contain sanitized service/network values only; RPC URLs, authorization,
 request bodies, raw block data, and bearer values are never labels.
 
 ## Payment Service integration

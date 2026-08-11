@@ -3,6 +3,7 @@ use std::{
     fmt,
     net::{IpAddr, SocketAddr},
     num::NonZeroU32,
+    str::FromStr,
     time::Duration,
 };
 
@@ -14,8 +15,8 @@ use chain_ethereum::{EthereumHttpRpcBuildError, EthereumHttpRpcConfig, EthereumR
 use chain_identity::AtomicAmount;
 use clap::{Args, Parser, Subcommand};
 use http_support::{
-    BearerToken, HttpServerConfig, HttpServerConfigError, HttpTransportBuildError,
-    HttpTransportConfig, RequestLimits, RetryPolicy, TransportSecurity,
+    AuthenticationMode, BearerToken, HttpServerConfig, HttpServerConfigError,
+    HttpTransportBuildError, HttpTransportConfig, RequestLimits, RetryPolicy, TransportSecurity,
 };
 use signer_remote::{
     BearerSecret, RemoteRetryPolicy, RemoteSignerConfig, RemoteSignerConfigError,
@@ -36,7 +37,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Serve authenticated stateless Ethereum wallet operations.
+    /// Serve stateless Ethereum operations with the configured authentication mode.
     Serve(ServeOptions),
     /// Operate the stateless Bitcoin Wallet Service.
     Bitcoin(BitcoinOptions),
@@ -50,12 +51,59 @@ pub struct BitcoinOptions {
 
 #[derive(Subcommand)]
 pub enum BitcoinCommand {
-    /// Serve authenticated stateless Bitcoin wallet operations.
+    /// Serve stateless Bitcoin operations with the configured authentication mode.
     Serve(BitcoinServeOptions),
+}
+
+/// Selects whether custody follows the repository-wide service mode or keeps
+/// an independently enforced strict bearer boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CustodyAuthenticationPolicy {
+    /// The repository-owned custody adapter must report the same mode as WS.
+    RepositoryModeMatched,
+    /// Vendor or independently administered custody must report strict mode.
+    IndependentStrict,
+}
+
+impl CustodyAuthenticationPolicy {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RepositoryModeMatched => "repository_mode_matched",
+            Self::IndependentStrict => "independent_strict",
+        }
+    }
+}
+
+impl fmt::Display for CustodyAuthenticationPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CustodyAuthenticationPolicy {
+    type Err = ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "repository_mode_matched" => Ok(Self::RepositoryModeMatched),
+            "independent_strict" => Ok(Self::IndependentStrict),
+            _ => Err(ConfigError::new(
+                "custody authentication policy must be exactly `repository_mode_matched` or `independent_strict`",
+            )),
+        }
+    }
 }
 
 #[derive(Args, Clone)]
 pub struct ServeOptions {
+    /// `true` requires bearers; `false` globally trusts every reachable caller.
+    #[arg(
+        long = "strict-authentication-mode",
+        env = "STRICT_AUTHENTICATION_MODE"
+    )]
+    pub authentication_mode: AuthenticationMode,
+
     #[arg(long, env = "WS_ETHEREUM_CHAIN_ID")]
     pub chain_id: u64,
 
@@ -112,8 +160,16 @@ pub struct ServeOptions {
     #[arg(long, env = "WS_CUSTODY_URL", hide_env_values = true)]
     pub custody_url: String,
 
+    /// Repository custody follows the global mode; independent custody stays strict.
+    #[arg(
+        long,
+        env = "WS_CUSTODY_AUTHENTICATION_POLICY",
+        default_value = "repository_mode_matched"
+    )]
+    pub custody_authentication_policy: CustodyAuthenticationPolicy,
+
     #[arg(long, env = "WS_CUSTODY_BEARER_TOKEN", hide_env_values = true)]
-    pub custody_bearer_token: String,
+    pub custody_bearer_token: Option<String>,
 
     #[arg(long, env = "WS_CUSTODY_CONNECT_TIMEOUT_SECONDS", default_value_t = 5)]
     pub custody_connect_timeout_seconds: u64,
@@ -140,12 +196,15 @@ pub struct ServeOptions {
     #[arg(long, env = "WS_HTTP_BIND", default_value = "127.0.0.1:8082")]
     pub http_bind: SocketAddr,
 
+    #[arg(long, env = "WS_METRICS_BIND", default_value = "127.0.0.1:9092")]
+    pub metrics_bind: SocketAddr,
+
     /// Assert that a trusted upstream terminates TLS for a non-loopback bind.
     #[arg(long, env = "WS_UPSTREAM_TLS_TERMINATED", default_value_t = false)]
     pub upstream_tls_terminated: bool,
 
     #[arg(long, env = "WS_BEARER_TOKEN", hide_env_values = true)]
-    pub bearer_token: String,
+    pub bearer_token: Option<String>,
 
     #[arg(long, env = "WS_MAX_REQUEST_BODY_BYTES", default_value_t = 65_536)]
     pub max_request_body_bytes: usize,
@@ -156,6 +215,13 @@ pub struct ServeOptions {
 
 #[derive(Args, Clone)]
 pub struct BitcoinServeOptions {
+    /// `true` requires bearers; `false` globally trusts every reachable caller.
+    #[arg(
+        long = "strict-authentication-mode",
+        env = "STRICT_AUTHENTICATION_MODE"
+    )]
+    pub authentication_mode: AuthenticationMode,
+
     /// Bitcoin Core network: mainnet, testnet3, testnet4, signet, or regtest.
     #[arg(long, env = "WS_BITCOIN_NETWORK")]
     pub network: String,
@@ -230,7 +296,7 @@ pub struct BitcoinServeOptions {
     pub ix_headers: Vec<String>,
 
     #[arg(long, env = "WS_BITCOIN_IX_BEARER_TOKEN", hide_env_values = true)]
-    pub ix_bearer_token: String,
+    pub ix_bearer_token: Option<String>,
 
     #[arg(long, env = "WS_BITCOIN_IX_TIMEOUT_SECONDS", default_value_t = 15)]
     pub ix_timeout_seconds: u64,
@@ -271,8 +337,16 @@ pub struct BitcoinServeOptions {
     #[arg(long, env = "WS_CUSTODY_URL", hide_env_values = true)]
     pub custody_url: String,
 
+    /// Repository custody follows the global mode; independent custody stays strict.
+    #[arg(
+        long,
+        env = "WS_CUSTODY_AUTHENTICATION_POLICY",
+        default_value = "repository_mode_matched"
+    )]
+    pub custody_authentication_policy: CustodyAuthenticationPolicy,
+
     #[arg(long, env = "WS_CUSTODY_BEARER_TOKEN", hide_env_values = true)]
-    pub custody_bearer_token: String,
+    pub custody_bearer_token: Option<String>,
 
     #[arg(long, env = "WS_CUSTODY_CONNECT_TIMEOUT_SECONDS", default_value_t = 5)]
     pub custody_connect_timeout_seconds: u64,
@@ -299,12 +373,15 @@ pub struct BitcoinServeOptions {
     #[arg(long, env = "WS_HTTP_BIND", default_value = "127.0.0.1:8082")]
     pub http_bind: SocketAddr,
 
+    #[arg(long, env = "WS_METRICS_BIND", default_value = "127.0.0.1:9092")]
+    pub metrics_bind: SocketAddr,
+
     /// Assert that a trusted upstream terminates TLS for a non-loopback bind.
     #[arg(long, env = "WS_UPSTREAM_TLS_TERMINATED", default_value_t = false)]
     pub upstream_tls_terminated: bool,
 
     #[arg(long, env = "WS_BEARER_TOKEN", hide_env_values = true)]
-    pub bearer_token: String,
+    pub bearer_token: Option<String>,
 
     #[arg(long, env = "WS_MAX_REQUEST_BODY_BYTES", default_value_t = 1_048_576)]
     pub max_request_body_bytes: usize,
@@ -335,14 +412,14 @@ impl ServeOptions {
         }
         self.rpc_configuration()?;
         self.custody_configuration()?;
-        if self.bearer_token.is_empty() {
-            return Err(ConfigError::new(
-                "Wallet Service bearer token must not be empty",
-            ));
-        }
         if !self.http_bind.ip().is_loopback() && !self.upstream_tls_terminated {
             return Err(ConfigError::new(
                 "a non-loopback Wallet Service bind requires trusted upstream TLS",
+            ));
+        }
+        if !self.metrics_bind.ip().is_loopback() {
+            return Err(ConfigError::new(
+                "Wallet Service metrics may bind only to a loopback address",
             ));
         }
         if self.max_request_body_bytes == 0 || self.shutdown_grace_seconds == 0 {
@@ -388,13 +465,18 @@ impl ServeOptions {
 
     pub fn custody_configuration(&self) -> Result<RemoteSignerConfig, ConfigError> {
         let endpoint = RemoteSignerEndpoint::new(&self.custody_url)?;
-        let secret = BearerSecret::new(&self.custody_bearer_token)?;
         let retry = RemoteRetryPolicy::new(
             self.custody_retry_attempts,
             Duration::from_millis(self.custody_retry_initial_millis),
             Duration::from_millis(self.custody_retry_max_millis),
         )?;
-        RemoteSignerConfig::new(endpoint, secret)
+        let config = custody_signer_configuration(
+            endpoint,
+            self.authentication_mode,
+            self.custody_authentication_policy,
+            self.custody_bearer_token.as_deref(),
+        )?;
+        config
             .with_timeouts(
                 Duration::from_secs(self.custody_connect_timeout_seconds),
                 Duration::from_secs(self.custody_request_timeout_seconds),
@@ -411,14 +493,19 @@ impl ServeOptions {
             TransportSecurity::TlsTerminatedUpstream
         };
         let limits = RequestLimits::new(self.max_request_body_bytes, 100, 1_000)?;
-        let config = HttpServerConfig::new(
-            self.http_bind,
-            security,
-            Some(BearerToken::new(&self.bearer_token)?),
-            limits,
-        );
+        let bearer_token = strict_bearer_token(
+            self.authentication_mode,
+            self.bearer_token.as_deref(),
+            "WS_BEARER_TOKEN",
+        )?;
+        let config = HttpServerConfig::new(self.http_bind, security, bearer_token, limits)
+            .with_authentication_mode(self.authentication_mode);
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn metrics_server_configuration(&self) -> Result<HttpServerConfig, ConfigError> {
+        metrics_server_configuration(self.metrics_bind, self.max_request_body_bytes)
     }
 
     #[must_use]
@@ -455,14 +542,14 @@ impl BitcoinServeOptions {
         self.custody_configuration()?;
         self.operation_policy()?;
         self.server_configuration()?;
-        if self.bearer_token.is_empty() {
-            return Err(ConfigError::new(
-                "Wallet Service bearer token must not be empty",
-            ));
-        }
         if !self.http_bind.ip().is_loopback() && !self.upstream_tls_terminated {
             return Err(ConfigError::new(
                 "a non-loopback Wallet Service bind requires trusted upstream TLS",
+            ));
+        }
+        if !self.metrics_bind.ip().is_loopback() {
+            return Err(ConfigError::new(
+                "Wallet Service metrics may bind only to a loopback address",
             ));
         }
         if self.shutdown_grace_seconds == 0 {
@@ -559,16 +646,30 @@ impl BitcoinServeOptions {
 
     pub fn ix_configuration(&self) -> Result<BitcoinIxClientConfig, ConfigError> {
         validate_http_endpoint(&self.ix_url, "Bitcoin IX")?;
-        validate_bearer_token(&self.ix_bearer_token, "Bitcoin IX bearer token")?;
-        let mut headers = parse_named_headers(&self.ix_headers, "Bitcoin IX")?;
-        insert_unique_header(
-            &mut headers,
-            "authorization".to_owned(),
-            format!("Bearer {}", self.ix_bearer_token),
-            "Bitcoin IX",
-        )?;
+        let mut headers = match self.authentication_mode {
+            AuthenticationMode::Strict => parse_named_headers(&self.ix_headers, "Bitcoin IX")?,
+            AuthenticationMode::GlobalTrusted => parse_named_headers(
+                &without_authorization_headers(&self.ix_headers),
+                "Bitcoin IX",
+            )?,
+        };
+        if self.authentication_mode == AuthenticationMode::Strict {
+            let token = self.ix_bearer_token.as_deref().ok_or_else(|| {
+                ConfigError::new(
+                    "WS_BITCOIN_IX_BEARER_TOKEN is required in strict authentication mode",
+                )
+            })?;
+            validate_bearer_token(token, "Bitcoin IX bearer token")?;
+            insert_unique_header(
+                &mut headers,
+                "authorization".to_owned(),
+                format!("Bearer {token}"),
+                "Bitcoin IX",
+            )?;
+        }
         let config = BitcoinIxClientConfig {
             endpoint: self.ix_url.clone(),
+            authentication_mode: self.authentication_mode,
             headers,
             request_timeout: Duration::from_secs(self.ix_timeout_seconds),
             maximum_response_bytes: self.ix_max_response_bytes,
@@ -592,13 +693,18 @@ impl BitcoinServeOptions {
 
     pub fn custody_configuration(&self) -> Result<RemoteSignerConfig, ConfigError> {
         let endpoint = RemoteSignerEndpoint::new(&self.custody_url)?;
-        let secret = BearerSecret::new(&self.custody_bearer_token)?;
         let retry = RemoteRetryPolicy::new(
             self.custody_retry_attempts,
             Duration::from_millis(self.custody_retry_initial_millis),
             Duration::from_millis(self.custody_retry_max_millis),
         )?;
-        RemoteSignerConfig::new(endpoint, secret)
+        let config = custody_signer_configuration(
+            endpoint,
+            self.authentication_mode,
+            self.custody_authentication_policy,
+            self.custody_bearer_token.as_deref(),
+        )?;
+        config
             .with_timeouts(
                 Duration::from_secs(self.custody_connect_timeout_seconds),
                 Duration::from_secs(self.custody_request_timeout_seconds),
@@ -628,14 +734,19 @@ impl BitcoinServeOptions {
             TransportSecurity::TlsTerminatedUpstream
         };
         let limits = RequestLimits::new(self.max_request_body_bytes, 100, 1_000)?;
-        let config = HttpServerConfig::new(
-            self.http_bind,
-            security,
-            Some(BearerToken::new(&self.bearer_token)?),
-            limits,
-        );
+        let bearer_token = strict_bearer_token(
+            self.authentication_mode,
+            self.bearer_token.as_deref(),
+            "WS_BEARER_TOKEN",
+        )?;
+        let config = HttpServerConfig::new(self.http_bind, security, bearer_token, limits)
+            .with_authentication_mode(self.authentication_mode);
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn metrics_server_configuration(&self) -> Result<HttpServerConfig, ConfigError> {
+        metrics_server_configuration(self.metrics_bind, self.max_request_body_bytes)
     }
 
     #[must_use]
@@ -653,6 +764,7 @@ impl fmt::Debug for ServeOptions {
             .collect();
         formatter
             .debug_struct("ServeOptions")
+            .field("authentication_mode", &self.authentication_mode)
             .field("chain_id", &self.chain_id)
             .field("rpc_url", &"[REDACTED]")
             .field("rpc_header_names", &header_names)
@@ -662,8 +774,13 @@ impl fmt::Debug for ServeOptions {
             .field("gas_margin_basis_points", &self.gas_margin_basis_points)
             .field("max_gas_limit", &self.max_gas_limit)
             .field("custody_url", &"[REDACTED]")
+            .field(
+                "custody_authentication_policy",
+                &self.custody_authentication_policy,
+            )
             .field("custody_bearer_token", &"[REDACTED]")
             .field("http_bind", &self.http_bind)
+            .field("metrics_bind", &self.metrics_bind)
             .field("upstream_tls_terminated", &self.upstream_tls_terminated)
             .field("bearer_token", &"[REDACTED]")
             .field("max_request_body_bytes", &self.max_request_body_bytes)
@@ -678,6 +795,7 @@ impl fmt::Debug for BitcoinServeOptions {
         let ix_header_names = header_names(&self.ix_headers);
         formatter
             .debug_struct("BitcoinServeOptions")
+            .field("authentication_mode", &self.authentication_mode)
             .field("network", &self.network)
             .field("expected_genesis_hash", &self.expected_genesis_hash)
             .field("core_rpc_url", &"[REDACTED]")
@@ -692,8 +810,13 @@ impl fmt::Debug for BitcoinServeOptions {
             .field("maximum_inputs", &self.maximum_inputs)
             .field("maximum_outputs", &self.maximum_outputs)
             .field("custody_url", &"[REDACTED]")
+            .field(
+                "custody_authentication_policy",
+                &self.custody_authentication_policy,
+            )
             .field("custody_bearer_token", &"[REDACTED]")
             .field("http_bind", &self.http_bind)
+            .field("metrics_bind", &self.metrics_bind)
             .field("upstream_tls_terminated", &self.upstream_tls_terminated)
             .field("bearer_token", &"[REDACTED]")
             .finish_non_exhaustive()
@@ -851,6 +974,80 @@ fn validate_bearer_token(value: &str, label: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn strict_bearer_token(
+    authentication_mode: AuthenticationMode,
+    value: Option<&str>,
+    variable: &str,
+) -> Result<Option<BearerToken>, ConfigError> {
+    match authentication_mode {
+        AuthenticationMode::Strict => value
+            .ok_or_else(|| {
+                ConfigError::new(format!(
+                    "{variable} is required in strict authentication mode"
+                ))
+            })
+            .and_then(|value| BearerToken::new(value).map(Some).map_err(Into::into)),
+        AuthenticationMode::GlobalTrusted => Ok(None),
+    }
+}
+
+fn custody_signer_configuration(
+    endpoint: RemoteSignerEndpoint,
+    service_authentication_mode: AuthenticationMode,
+    custody_authentication_policy: CustodyAuthenticationPolicy,
+    bearer_token: Option<&str>,
+) -> Result<RemoteSignerConfig, ConfigError> {
+    match (custody_authentication_policy, service_authentication_mode) {
+        (CustodyAuthenticationPolicy::RepositoryModeMatched, AuthenticationMode::GlobalTrusted) => {
+            Ok(RemoteSignerConfig::global_trusted(endpoint))
+        }
+        (CustodyAuthenticationPolicy::RepositoryModeMatched, AuthenticationMode::Strict)
+        | (CustodyAuthenticationPolicy::IndependentStrict, _) => {
+            let bearer_token = bearer_token.ok_or_else(|| {
+                ConfigError::new(
+                    "WS_CUSTODY_BEARER_TOKEN is required by the selected custody authentication policy",
+                )
+            })?;
+            Ok(RemoteSignerConfig::new(
+                endpoint,
+                BearerSecret::new(bearer_token)?,
+            ))
+        }
+    }
+}
+
+fn without_authorization_headers(headers: &[String]) -> Vec<String> {
+    headers
+        .iter()
+        .filter(|header| {
+            !header
+                .split_once('=')
+                .is_some_and(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        })
+        .cloned()
+        .collect()
+}
+
+fn metrics_server_configuration(
+    bind: SocketAddr,
+    maximum_request_body_bytes: usize,
+) -> Result<HttpServerConfig, ConfigError> {
+    if !bind.ip().is_loopback() {
+        return Err(ConfigError::new(
+            "Wallet Service metrics may bind only to a loopback address",
+        ));
+    }
+    let config = HttpServerConfig::new(
+        bind,
+        TransportSecurity::PlaintextLoopback,
+        None,
+        RequestLimits::new(maximum_request_body_bytes, 100, 1_000)?,
+    )
+    .with_authentication_mode(AuthenticationMode::GlobalTrusted);
+    config.validate()?;
+    Ok(config)
+}
+
 fn header_names(headers: &[String]) -> Vec<&str> {
     headers
         .iter()
@@ -870,10 +1067,18 @@ fn is_loopback_url(url: &reqwest::Url) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
     use super::*;
+
+    #[test]
+    fn cli_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
 
     fn options() -> ServeOptions {
         ServeOptions {
+            authentication_mode: AuthenticationMode::Strict,
             chain_id: 31_337,
             rpc_url: "http://127.0.0.1:8545".to_owned(),
             rpc_headers: vec!["Authorization=rpc-secret".to_owned()],
@@ -889,7 +1094,8 @@ mod tests {
             max_priority_fee_per_gas: "100000000000".to_owned(),
             max_total_fee: "100000000000000000".to_owned(),
             custody_url: "http://127.0.0.1:8181".to_owned(),
-            custody_bearer_token: "custody-secret".to_owned(),
+            custody_authentication_policy: CustodyAuthenticationPolicy::RepositoryModeMatched,
+            custody_bearer_token: Some("custody-secret".to_owned()),
             custody_connect_timeout_seconds: 5,
             custody_request_timeout_seconds: 30,
             custody_max_response_bytes: 1024,
@@ -897,8 +1103,11 @@ mod tests {
             custody_retry_initial_millis: 10,
             custody_retry_max_millis: 20,
             http_bind: "127.0.0.1:8082".parse().expect("test bind must parse"),
+            metrics_bind: "127.0.0.1:9092"
+                .parse()
+                .expect("test metrics bind must parse"),
             upstream_tls_terminated: false,
-            bearer_token: "wallet-secret".to_owned(),
+            bearer_token: Some("wallet-secret".to_owned()),
             max_request_body_bytes: 1024,
             shutdown_grace_seconds: 30,
         }
@@ -906,6 +1115,7 @@ mod tests {
 
     fn bitcoin_options() -> BitcoinServeOptions {
         BitcoinServeOptions {
+            authentication_mode: AuthenticationMode::Strict,
             network: "regtest".to_owned(),
             expected_genesis_hash:
                 "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206".to_owned(),
@@ -919,7 +1129,7 @@ mod tests {
             core_rpc_retry_max_millis: 20,
             ix_url: "http://127.0.0.1:8081".to_owned(),
             ix_headers: vec!["x-ix-token=ix-header-secret".to_owned()],
-            ix_bearer_token: "ix-secret".to_owned(),
+            ix_bearer_token: Some("ix-secret".to_owned()),
             ix_timeout_seconds: 15,
             ix_max_response_bytes: 1024,
             ix_page_size: 100,
@@ -931,7 +1141,8 @@ mod tests {
             maximum_inputs: 100,
             maximum_outputs: 100,
             custody_url: "http://127.0.0.1:8181".to_owned(),
-            custody_bearer_token: "custody-secret".to_owned(),
+            custody_authentication_policy: CustodyAuthenticationPolicy::RepositoryModeMatched,
+            custody_bearer_token: Some("custody-secret".to_owned()),
             custody_connect_timeout_seconds: 5,
             custody_request_timeout_seconds: 30,
             custody_max_response_bytes: 1024,
@@ -939,8 +1150,11 @@ mod tests {
             custody_retry_initial_millis: 10,
             custody_retry_max_millis: 20,
             http_bind: "127.0.0.1:8082".parse().expect("test bind must parse"),
+            metrics_bind: "127.0.0.1:9092"
+                .parse()
+                .expect("test metrics bind must parse"),
             upstream_tls_terminated: false,
-            bearer_token: "wallet-secret".to_owned(),
+            bearer_token: Some("wallet-secret".to_owned()),
             max_request_body_bytes: 1024,
             shutdown_grace_seconds: 30,
         }
@@ -959,6 +1173,129 @@ mod tests {
         options
             .server_configuration()
             .expect("server configuration must materialize");
+    }
+
+    #[test]
+    fn strict_mode_requires_wallet_and_custody_tokens() {
+        let mut missing_wallet = options();
+        missing_wallet.bearer_token = None;
+        assert!(missing_wallet.validate().is_err());
+
+        let mut missing_custody = options();
+        missing_custody.custody_bearer_token = None;
+        assert!(missing_custody.validate().is_err());
+
+        let mut missing_ix = bitcoin_options();
+        missing_ix.ix_bearer_token = None;
+        assert!(missing_ix.validate().is_err());
+    }
+
+    #[test]
+    fn global_trusted_mode_ignores_repo_owned_tokens_and_ix_authorization() {
+        let mut ethereum = options();
+        ethereum.authentication_mode = AuthenticationMode::GlobalTrusted;
+        ethereum.bearer_token = Some("ignored invalid wallet token".to_owned());
+        ethereum.custody_bearer_token = Some("ignored invalid custody token".to_owned());
+        ethereum
+            .validate()
+            .expect("global-trusted Ethereum configuration must ignore tokens");
+
+        let mut bitcoin = bitcoin_options();
+        bitcoin.authentication_mode = AuthenticationMode::GlobalTrusted;
+        bitcoin.bearer_token = None;
+        bitcoin.custody_bearer_token = Some("ignored invalid custody token".to_owned());
+        bitcoin.ix_bearer_token = Some("ignored invalid IX token".to_owned());
+        bitcoin
+            .ix_headers
+            .push("Authorization=ignored\r\ninvalid".to_owned());
+        bitcoin
+            .validate()
+            .expect("global-trusted Bitcoin configuration must ignore repo-owned credentials");
+        let ix = bitcoin
+            .ix_configuration()
+            .expect("global-trusted IX configuration must materialize");
+        assert!(
+            ix.headers
+                .iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("authorization"))
+        );
+    }
+
+    #[test]
+    fn independent_custody_stays_strict_when_wallet_is_global_trusted() {
+        let mut ethereum = options();
+        ethereum.authentication_mode = AuthenticationMode::GlobalTrusted;
+        ethereum.custody_authentication_policy = CustodyAuthenticationPolicy::IndependentStrict;
+        ethereum.bearer_token = None;
+        ethereum.custody_bearer_token = None;
+        let error = ethereum
+            .custody_configuration()
+            .expect_err("independent custody must keep requiring its bearer");
+        assert!(error.to_string().contains("WS_CUSTODY_BEARER_TOKEN"));
+
+        ethereum.custody_bearer_token = Some("independent-custody-secret".to_owned());
+        let custody = ethereum
+            .custody_configuration()
+            .expect("independent custody must materialize with a bearer");
+        let rendered = format!("{custody:?}");
+        assert!(rendered.contains("Strict"));
+        assert!(!rendered.contains("independent-custody-secret"));
+
+        let mut repository = options();
+        repository.authentication_mode = AuthenticationMode::GlobalTrusted;
+        repository.custody_bearer_token = None;
+        assert!(
+            format!(
+                "{:?}",
+                repository
+                    .custody_configuration()
+                    .expect("repository custody must match global-trusted mode")
+            )
+            .contains("GlobalTrusted")
+        );
+
+        let mut bitcoin = bitcoin_options();
+        bitcoin.authentication_mode = AuthenticationMode::GlobalTrusted;
+        bitcoin.custody_authentication_policy = CustodyAuthenticationPolicy::IndependentStrict;
+        bitcoin.bearer_token = None;
+        bitcoin.ix_bearer_token = None;
+        bitcoin.custody_bearer_token = None;
+        assert!(bitcoin.validate().is_err());
+        bitcoin.custody_bearer_token = Some("independent-bitcoin-custody".to_owned());
+        bitcoin
+            .validate()
+            .expect("global-trusted Bitcoin WS must support independent strict custody");
+    }
+
+    #[test]
+    fn custody_authentication_policy_parsing_is_exact() {
+        assert_eq!(
+            "repository_mode_matched".parse(),
+            Ok(CustodyAuthenticationPolicy::RepositoryModeMatched)
+        );
+        assert_eq!(
+            "independent_strict".parse(),
+            Ok(CustodyAuthenticationPolicy::IndependentStrict)
+        );
+        assert!(
+            "IndependentStrict"
+                .parse::<CustodyAuthenticationPolicy>()
+                .is_err()
+        );
+        assert!(
+            " independent_strict"
+                .parse::<CustodyAuthenticationPolicy>()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn metrics_listener_must_remain_on_loopback() {
+        let mut ethereum = options();
+        ethereum.metrics_bind = "0.0.0.0:9092"
+            .parse()
+            .expect("test metrics bind must parse");
+        assert!(ethereum.validate().is_err());
     }
 
     #[test]

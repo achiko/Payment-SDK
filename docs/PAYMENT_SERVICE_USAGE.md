@@ -153,15 +153,16 @@ arguments.
 
 | Environment variable | Required | Meaning/default |
 |---|---:|---|
+| `STRICT_AUTHENTICATION_MODE` | yes | Exact `true` for bearer-protected role scopes or `false` for one globally trusted principal; no default |
 | `PS_DATABASE_PATH` | yes | Dedicated PS RocksDB directory; never the IX path |
 | `PS_POLICY_PATH` | yes | Versioned policy JSON file |
 | `PS_INDEXER_URL` | yes | IX API origin without a path/query/embedded credentials |
 | `PS_INDEXER_NETWORK` | yes | Must match the policy network |
-| `PS_INDEXER_BEARER_TOKEN` | remote IX | Required for a non-loopback IX endpoint |
+| `PS_INDEXER_BEARER_TOKEN` | strict mode | Credential used by PS when calling IX |
 | `PS_WALLET_URL` | yes | WS API origin without a path/query/embedded credentials |
-| `PS_WALLET_BEARER_TOKEN` | yes | Credential used by PS when calling WS |
-| `PS_API_BEARER_TOKEN` | yes | Ordinary exchange-backend credential |
-| `PS_ADMIN_BEARER_TOKEN` | yes | Administrator credential; must differ from the ordinary token |
+| `PS_WALLET_BEARER_TOKEN` | strict mode | Credential used by PS when calling WS |
+| `PS_API_BEARER_TOKEN` | strict mode | Ordinary exchange-backend credential |
+| `PS_ADMIN_BEARER_TOKEN` | strict mode | Administrator credential; must differ from the ordinary token |
 | `PS_HTTP_BIND` | no | `127.0.0.1:8081` |
 | `PS_METRICS_BIND` | no | `127.0.0.1:9091`; must remain loopback |
 | `PS_TLS_TERMINATED_UPSTREAM` | no | `false`; must be `true` for a non-loopback PS listener |
@@ -189,6 +190,13 @@ Plain HTTP dependency URLs are accepted only for `localhost` or loopback IPs.
 Remote IX and WS URLs must use HTTPS. A public PS bind additionally requires a
 trusted upstream TLS terminator; PS does not terminate TLS itself.
 
+When the mode is `false`, every process or person that can reach PS has both
+ordinary and administrator authority under one stable ownership scope. Bearer
+values and Authorization headers do not partially restore identity isolation.
+Use network controls outside the application and a new or explicitly
+mode-bound empty PS database. PS refuses a populated strict/global-trusted mode
+switch. Repo-owned IX and WS must report the same mode before PS becomes ready.
+
 ## One-command local service launcher
 
 [`scripts/run-local-payment-services.sh`](../scripts/run-local-payment-services.sh)
@@ -197,19 +205,22 @@ starts IX, local ephemeral custody, WS, and PS in dependency order. It does
 loopback Ethereum JSON-RPC node separately, then run from the repository root:
 
 ```bash
+STRICT_AUTHENTICATION_MODE='false' \
 ETHEREUM_RPC_URL='http://127.0.0.1:8545' \
 PAYMENT_NETWORK='local' \
 ./scripts/run-local-payment-services.sh --disposable-policy
 ```
 
-The launcher:
+The launcher requires an explicit mode and supplies no fallback. This example
+selects global-trusted mode for a disposable loopback stack. The launcher:
 
 - verifies `eth_chainId` and the block-zero hash before starting a service;
 - refuses to kill or reuse processes already listening on its ports;
 - builds the four packages once and then supervises their direct binaries;
 - creates fresh private IX/PS databases under
   `./tmp/payment-sdk-stack.XXXXXX` for every run;
-- generates distinct local bearer tokens without printing them;
+- generates and uses distinct local bearer tokens without printing them only
+  in strict mode; global-trusted mode creates no credential-bearing curl files;
 - provisions a fresh ephemeral gas-funder identity and, only with the explicit
   `--disposable-policy` option, creates a native-only local test policy; and
 - waits for IX, custody, WS, and PS readiness before reporting success.
@@ -228,9 +239,10 @@ equal the template's digest.
 
 After startup, the launcher prints the relative path of a mode-`600`
 `client.env` file. In another terminal, source that exact path to obtain the
-generated PS, WS, IX, and custody credentials. The values themselves are never
-printed. Use `--no-build` on later runs only when all four debug binaries are
-already current.
+mode and service URLs. In strict mode it also contains the generated PS, WS,
+IX, and custody credentials; global-trusted mode creates no service
+credentials. Secret values are never printed. Use `--no-build` on later runs
+only when all four debug binaries are already current.
 
 Keep the launcher attached. `Ctrl-C` stops PS, WS, custody, and IX in reverse
 dependency order but leaves the external Ethereum node untouched. Logs and
@@ -244,10 +256,11 @@ and chain configuration variables.
 
 [`scripts/run-release-payment-services-with-mock-custody.sh`](../scripts/run-release-payment-services-with-mock-custody.sh)
 uses locked release binaries, an operator-reviewed policy, explicit chain
-identity, externally supplied bearer credentials, and private one-shot IX/PS
-databases. It is useful for a production-shaped development or staging run
-against a remote test network. It is **not** a production deployment and must
-not hold real funds.
+identity, an explicit whole-stack authentication mode, and private one-shot
+IX/PS databases. Strict mode uses externally supplied bearer credentials;
+global-trusted mode does not. It is useful for a production-shaped development
+or staging run against a remote test network. It is **not** a production
+deployment and must not hold real funds.
 
 The limitation is fundamental to the included custody adapter: it generates
 random keys and keeps its operation map only in memory. Once custody exits,
@@ -267,10 +280,11 @@ business records remain on disk. The launcher therefore:
 - snapshots a reviewed `STACK_POLICY_TEMPLATE` before building or starting
   services, preserving its assets, master destinations, thresholds, and fee
   limits while replacing only the mock gas-funder address and locator;
-- requires five distinct credentials from the calling shell or secret manager
-  then removes their exported input names, scopes each credential to only the
-  service that needs it, and never writes a `client.env`; and
-- keeps IX, custody, WS, PS, and both metrics listeners on loopback. Remote PS
+- in strict mode, requires five distinct credentials from the calling shell or
+  secret manager, removes their exported input names, scopes each credential
+  to only the service that needs it, and never writes a `client.env`;
+- in global-trusted mode, neither requires nor forwards those credentials; and
+- keeps IX, custody, WS, PS, and all four metrics listeners on loopback. Remote PS
   access requires a separately reviewed TLS reverse proxy.
 
 Required configuration is:
@@ -285,6 +299,10 @@ ETHEREUM_GENESIS_HASH
 PAYMENT_NETWORK
 IX_BOOTSTRAP_HEIGHT
 
+# required exact value; no default
+STRICT_AUTHENTICATION_MODE
+
+# required only when STRICT_AUTHENTICATION_MODE=true
 CUSTODY_BEARER_TOKEN
 IX_BEARER_TOKEN
 WS_BEARER_TOKEN
@@ -325,9 +343,10 @@ services. Start the release stack with:
 
 Use `--no-build` only when all four `target/release` executables are already
 current. The launcher starts RPC-dependent IX and mock custody, then WS, then
-PS; it requires every readiness check and the authenticated PS administrator
-status before reporting success. The `PS_API_BEARER_TOKEN` already present in
-the calling shell is the ordinary API token for curl or Postman.
+PS; it requires every readiness check, reported authentication-mode agreement,
+and PS administrator status before reporting success. In strict mode, the
+`PS_API_BEARER_TOKEN` already present in the calling shell is the ordinary API
+token for curl or Postman. In global-trusted mode no service token is used.
 
 The launcher provisions but does not fund its fresh mock gas-funder address;
 funding would be an external asset transfer and is intentionally outside this
@@ -409,6 +428,8 @@ IX_LOCAL_ROOT="$(mktemp -d ./tmp/payment-sdk-indexer.XXXXXX)"
 IX_GENESIS_HASH="$(cast block 0 \
   --field hash \
   --rpc-url http://127.0.0.1:8545)"
+export STRICT_AUTHENTICATION_MODE='true'
+export IX_BEARER_TOKEN='local-indexer-token'
 
 cargo run --locked -p indexer-worker -- serve \
   --database-path "$IX_LOCAL_ROOT/database" \
@@ -435,8 +456,9 @@ curl --connect-timeout 2 --max-time 10 \
   http://127.0.0.1:8080/health/ready
 ```
 
-A ready local sequence returns `{"status":"ready"}` from the second request.
-If IX is listening but catching up or reconciling, readiness may
+A ready local sequence returns
+`{"status":"ready","authentication_mode":"strict"}` from the second
+request. If IX is listening but catching up or reconciling, readiness may
 temporarily return HTTP `503` instead of timing out.
 
 #### 1C. Start local ephemeral custody
@@ -444,7 +466,9 @@ temporarily return HTTP `503` instead of timing out.
 In terminal C, start the repository's development-only custody adapter:
 
 ```bash
+export STRICT_AUTHENTICATION_MODE='true'
 export CUSTODY_BIND='127.0.0.1:8181'
+export CUSTODY_METRICS_BIND='127.0.0.1:9093'
 export CUSTODY_BEARER_TOKEN='local-development-token'
 
 cargo run --locked -p custody-worker -- serve
@@ -480,8 +504,14 @@ calls them automatically:
 
 ```bash
 export WS_CUSTODY_URL='http://127.0.0.1:8181'
+export WS_CUSTODY_AUTHENTICATION_POLICY='repository_mode_matched'
 export WS_CUSTODY_BEARER_TOKEN='local-development-token'
 ```
+
+`repository_mode_matched` is the correct policy for this repo-owned adapter.
+An independently administered custody service uses `independent_strict`, which
+keeps its bearer mandatory even when the surrounding services are
+global-trusted.
 
 To diagnose a **running development custody server**, call its read-only
 endpoints directly:
@@ -513,10 +543,10 @@ WS requires capabilities equivalent to:
 }
 ```
 
-and readiness:
+and readiness with the negotiated service mode:
 
 ```json
-{"status":"available"}
+{"status":"available","authentication_mode":"strict"}
 ```
 
 The three `POST` endpoints mutate or use custody state and normally are called
@@ -584,14 +614,17 @@ custody. Do not fund keys created by `custody-worker` with real assets.
 After custody is running, open terminal D and start WS:
 
 ```bash
+export STRICT_AUTHENTICATION_MODE='true'
 export WS_ETHEREUM_CHAIN_ID='31337'
 export WS_ETHEREUM_RPC_URL='http://127.0.0.1:8545'
 
 export WS_CUSTODY_URL='http://127.0.0.1:8181'
+export WS_CUSTODY_AUTHENTICATION_POLICY='repository_mode_matched'
 export WS_CUSTODY_BEARER_TOKEN='local-development-token'
 
 export WS_BEARER_TOKEN='local-wallet-token'
 export WS_HTTP_BIND='127.0.0.1:8082'
+export WS_METRICS_BIND='127.0.0.1:9092'
 export RUST_LOG='info'
 
 cargo run --locked -p wallet-worker -- serve
@@ -736,17 +769,18 @@ destinations or locators.
 
 ### Step 4: configure the process
 
-Use distinct token values. The WS token must match the token accepted by the
-Wallet Service. The IX token is optional only for an unauthenticated loopback
-IX listener.
+This walkthrough intentionally uses strict mode. Use distinct token values.
+The WS token must match the token accepted by the Wallet Service, and the IX
+token must match IX even on loopback.
 
 ```bash
+export STRICT_AUTHENTICATION_MODE='true'
 export PS_DATABASE_PATH='./tmp/payment-service-local/database'
 export PS_POLICY_PATH='./tmp/payment-service-local/policy.json'
 
 export PS_INDEXER_URL='http://127.0.0.1:8080'
 export PS_INDEXER_NETWORK='anvil'
-# export PS_INDEXER_BEARER_TOKEN='replace-with-indexer-token'
+export PS_INDEXER_BEARER_TOKEN='local-indexer-token'
 
 export PS_WALLET_URL='http://127.0.0.1:8082'
 export PS_WALLET_BEARER_TOKEN='local-wallet-token'
@@ -798,7 +832,8 @@ curl --fail-with-body --silent --show-error \
 ```
 
 Liveness proves only that the process is serving. Do not accept deposits until
-readiness returns `200` with `{"status":"ready"}`.
+readiness returns `200` with
+`{"status":"ready","authentication_mode":"strict"}`.
 
 ### Step 8: stop Payment Service
 
@@ -817,8 +852,10 @@ GET /health/ready
 ```
 
 Liveness returns `200` while the process is serving. Readiness returns `200`
-with `{"status":"ready"}` or `503` with `{"status":"not_ready"}`. Readiness
-becomes false before graceful shutdown.
+with `{"status":"ready","authentication_mode":"strict"}` or `503` with
+`{"status":"not_ready","authentication_mode":"strict"}` in this walkthrough.
+The mode field reflects the selected deployment mode, and readiness becomes
+false before graceful shutdown.
 
 Prometheus metrics are served on the separate loopback metrics listener:
 
@@ -840,12 +877,15 @@ the default filter is `info`.
 
 ## HTTP conventions
 
-All `/v1` routes require `Authorization: Bearer ...`. The administrator token
-may use every route. The ordinary token receives `403` on administrator-only
-routes. Missing or invalid authentication receives `401`.
+In strict mode all `/v1` routes require `Authorization: Bearer ...`. The
+administrator token may use every route. The ordinary token receives `403` on
+administrator-only routes. Missing or invalid authentication receives `401`.
+In global-trusted mode Authorization is ignored and the one principal can call
+both route families.
 
-Every mutation requires an `Idempotency-Key` header. Idempotency is scoped by
-authenticated role, operation, and key. Idempotency keys and opaque identifiers
+Strict-mode mutations require an `Idempotency-Key` header. Global-trusted mode
+generates and returns a UUIDv7 when it is absent. Idempotency is scoped by the
+effective principal, operation, and key. Idempotency keys and opaque identifiers
 in paths, query parameters, and bodies must contain 1–256 visible ASCII bytes
 without quotes or backslashes. Exact command replay returns the original
 resource IDs or result; reusing the same scoped key for different semantic
@@ -1482,6 +1522,7 @@ binds the database to the policy and Ethereum scope.
 
 ```bash
 cargo run --locked -p payment-api -- migrate \
+  --strict-authentication-mode true \
   --database-path /absolute/path/to/payment-db \
   --backup-path /absolute/path/to/pre-migration-backup \
   --policy-path /absolute/path/to/payment-policy.json \
@@ -1501,6 +1542,7 @@ IX acknowledgement using the already persisted address and birthday:
 ```bash
 PS_INDEXER_BEARER_TOKEN='<indexer-token>' \
   cargo run --locked -p payment-api -- reconcile-watches \
+  --strict-authentication-mode true \
   --database-path /absolute/path/to/payment-db \
   --indexer-url https://indexer.example.invalid \
   --network anvil \
@@ -1508,14 +1550,16 @@ PS_INDEXER_BEARER_TOKEN='<indexer-token>' \
   --max-batches 100
 ```
 
-Omit the bearer environment variable only for an unauthenticated loopback IX
-deployment.
+Omit the repo-owned bearer only when `STRICT_AUTHENTICATION_MODE=false`.
+Strict IX requires its bearer even on loopback; non-loopback IX requires HTTPS
+in either mode.
 
 ### Mirror a bounded IX event backlog
 
 ```bash
 PS_INDEXER_BEARER_TOKEN='<indexer-token>' \
   cargo run --locked -p payment-api -- ingest-events \
+  --strict-authentication-mode true \
   --database-path /absolute/path/to/payment-db \
   --indexer-url https://indexer.example.invalid \
   --network anvil \

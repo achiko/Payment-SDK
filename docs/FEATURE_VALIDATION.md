@@ -21,14 +21,16 @@ bytes, and all-participant projection. Neither Wallet HTTP mode owns a database.
 This is still not evidence of a production deployment. A loopback-only
 ephemeral custody adapter now exists, but external durable custody, automated
 Anvil acceptance, HA, and multi-network ownership in a single PS store remain
-absent or deliberately excluded. The Bitcoin Core 31 disposable-regtest
-acceptance scenario is also pending because the required binary is unavailable
-in the current environment; deterministic fixtures do not prove composed
-real-node behavior. Its checked-in
-[`manual acceptance procedure`](./manual-bitcoin-regtest/README.md) has not been
-executed and is not pass evidence. The complete composed failure-window matrix
-remains acceptance work even though the repository command applies a Bitcoin
-batch's collection/ledger/reconciliation/cursor effects atomically.
+absent or deliberately excluded. A Bitcoin Core 31.1 disposable-regtest
+Payment Service happy path was manually exercised on 2026-08-11 in
+global-trusted mode; its reproducible steps and bounded evidence are recorded
+in the
+[`manual happy-path guide`](./manual-bitcoin-regtest/PAYMENT_HAPPY_PATH.md).
+That run does not prove the pending strict-mode, P2TR, restart, reorg,
+restoration, re-inclusion, or complete composed failure-window matrix in the
+[`extended procedure`](./manual-bitcoin-regtest/README.md), even though the
+repository command applies a Bitcoin batch's
+collection/ledger/reconciliation/cursor effects atomically.
 
 The original document is accepted with five corrections required for safety:
 
@@ -245,9 +247,9 @@ recoverable.
 
 | Original requirement | Scaffold location | Structural status |
 |---|---|---|
-| PS runtime composition | `apps/api` | Authenticated Ethereum and nested Bitcoin modes with durable jobs, watch reconciliation, IX ingestion/projection, expiration, collection, readiness, backup, and migration |
-| Stateless WS composition | `apps/wallet` | Authenticated chain-specific Ethereum and Bitcoin HTTP runtimes with concrete RPC/IX and remote-custody adapters; no direct storage/backend |
-| Independent IX composition | `apps/indexer` | Runnable Ethereum and nested Bitcoin workers, APIs, health, metrics, maintenance commands, and embeddable lifecycle facades implemented |
+| PS runtime composition | `apps/api` | Ethereum and nested Bitcoin modes use one required strict/global-trusted transport setting with durable jobs, watch reconciliation, IX ingestion/projection, expiration, collection, readiness, backup, and migration |
+| Stateless WS composition | `apps/wallet` | Chain-specific Ethereum and Bitcoin HTTP runtimes select the same typed authentication mode across RPC/IX and repo-owned remote-custody adapters; no direct storage/backend |
+| Independent IX composition | `apps/indexer` | Runnable Ethereum and nested Bitcoin workers, mode-aware APIs/clients, health, metrics, maintenance commands, and embeddable lifecycle facades implemented |
 | Per-chain checkpoint height/hash | `IndexScope`, `IndexRepository`, `SyncStatus` | Implemented for Ethereum and Bitcoin scopes |
 | Wait for provable depth | `ConfirmationPolicy`, `Included`, `ConfirmationProof` | Persisted depth transitions; Ethereum v1 defaults to 12 while Bitcoin requires an explicit deployment value |
 | `watch(address)` / `watch(txid)` | `ObservationRegistry`, `WatchSelector` | Implemented through both chain-specific IX HTTP APIs |
@@ -274,7 +276,8 @@ recoverable.
 | Fee and chain policy | Chain-native signed-transaction inspection + PS policy | Ethereum chain/gas/fee ceilings and Bitcoin exact-input/output/vsize/rate/absolute-fee bounds enforced before collection broadcast |
 | Local/remote/Trezor substitution | `Signer` and separate signer crates | Ephemeral local signer and authenticated remote adapter implemented; Trezor remains a placeholder |
 | Concrete storage engine | `sdk/storage/rocksdb` | Implemented for IX and PS as separate database paths |
-| PS schema migration | `PaymentDatabaseMetadataStore`, `payment-api migrate` | Verified physical backup, semantic validation/index rebuild, and fail-closed schema-v2 binding implemented |
+| PS schema migration | `PaymentDatabaseMetadataStore`, `payment-api migrate` | Verified physical backup, semantic validation/index rebuild, and fail-closed current-schema/principal-scope binding implemented |
+| Global service authentication mode | `packages/http`, `apps/{wallet,indexer,api,custody}` | Exact required parsing, strict regression, one global-trusted principal, dependency-mode negotiation, generated external identities, and sanitized readiness/metric posture implemented; global-trusted is explicitly not identity isolation |
 
 ## Corrections to the original accounting statements
 
@@ -391,8 +394,9 @@ Source structure and deterministic tests cannot establish:
 - automated, repeatable PS/WS/IX Anvil end-to-end acceptance;
 - the composed IX service against a live Ethereum node;
 - the composed Bitcoin IX/WS/PS services against the pinned Bitcoin Core 31
-  regtest node, including restart, controlled reorg, UTXO restoration, and
-  re-inclusion; the unexecuted procedure is documented in
+  regtest node in strict mode, including P2TR, restart, controlled reorg, UTXO
+  restoration, and re-inclusion; the global-trusted happy path passed, while
+  the extended procedure remains documented in
   [`manual-bitcoin-regtest/README.md`](./manual-bitcoin-regtest/README.md); and
 - the checked-in Kurtosis/Disruptoor scenario, which remains opt-in and has not
   been executed as part of ordinary Rust validation.

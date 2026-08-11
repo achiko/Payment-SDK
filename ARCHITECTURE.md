@@ -219,9 +219,12 @@ concrete PS selection without weakening the ownership rules above:
 - `sdk/deposits` owns durable users, jobs, command idempotency, deposits,
   deposit-to-observation indexes, absolute ledgers, typed reconciliation, and
   collection aggregates/legs/reservations;
-- PS reaches IX and stateless WS only through semantic HTTP clients, requires
-  bearer authentication for every WS connection and every non-loopback IX
-  connection, and never opens IX storage or custody secret material;
+- PS reaches IX and stateless WS only through semantic HTTP clients and never
+  opens IX storage or custody secret material. Application adapters select the
+  required global authentication mode once: strict mode requires bearer
+  authentication on every repo-owned boundary, while global-trusted mode omits
+  repo-owned bearer authorization and maps every reachable caller to one typed
+  principal;
 - the collection executor persists the exact signed envelope before broadcast,
   checks its chain ID and configured fee ceilings, and advances durable legs
   from IX facts; and
@@ -231,3 +234,12 @@ concrete PS selection without weakening the ownership rules above:
 - one exclusive writer is an Ethereum v1 constraint, not a claim of HA.
   Another network requires another process/database until a scope-keyed PS
   design is approved.
+
+Authentication remains a transport/application concern. Chain, signing,
+indexing, deposit, transaction, and storage contracts do not accept endpoint,
+header, bearer, TLS, or environment-variable data. Disabling repo-owned bearer
+authorization never disables Core/RPC or vendor custody authentication,
+operation identities, chain-native validation, policy, or durable idempotency.
+Matching HTTP clients validate the sanitized remote mode and fail closed on a
+missing or mismatched value; they never infer or downgrade a mode from an
+absent credential or failed request.

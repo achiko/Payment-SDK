@@ -56,9 +56,10 @@ Obtain or discover these values without printing their secrets:
 - Ethereum network name and chain ID;
 - reviewed PS policy path;
 - disposable PS database path;
-- IX URL and optional IX bearer token;
-- WS URL and required WS bearer token;
-- distinct ordinary and administrator PS bearer tokens; and
+- the exact shared `STRICT_AUTHENTICATION_MODE` selection;
+- IX URL and strict-mode IX bearer token;
+- WS URL and strict-mode WS bearer token;
+- distinct ordinary and administrator PS bearer tokens in strict mode; and
 - confirmation that IX, WS, and remote custody are non-production or approved
   for the requested test.
 
@@ -134,13 +135,13 @@ Set values in the private shell that will run PS. Placeholders are not working
 credentials:
 
 ```bash
+export STRICT_AUTHENTICATION_MODE='true'
 export PS_DATABASE_PATH='./tmp/payment-service-agent-run/database'
 export PS_POLICY_PATH='./tmp/payment-service-agent-run/policy.json'
 
 export PS_INDEXER_URL='http://127.0.0.1:8080'
 export PS_INDEXER_NETWORK='anvil'
-# Set only when the IX listener requires authentication.
-# export PS_INDEXER_BEARER_TOKEN='replace-with-indexer-token'
+export PS_INDEXER_BEARER_TOKEN='replace-with-indexer-token'
 
 export PS_WALLET_URL='http://127.0.0.1:8082'
 export PS_WALLET_BEARER_TOKEN='replace-with-wallet-token'
@@ -153,8 +154,9 @@ export PS_METRICS_BIND='127.0.0.1:9091'
 export RUST_LOG='info'
 ```
 
-The policy network, `PS_INDEXER_NETWORK`, and IX scope must match exactly. The
-ordinary and administrator PS tokens must be distinct.
+This runbook intentionally selects strict mode. The policy network,
+`PS_INDEXER_NETWORK`, and IX scope must match exactly. The ordinary and
+administrator PS tokens must be distinct.
 
 ### 5. Start Payment Service
 
@@ -188,9 +190,11 @@ curl --fail-with-body --silent --show-error \
 ```
 
 Redact tokens and any sensitive response content from the handoff report.
-Readiness must be `200` with `{"status":"ready"}`. Record the admin status
-scope, policy version/digest, IX and WS readiness flags, ingestion/projection
-cursors, event lag, and job backlog without exposing credentials.
+Readiness must be `200` with
+`{"status":"ready","authentication_mode":"strict"}` for this strict-mode
+runbook. Record the admin status mode, scope, policy version/digest, IX and WS
+readiness flags, ingestion/projection cursors, event lag, and job backlog
+without exposing credentials.
 
 ### 7. Run only authorized API smoke requests
 

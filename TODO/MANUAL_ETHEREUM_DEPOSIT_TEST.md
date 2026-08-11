@@ -71,6 +71,7 @@ Start the Indexer with the Ethereum v1 confirmation and reorg-retention policy:
 
 ```bash
 cargo run --locked -p indexer-worker -- serve \
+  --strict-authentication-mode false \
   --database-path "$MANUAL_IX_DB" \
   --network anvil \
   --bootstrap-height 0 \
@@ -106,9 +107,14 @@ Expected response:
 
 ```json
 {
-  "status": "ready"
+  "status": "ready",
+  "authentication_mode": "global_trusted"
 }
 ```
+
+This disposable loopback walkthrough deliberately selects global-trusted mode;
+every caller that can reach IX has full IX authority. Use strict mode and its
+bearer for any shared or non-disposable environment.
 
 If the request fails while IX is starting, wait briefly and retry it. Do not
 register the watch before readiness succeeds.

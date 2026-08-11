@@ -15,18 +15,22 @@ preflight, or broadcast operation and cannot spend funds. The indexer example
 performs read-only Bitcoin Core RPC calls, but it does create a local RocksDB
 database and bind its configured HTTP and metrics listeners.
 
-The Core-backed indexer demo auto-loads `payment_sdk_demo/.env` when it exists,
-so its local configuration can live next to the sample package. Start from the
-safe template and keep the filled file ignored by git:
+The demo binaries use only their process environment and never discover a
+current-directory `.env`. Start from the safe template, keep the filled file
+ignored by git, and explicitly source the copy you reviewed:
 
 ```bash
 cp payment_sdk_demo/.env.example payment_sdk_demo/.env
+chmod 600 payment_sdk_demo/.env
+set -a
+source payment_sdk_demo/.env
+set +a
 ```
 
 Never put Core authorization or bearer values in a checked-in file or a
 command-line argument. The offline wallet and Payment Service examples need no
-environment configuration, and this repository does not create a populated
-`.env` for them.
+environment configuration, and this repository does not create or implicitly
+load a populated `.env` for them.
 
 ## Bitcoin indexer sample
 
@@ -40,7 +44,8 @@ Required environment:
 |---|---|
 | `DEMO_BITCOIN_EXPECTED_GENESIS_HASH` | Network block-zero hash, without `0x` |
 | `DEMO_BITCOIN_CORE_AUTHORIZATION` | Complete Core `Authorization` value, such as a protected Basic value |
-| `DEMO_BITCOIN_IX_BEARER_TOKEN` | Non-empty bearer accepted by the sample IX API |
+| `STRICT_AUTHENTICATION_MODE` | Exact `true` for strict or `false` for global-trusted mode |
+| `DEMO_BITCOIN_IX_BEARER_TOKEN` | Non-empty bearer accepted by the sample IX API; strict mode only |
 
 Optional environment:
 
@@ -59,15 +64,21 @@ Optional environment:
 | `DEMO_BITCOIN_READY_MAX_LAG` | `2` |
 | `DEMO_BITCOIN_READY_MAX_AGE_SECONDS` | `30` |
 
-Run it from the repository root after filling `payment_sdk_demo/.env` or
-otherwise supplying the required environment:
+Run it from the repository root after explicitly exporting the required
+environment. The binaries never discover or auto-load a `.env` file:
 
 ```bash
+set -a
+source payment_sdk_demo/.env
+set +a
 cargo run --locked -p payment_sdk_demo --bin bitcoin-indexer
 ```
 
-The API is authenticated at `127.0.0.1:18080` by default. Metrics remain on
-the separate loopback listener at `127.0.0.1:19090`.
+The checked-in template explicitly selects global-trusted mode. Set
+`STRICT_AUTHENTICATION_MODE=true` and provide the bearer to authenticate the
+API at `127.0.0.1:18080`. Metrics remain on the separate loopback listener at
+`127.0.0.1:19090` in either mode. Bitcoin Core authentication is always
+required and is never disabled by the service authentication mode.
 
 ## Bitcoin wallet sample
 

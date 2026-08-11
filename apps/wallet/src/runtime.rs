@@ -1,24 +1,29 @@
-use std::{error::Error, fmt, sync::Arc};
+use std::{error::Error, fmt, future::Future, sync::Arc, time::Duration};
 
+use axum::{Router, extract::State, response::IntoResponse, routing::get};
 use chain_bitcoin::BitcoinCoreClient;
 use chain_ethereum::{Ethereum, EthereumHttpRpc, EthereumWallet};
-use http_support::{HealthState, HttpTransport};
+use http_support::{AuthenticationMode, HealthState, HttpServerConfig, HttpTransport};
 use json_rpc::TransportJsonRpcClient;
 use signer::{Curve, KeyTweakKind, SignatureScheme, Signer, SignerCapabilities, SignerStatus};
 use signer_remote::RemoteSignerClient;
+use telemetry::{Attribute, PrometheusTelemetry, Telemetry};
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{info, warn};
 use wallet_worker::{
     BitcoinIxClient, BitcoinOperations, EthereumOperations, WalletService, api, bitcoin_api,
 };
 
-use crate::config::{BitcoinServeOptions, ServeOptions};
+use crate::config::{BitcoinServeOptions, CustodyAuthenticationPolicy, ServeOptions};
 
 pub type AppError = Box<dyn Error + Send + Sync>;
 pub type AppResult<T> = Result<T, AppError>;
 
+const DEPENDENCY_READINESS_INTERVAL: Duration = Duration::from_secs(5);
+
 pub async fn serve(options: ServeOptions) -> AppResult<()> {
     options.validate()?;
+    let telemetry = install_telemetry(options.authentication_mode)?;
     let rpc = EthereumHttpRpc::new(options.rpc_configuration()?)?;
     rpc.verify_chain_id().await.map_err(|_| {
         Box::new(RuntimeError(
@@ -47,6 +52,9 @@ pub async fn serve(options: ServeOptions) -> AppResult<()> {
         }
     }
 
+    let readiness_monitor = DependencyReadinessMonitor::Ethereum {
+        custody: custody.clone(),
+    };
     let wallet = EthereumWallet::new(options.chain_id, rpc);
     let service = WalletService::<Ethereum, _, _, _>::new(wallet, custody.clone(), custody);
     let operations: Arc<dyn api::EthereumWalletOperations> =
@@ -54,38 +62,42 @@ pub async fn serve(options: ServeOptions) -> AppResult<()> {
 
     let health = HealthState::new(false);
     let server_config = options.server_configuration()?;
-    let router =
-        http_support::service_router(api::router(operations), &server_config, health.clone())?;
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let server = http_support::serve(router, &server_config, shutdown_signal(shutdown_rx));
-    tokio::pin!(server);
+    let metrics_server_config = options.metrics_server_configuration()?;
+    let router = http_support::service_router(
+        api::router(operations, options.authentication_mode),
+        &server_config,
+        health.clone(),
+    )?;
 
     health.set_ready(true);
+    warn_global_trusted(
+        options.authentication_mode,
+        options.custody_authentication_policy,
+        false,
+    );
     info!(
         chain_id = options.chain_id,
         bind = %options.http_bind,
+        metrics_bind = %options.metrics_bind,
+        authentication_mode = %options.authentication_mode,
+        custody_authentication_policy = %options.custody_authentication_policy,
         "stateless Ethereum Wallet Service is ready"
     );
-
-    tokio::select! {
-        result = &mut server => return result.map_err(|error| Box::new(error) as AppError),
-        result = termination_signal() => result?,
-    }
-
-    // Readiness flips before graceful drain begins, so callers stop sending
-    // new signing or broadcast requests during shutdown.
-    health.set_ready(false);
-    let _ = shutdown_tx.send(true);
-    match tokio::time::timeout(options.shutdown_grace(), &mut server).await {
-        Ok(result) => result.map_err(|error| Box::new(error) as AppError),
-        Err(_) => Err(Box::new(RuntimeError(
-            "Wallet Service graceful shutdown deadline expired".to_owned(),
-        ))),
-    }
+    serve_http_pair(
+        router,
+        server_config,
+        metrics_router(telemetry),
+        metrics_server_config,
+        health,
+        readiness_monitor,
+        options.shutdown_grace(),
+    )
+    .await
 }
 
 pub async fn serve_bitcoin(options: BitcoinServeOptions) -> AppResult<()> {
     options.validate()?;
+    let telemetry = install_telemetry(options.authentication_mode)?;
     let network = options.bitcoin_network()?;
     let transport = HttpTransport::new(options.core_transport_configuration()?)?;
     let json_rpc = TransportJsonRpcClient::new(transport, options.core_rpc_url.clone());
@@ -139,6 +151,10 @@ pub async fn serve_bitcoin(options: BitcoinServeOptions) -> AppResult<()> {
         }
     }
 
+    let readiness_monitor = DependencyReadinessMonitor::Bitcoin {
+        custody: custody.clone(),
+        ix: Arc::clone(&ix),
+    };
     let operations: Arc<dyn bitcoin_api::BitcoinWalletOperations> =
         Arc::new(BitcoinOperations::new(
             network,
@@ -150,35 +166,223 @@ pub async fn serve_bitcoin(options: BitcoinServeOptions) -> AppResult<()> {
         )?);
     let health = HealthState::new(false);
     let server_config = options.server_configuration()?;
+    let metrics_server_config = options.metrics_server_configuration()?;
     let router = http_support::service_router(
-        bitcoin_api::router(network, operations),
+        bitcoin_api::router(network, operations, options.authentication_mode),
         &server_config,
         health.clone(),
     )?;
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let server = http_support::serve(router, &server_config, shutdown_signal(shutdown_rx));
-    tokio::pin!(server);
 
     health.set_ready(true);
+    warn_global_trusted(
+        options.authentication_mode,
+        options.custody_authentication_policy,
+        true,
+    );
     info!(
         network = network.canonical_name(),
         ix_checkpoint_height = ix_status.checkpoint.height.0,
         bind = %options.http_bind,
+        metrics_bind = %options.metrics_bind,
+        authentication_mode = %options.authentication_mode,
+        custody_authentication_policy = %options.custody_authentication_policy,
         "stateless Bitcoin Wallet Service is ready"
     );
+    serve_http_pair(
+        router,
+        server_config,
+        metrics_router(telemetry),
+        metrics_server_config,
+        health,
+        readiness_monitor,
+        options.shutdown_grace(),
+    )
+    .await
+}
+
+fn install_telemetry(authentication_mode: AuthenticationMode) -> AppResult<PrometheusTelemetry> {
+    let telemetry = PrometheusTelemetry::install()?;
+    telemetry.gauge(
+        "payment_sdk_strict_authentication_mode",
+        if authentication_mode.is_strict() {
+            1.0
+        } else {
+            0.0
+        },
+        &[Attribute {
+            key: "service".to_owned(),
+            value: "wallet".to_owned(),
+        }],
+    );
+    Ok(telemetry)
+}
+
+fn metrics_router(telemetry: PrometheusTelemetry) -> Router {
+    Router::new()
+        .route("/metrics", get(metrics))
+        .with_state(telemetry)
+}
+
+async fn metrics(State(telemetry): State<PrometheusTelemetry>) -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        telemetry.render(),
+    )
+}
+
+fn warn_global_trusted(
+    authentication_mode: AuthenticationMode,
+    custody_authentication_policy: CustodyAuthenticationPolicy,
+    bitcoin: bool,
+) {
+    if authentication_mode != AuthenticationMode::GlobalTrusted {
+        return;
+    }
+    let ignored_credentials = match (bitcoin, custody_authentication_policy) {
+        (false, CustodyAuthenticationPolicy::RepositoryModeMatched) => {
+            "WS_BEARER_TOKEN and WS_CUSTODY_BEARER_TOKEN"
+        }
+        (false, CustodyAuthenticationPolicy::IndependentStrict) => "WS_BEARER_TOKEN",
+        (true, CustodyAuthenticationPolicy::RepositoryModeMatched) => {
+            "WS_BEARER_TOKEN, WS_CUSTODY_BEARER_TOKEN, WS_BITCOIN_IX_BEARER_TOKEN, and IX Authorization headers"
+        }
+        (true, CustodyAuthenticationPolicy::IndependentStrict) => {
+            "WS_BEARER_TOKEN, WS_BITCOIN_IX_BEARER_TOKEN, and IX Authorization headers"
+        }
+    };
+    warn!(
+        ignored_credentials,
+        custody_authentication_policy = %custody_authentication_policy,
+        "STRICT AUTHENTICATION IS DISABLED: every reachable caller is globally trusted; listed service credentials are ignored"
+    );
+}
+
+async fn serve_http_pair(
+    api_router: Router,
+    api_config: HttpServerConfig,
+    metrics_router: Router,
+    metrics_config: HttpServerConfig,
+    health: HealthState,
+    readiness_monitor: DependencyReadinessMonitor,
+    shutdown_grace: Duration,
+) -> AppResult<()> {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let timeout_message = readiness_monitor.shutdown_timeout_message();
+    let api_server = http_support::serve(
+        api_router,
+        &api_config,
+        shutdown_signal(shutdown_rx.clone()),
+    );
+    let metrics_server = http_support::serve(
+        metrics_router,
+        &metrics_config,
+        shutdown_signal(shutdown_rx.clone()),
+    );
+    let readiness_monitor = readiness_monitor.run(health.clone(), shutdown_rx);
+    tokio::pin!(api_server);
+    tokio::pin!(metrics_server);
+    tokio::pin!(readiness_monitor);
 
     tokio::select! {
-        result = &mut server => return result.map_err(|error| Box::new(error) as AppError),
+        result = &mut api_server => return result.map_err(|error| Box::new(error) as AppError),
+        result = &mut metrics_server => return result.map_err(|error| Box::new(error) as AppError),
+        () = &mut readiness_monitor => return Err(Box::new(RuntimeError(
+            "Wallet Service dependency readiness monitor stopped unexpectedly".to_owned(),
+        ))),
         result = termination_signal() => result?,
     }
 
+    // Readiness flips before graceful drain begins, so callers stop sending
+    // new signing or broadcast requests during shutdown.
     health.set_ready(false);
     let _ = shutdown_tx.send(true);
-    match tokio::time::timeout(options.shutdown_grace(), &mut server).await {
-        Ok(result) => result.map_err(|error| Box::new(error) as AppError),
-        Err(_) => Err(Box::new(RuntimeError(
-            "Bitcoin Wallet Service graceful shutdown deadline expired".to_owned(),
-        ))),
+    let shutdown = async {
+        let (api_result, metrics_result, ()) =
+            tokio::join!(&mut api_server, &mut metrics_server, &mut readiness_monitor);
+        api_result.map_err(|error| Box::new(error) as AppError)?;
+        metrics_result.map_err(|error| Box::new(error) as AppError)
+    };
+    match tokio::time::timeout(shutdown_grace, shutdown).await {
+        Ok(result) => result,
+        Err(_) => Err(Box::new(RuntimeError(timeout_message.to_owned()))),
+    }
+}
+
+enum DependencyReadinessMonitor {
+    Ethereum {
+        custody: RemoteSignerClient,
+    },
+    Bitcoin {
+        custody: RemoteSignerClient,
+        ix: Arc<BitcoinIxClient>,
+    },
+}
+
+impl DependencyReadinessMonitor {
+    fn shutdown_timeout_message(&self) -> &'static str {
+        match self {
+            Self::Ethereum { .. } => "Wallet Service graceful shutdown deadline expired",
+            Self::Bitcoin { .. } => "Bitcoin Wallet Service graceful shutdown deadline expired",
+        }
+    }
+
+    async fn dependencies_ready(&self) -> bool {
+        match self {
+            Self::Ethereum { custody } => {
+                matches!(custody.status().await, Ok(SignerStatus::Available))
+            }
+            Self::Bitcoin { custody, ix } => {
+                let (custody_status, ix_status) = tokio::join!(custody.status(), ix.readiness());
+                matches!(custody_status, Ok(SignerStatus::Available)) && ix_status.is_ok()
+            }
+        }
+    }
+
+    async fn run(self, health: HealthState, shutdown: watch::Receiver<bool>) {
+        let monitor = Arc::new(self);
+        run_readiness_monitor(health, DEPENDENCY_READINESS_INTERVAL, shutdown, move || {
+            let monitor = Arc::clone(&monitor);
+            async move { monitor.dependencies_ready().await }
+        })
+        .await;
+    }
+}
+
+async fn run_readiness_monitor<P, F>(
+    health: HealthState,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+    mut probe: P,
+) where
+    P: FnMut() -> F,
+    F: Future<Output = bool>,
+{
+    let start = tokio::time::Instant::now() + interval;
+    let mut ticker = tokio::time::interval_at(start, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+            () = wait_for_shutdown(&mut shutdown) => {
+                health.set_ready(false);
+                return;
+            }
+            _ = ticker.tick() => {}
+        }
+
+        let ready = tokio::select! {
+            biased;
+            () = wait_for_shutdown(&mut shutdown) => {
+                health.set_ready(false);
+                return;
+            }
+            ready = probe() => ready,
+        };
+        health.set_ready(ready);
     }
 }
 
@@ -237,8 +441,14 @@ async fn termination_signal() -> AppResult<()> {
 }
 
 async fn shutdown_signal(mut shutdown: watch::Receiver<bool>) {
-    if !*shutdown.borrow() {
-        drop(shutdown.changed().await);
+    wait_for_shutdown(&mut shutdown).await;
+}
+
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    while !*shutdown.borrow_and_update() {
+        if shutdown.changed().await.is_err() {
+            return;
+        }
     }
 }
 
@@ -255,7 +465,39 @@ impl Error for RuntimeError {}
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn recurring_monitor_tracks_dependency_recovery_and_shutdown() {
+        let health = HealthState::new(true);
+        let dependency_ready = Arc::new(AtomicBool::new(false));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let probe_state = Arc::clone(&dependency_ready);
+        let monitor = tokio::spawn(run_readiness_monitor(
+            health.clone(),
+            DEPENDENCY_READINESS_INTERVAL,
+            shutdown_rx,
+            move || std::future::ready(probe_state.load(Ordering::Acquire)),
+        ));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(DEPENDENCY_READINESS_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert!(!health.is_ready());
+
+        dependency_ready.store(true, Ordering::Release);
+        tokio::time::advance(DEPENDENCY_READINESS_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert!(health.is_ready());
+
+        shutdown_tx
+            .send(true)
+            .expect("readiness monitor must remain subscribed");
+        monitor.await.expect("readiness monitor must not panic");
+        assert!(!health.is_ready());
+    }
 
     #[test]
     fn capability_contract_requires_ethereum_digest_signing() {

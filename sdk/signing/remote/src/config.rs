@@ -1,3 +1,4 @@
+use http_support::AuthenticationMode;
 use reqwest::Url;
 use std::{error::Error, fmt, net::IpAddr, num::NonZeroU32, str::FromStr, time::Duration};
 use zeroize::Zeroize;
@@ -193,7 +194,8 @@ impl Default for RemoteRetryPolicy {
 #[derive(Clone, PartialEq, Eq)]
 pub struct RemoteSignerConfig {
     pub(crate) endpoint: RemoteSignerEndpoint,
-    pub(crate) bearer_secret: BearerSecret,
+    pub(crate) authentication_mode: AuthenticationMode,
+    pub(crate) bearer_secret: Option<BearerSecret>,
     pub(crate) connect_timeout: Duration,
     pub(crate) request_timeout: Duration,
     pub(crate) max_response_bytes: usize,
@@ -205,7 +207,25 @@ impl RemoteSignerConfig {
     pub fn new(endpoint: RemoteSignerEndpoint, bearer_secret: BearerSecret) -> Self {
         Self {
             endpoint,
-            bearer_secret,
+            authentication_mode: AuthenticationMode::Strict,
+            bearer_secret: Some(bearer_secret),
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            retry_policy: RemoteRetryPolicy::default(),
+        }
+    }
+
+    /// Configures a client for an explicitly trusted global deployment.
+    ///
+    /// No bearer credential is accepted in this mode, so selecting it cannot
+    /// accidentally depend on whether an optional secret was configured.
+    #[must_use]
+    pub fn global_trusted(endpoint: RemoteSignerEndpoint) -> Self {
+        Self {
+            endpoint,
+            authentication_mode: AuthenticationMode::GlobalTrusted,
+            bearer_secret: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
@@ -255,6 +275,7 @@ impl fmt::Debug for RemoteSignerConfig {
         formatter
             .debug_struct("RemoteSignerConfig")
             .field("endpoint", &self.endpoint)
+            .field("authentication_mode", &self.authentication_mode)
             .field("bearer_secret", &self.bearer_secret)
             .field("connect_timeout", &self.connect_timeout)
             .field("request_timeout", &self.request_timeout)

@@ -6,6 +6,7 @@ use chain_bitcoin::{
 };
 use chain_identity::{AssetId, AtomicAmount, CanonicalAddress, CanonicalTransactionId, ChainId};
 use deposits::{BoxFuture, DepositIndexerClient};
+use http_support::AuthenticationMode;
 use indexing::{
     BlockHash, BlockHeight, BlockRef, ConfirmationPolicy, ConfirmationProof, EventCursor,
     IndexError, IndexErrorKind, IndexScope, MovementId, MovementKind, NetworkFee, ObservationEvent,
@@ -19,10 +20,17 @@ use crate::config::{BearerSecret, IndexerEndpoint, IndexerOptions};
 
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestEffect {
+    ReadOnly,
+    Effectful,
+}
+
 #[derive(Clone)]
 pub struct IndexerClient {
     endpoint: IndexerEndpoint,
     bearer_token: Option<BearerSecret>,
+    authentication_mode: AuthenticationMode,
     request_timeout: Duration,
     retry_attempts: NonZeroU32,
     retry_initial_backoff: Duration,
@@ -31,9 +39,12 @@ pub struct IndexerClient {
 }
 
 impl IndexerClient {
-    pub fn new(options: &IndexerOptions) -> Result<Self, IndexError> {
+    pub fn new(
+        options: &IndexerOptions,
+        authentication_mode: AuthenticationMode,
+    ) -> Result<Self, IndexError> {
         options
-            .validate()
+            .validate(authentication_mode)
             .map_err(|error| invalid_request(error.to_string()))?;
         let client = reqwest::Client::builder()
             .redirect(Policy::none())
@@ -44,6 +55,7 @@ impl IndexerClient {
         Ok(Self {
             endpoint: options.indexer_url.clone(),
             bearer_token: options.bearer_token.clone(),
+            authentication_mode,
             request_timeout: options.request_timeout(),
             retry_attempts: options
                 .retry_attempts()
@@ -74,7 +86,9 @@ impl IndexerClient {
             }
             query.append_pair("limit", &limit.to_string());
         }
-        let dto: EventPageDto = self.send_json(Method::GET, url, None::<&()>).await?;
+        let dto: EventPageDto = self
+            .send_json(Method::GET, url, None::<&()>, RequestEffect::ReadOnly)
+            .await?;
         let events: Vec<ObservationEvent> = dto
             .events
             .into_iter()
@@ -108,10 +122,30 @@ impl IndexerClient {
         self.status_request(scope).await
     }
 
+    pub async fn readiness(&self) -> Result<bool, IndexError> {
+        let url = self.route(&["health", "ready"])?;
+        let response = self
+            .client
+            .get(url)
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    cannot_connect("Indexer readiness request timed out", true)
+                } else {
+                    cannot_connect("Indexer readiness endpoint is unavailable", true)
+                }
+            })?;
+        decode_readiness(response, self.authentication_mode).await
+    }
+
     async fn status_request(&self, scope: &IndexScope) -> Result<SyncStatus, IndexError> {
         wire_chain(scope)?;
         let url = self.route(&["v1", "scopes", &scope.chain.0, &scope.network, "status"])?;
-        let dto: StatusDto = self.send_json(Method::GET, url, None::<&()>).await?;
+        let dto: StatusDto = self
+            .send_json(Method::GET, url, None::<&()>, RequestEffect::ReadOnly)
+            .await?;
         let result = dto.into_value(scope)?;
         if result.scope != *scope {
             return Err(protocol_error(
@@ -162,7 +196,9 @@ impl IndexerClient {
             start_height: request.start_height.0.to_string(),
             idempotency_key: request.idempotency_key,
         };
-        let dto: WatchDto = self.send_json(Method::POST, url, Some(&body)).await?;
+        let dto: WatchDto = self
+            .send_json(Method::POST, url, Some(&body), RequestEffect::Effectful)
+            .await?;
         let result = dto.into_value(&request.scope)?;
         if result.scope != request.scope
             || result.selector != expected_selector
@@ -224,7 +260,9 @@ impl IndexerClient {
             }
             query.append_pair("limit", &limit.to_string());
         }
-        let dto: BitcoinUtxoPageDto = self.send_json(Method::GET, url, None::<&()>).await?;
+        let dto: BitcoinUtxoPageDto = self
+            .send_json(Method::GET, url, None::<&()>, RequestEffect::ReadOnly)
+            .await?;
         dto.into_value(scope, address)
     }
 
@@ -242,6 +280,7 @@ impl IndexerClient {
         method: Method,
         url: Url,
         body: Option<&B>,
+        effect: RequestEffect,
     ) -> Result<T, IndexError>
     where
         T: DeserializeOwned,
@@ -253,6 +292,26 @@ impl IndexerClient {
             .map_err(|_| invalid_request("failed to encode Indexer request"))?;
         let mut attempt = 1_u32;
         loop {
+            match (self.readiness().await, effect) {
+                (Ok(true), _) | (Ok(false), RequestEffect::ReadOnly) => {}
+                (Ok(false), RequestEffect::Effectful) if attempt < self.retry_attempts.get() => {
+                    tokio::time::sleep(self.backoff_after(attempt)).await;
+                    attempt += 1;
+                    continue;
+                }
+                (Ok(false), RequestEffect::Effectful) => {
+                    return Err(cannot_connect(
+                        "Indexer is not ready for an effectful request",
+                        true,
+                    ));
+                }
+                (Err(error), _) if error.retryable && attempt < self.retry_attempts.get() => {
+                    tokio::time::sleep(self.backoff_after(attempt)).await;
+                    attempt += 1;
+                    continue;
+                }
+                (Err(error), _) => return Err(error),
+            }
             let response = self
                 .send_once(method.clone(), url.clone(), body.as_deref())
                 .await;
@@ -285,8 +344,10 @@ impl IndexerClient {
             .client
             .request(method, url)
             .timeout(self.request_timeout);
-        if let Some(token) = &self.bearer_token {
-            request = request.bearer_auth(token.expose());
+        if self.authentication_mode.is_strict() {
+            if let Some(token) = &self.bearer_token {
+                request = request.bearer_auth(token.expose());
+            }
         }
         if let Some(body) = body {
             request = request
@@ -320,6 +381,7 @@ impl fmt::Debug for IndexerClient {
             .debug_struct("IndexerClient")
             .field("endpoint", &self.endpoint)
             .field("bearer_token", &self.bearer_token)
+            .field("authentication_mode", &self.authentication_mode)
             .field("request_timeout", &self.request_timeout)
             .field("retry_attempts", &self.retry_attempts)
             .field("retry_initial_backoff", &self.retry_initial_backoff)
@@ -439,6 +501,47 @@ where
     }
     serde_json::from_slice(&body)
         .map_err(|_| protocol_error("Indexer returned an invalid JSON response"))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadinessDto {
+    status: String,
+    authentication_mode: String,
+}
+
+async fn decode_readiness(
+    response: reqwest::Response,
+    expected_mode: AuthenticationMode,
+) -> Result<bool, IndexError> {
+    let status = response.status();
+    if !matches!(status, StatusCode::OK | StatusCode::SERVICE_UNAVAILABLE) {
+        return Err(protocol_error(
+            "Indexer readiness endpoint returned an unexpected status",
+        ));
+    }
+    let body = bounded_body(response).await?;
+    let readiness: ReadinessDto = serde_json::from_slice(&body)
+        .map_err(|_| protocol_error("Indexer readiness response is invalid"))?;
+    let mode = match readiness.authentication_mode.as_str() {
+        "strict" => AuthenticationMode::Strict,
+        "global_trusted" => AuthenticationMode::GlobalTrusted,
+        _ => {
+            return Err(protocol_error(
+                "Indexer readiness returned an unknown authentication mode",
+            ));
+        }
+    };
+    if mode != expected_mode {
+        return Err(protocol_error(
+            "Indexer authentication mode does not match Payment Service",
+        ));
+    }
+    match (status, readiness.status.as_str()) {
+        (StatusCode::OK, "ready") => Ok(true),
+        (StatusCode::SERVICE_UNAVAILABLE, "not_ready") => Ok(false),
+        _ => Err(protocol_error("Indexer readiness status and body disagree")),
+    }
 }
 
 async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>, IndexError> {
@@ -1314,6 +1417,26 @@ mod tests {
         format!("http://{address}")
     }
 
+    async fn strict_readiness() -> (AxumStatusCode, Json<Value>) {
+        (
+            AxumStatusCode::OK,
+            Json(json!({
+                "status": "ready",
+                "authentication_mode": "strict"
+            })),
+        )
+    }
+
+    async fn global_readiness() -> (AxumStatusCode, Json<Value>) {
+        (
+            AxumStatusCode::OK,
+            Json(json!({
+                "status": "ready",
+                "authentication_mode": "global_trusted"
+            })),
+        )
+    }
+
     #[tokio::test]
     async fn status_watch_and_event_dtos_match_indexer_wire_contract() {
         async fn status(headers: HeaderMap) -> (AxumStatusCode, Json<Value>) {
@@ -1370,13 +1493,17 @@ mod tests {
 
         let endpoint = spawn(
             Router::new()
+                .route("/health/ready", get(strict_readiness))
                 .route("/v1/scopes/ethereum/test/status", get(status))
                 .route("/v1/scopes/ethereum/test/watches", post(watch))
                 .route("/v1/events", get(events)),
         )
         .await;
-        let client =
-            IndexerClient::new(&options(endpoint, Some("test-secret"))).expect("client must build");
+        let client = IndexerClient::new(
+            &options(endpoint, Some("test-secret")),
+            AuthenticationMode::Strict,
+        )
+        .expect("client must build");
 
         let status = client.status(&scope()).await.expect("status must decode");
         assert_eq!(status.phase, SyncPhase::Ready);
@@ -1481,6 +1608,7 @@ mod tests {
 
         let endpoint = spawn(
             Router::new()
+                .route("/health/ready", get(global_readiness))
                 .route("/v1/scopes/bitcoin/regtest/status", get(status))
                 .route("/v1/scopes/bitcoin/regtest/watches", post(watch))
                 .route("/v1/events", get(events))
@@ -1490,7 +1618,9 @@ mod tests {
                 ),
         )
         .await;
-        let client = IndexerClient::new(&options(endpoint, None)).expect("client must build");
+        let client =
+            IndexerClient::new(&options(endpoint, None), AuthenticationMode::GlobalTrusted)
+                .expect("client must build");
         let scope = bitcoin_scope();
         let address = bitcoin_test_address();
 
@@ -1573,12 +1703,16 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let endpoint = spawn(
             Router::new()
+                .route("/health/ready", get(strict_readiness))
                 .route("/v1/scopes/ethereum/test/status", get(flaky))
                 .with_state(Arc::clone(&attempts)),
         )
         .await;
-        let client = IndexerClient::new(&options(endpoint.clone(), Some("test-secret")))
-            .expect("client must build");
+        let client = IndexerClient::new(
+            &options(endpoint.clone(), Some("test-secret")),
+            AuthenticationMode::Strict,
+        )
+        .expect("client must build");
         client
             .status(&scope())
             .await
@@ -1588,6 +1722,115 @@ mod tests {
         let debug = format!("{client:?}");
         assert!(!debug.contains(&endpoint));
         assert!(!debug.contains("test-secret"));
+    }
+
+    #[tokio::test]
+    async fn global_trusted_omits_bearer_and_readiness_rejects_mode_mismatch()
+    -> Result<(), IndexError> {
+        async fn readiness(
+            State(effectful_requests): State<Arc<AtomicUsize>>,
+        ) -> (AxumStatusCode, Json<Value>) {
+            if effectful_requests.load(Ordering::SeqCst) == 0 {
+                (
+                    AxumStatusCode::OK,
+                    Json(json!({
+                        "status": "ready",
+                        "authentication_mode": "global_trusted"
+                    })),
+                )
+            } else {
+                (
+                    AxumStatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "status": "not_ready",
+                        "authentication_mode": "global_trusted"
+                    })),
+                )
+            }
+        }
+
+        async fn events(headers: HeaderMap) -> (AxumStatusCode, Json<Value>) {
+            assert!(headers.get("authorization").is_none());
+            (
+                AxumStatusCode::OK,
+                Json(json!({"events": [], "next_cursor": null})),
+            )
+        }
+
+        async fn watch(
+            State(effectful_requests): State<Arc<AtomicUsize>>,
+            headers: HeaderMap,
+        ) -> (AxumStatusCode, Json<Value>) {
+            assert!(headers.get("authorization").is_none());
+            effectful_requests.fetch_add(1, Ordering::SeqCst);
+            (
+                AxumStatusCode::OK,
+                Json(json!({
+                    "id": "global-watch-1",
+                    "scope": {"chain": "ethereum", "network": "test"},
+                    "selector": {
+                        "type": "address",
+                        "value": "0x1111111111111111111111111111111111111111"
+                    },
+                    "start_height": "42",
+                    "registered_at": block_json(42),
+                    "inactive_from": null,
+                    "confirmation_depth": "12"
+                })),
+            )
+        }
+
+        let effectful_requests = Arc::new(AtomicUsize::new(0));
+
+        let endpoint = spawn(
+            Router::new()
+                .route("/health/ready", get(readiness))
+                .route("/v1/events", get(events))
+                .route("/v1/scopes/ethereum/test/watches", post(watch))
+                .with_state(Arc::clone(&effectful_requests)),
+        )
+        .await;
+        let global = IndexerClient::new(
+            &options(endpoint.clone(), Some("configured-but-ignored")),
+            AuthenticationMode::GlobalTrusted,
+        )?;
+        assert!(global.readiness().await?);
+        assert!(global.events(&scope(), None, 10).await?.events.is_empty());
+        let watch_request = || WatchRequest {
+            scope: scope(),
+            selector: WatchSelector::Address(CanonicalAddress {
+                chain: ChainId("ethereum".to_owned()),
+                value: "0x1111111111111111111111111111111111111111".to_owned(),
+            }),
+            start_height: BlockHeight(42),
+            idempotency_key: "global-watch-request".to_owned(),
+        };
+        global.watch(watch_request()).await?;
+        assert_eq!(effectful_requests.load(Ordering::SeqCst), 1);
+        assert!(
+            global.events(&scope(), None, 10).await?.events.is_empty(),
+            "same-mode not-ready must not block factual polling"
+        );
+        let not_ready = global
+            .watch(watch_request())
+            .await
+            .expect_err("not-ready dependency must block an effectful request");
+        assert!(not_ready.retryable);
+        assert!(not_ready.message.contains("not ready"));
+        assert_eq!(effectful_requests.load(Ordering::SeqCst), 1);
+
+        let strict = IndexerClient::new(
+            &options(endpoint, Some("strict-secret")),
+            AuthenticationMode::Strict,
+        )?;
+        let mismatch = strict
+            .watch(watch_request())
+            .await
+            .expect_err("live mode mismatch must fail before watch registration");
+        assert!(!mismatch.retryable);
+        assert!(mismatch.message.contains("does not match"));
+        assert_eq!(effectful_requests.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1601,8 +1844,15 @@ mod tests {
                 Json(json!({"events": [event], "next_cursor": null})),
             )
         }
-        let endpoint = spawn(Router::new().route("/v1/events", get(pending))).await;
-        let client = IndexerClient::new(&options(endpoint, None)).expect("client must build");
+        let endpoint = spawn(
+            Router::new()
+                .route("/health/ready", get(global_readiness))
+                .route("/v1/events", get(pending)),
+        )
+        .await;
+        let client =
+            IndexerClient::new(&options(endpoint, None), AuthenticationMode::GlobalTrusted)
+                .expect("client must build");
         let error = client
             .events(&scope(), None, 10)
             .await

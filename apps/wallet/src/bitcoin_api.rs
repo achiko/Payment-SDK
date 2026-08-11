@@ -1,4 +1,4 @@
-//! Authenticated-transport-ready, stateless Bitcoin Wallet HTTP adapter.
+//! Authentication-mode-aware, stateless Bitcoin Wallet HTTP adapter.
 //!
 //! Authentication, body limits, health, and transport policy are applied by
 //! `http_support::service_router`, exactly as for the Ethereum adapter. This
@@ -21,6 +21,7 @@ use chain_bitcoin::{
     format_bitcoin_block_hash,
 };
 use chain_contract::{Balance, ChainError, ChainErrorKind, GeneratedAddress};
+use http_support::AuthenticationMode;
 use serde::{Deserialize, Serialize};
 use signer::{ChildIndex, DerivationPath, KeyLocator, OperationId};
 use uuid::Uuid;
@@ -161,9 +162,14 @@ pub trait BitcoinWalletOperations: Send + Sync {
 struct ApiState {
     network: BitcoinNetwork,
     operations: Arc<dyn BitcoinWalletOperations>,
+    authentication_mode: AuthenticationMode,
 }
 
-pub fn router(network: BitcoinNetwork, operations: Arc<dyn BitcoinWalletOperations>) -> Router {
+pub fn router(
+    network: BitcoinNetwork,
+    operations: Arc<dyn BitcoinWalletOperations>,
+    authentication_mode: AuthenticationMode,
+) -> Router {
     Router::new()
         .route(ADDRESS_PATH, post(generate_address))
         .route(BALANCE_PATH, post(balance))
@@ -175,13 +181,14 @@ pub fn router(network: BitcoinNetwork, operations: Arc<dyn BitcoinWalletOperatio
         .with_state(ApiState {
             network,
             operations,
+            authentication_mode,
         })
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GenerateAddressRequest {
-    operation_id: String,
+    operation_id: Option<String>,
     address_kind: AddressKindDto,
     key_purpose: String,
 }
@@ -202,8 +209,10 @@ impl From<AddressKindDto> for BitcoinAddressKind {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 struct GenerateAddressResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation_id: Option<String>,
     address: String,
     key_locator: KeyLocatorDto,
 }
@@ -213,13 +222,15 @@ async fn generate_address(
     payload: Result<Json<GenerateAddressRequest>, JsonRejection>,
 ) -> ApiResult<Json<GenerateAddressResponse>> {
     let request = json_payload(payload)?;
+    let (operation_id, effective_operation_id) =
+        effective_operation_id(request.operation_id.as_deref(), state.authentication_mode)?;
     validate_key_purpose(&request.key_purpose)?;
     let generated = state
         .operations
         .generate_address(BitcoinGenerateAddress::new(
             state.network,
             request.address_kind.into(),
-            operation_id(&request.operation_id)?,
+            operation_id,
             request.key_purpose,
         ))
         .await
@@ -230,6 +241,7 @@ async fn generate_address(
         )
     })?;
     Ok(Json(GenerateAddressResponse {
+        operation_id: effective_operation_id,
         address: generated.address.0,
         key_locator: KeyLocatorDto::from(generated.key),
     }))
@@ -268,7 +280,7 @@ async fn balance(
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SignTransferRequest {
-    operation_id: String,
+    operation_id: Option<String>,
     inputs: Vec<ExactInputDto>,
     recipients: Vec<OutputDto>,
     change_address: String,
@@ -280,6 +292,8 @@ async fn sign_transfer(
     payload: Result<Json<SignTransferRequest>, JsonRejection>,
 ) -> ApiResult<Json<PreparedTransactionResponse>> {
     let request = json_payload(payload)?;
+    let (operation_id, effective_operation_id) =
+        effective_operation_id(request.operation_id.as_deref(), state.authentication_mode)?;
     if request.inputs.is_empty() || request.recipients.is_empty() {
         return Err(ApiError::bad_request(
             "invalid_transaction",
@@ -300,7 +314,7 @@ async fn sign_transfer(
     let prepared = state
         .operations
         .sign_transfer(BitcoinTransferSignRequest {
-            signing_operation_id: operation_id(&request.operation_id)?,
+            signing_operation_id: operation_id,
             inputs,
             recipients,
             change_address: canonical_address(&request.change_address, state.network)?,
@@ -308,7 +322,10 @@ async fn sign_transfer(
         })
         .await
         .map_err(ApiError::from_chain)?;
-    Ok(Json(PreparedTransactionResponse::from(prepared)))
+    Ok(Json(PreparedTransactionResponse::new(
+        effective_operation_id,
+        prepared,
+    )))
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -371,7 +388,7 @@ async fn collection_requirements(
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SignCollectionRequest {
-    operation_id: String,
+    operation_id: Option<String>,
     sources: Vec<CollectionSourceDto>,
     destination: String,
     fee_rate_satoshis_per_kvb: String,
@@ -399,6 +416,8 @@ async fn sign_collection(
     payload: Result<Json<SignCollectionRequest>, JsonRejection>,
 ) -> ApiResult<Json<PreparedCollectionResponse>> {
     let request = json_payload(payload)?;
+    let (operation_id, effective_operation_id) =
+        effective_operation_id(request.operation_id.as_deref(), state.authentication_mode)?;
     if request.sources.is_empty() {
         return Err(ApiError::bad_request(
             "invalid_collection",
@@ -431,14 +450,17 @@ async fn sign_collection(
     let prepared = state
         .operations
         .sign_collection(BitcoinCollectionSignRequest {
-            signing_operation_id: operation_id(&request.operation_id)?,
+            signing_operation_id: operation_id,
             sources,
             destination: canonical_address(&request.destination, state.network)?,
             fee_rate: fee_rate(&request.fee_rate_satoshis_per_kvb)?,
         })
         .await
         .map_err(ApiError::from_chain)?;
-    Ok(Json(PreparedCollectionResponse::from(prepared)))
+    Ok(Json(PreparedCollectionResponse::new(
+        effective_operation_id,
+        prepared,
+    )))
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -509,6 +531,8 @@ impl OutputDto {
 
 #[derive(Clone, Serialize)]
 struct PreparedTransactionResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation_id: Option<String>,
     transaction_id: String,
     raw_transaction: String,
     selected_outpoints: Vec<OutpointDto>,
@@ -521,6 +545,7 @@ impl std::fmt::Debug for PreparedTransactionResponse {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PreparedTransactionResponse")
+            .field("operation_id", &"[REDACTED]")
             .field("transaction_id", &self.transaction_id)
             .field("raw_transaction", &"[REDACTED]")
             .field("selected_outpoints", &self.selected_outpoints)
@@ -531,9 +556,10 @@ impl std::fmt::Debug for PreparedTransactionResponse {
     }
 }
 
-impl From<BitcoinPreparedTransaction> for PreparedTransactionResponse {
-    fn from(prepared: BitcoinPreparedTransaction) -> Self {
+impl PreparedTransactionResponse {
+    fn new(operation_id: Option<String>, prepared: BitcoinPreparedTransaction) -> Self {
         Self {
+            operation_id,
             transaction_id: prepared.transaction.id().to_string(),
             raw_transaction: hex_prefixed(prepared.transaction.consensus_bytes()),
             selected_outpoints: prepared
@@ -587,10 +613,10 @@ impl std::fmt::Debug for PreparedCollectionResponse {
     }
 }
 
-impl From<BitcoinPreparedCollection> for PreparedCollectionResponse {
-    fn from(collection: BitcoinPreparedCollection) -> Self {
+impl PreparedCollectionResponse {
+    fn new(operation_id: Option<String>, collection: BitcoinPreparedCollection) -> Self {
         Self {
-            prepared: PreparedTransactionResponse::from(collection.prepared),
+            prepared: PreparedTransactionResponse::new(operation_id, collection.prepared),
             attribution: collection
                 .attribution
                 .into_iter()
@@ -918,6 +944,26 @@ fn operation_id(value: &str) -> ApiResult<OperationId> {
             "operation_id must be a non-empty opaque value without whitespace",
         )
     })
+}
+
+fn effective_operation_id(
+    value: Option<&str>,
+    authentication_mode: AuthenticationMode,
+) -> ApiResult<(OperationId, Option<String>)> {
+    let (value, generated) = match value {
+        Some(value) => (value.to_owned(), false),
+        None if authentication_mode == AuthenticationMode::GlobalTrusted => {
+            (format!("ws-operation-{}", Uuid::now_v7()), true)
+        }
+        None => {
+            return Err(ApiError::bad_request(
+                "invalid_operation_id",
+                "operation_id is required in strict authentication mode",
+            ));
+        }
+    };
+    let operation_id = operation_id(&value)?;
+    Ok((operation_id, generated.then_some(value)))
 }
 
 fn validate_key_purpose(value: &str) -> ApiResult<()> {
@@ -1328,15 +1374,29 @@ mod tests {
     }
 
     fn test_router(fake: Arc<FakeOperations>) -> Router {
+        test_router_with_mode(fake, AuthenticationMode::Strict)
+    }
+
+    fn test_router_with_mode(
+        fake: Arc<FakeOperations>,
+        authentication_mode: AuthenticationMode,
+    ) -> Router {
+        let bearer_token = match authentication_mode {
+            AuthenticationMode::Strict => {
+                Some(BearerToken::new("wallet-secret").expect("test token must be valid"))
+            }
+            AuthenticationMode::GlobalTrusted => None,
+        };
         let config = HttpServerConfig::new(
             "127.0.0.1:8083".parse().expect("test bind must parse"),
             TransportSecurity::PlaintextLoopback,
-            Some(BearerToken::new("wallet-secret").expect("test token must be valid")),
+            bearer_token,
             RequestLimits::new(1024 * 1024, 10, 10).expect("test limits must be valid"),
-        );
+        )
+        .with_authentication_mode(authentication_mode);
         let operations: Arc<dyn BitcoinWalletOperations> = fake;
         service_router(
-            router(BitcoinNetwork::Regtest, operations),
+            router(BitcoinNetwork::Regtest, operations, authentication_mode),
             &config,
             HealthState::new(true),
         )
@@ -1348,6 +1408,15 @@ mod tests {
             .method("POST")
             .uri(path)
             .header(header::AUTHORIZATION, "Bearer wallet-secret")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("test request must build")
+    }
+
+    fn json_request_without_auth(path: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body.to_string()))
             .expect("test request must build")
@@ -1402,6 +1471,7 @@ mod tests {
             .expect("address request must complete");
         assert_eq!(response.status(), StatusCode::OK);
         let address_body = body_json(response).await;
+        assert!(address_body.get("operation_id").is_none());
         assert_eq!(address_body["address"], fake.p2tr.address.0);
 
         let response = app
@@ -1434,6 +1504,7 @@ mod tests {
             .expect("transfer signing request must complete");
         assert_eq!(response.status(), StatusCode::OK);
         let transfer_body = body_json(response).await;
+        assert!(transfer_body.get("operation_id").is_none());
         assert_eq!(transfer_body["transaction_id"], TRANSACTION_ID);
         assert_eq!(
             transfer_body["raw_transaction"],
@@ -1474,6 +1545,7 @@ mod tests {
             .expect("collection signing request must complete");
         assert_eq!(response.status(), StatusCode::OK);
         let collection_body = body_json(response).await;
+        assert!(collection_body.get("operation_id").is_none());
         assert_eq!(
             collection_body["attribution"][0]["gross_input_satoshis"],
             "43000"
@@ -1611,9 +1683,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn operation_id_is_optional_only_in_global_trusted_mode_and_is_returned() {
+        let global_fake = Arc::new(FakeOperations::new().await);
+        let global_app = test_router_with_mode(global_fake, AuthenticationMode::GlobalTrusted);
+        let global_response = global_app
+            .oneshot(json_request_without_auth(
+                ADDRESS_PATH,
+                json!({
+                    "address_kind": "p2wpkh",
+                    "key_purpose": "global-address"
+                }),
+            ))
+            .await
+            .expect("global-trusted address request must complete");
+        assert_eq!(global_response.status(), StatusCode::OK);
+        let body = body_json(global_response).await;
+        let generated = body["operation_id"]
+            .as_str()
+            .expect("response must return the effective operation ID");
+        let uuid = generated
+            .strip_prefix("ws-operation-")
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .expect("generated operation ID must contain a UUID");
+        assert_eq!(uuid.get_version_num(), 7);
+
+        let strict_fake = Arc::new(FakeOperations::new().await);
+        let strict_response = test_router(strict_fake)
+            .oneshot(json_request(
+                ADDRESS_PATH,
+                json!({
+                    "address_kind": "p2wpkh",
+                    "key_purpose": "strict-address"
+                }),
+            ))
+            .await
+            .expect("strict address request must complete");
+        assert_eq!(strict_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(strict_response).await["code"],
+            "invalid_operation_id"
+        );
+    }
+
+    #[tokio::test]
     async fn debug_output_redacts_signed_transaction_bytes() {
         let fake = FakeOperations::new().await;
-        let prepared = PreparedTransactionResponse::from(fake.prepared());
+        let prepared = PreparedTransactionResponse::new(
+            Some("operation-debug-test".to_owned()),
+            fake.prepared(),
+        );
         let broadcast = BroadcastRequest {
             expected_transaction_id: TRANSACTION_ID.to_owned(),
             raw_transaction: format!("0x{RAW_TRANSACTION_HEX}"),

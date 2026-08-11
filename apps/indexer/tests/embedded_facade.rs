@@ -1,6 +1,7 @@
 use chain_bitcoin::BitcoinNetwork;
 use indexer_worker::{
-    BitcoinIndexerService, BitcoinIndexerServiceConfig, IndexerService, IndexerServiceConfig,
+    AuthenticationMode, BitcoinIndexerService, BitcoinIndexerServiceConfig, IndexerService,
+    IndexerServiceConfig,
 };
 
 fn config() -> IndexerServiceConfig {
@@ -11,6 +12,7 @@ fn config() -> IndexerServiceConfig {
         31_337,
         format!("0x{}", "11".repeat(32)),
         "http://127.0.0.1:8545",
+        AuthenticationMode::GlobalTrusted,
     )
 }
 
@@ -24,6 +26,7 @@ fn bitcoin_facade_is_constructible_without_runtime_side_effects() {
         100,
         "22".repeat(32),
         "http://127.0.0.1:18443",
+        AuthenticationMode::Strict,
     );
     config.rpc_headers = vec!["authorization=Basic hidden".to_owned()];
     config.bearer_token = Some("indexer-hidden".to_owned());

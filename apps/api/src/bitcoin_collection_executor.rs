@@ -82,6 +82,13 @@ const EVIDENCE_VERSION: u8 = 1;
 const EVIDENCE_MAGIC: &[u8; 8] = b"btcpsutx";
 const MAX_EVIDENCE_ADDRESS_BYTES: usize = 128;
 const MAX_EVIDENCE_SCRIPT_BYTES: usize = 128;
+// These exact prefixes and purpose bytes are the durable v1 domain encoding.
+// Keep them unchanged for replay compatibility; a future version must use new
+// domains together with an explicit migration/version selection.
+const BITCOIN_COLLECTION_LEG_ID_DOMAIN_V1: &str = "leg";
+const BITCOIN_COLLECTION_OPERATION_ID_DOMAIN_V1: &str = "ps-bitcoin-collection";
+const BITCOIN_COLLECTION_WATCH_IDEMPOTENCY_DOMAIN_V1: &str = "ps-bitcoin-watch";
+const BITCOIN_COLLECTION_SWEEP_PURPOSE_V1: &[u8] = b"bitcoin-sweep";
 
 #[derive(Clone)]
 struct SelectedParticipant {
@@ -1230,8 +1237,11 @@ const fn collection_eligible_deposit_state(state: &DepositState) -> bool {
 
 fn stable_leg_id(collection_id: &CollectionId) -> CollectionLegId {
     CollectionLegId(format!(
-        "leg-{}",
-        digest_hex(&[collection_id.0.as_bytes(), b"bitcoin-sweep"])
+        "{BITCOIN_COLLECTION_LEG_ID_DOMAIN_V1}-{}",
+        digest_hex(&[
+            collection_id.0.as_bytes(),
+            BITCOIN_COLLECTION_SWEEP_PURPOSE_V1,
+        ])
     ))
 }
 
@@ -1240,10 +1250,10 @@ fn stable_operation_id(
     attempt: u32,
 ) -> Result<OperationId, DepositError> {
     OperationId::new(format!(
-        "ps-bitcoin-collection-{}",
+        "{BITCOIN_COLLECTION_OPERATION_ID_DOMAIN_V1}-{}",
         digest_hex(&[
             collection_id.0.as_bytes(),
-            b"bitcoin-sweep",
+            BITCOIN_COLLECTION_SWEEP_PURPOSE_V1,
             &attempt.to_be_bytes(),
         ])
     ))
@@ -1252,7 +1262,7 @@ fn stable_operation_id(
 
 fn watch_idempotency_key(collection_id: &CollectionId, leg_id: &CollectionLegId) -> String {
     format!(
-        "ps-bitcoin-watch-{}",
+        "{BITCOIN_COLLECTION_WATCH_IDEMPOTENCY_DOMAIN_V1}-{}",
         digest_hex(&[collection_id.0.as_bytes(), leg_id.0.as_bytes()])
     )
 }
@@ -1669,6 +1679,27 @@ mod tests {
             vec![first.clone(), second]
         );
         assert!(canonical_deposit_ids(&[first.clone(), first]).is_err());
+    }
+
+    #[test]
+    fn bitcoin_collection_child_identity_v1_bytes_are_frozen() {
+        let collection = CollectionId("collection-1".to_owned());
+        let leg = stable_leg_id(&collection);
+
+        assert_eq!(
+            leg.0,
+            "leg-668b10694811b788aee242414dd47252adebb7d51167f145b5d9f3439fca8064"
+        );
+        assert_eq!(
+            stable_operation_id(&collection, 1)
+                .expect("operation ID must be valid")
+                .as_str(),
+            "ps-bitcoin-collection-6f234c8749df346ec40e07b7ded57e2b2fa12671977584c7a4467f85cc95cb06"
+        );
+        assert_eq!(
+            watch_idempotency_key(&collection, &leg),
+            "ps-bitcoin-watch-9b8376c52ab5624d2042935cf1f9b2f61dcd2f4893f27b28812602430fc9487a"
+        );
     }
 
     #[test]
