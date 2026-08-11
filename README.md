@@ -98,6 +98,7 @@ As an optional one-command alternative, start IX, custody, WS, and PS against
 an already-running loopback Ethereum RPC with:
 
 ```bash
+STRICT_AUTHENTICATION_MODE='false' \
 ./scripts/run-local-payment-services.sh --disposable-policy
 ```
 

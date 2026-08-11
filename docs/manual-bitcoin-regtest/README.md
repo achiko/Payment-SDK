@@ -1,10 +1,10 @@
 # Manual Bitcoin Core 31 regtest acceptance
 
-Status: checked-in procedure only. This scenario has **not** been executed on
-this checkout because a Bitcoin Core 31 binary is unavailable in the current
-development environment. Following this document is opt-in operational work;
-the Bitcoin acceptance item remains pending until an actual run records every
-assertion below.
+Status: extended acceptance procedure. The simpler
+[`global_trusted` Payment Service happy path](./PAYMENT_HAPPY_PATH.md) was
+manually exercised on 2026-08-11 against Bitcoin Core 31.1. The strict-mode,
+P2TR, restart/replay, controlled-reorg, restoration, and re-inclusion matrix in
+this document remains pending until one run records every assertion below.
 
 This procedure exercises the composed Bitcoin Indexer Service (IX), ephemeral
 development custody, and stateless Wallet Service (WS) against one disposable
@@ -98,7 +98,11 @@ export BTC_CORE_RPC_PORT='19443'
 export BTC_IX_HTTP_PORT='18080'
 export BTC_IX_METRICS_PORT='19090'
 export BTC_CUSTODY_PORT='18181'
+export BTC_CUSTODY_METRICS_PORT='19093'
 export BTC_WS_HTTP_PORT='18082'
+export BTC_WS_METRICS_PORT='19092'
+
+export STRICT_AUTHENTICATION_MODE='true'
 
 export IX_BEARER_TOKEN="$(openssl rand -hex 32)"
 export CUSTODY_BEARER_TOKEN="$(openssl rand -hex 32)"
@@ -116,7 +120,10 @@ export WS_BEARER_TOKEN="$(openssl rand -hex 32)"
   printf "export BTC_IX_HTTP_PORT='%s'\n" "$BTC_IX_HTTP_PORT"
   printf "export BTC_IX_METRICS_PORT='%s'\n" "$BTC_IX_METRICS_PORT"
   printf "export BTC_CUSTODY_PORT='%s'\n" "$BTC_CUSTODY_PORT"
+  printf "export BTC_CUSTODY_METRICS_PORT='%s'\n" "$BTC_CUSTODY_METRICS_PORT"
   printf "export BTC_WS_HTTP_PORT='%s'\n" "$BTC_WS_HTTP_PORT"
+  printf "export BTC_WS_METRICS_PORT='%s'\n" "$BTC_WS_METRICS_PORT"
+  printf "export STRICT_AUTHENTICATION_MODE='%s'\n" "$STRICT_AUTHENTICATION_MODE"
   printf "export IX_BEARER_TOKEN='%s'\n" "$IX_BEARER_TOKEN"
   printf "export CUSTODY_BEARER_TOKEN='%s'\n" "$CUSTODY_BEARER_TOKEN"
   printf "export WS_BEARER_TOKEN='%s'\n" "$WS_BEARER_TOKEN"
@@ -193,7 +200,9 @@ chmod 600 "$BTC_PRIVATE_ENV"
 
 A fresh regtest fee estimator may not return `feerate`. WS intentionally fails
 retryably rather than silently trusting only the caller's requested rate, so
-the acceptance run must create fee-paying history before signing.
+the acceptance run must create fee-paying history before signing. Core 31.1
+does not expose the older `settxfee` RPC; each warm-up `sendtoaddress` therefore
+sets an explicit `2 sat/vB` rate through its named `fee_rate` argument.
 
 ```bash
 btc_cli createwallet miner > "$BTC_EVIDENCE_DIR/create-miner-wallet.json"
@@ -207,8 +216,6 @@ export BTC_MINER_ADDRESS="$(btc_wallet getnewaddress 'acceptance-miner' bech32)"
 btc_cli generatetoaddress 101 "$BTC_MINER_ADDRESS" \
   > "$BTC_EVIDENCE_DIR/maturity-blocks.json"
 test "$(jq 'length' "$BTC_EVIDENCE_DIR/maturity-blocks.json")" -eq 101
-btc_wallet settxfee 0.00010000 | jq -e '. == true'
-
 FEE_ESTIMATE_READY='false'
 for ROUND in $(seq 1 50); do
   if btc_cli estimatesmartfee 6 conservative 2>/dev/null \
@@ -217,9 +224,12 @@ for ROUND in $(seq 1 50); do
     break
   fi
 
+  WARM_ADDRESS="$(btc_wallet getnewaddress "fee-warmup-$ROUND" bech32)"
   for ITEM in $(seq 1 12); do
-    WARM_ADDRESS="$(btc_wallet getnewaddress "fee-warmup-$ROUND-$ITEM" bech32)"
-    btc_wallet sendtoaddress "$WARM_ADDRESS" 0.00100000 >/dev/null
+    btc_wallet -named sendtoaddress \
+      address="$WARM_ADDRESS" \
+      amount=0.00100000 \
+      fee_rate=2 >/dev/null
   done
   btc_cli generatetoaddress 1 "$BTC_MINER_ADDRESS" >/dev/null
 done
@@ -268,6 +278,7 @@ export IX_READY_MAX_LAG='0'
 export IX_READY_MAX_AGE_SECONDS='30'
 
 export CUSTODY_BIND="127.0.0.1:$BTC_CUSTODY_PORT"
+export CUSTODY_METRICS_BIND="127.0.0.1:$BTC_CUSTODY_METRICS_PORT"
 
 export WS_BITCOIN_NETWORK='regtest'
 export WS_BITCOIN_EXPECTED_GENESIS_HASH="$BTC_REGTEST_GENESIS"
@@ -280,8 +291,10 @@ export WS_BITCOIN_MINIMUM_CONFIRMATIONS='1'
 export WS_BITCOIN_FEE_TARGET_BLOCKS='6'
 export WS_BITCOIN_MAX_SATOSHIS_PER_KVB='100000'
 export WS_CUSTODY_URL="http://127.0.0.1:$BTC_CUSTODY_PORT"
+export WS_CUSTODY_AUTHENTICATION_POLICY='repository_mode_matched'
 export WS_CUSTODY_BEARER_TOKEN="$CUSTODY_BEARER_TOKEN"
 export WS_HTTP_BIND="127.0.0.1:$BTC_WS_HTTP_PORT"
+export WS_METRICS_BIND="127.0.0.1:$BTC_WS_METRICS_PORT"
 ```
 
 Create private curl configuration files so bearer values do not appear in the
@@ -390,9 +403,11 @@ jq -e --arg genesis "$BTC_REGTEST_GENESIS" '
 ' "$BTC_EVIDENCE_DIR/ix-status-start.json"
 ```
 
-WS readiness is startup-latched in this version. A later Core, IX, or custody
-outage may not clear `/health/ready`; the remaining steps therefore assert
-authenticated functional responses and Core/IX state, not health alone.
+WS periodically rechecks custody availability/mode and IX
+readiness/network/mode. Those failures clear `/health/ready`, which recovers
+after the dependencies do. Core operation failures remain separate, so the
+remaining steps still assert mode-aware functional responses and Core/IX state,
+not health alone.
 
 ## 7. Generate P2WPKH/P2TR addresses and register watches
 

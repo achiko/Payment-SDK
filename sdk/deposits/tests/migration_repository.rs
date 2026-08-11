@@ -6,7 +6,7 @@ use deposits::{
     DepositStateKind, DepositStore, EnsureUser, IdempotencyKey, InitializePaymentDatabase, JobId,
     JobPayload, JobStore, MigratePaymentDatabase, PAYMENT_DOMAIN_SCHEMA_VERSION,
     PAYMENT_SERVICE_OWNER, PaymentDatabaseMetadataStore, PersistentPaymentRepository,
-    PolicyIdentity, RequestHash, UserId, UserStore,
+    PolicyIdentity, PrincipalScopeMode, RequestHash, UserId, UserStore,
 };
 use indexing::{BlockHeight, IndexScope};
 use signer::KeyLocator;
@@ -174,6 +174,39 @@ async fn wrong_operator_scope_fails_without_binding_metadata()
 }
 
 #[tokio::test]
+async fn populated_unbound_database_cannot_adopt_global_trusted_scope()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let storage = RocksDbStorage::open(directory.path())?;
+    let repository = PersistentPaymentRepository::new(storage.clone());
+    repository.create_or_replay(create_deposit_job()).await?;
+
+    let error = repository
+        .migrate_and_bind_principal_scope(
+            migrate_command("sepolia", policy("policy-v1", 1)),
+            PrincipalScopeMode::GlobalTrusted,
+        )
+        .await
+        .expect_err("populated role-scoped records require a future principal-aware migration");
+    assert_eq!(error.kind, DepositErrorKind::Conflict);
+    assert_eq!(repository.database_metadata().await?, None);
+    assert!(
+        storage
+            .scan(ScanRequest {
+                namespace: Namespace("ps.v1.deposit_index_metadata".to_owned()),
+                prefix: Vec::new(),
+                after: None,
+                limit: 1,
+            })
+            .await?
+            .entries
+            .is_empty(),
+        "a rejected principal-scope migration must not rebuild or mark indexes"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn indexer_owned_database_is_never_adopted_by_migration()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
@@ -276,6 +309,77 @@ struct LegacyDatabaseMetadataRecordV1 {
     active_policy_version: String,
     active_policy_digest: [u8; 32],
     initialized_at: u64,
+}
+
+#[derive(Encode)]
+struct LegacyIdRecordV1 {
+    version: u16,
+    id: String,
+}
+
+#[tokio::test]
+async fn explicitly_migrated_empty_legacy_database_may_bind_global_trusted_scope()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let storage = RocksDbStorage::open(directory.path())?;
+    let value = bincode::encode_to_vec(
+        LegacyDatabaseMetadataRecordV1 {
+            record_version: 1,
+            service_owner: PAYMENT_SERVICE_OWNER.to_owned(),
+            domain_schema_version: 3,
+            scope: LegacyScopeRecordV1 {
+                chain: "ethereum".to_owned(),
+                network: "sepolia".to_owned(),
+            },
+            active_policy_version: "policy-v1".to_owned(),
+            active_policy_digest: [1; 32],
+            initialized_at: 100,
+        },
+        bincode::config::standard()
+            .with_fixed_int_encoding()
+            .with_big_endian(),
+    )?;
+    let deposit_index_marker = bincode::encode_to_vec(
+        LegacyIdRecordV1 {
+            version: 1,
+            id: "complete".to_owned(),
+        },
+        bincode::config::standard()
+            .with_fixed_int_encoding()
+            .with_big_endian(),
+    )?;
+    storage
+        .commit(WriteBatch {
+            conditions: Vec::new(),
+            operations: vec![
+                Operation::Put {
+                    namespace: Namespace("ps.v1.database_metadata".to_owned()),
+                    key: Key(b"identity".to_vec()),
+                    value: Value(value),
+                },
+                Operation::Put {
+                    namespace: Namespace("ps.v1.deposit_index_metadata".to_owned()),
+                    key: Key(b"v1_complete".to_vec()),
+                    value: Value(deposit_index_marker),
+                },
+            ],
+        })
+        .await?;
+    let repository = PersistentPaymentRepository::new(storage);
+
+    let report = repository
+        .migrate_and_bind_principal_scope(
+            migrate_command("sepolia", policy("policy-v1", 1)),
+            PrincipalScopeMode::GlobalTrusted,
+        )
+        .await?;
+    assert_eq!(report.previous_domain_schema_version, Some(3));
+    assert_eq!(
+        report.metadata.principal_scope_mode,
+        PrincipalScopeMode::GlobalTrusted
+    );
+    assert_eq!(repository.database_metadata().await?, Some(report.metadata));
+    Ok(())
 }
 
 #[tokio::test]

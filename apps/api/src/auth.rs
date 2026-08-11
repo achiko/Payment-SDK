@@ -15,6 +15,7 @@ use uuid::Uuid;
 pub enum PrincipalRole {
     Exchange,
     Administrator,
+    GlobalTrusted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,7 +36,16 @@ impl AuthenticatedPrincipal {
         match self.role {
             PrincipalRole::Exchange => "exchange",
             PrincipalRole::Administrator => "administrator",
+            PrincipalRole::GlobalTrusted => "global_trusted",
         }
+    }
+
+    #[must_use]
+    pub const fn can_administer(self) -> bool {
+        matches!(
+            self.role,
+            PrincipalRole::Administrator | PrincipalRole::GlobalTrusted
+        )
     }
 }
 
@@ -61,6 +71,33 @@ impl fmt::Debug for Credentials {
     }
 }
 
+#[derive(Clone)]
+pub enum Authorizer {
+    Strict(Credentials),
+    GlobalTrusted,
+}
+
+impl Authorizer {
+    #[must_use]
+    pub const fn strict(credentials: Credentials) -> Self {
+        Self::Strict(credentials)
+    }
+
+    #[must_use]
+    pub const fn global_trusted() -> Self {
+        Self::GlobalTrusted
+    }
+}
+
+impl fmt::Debug for Authorizer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Strict(_) => formatter.write_str("Authorizer::Strict([REDACTED])"),
+            Self::GlobalTrusted => formatter.write_str("Authorizer::GlobalTrusted"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RequiredRole {
     Ordinary,
@@ -69,19 +106,19 @@ enum RequiredRole {
 
 #[derive(Clone)]
 struct AuthState {
-    credentials: Arc<Credentials>,
+    authorizer: Arc<Authorizer>,
     required: RequiredRole,
 }
 
 /// Protects user-facing routes. The administrator credential is a strict
 /// superset and may call these routes as required by the PS contract.
-pub fn ordinary_routes<S>(router: Router<S>, credentials: Arc<Credentials>) -> Router<S>
+pub fn ordinary_routes<S>(router: Router<S>, authorizer: Arc<Authorizer>) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
     router.layer(middleware::from_fn_with_state(
         AuthState {
-            credentials,
+            authorizer,
             required: RequiredRole::Ordinary,
         },
         authenticate,
@@ -90,13 +127,13 @@ where
 
 /// Protects administrator-only routes. A valid ordinary credential is
 /// authenticated but forbidden, and therefore receives 403 rather than 401.
-pub fn administrator_routes<S>(router: Router<S>, credentials: Arc<Credentials>) -> Router<S>
+pub fn administrator_routes<S>(router: Router<S>, authorizer: Arc<Authorizer>) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
     router.layer(middleware::from_fn_with_state(
         AuthState {
-            credentials,
+            authorizer,
             required: RequiredRole::Administrator,
         },
         authenticate,
@@ -108,25 +145,30 @@ async fn authenticate(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let authorization = request.headers().get(header::AUTHORIZATION);
-    let principal = if state
-        .credentials
-        .administrator
-        .matches_authorization_header(authorization)
-    {
-        Some(AuthenticatedPrincipal {
-            role: PrincipalRole::Administrator,
-        })
-    } else if state
-        .credentials
-        .ordinary
-        .matches_authorization_header(authorization)
-    {
-        Some(AuthenticatedPrincipal {
-            role: PrincipalRole::Exchange,
-        })
-    } else {
-        None
+    let principal = match state.authorizer.as_ref() {
+        Authorizer::GlobalTrusted => Some(AuthenticatedPrincipal {
+            role: PrincipalRole::GlobalTrusted,
+        }),
+        Authorizer::Strict(credentials) => {
+            let authorization = request.headers().get(header::AUTHORIZATION);
+            if credentials
+                .administrator
+                .matches_authorization_header(authorization)
+            {
+                Some(AuthenticatedPrincipal {
+                    role: PrincipalRole::Administrator,
+                })
+            } else if credentials
+                .ordinary
+                .matches_authorization_header(authorization)
+            {
+                Some(AuthenticatedPrincipal {
+                    role: PrincipalRole::Exchange,
+                })
+            } else {
+                None
+            }
+        }
     };
 
     match (state.required, principal) {
@@ -135,9 +177,7 @@ async fn authenticate(
             "unauthorized",
             "valid bearer authentication is required",
         ),
-        (RequiredRole::Administrator, Some(principal))
-            if principal.role != PrincipalRole::Administrator =>
-        {
+        (RequiredRole::Administrator, Some(principal)) if !principal.can_administer() => {
             authentication_error(
                 StatusCode::FORBIDDEN,
                 "forbidden",
@@ -192,15 +232,14 @@ mod tests {
 
     use super::*;
 
-    fn credentials() -> Arc<Credentials> {
-        Arc::new(Credentials::new(
+    fn authorizer() -> Arc<Authorizer> {
+        Arc::new(Authorizer::strict(Credentials::new(
             BearerToken::new("ordinary-secret").expect("test token must be valid"),
             BearerToken::new("admin-secret").expect("test token must be valid"),
-        ))
+        )))
     }
 
-    fn router() -> Router {
-        let credentials = credentials();
+    fn router(authorizer: Arc<Authorizer>) -> Router {
         let ordinary = ordinary_routes(
             Router::new().route(
                 "/ordinary",
@@ -210,7 +249,7 @@ mod tests {
                     },
                 ),
             ),
-            Arc::clone(&credentials),
+            Arc::clone(&authorizer),
         );
         let administrator = administrator_routes(
             Router::new().route(
@@ -221,7 +260,7 @@ mod tests {
                     },
                 ),
             ),
-            credentials,
+            authorizer,
         );
         ordinary.merge(administrator)
     }
@@ -231,7 +270,7 @@ mod tests {
         if let Some(token) = token {
             builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
         }
-        router()
+        router(authorizer())
             .oneshot(
                 builder
                     .body(Body::empty())
@@ -306,10 +345,37 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn global_trusted_ignores_authorization_and_can_use_all_routes() {
+        for token in [None, Some("wrong-secret"), Some("ordinary-secret")] {
+            for path in ["/ordinary", "/admin"] {
+                let mut builder = Request::builder().uri(path);
+                if let Some(token) = token {
+                    builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+                }
+                let response = router(Arc::new(Authorizer::global_trusted()))
+                    .oneshot(
+                        builder
+                            .body(Body::empty())
+                            .expect("test request must build"),
+                    )
+                    .await
+                    .expect("router must respond");
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    to_bytes(response.into_body(), 64)
+                        .await
+                        .expect("body must be readable"),
+                    "global_trusted"
+                );
+            }
+        }
+    }
+
     #[test]
     fn credential_debug_output_is_redacted() {
-        let output = format!("{:?}", credentials());
-        assert_eq!(output, "Credentials([REDACTED])");
+        let output = format!("{:?}", authorizer());
+        assert_eq!(output, "Authorizer::Strict([REDACTED])");
         assert!(!output.contains("secret"));
     }
 }

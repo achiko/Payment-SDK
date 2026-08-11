@@ -3,7 +3,7 @@
 This guide explains how an in-process Rust application composes and calls the
 stateless [`wallet_worker::WalletService`](../apps/wallet/src/lib.rs) facade for
 native ETH and ERC-20 assets. It covers the eight asynchronous operations on
-that facade. For the separately deployed authenticated HTTP process, use
+that facade. For the separately deployed mode-aware HTTP process, use
 [`WALLET_SERVICE.md`](./WALLET_SERVICE.md) instead.
 
 The Wallet Service knows how to perform one chain-native operation. It does not
@@ -428,9 +428,17 @@ limits, retry bounds, input-size limits, gas margin, maximum gas, per-gas fee
 ceilings, and maximum total fee. Use HTTPS for non-loopback RPC endpoints and
 keep authentication header values out of logs.
 
-Construct `RemoteSignerConfig` with a validated HTTPS endpoint, a bearer secret
-loaded from a secret manager, bounded connection/request timeouts, a response
-limit, and bounded operation retries. Before readiness, require:
+Construct `RemoteSignerConfig` with one explicit auth constructor: strict mode
+uses a bearer secret loaded from a secret manager, while global-trusted mode
+uses the dedicated credential-free constructor. Never infer the mode from a
+missing optional token. In either mode use a validated HTTPS endpoint, bounded
+connection/request timeouts, a response limit, and bounded operation retries.
+The `wallet-worker` composition root selects this explicitly with
+`WS_CUSTODY_AUTHENTICATION_POLICY`: `repository_mode_matched` follows
+`STRICT_AUTHENTICATION_MODE`, while `independent_strict` requires
+`WS_CUSTODY_BEARER_TOKEN` and a strict custody posture in either service mode.
+Before readiness, require the custody endpoint to report the selected
+authentication mode plus:
 
 - `Curve::Secp256k1`;
 - `SignatureScheme::EcdsaSecp256k1`;

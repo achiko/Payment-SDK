@@ -13,7 +13,10 @@ use axum::{
     routing::{get, post},
 };
 use clap::{Args, Parser, Subcommand};
-use http_support::{BearerToken, HealthState, HttpServerConfig, RequestLimits, TransportSecurity};
+use http_support::{
+    AuthenticationMode, BearerToken, HealthState, HttpServerConfig, RequestLimits,
+    TransportSecurity,
+};
 use signer::{
     ChildIndex, Curve, DerivationPath, Digest, KeyLocator, KeyProvisionRequest, KeyProvisioner,
     KeyTweak, KeyTweakKind, OperationId, PublicKey, PublicKeyFormat, SignRequest, SignablePayload,
@@ -24,6 +27,7 @@ use signer_local::LocalSigner;
 use signer_remote::{
     CAPABILITIES_PATH, PROVISION_PATH, PUBLIC_KEY_PATH, READINESS_PATH, SIGN_PATH, wire,
 };
+use telemetry::{Attribute, PrometheusTelemetry, Telemetry};
 use tokio::sync::{Mutex, watch};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -44,7 +48,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Serve the authenticated v1 custody API on loopback.
+    /// Serve the mode-aware v1 custody API on loopback.
     Serve(ServeOptions),
 }
 
@@ -53,8 +57,18 @@ struct ServeOptions {
     #[arg(long, env = "CUSTODY_BIND", default_value = "127.0.0.1:8181")]
     bind: SocketAddr,
 
+    #[arg(long, env = "CUSTODY_METRICS_BIND", default_value = "127.0.0.1:9093")]
+    metrics_bind: SocketAddr,
+
+    /// `true` requires a bearer; `false` globally trusts every reachable caller.
+    #[arg(
+        long = "strict-authentication-mode",
+        env = "STRICT_AUTHENTICATION_MODE"
+    )]
+    authentication_mode: AuthenticationMode,
+
     #[arg(long, env = "CUSTODY_BEARER_TOKEN", hide_env_values = true)]
-    bearer_token: String,
+    bearer_token: Option<String>,
 
     #[arg(long, env = "CUSTODY_MAX_REQUEST_BODY_BYTES", default_value_t = 65_536)]
     max_request_body_bytes: usize,
@@ -65,9 +79,9 @@ struct ServeOptions {
 
 impl ServeOptions {
     fn server_config(&self) -> AppResult<HttpServerConfig> {
-        if !self.bind.ip().is_loopback() {
+        if !self.bind.ip().is_loopback() || !self.metrics_bind.ip().is_loopback() {
             return Err(Box::new(ConfigError(
-                "local custody may bind only to a loopback address".to_owned(),
+                "local custody API and metrics may bind only to loopback addresses".to_owned(),
             )));
         }
         if self.max_request_body_bytes == 0 || self.shutdown_grace_seconds == 0 {
@@ -75,14 +89,36 @@ impl ServeOptions {
                 "request-body and shutdown-grace limits must be greater than zero".to_owned(),
             )));
         }
-        let token = BearerToken::new(&self.bearer_token)?;
+        let token = match self.authentication_mode {
+            AuthenticationMode::Strict => Some(BearerToken::new(
+                self.bearer_token.as_deref().ok_or_else(|| {
+                    ConfigError(
+                        "CUSTODY_BEARER_TOKEN is required in strict authentication mode".to_owned(),
+                    )
+                })?,
+            )?),
+            AuthenticationMode::GlobalTrusted => None,
+        };
         let limits = RequestLimits::new(self.max_request_body_bytes, 1, 1)?;
         let config = HttpServerConfig::new(
             self.bind,
             TransportSecurity::PlaintextLoopback,
-            Some(token),
+            token,
             limits,
-        );
+        )
+        .with_authentication_mode(self.authentication_mode);
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn metrics_server_config(&self) -> AppResult<HttpServerConfig> {
+        let config = HttpServerConfig::new(
+            self.metrics_bind,
+            TransportSecurity::PlaintextLoopback,
+            None,
+            RequestLimits::new(self.max_request_body_bytes, 1, 1)?,
+        )
+        .with_authentication_mode(AuthenticationMode::GlobalTrusted);
         config.validate()?;
         Ok(config)
     }
@@ -95,6 +131,7 @@ impl ServeOptions {
 #[derive(Clone)]
 struct AppState {
     signer: Arc<LocalSigner>,
+    authentication_mode: AuthenticationMode,
     operations: Arc<Mutex<BTreeMap<String, StoredOperation>>>,
 }
 
@@ -125,8 +162,23 @@ async fn main() -> AppResult<()> {
 
 async fn serve(options: ServeOptions) -> AppResult<()> {
     let server_config = options.server_config()?;
+    let metrics_server_config = options.metrics_server_config()?;
+    let telemetry = PrometheusTelemetry::install()?;
+    telemetry.gauge(
+        "payment_sdk_strict_authentication_mode",
+        if options.authentication_mode.is_strict() {
+            1.0
+        } else {
+            0.0
+        },
+        &[Attribute {
+            key: "service".to_owned(),
+            value: "custody".to_owned(),
+        }],
+    );
     let state = AppState {
         signer: Arc::new(LocalSigner::ephemeral_for_testing()),
+        authentication_mode: options.authentication_mode,
         operations: Arc::new(Mutex::new(BTreeMap::new())),
     };
     let protected = Router::new()
@@ -138,22 +190,49 @@ async fn serve(options: ServeOptions) -> AppResult<()> {
         .with_state(state);
     let health = HealthState::new(true);
     let router = http_support::service_router(protected, &server_config, health.clone())?;
+    let metrics_router = Router::new()
+        .route("/metrics", get(metrics))
+        .with_state(telemetry);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let server = http_support::serve(router, &server_config, shutdown_signal(shutdown_rx));
-    tokio::pin!(server);
+    let api_server =
+        http_support::serve(router, &server_config, shutdown_signal(shutdown_rx.clone()));
+    let metrics_server = http_support::serve(
+        metrics_router,
+        &metrics_server_config,
+        shutdown_signal(shutdown_rx),
+    );
+    tokio::pin!(api_server);
+    tokio::pin!(metrics_server);
 
+    if options.authentication_mode == AuthenticationMode::GlobalTrusted {
+        warn!(
+            ignored_bearer_variable = "CUSTODY_BEARER_TOKEN",
+            "STRICT AUTHENTICATION IS DISABLED: every reachable custody caller is globally trusted"
+        );
+    }
     warn!("ephemeral local custody is active; all keys will be lost when this process exits");
-    info!(bind = %options.bind, "local custody is ready");
+    info!(
+        bind = %options.bind,
+        metrics_bind = %options.metrics_bind,
+        authentication_mode = %options.authentication_mode,
+        "local custody is ready"
+    );
 
     tokio::select! {
-        result = &mut server => return result.map_err(|error| Box::new(error) as AppError),
+        result = &mut api_server => return result.map_err(|error| Box::new(error) as AppError),
+        result = &mut metrics_server => return result.map_err(|error| Box::new(error) as AppError),
         result = termination_signal() => result?,
     }
 
     health.set_ready(false);
     let _ = shutdown_tx.send(true);
-    match tokio::time::timeout(options.shutdown_grace(), &mut server).await {
-        Ok(result) => result.map_err(|error| Box::new(error) as AppError),
+    let shutdown = async {
+        let (api_result, metrics_result) = tokio::join!(&mut api_server, &mut metrics_server);
+        api_result.map_err(|error| Box::new(error) as AppError)?;
+        metrics_result.map_err(|error| Box::new(error) as AppError)
+    };
+    match tokio::time::timeout(options.shutdown_grace(), shutdown).await {
+        Ok(result) => result,
         Err(_) => Err(Box::new(ConfigError(
             "local custody graceful shutdown deadline expired".to_owned(),
         ))),
@@ -163,6 +242,7 @@ async fn serve(options: ServeOptions) -> AppResult<()> {
 async fn capabilities(State(state): State<AppState>) -> Json<wire::CapabilitiesResponse> {
     let capabilities = state.signer.capabilities();
     Json(wire::CapabilitiesResponse {
+        authentication_mode: state.authentication_mode.as_str().to_owned(),
         curves: capabilities.curves.into_iter().map(curve_to_wire).collect(),
         schemes: capabilities
             .schemes
@@ -185,6 +265,7 @@ async fn capabilities(State(state): State<AppState>) -> Json<wire::CapabilitiesR
 async fn readiness(State(state): State<AppState>) -> Response {
     match state.signer.status().await {
         Ok(status) => Json(wire::ReadinessResponse {
+            authentication_mode: state.authentication_mode.as_str().to_owned(),
             status: match status {
                 SignerStatus::Available => wire::ReadinessStatus::Available,
                 SignerStatus::InteractionRequired => wire::ReadinessStatus::InteractionRequired,
@@ -194,6 +275,16 @@ async fn readiness(State(state): State<AppState>) -> Response {
         .into_response(),
         Err(error) => signer_error_response(error),
     }
+}
+
+async fn metrics(State(telemetry): State<PrometheusTelemetry>) -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        telemetry.render(),
+    )
 }
 
 async fn provision(
@@ -588,6 +679,19 @@ mod tests {
 
     use super::*;
 
+    fn serve_options(authentication_mode: AuthenticationMode) -> ServeOptions {
+        ServeOptions {
+            bind: "127.0.0.1:8181".parse().expect("test bind must parse"),
+            metrics_bind: "127.0.0.1:9093"
+                .parse()
+                .expect("test metrics bind must parse"),
+            authentication_mode,
+            bearer_token: Some("test-token".to_owned()),
+            max_request_body_bytes: 1024,
+            shutdown_grace_seconds: 1,
+        }
+    }
+
     #[test]
     fn cli_definition_is_consistent() {
         Cli::command().debug_assert();
@@ -597,17 +701,63 @@ mod tests {
     fn local_custody_rejects_non_loopback_bind() {
         let options = ServeOptions {
             bind: "0.0.0.0:8181".parse().expect("test bind must parse"),
-            bearer_token: "test-token".to_owned(),
-            max_request_body_bytes: 1024,
-            shutdown_grace_seconds: 1,
+            ..serve_options(AuthenticationMode::Strict)
         };
         assert!(options.server_config().is_err());
+    }
+
+    #[test]
+    fn local_custody_rejects_non_loopback_metrics_bind() {
+        let options = ServeOptions {
+            metrics_bind: "0.0.0.0:9093"
+                .parse()
+                .expect("test metrics bind must parse"),
+            ..serve_options(AuthenticationMode::Strict)
+        };
+        assert!(options.server_config().is_err());
+        assert!(options.metrics_server_config().is_err());
+    }
+
+    #[test]
+    fn strict_authentication_requires_a_token() {
+        let options = ServeOptions {
+            bearer_token: None,
+            ..serve_options(AuthenticationMode::Strict)
+        };
+        let error = options
+            .server_config()
+            .expect_err("strict mode without a token must fail");
+        assert!(error.to_string().contains("CUSTODY_BEARER_TOKEN"));
+    }
+
+    #[test]
+    fn global_trusted_authentication_ignores_an_optional_token() {
+        let options = ServeOptions {
+            bearer_token: Some("intentionally invalid token".to_owned()),
+            ..serve_options(AuthenticationMode::GlobalTrusted)
+        };
+        options
+            .server_config()
+            .expect("global-trusted mode must not validate an ignored token");
+    }
+
+    #[tokio::test]
+    async fn capabilities_report_the_configured_authentication_mode() {
+        let state = AppState {
+            signer: Arc::new(LocalSigner::ephemeral_for_testing()),
+            authentication_mode: AuthenticationMode::GlobalTrusted,
+            operations: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+
+        let Json(response) = capabilities(State(state)).await;
+        assert_eq!(response.authentication_mode, "global_trusted");
     }
 
     #[tokio::test]
     async fn provision_is_idempotent_and_rejects_changed_content() {
         let state = AppState {
             signer: Arc::new(LocalSigner::ephemeral_for_testing()),
+            authentication_mode: AuthenticationMode::Strict,
             operations: Arc::new(Mutex::new(BTreeMap::new())),
         };
         let request = wire::ProvisionRequest {

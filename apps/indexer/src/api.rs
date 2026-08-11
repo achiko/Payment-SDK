@@ -7,10 +7,10 @@ use std::{marker::PhantomData, str::FromStr};
 use axum::{
     Json, Router,
     extract::{
-        Path, Query, State,
+        Extension, Path, Query, State,
         rejection::{JsonRejection, QueryRejection},
     },
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
@@ -20,6 +20,7 @@ use chain_bitcoin::{
 };
 use chain_ethereum::{EthereumAddress, EthereumTransactionId, EthereumWatchTarget};
 use chain_identity::{CanonicalAddress, CanonicalTransactionId};
+use http::AuthenticationMode;
 use indexing::{
     BlockHeight, BoxFuture, EventCursor, IndexError, IndexErrorKind, IndexRepository, IndexScope,
     ObservationEvent, ObservationEventPage, ObservationEventRequest, ObservedTransaction,
@@ -29,6 +30,7 @@ use indexing::{
     UnwatchOutcome, WatchReceipt, WatchRequest, WatchSelector,
 };
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 pub trait ApiRepository: Send + Sync {
     fn status<'a>(&'a self, scope: &'a IndexScope)
@@ -308,7 +310,7 @@ pub struct ApiState {
 
 impl ApiState {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         scope: IndexScope,
         repository: Arc<dyn ApiRepository>,
         bootstrap_height: BlockHeight,
@@ -327,7 +329,7 @@ impl ApiState {
     }
 
     #[must_use]
-    pub fn new_bitcoin(
+    pub(crate) fn new_bitcoin(
         scope: IndexScope,
         network: BitcoinNetwork,
         repository: Arc<dyn ApiRepository>,
@@ -459,6 +461,7 @@ async fn method_not_allowed(State(state): State<Arc<ApiState>>) -> ApiError {
 
 async fn status(
     State(state): State<Arc<ApiState>>,
+    Extension(authentication_mode): Extension<AuthenticationMode>,
     Path(network): Path<String>,
 ) -> Result<Json<StatusDto>, ApiError> {
     state.validate_network(&network)?;
@@ -467,16 +470,18 @@ async fn status(
         .status(&state.scope)
         .await
         .map_err(|error| ApiError::from_index(error, state.request_id()))?;
-    Ok(Json(StatusDto::try_from_status(status).map_err(
-        |error| ApiError::from_index(error, state.request_id()),
-    )?))
+    Ok(Json(
+        StatusDto::try_from_status(status, authentication_mode)
+            .map_err(|error| ApiError::from_index(error, state.request_id()))?,
+    ))
 }
 
 async fn register_watch(
     State(state): State<Arc<ApiState>>,
+    Extension(authentication_mode): Extension<AuthenticationMode>,
     Path(network): Path<String>,
     body: Result<Json<CreateWatchDto>, JsonRejection>,
-) -> Result<(StatusCode, Json<WatchDto>), ApiError> {
+) -> Result<(StatusCode, HeaderMap, Json<WatchDto>), ApiError> {
     state.validate_network(&network)?;
     state.semantic_status().await?;
     let Json(body) = body.map_err(|_| {
@@ -494,13 +499,38 @@ async fn register_watch(
             state.request_id(),
         ));
     }
-    if body.idempotency_key.trim().is_empty() {
-        return Err(ApiError::bad_request(
-            "invalid_idempotency_key",
-            "watch idempotency key must not be empty",
-            state.request_id(),
-        ));
-    }
+    let (idempotency_key, generated_idempotency_key) = match body.idempotency_key {
+        Some(value) if value.trim().is_empty() => {
+            return Err(ApiError::bad_request(
+                "invalid_idempotency_key",
+                "watch idempotency key must not be empty",
+                state.request_id(),
+            ));
+        }
+        Some(value) => (value, None),
+        None if authentication_mode.is_strict() => {
+            return Err(ApiError::bad_request(
+                "invalid_idempotency_key",
+                "watch idempotency key is required in strict authentication mode",
+                state.request_id(),
+            ));
+        }
+        None => {
+            let generated = Uuid::now_v7().to_string();
+            (generated.clone(), Some(generated))
+        }
+    };
+    let generated_idempotency_header = generated_idempotency_key
+        .as_deref()
+        .map(HeaderValue::from_str)
+        .transpose()
+        .map_err(|_| {
+            ApiError::bad_request(
+                "invalid_idempotency_key",
+                "generated watch idempotency key is not a valid HTTP header value",
+                state.request_id(),
+            )
+        })?;
     let (selector, target) = parse_selector(&state, body.selector)?;
     let receipt = state
         .repository
@@ -509,19 +539,19 @@ async fn register_watch(
                 scope: state.scope.clone(),
                 selector,
                 start_height: BlockHeight(start_height),
-                idempotency_key: body.idempotency_key.clone(),
+                idempotency_key: idempotency_key.clone(),
             },
             target,
         )
         .await
         .map_err(|error| ApiError::from_index(error, state.request_id()))?;
-    Ok((
-        StatusCode::OK,
-        Json(
-            WatchDto::try_from_receipt(receipt)
-                .map_err(|error| ApiError::from_index(error, state.request_id()))?,
-        ),
-    ))
+    let watch = WatchDto::try_from_receipt(receipt, generated_idempotency_key)
+        .map_err(|error| ApiError::from_index(error, state.request_id()))?;
+    let mut headers = HeaderMap::new();
+    if let Some(header) = generated_idempotency_header {
+        headers.insert("idempotency-key", header);
+    }
+    Ok((StatusCode::OK, headers, Json(watch)))
 }
 
 async fn unwatch(
@@ -919,7 +949,7 @@ async fn events(
 struct CreateWatchDto {
     selector: SelectorDto,
     start_height: String,
-    idempotency_key: String,
+    idempotency_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1105,6 +1135,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 #[derive(Serialize)]
 struct StatusDto {
     scope: ScopeDto,
+    authentication_mode: &'static str,
     phase: &'static str,
     checkpoint: Option<BlockDto>,
     observed_tip: Option<BlockDto>,
@@ -1114,10 +1145,14 @@ struct StatusDto {
 }
 
 impl StatusDto {
-    fn try_from_status(status: SyncStatus) -> Result<Self, IndexError> {
+    fn try_from_status(
+        status: SyncStatus,
+        authentication_mode: AuthenticationMode,
+    ) -> Result<Self, IndexError> {
         let chain = status.scope.chain.clone();
         Ok(Self {
             scope: ScopeDto::from(&status.scope),
+            authentication_mode: authentication_mode.as_str(),
             phase: phase_name(status.phase),
             checkpoint: status
                 .checkpoint
@@ -1195,6 +1230,8 @@ fn encode_chain_block_hash(
 #[derive(Serialize)]
 struct WatchDto {
     id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    idempotency_key: Option<String>,
     scope: ScopeDto,
     selector: SelectorResponseDto,
     start_height: String,
@@ -1204,10 +1241,14 @@ struct WatchDto {
 }
 
 impl WatchDto {
-    fn try_from_receipt(receipt: WatchReceipt) -> Result<Self, IndexError> {
+    fn try_from_receipt(
+        receipt: WatchReceipt,
+        idempotency_key: Option<String>,
+    ) -> Result<Self, IndexError> {
         let chain = receipt.scope.chain.clone();
         Ok(Self {
             id: receipt.id.0,
+            idempotency_key,
             scope: ScopeDto::from(&receipt.scope),
             selector: SelectorResponseDto::from(receipt.selector),
             start_height: receipt.start_height.0.to_string(),
@@ -1590,6 +1631,8 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use axum::{
         body::{Body, to_bytes},
         http::Request,
@@ -1654,10 +1697,22 @@ mod tests {
 
         fn register<'a>(
             &'a self,
-            _request: WatchRequest,
+            request: WatchRequest,
             _target: ApiWatchTarget,
         ) -> BoxFuture<'a, Result<WatchReceipt, IndexError>> {
-            unexpected_call()
+            let registered_at = self.status.checkpoint.clone();
+            let confirmation_policy = self.status.confirmation_policy;
+            Box::pin(async move {
+                Ok(WatchReceipt {
+                    id: indexing::WatchId("watch-1".to_owned()),
+                    scope: request.scope,
+                    selector: request.selector,
+                    start_height: request.start_height,
+                    registered_at,
+                    inactive_from: None,
+                    confirmation_policy,
+                })
+            })
         }
 
         fn unwatch<'a>(
@@ -1770,6 +1825,14 @@ mod tests {
     }
 
     fn app(phase: SyncPhase) -> Router {
+        app_with_mode(phase, AuthenticationMode::Strict)
+    }
+
+    fn app_with_mode(phase: SyncPhase, authentication_mode: AuthenticationMode) -> Router {
+        raw_app(phase).layer(Extension(authentication_mode))
+    }
+
+    fn raw_app(phase: SyncPhase) -> Router {
         let state = Arc::new(ApiState::new(
             scope(),
             Arc::new(FakeRepository {
@@ -1779,6 +1842,22 @@ mod tests {
             http::RequestLimits::default(),
         ));
         router(state)
+    }
+
+    fn served_app(authentication_mode: AuthenticationMode) -> Router {
+        let config = http::HttpServerConfig::new(
+            SocketAddr::from(([127, 0, 0, 1], 8080)),
+            http::TransportSecurity::PlaintextLoopback,
+            Some(http::BearerToken::new("indexer-test-token").expect("test bearer must be valid")),
+            http::RequestLimits::default(),
+        )
+        .with_authentication_mode(authentication_mode);
+        http::service_router(
+            raw_app(SyncPhase::Ready),
+            &config,
+            http::HealthState::new(true),
+        )
+        .expect("test service router must be valid")
     }
 
     fn bitcoin_app() -> Router {
@@ -1797,7 +1876,7 @@ mod tests {
             BlockHeight(0),
             http::RequestLimits::default(),
         ));
-        bitcoin_router(state)
+        bitcoin_router(state).layer(Extension(AuthenticationMode::Strict))
     }
 
     async fn response_json(response: Response) -> Value {
@@ -1833,6 +1912,149 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body["checkpoint"]["height"], "42");
         assert_eq!(body["confirmation_depth"], "12");
+        assert_eq!(body["authentication_mode"], "strict");
+    }
+
+    #[tokio::test]
+    async fn status_reports_global_trusted_authentication_mode() {
+        let response = app_with_mode(SyncPhase::Ready, AuthenticationMode::GlobalTrusted)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/scopes/ethereum/test/status")
+                    .body(Body::empty())
+                    .expect("test request must build"),
+            )
+            .await
+            .expect("router must respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await["authentication_mode"],
+            "global_trusted"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_requires_bearer_on_loopback_while_global_trusted_ignores_it() {
+        let strict = served_app(AuthenticationMode::Strict);
+        let unauthorized = strict
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/scopes/ethereum/test/status")
+                    .body(Body::empty())
+                    .expect("test request must build"),
+            )
+            .await
+            .expect("router must respond");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = strict
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/scopes/ethereum/test/status")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        "Bearer indexer-test-token",
+                    )
+                    .body(Body::empty())
+                    .expect("test request must build"),
+            )
+            .await
+            .expect("router must respond");
+        assert_eq!(authorized.status(), StatusCode::OK);
+
+        let global = served_app(AuthenticationMode::GlobalTrusted)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/scopes/ethereum/test/status")
+                    .body(Body::empty())
+                    .expect("test request must build"),
+            )
+            .await
+            .expect("router must respond");
+        assert_eq!(global.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn strict_watch_registration_requires_idempotency_without_changing_its_response() {
+        let application = app(SyncPhase::Ready);
+        let response = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/scopes/ethereum/test/watches")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"selector":{{"type":"address","value":"0x{}"}},"start_height":"42"}}"#,
+                        "11".repeat(20)
+                    )))
+                    .expect("test request must build"),
+            )
+            .await
+            .expect("router must respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await["code"],
+            "invalid_idempotency_key"
+        );
+
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/scopes/ethereum/test/watches")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"selector":{{"type":"address","value":"0x{}"}},"start_height":"42","idempotency_key":"deposit-1"}}"#,
+                        "11".repeat(20)
+                    )))
+                    .expect("test request must build"),
+            )
+            .await
+            .expect("router must respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("idempotency-key").is_none());
+        assert!(
+            response_json(response)
+                .await
+                .get("idempotency_key")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn global_trusted_watch_generates_and_returns_uuid_v7_idempotency() {
+        let response = app_with_mode(SyncPhase::Ready, AuthenticationMode::GlobalTrusted)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/scopes/ethereum/test/watches")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"selector":{{"type":"address","value":"0x{}"}},"start_height":"42"}}"#,
+                        "11".repeat(20)
+                    )))
+                    .expect("test request must build"),
+            )
+            .await
+            .expect("router must respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let header = response
+            .headers()
+            .get("idempotency-key")
+            .expect("watch response must include its effective idempotency key")
+            .to_str()
+            .expect("generated idempotency key must be a visible header value")
+            .to_owned();
+        let generated = Uuid::parse_str(&header).expect("generated key must be a UUID");
+        assert_eq!(generated.get_version_num(), 7);
+        let body = response_json(response).await;
+        assert_eq!(body["id"], "watch-1");
+        assert_eq!(body["idempotency_key"], header);
     }
 
     #[tokio::test]

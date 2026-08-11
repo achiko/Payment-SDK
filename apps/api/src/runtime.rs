@@ -19,26 +19,29 @@ use deposits::{
     JobPayload, JobState, JobStore, LedgerEffect, LedgerObservationTransition,
     MigratePaymentDatabase, MirrorObservation, MirrorOutcome, MirroredObservation,
     ObservationConsumerCheckpoints, ObservationEventLog, ObservationLogRequest,
-    PaymentDatabaseMetadataStore, PersistentPaymentRepository, ProjectObservation,
-    ProjectionFeeTreatment, ReconciliationCase, ReconciliationCaseId, ReconciliationReason,
-    ReconciliationState, ReconciliationStore, RecordObservation, RegisterDeposit,
-    ReleaseCollectionReservation, ReorgCollectionLeg, ReservationReleaseReason,
+    PaymentDatabaseMetadataStore, PersistentPaymentRepository, PrincipalScopeMode,
+    ProjectObservation, ProjectionFeeTreatment, ReconciliationCase, ReconciliationCaseId,
+    ReconciliationReason, ReconciliationState, ReconciliationStore, RecordObservation,
+    RegisterDeposit, ReleaseCollectionReservation, ReorgCollectionLeg, ReservationReleaseReason,
     SafeCollectionError, TransitionJob, UtxoBatchProjectionMutation, UtxoBatchProjectionTransition,
     apply_observation_transition,
 };
-use http_support::{BearerToken, HealthState, HttpServerConfig, RequestLimits, TransportSecurity};
+use http_support::{
+    AuthenticationMode, BearerToken, HealthState, HttpServerConfig, RequestLimits,
+    TransportSecurity,
+};
 use indexing::{
     EventCursor, IndexError, IndexScope, MovementId, MovementKind, SyncPhase, SyncStatus,
     TransactionStatus,
 };
 use storage_rocksdb::RocksDbStorage;
-use telemetry::PrometheusTelemetry;
+use telemetry::{Attribute, PrometheusTelemetry, Telemetry};
 use tokio::{sync::watch, task::JoinSet, time::MissedTickBehavior};
 
 use crate::{
     active_policy::ActivePaymentPolicy,
     api::{self, ApiState},
-    auth::Credentials,
+    auth::{Authorizer, Credentials},
     bitcoin_collection_executor,
     bitcoin_policy::BitcoinPaymentPolicy,
     bitcoin_wallet_client::BitcoinWalletClient,
@@ -57,6 +60,74 @@ type Repository = PersistentPaymentRepository<RocksDbStorage>;
 const JOB_LEASE_DURATION: Duration = Duration::from_secs(5 * 60);
 const MAX_JOB_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 const MIGRATION_PAGE_SIZE: usize = 1_000;
+
+const fn principal_scope_mode(authentication_mode: AuthenticationMode) -> PrincipalScopeMode {
+    match authentication_mode {
+        AuthenticationMode::Strict => PrincipalScopeMode::RoleScoped,
+        AuthenticationMode::GlobalTrusted => PrincipalScopeMode::GlobalTrusted,
+    }
+}
+
+fn authorizer(options: &ServeOptions) -> Result<Arc<Authorizer>, RuntimeError> {
+    match options.authentication.mode {
+        AuthenticationMode::Strict => {
+            let ordinary = options.ordinary_bearer_token.as_ref().ok_or_else(|| {
+                RuntimeError::configuration(
+                    "strict authentication requires an ordinary bearer token",
+                )
+            })?;
+            let administrator = options.admin_bearer_token.as_ref().ok_or_else(|| {
+                RuntimeError::configuration(
+                    "strict authentication requires an administrator bearer token",
+                )
+            })?;
+            Ok(Arc::new(Authorizer::strict(Credentials::new(
+                BearerToken::new(ordinary.expose()).map_err(RuntimeError::configuration)?,
+                BearerToken::new(administrator.expose()).map_err(RuntimeError::configuration)?,
+            ))))
+        }
+        AuthenticationMode::GlobalTrusted => Ok(Arc::new(Authorizer::global_trusted())),
+    }
+}
+
+fn report_authentication_mode(options: &ServeOptions) {
+    let mode = options.authentication.mode;
+    tracing::info!(
+        authentication_mode = mode.as_str(),
+        "Payment Service authentication mode selected"
+    );
+    if mode == AuthenticationMode::GlobalTrusted {
+        let mut ignored = Vec::new();
+        if options.ordinary_bearer_token.is_some() {
+            ignored.push("PS_API_BEARER_TOKEN");
+        }
+        if options.admin_bearer_token.is_some() {
+            ignored.push("PS_ADMIN_BEARER_TOKEN");
+        }
+        if options.wallet.bearer_token.is_some() {
+            ignored.push("PS_WALLET_BEARER_TOKEN");
+        }
+        if options.indexer.bearer_token.is_some() {
+            ignored.push("PS_INDEXER_BEARER_TOKEN");
+        }
+        tracing::warn!(
+            authentication_mode = mode.as_str(),
+            ignored_bearer_variables = ignored.join(","),
+            "GLOBAL-TRUSTED AUTHENTICATION MODE: every caller with network access has ordinary and administrator authority"
+        );
+    }
+}
+
+fn record_authentication_mode_metric(telemetry: &dyn Telemetry, mode: AuthenticationMode) {
+    telemetry.gauge(
+        "payment_sdk_strict_authentication_mode",
+        if mode.is_strict() { 1.0 } else { 0.0 },
+        &[Attribute {
+            key: "service".to_owned(),
+            value: "payment-service".to_owned(),
+        }],
+    );
+}
 
 pub async fn backup(options: BackupOptions) -> Result<(), RuntimeError> {
     options.validate().map_err(RuntimeError::configuration)?;
@@ -93,12 +164,15 @@ pub async fn migrate(options: MigrationOptions) -> Result<(), RuntimeError> {
     let storage = RocksDbStorage::open(&options.database.database_path)?;
     let repository = PersistentPaymentRepository::new(storage);
     let report = repository
-        .migrate_and_bind(MigratePaymentDatabase {
-            scope: policy.scope.clone(),
-            active_policy: policy.identity(),
-            migrated_at: unix_timestamp()?,
-            page_size: MIGRATION_PAGE_SIZE,
-        })
+        .migrate_and_bind_principal_scope(
+            MigratePaymentDatabase {
+                scope: policy.scope.clone(),
+                active_policy: policy.identity(),
+                migrated_at: unix_timestamp()?,
+                page_size: MIGRATION_PAGE_SIZE,
+            },
+            principal_scope_mode(options.authentication.mode),
+        )
         .await?;
     tracing::info!(
         previous_schema = ?report.previous_domain_schema_version,
@@ -142,12 +216,15 @@ pub async fn migrate_bitcoin(options: MigrationOptions) -> Result<(), RuntimeErr
     let scope = policy.scope.clone();
     let active_policy = policy.identity();
     let report = repository
-        .migrate_and_bind(MigratePaymentDatabase {
-            scope,
-            active_policy,
-            migrated_at: unix_timestamp()?,
-            page_size: MIGRATION_PAGE_SIZE,
-        })
+        .migrate_and_bind_principal_scope(
+            MigratePaymentDatabase {
+                scope,
+                active_policy,
+                migrated_at: unix_timestamp()?,
+                page_size: MIGRATION_PAGE_SIZE,
+            },
+            principal_scope_mode(options.authentication.mode),
+        )
         .await?;
     tracing::info!(
         previous_schema = ?report.previous_domain_schema_version,
@@ -168,6 +245,7 @@ pub async fn migrate_bitcoin(options: MigrationOptions) -> Result<(), RuntimeErr
 
 pub async fn serve(options: ServeOptions) -> Result<(), RuntimeError> {
     options.validate().map_err(RuntimeError::configuration)?;
+    report_authentication_mode(&options);
     let policy = Arc::new(PaymentPolicy::load(&options.policy_path).map_err(|error| {
         RuntimeError::configuration(format!(
             "failed to load Payment Service policy ({:?}): {error}",
@@ -180,37 +258,48 @@ pub async fn serve(options: ServeOptions) -> Result<(), RuntimeError> {
         ));
     }
 
+    // Negotiate dependency modes before any durable bind, public listener, or
+    // effectful worker. Client construction and readiness are read-only.
+    let indexer = Arc::new(IndexerClient::new(
+        &options.indexer,
+        options.authentication.mode,
+    )?);
+    let wallet = Arc::new(WalletClient::new(
+        &options.wallet,
+        options.authentication.mode,
+    )?);
+    let (indexer_mode_probe, wallet_mode_probe) =
+        tokio::join!(indexer.readiness(), wallet.readiness());
+    let _indexer_ready = indexer_mode_probe?;
+    let _wallet_ready = wallet_mode_probe?;
+
     let storage = RocksDbStorage::open(&options.database.database_path)?;
     let repository = PersistentPaymentRepository::new(storage);
     repository
-        .initialize_or_validate(InitializePaymentDatabase {
-            scope: policy.scope.clone(),
-            active_policy: policy.identity(),
-            initialized_at: unix_timestamp()?,
-        })
+        .initialize_or_validate_principal_scope(
+            InitializePaymentDatabase {
+                scope: policy.scope.clone(),
+                active_policy: policy.identity(),
+                initialized_at: unix_timestamp()?,
+            },
+            principal_scope_mode(options.authentication.mode),
+        )
         .await?;
-    // Validate both dependency clients before opening public listeners. Their
-    // constructors perform no live transaction or signing operation.
-    let indexer = Arc::new(IndexerClient::new(&options.indexer)?);
-    let wallet = Arc::new(WalletClient::new(&options.wallet)?);
 
-    let credentials = Arc::new(Credentials::new(
-        BearerToken::new(options.ordinary_bearer_token.expose())
-            .map_err(RuntimeError::configuration)?,
-        BearerToken::new(options.admin_bearer_token.expose())
-            .map_err(RuntimeError::configuration)?,
-    ));
+    let authorizer = authorizer(&options)?;
     let health = HealthState::new(false);
     let indexer_health = HealthState::new(false);
     let wallet_health = HealthState::new(false);
     let limits = RequestLimits::default();
     let api_policy = Arc::new(ActivePaymentPolicy::Ethereum(policy.as_ref().clone()));
     let api_state = Arc::new(
-        ApiState::new(repository.clone(), api_policy, limits.clone()).with_runtime_health(
-            health.clone(),
-            indexer_health.clone(),
-            wallet_health.clone(),
-        ),
+        ApiState::new(repository.clone(), api_policy, limits.clone())
+            .with_authentication_mode(options.authentication.mode)
+            .with_runtime_health(
+                health.clone(),
+                indexer_health.clone(),
+                wallet_health.clone(),
+            ),
     );
     let security = if options.http_bind.ip().is_loopback() {
         TransportSecurity::PlaintextLoopback
@@ -218,9 +307,10 @@ pub async fn serve(options: ServeOptions) -> Result<(), RuntimeError> {
         TransportSecurity::TlsTerminatedUpstream
     };
     let server_config = HttpServerConfig::new(options.http_bind, security, None, limits)
+        .with_authentication_mode(options.authentication.mode)
         .with_custom_authentication();
     let application_router = http_support::service_router(
-        api::router(api_state, credentials),
+        api::router(api_state, authorizer),
         &server_config,
         health.clone(),
     )
@@ -228,12 +318,14 @@ pub async fn serve(options: ServeOptions) -> Result<(), RuntimeError> {
 
     let telemetry = PrometheusTelemetry::install()
         .map_err(|error| RuntimeError::invariant(error.to_string()))?;
+    record_authentication_mode_metric(&telemetry, options.authentication.mode);
     let metrics_config = HttpServerConfig::new(
         options.metrics_bind,
         TransportSecurity::PlaintextLoopback,
         None,
         RequestLimits::default(),
-    );
+    )
+    .with_authentication_mode(AuthenticationMode::GlobalTrusted);
     let metrics_router = Router::new()
         .route("/metrics", get(metrics))
         .with_state(telemetry);
@@ -423,6 +515,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), RuntimeError> {
 pub async fn serve_bitcoin(options: BitcoinServeOptions) -> Result<(), RuntimeError> {
     options.validate().map_err(RuntimeError::configuration)?;
     let options = options.common;
+    report_authentication_mode(&options);
     let policy = Arc::new(
         BitcoinPaymentPolicy::load(&options.policy_path).map_err(|error| {
             RuntimeError::configuration(format!(
@@ -437,41 +530,50 @@ pub async fn serve_bitcoin(options: BitcoinServeOptions) -> Result<(), RuntimeEr
         ));
     }
 
-    let storage = RocksDbStorage::open(&options.database.database_path)?;
-    let repository = PersistentPaymentRepository::new(storage);
-    repository
-        .initialize_or_validate(InitializePaymentDatabase {
-            scope: policy.scope.clone(),
-            active_policy: policy.identity(),
-            initialized_at: unix_timestamp()?,
-        })
-        .await?;
-    // Client construction validates transport and request bounds, but never
-    // generates a key, signs a transaction, or contacts Bitcoin Core.
-    let indexer = Arc::new(IndexerClient::new(&options.indexer)?);
+    // Negotiate dependency modes before any durable bind, public listener, or
+    // effectful worker. Client construction and readiness are read-only.
+    let indexer = Arc::new(IndexerClient::new(
+        &options.indexer,
+        options.authentication.mode,
+    )?);
     let wallet = Arc::new(BitcoinWalletClient::new(
         &options.wallet,
+        options.authentication.mode,
         policy.network,
         policy.deposit_address_kind,
     )?);
+    let (indexer_mode_probe, wallet_mode_probe) =
+        tokio::join!(indexer.readiness(), wallet.readiness());
+    let _indexer_ready = indexer_mode_probe?;
+    let _wallet_ready = wallet_mode_probe?;
 
-    let credentials = Arc::new(Credentials::new(
-        BearerToken::new(options.ordinary_bearer_token.expose())
-            .map_err(RuntimeError::configuration)?,
-        BearerToken::new(options.admin_bearer_token.expose())
-            .map_err(RuntimeError::configuration)?,
-    ));
+    let storage = RocksDbStorage::open(&options.database.database_path)?;
+    let repository = PersistentPaymentRepository::new(storage);
+    repository
+        .initialize_or_validate_principal_scope(
+            InitializePaymentDatabase {
+                scope: policy.scope.clone(),
+                active_policy: policy.identity(),
+                initialized_at: unix_timestamp()?,
+            },
+            principal_scope_mode(options.authentication.mode),
+        )
+        .await?;
+
+    let authorizer = authorizer(&options)?;
     let health = HealthState::new(false);
     let indexer_health = HealthState::new(false);
     let wallet_health = HealthState::new(false);
     let limits = RequestLimits::default();
     let api_policy = Arc::new(ActivePaymentPolicy::Bitcoin(policy.as_ref().clone()));
     let api_state = Arc::new(
-        ApiState::new(repository.clone(), api_policy, limits.clone()).with_runtime_health(
-            health.clone(),
-            indexer_health.clone(),
-            wallet_health.clone(),
-        ),
+        ApiState::new(repository.clone(), api_policy, limits.clone())
+            .with_authentication_mode(options.authentication.mode)
+            .with_runtime_health(
+                health.clone(),
+                indexer_health.clone(),
+                wallet_health.clone(),
+            ),
     );
     let security = if options.http_bind.ip().is_loopback() {
         TransportSecurity::PlaintextLoopback
@@ -479,9 +581,10 @@ pub async fn serve_bitcoin(options: BitcoinServeOptions) -> Result<(), RuntimeEr
         TransportSecurity::TlsTerminatedUpstream
     };
     let server_config = HttpServerConfig::new(options.http_bind, security, None, limits)
+        .with_authentication_mode(options.authentication.mode)
         .with_custom_authentication();
     let application_router = http_support::service_router(
-        api::router(api_state, credentials),
+        api::router(api_state, authorizer),
         &server_config,
         health.clone(),
     )
@@ -489,12 +592,14 @@ pub async fn serve_bitcoin(options: BitcoinServeOptions) -> Result<(), RuntimeEr
 
     let telemetry = PrometheusTelemetry::install()
         .map_err(|error| RuntimeError::invariant(error.to_string()))?;
+    record_authentication_mode_metric(&telemetry, options.authentication.mode);
     let metrics_config = HttpServerConfig::new(
         options.metrics_bind,
         TransportSecurity::PlaintextLoopback,
         None,
         RequestLimits::default(),
-    );
+    )
+    .with_authentication_mode(AuthenticationMode::GlobalTrusted);
     let metrics_router = Router::new()
         .route("/metrics", get(metrics))
         .with_state(telemetry);
@@ -1280,11 +1385,15 @@ async fn run_readiness_worker(
             }
             _ = ticker.tick() => {}
         }
-        let (indexer_status, wallet_ready) =
-            tokio::join!(indexer.status(&scope), wallet.readiness());
-        let indexer_ready = indexer_status
-            .as_ref()
-            .is_ok_and(|status| status.scope == scope && status.phase == SyncPhase::Ready);
+        let (indexer_status, indexer_transport_ready, wallet_ready) = tokio::join!(
+            indexer.status(&scope),
+            indexer.readiness(),
+            wallet.readiness()
+        );
+        let indexer_ready = indexer_transport_ready.as_ref().is_ok_and(|ready| *ready)
+            && indexer_status
+                .as_ref()
+                .is_ok_and(|status| status.scope == scope && status.phase == SyncPhase::Ready);
         let wallet_is_ready = wallet_ready.as_ref().is_ok_and(|ready| *ready);
         indexer_health.set_ready(indexer_ready);
         wallet_health.set_ready(wallet_is_ready);
@@ -1336,11 +1445,15 @@ async fn run_bitcoin_readiness_worker(
             }
             _ = ticker.tick() => {}
         }
-        let (indexer_status, wallet_ready) =
-            tokio::join!(indexer.status(&scope), wallet.readiness());
-        let indexer_ready = indexer_status
-            .as_ref()
-            .is_ok_and(|status| bitcoin_indexer_is_ready(status, &scope));
+        let (indexer_status, indexer_transport_ready, wallet_ready) = tokio::join!(
+            indexer.status(&scope),
+            indexer.readiness(),
+            wallet.readiness()
+        );
+        let indexer_ready = indexer_transport_ready.as_ref().is_ok_and(|ready| *ready)
+            && indexer_status
+                .as_ref()
+                .is_ok_and(|status| bitcoin_indexer_is_ready(status, &scope));
         let wallet_is_ready = wallet_ready.as_ref().is_ok_and(|ready| *ready);
         indexer_health.set_ready(indexer_ready);
         wallet_health.set_ready(wallet_is_ready);
@@ -2373,7 +2486,7 @@ pub async fn reconcile_watches(
 pub async fn reconcile_bitcoin_watches(
     options: &ReconcileOptions,
 ) -> Result<ReconcileReport, RuntimeError> {
-    let scope = validated_bitcoin_indexer_scope(&options.indexer)?;
+    let scope = validated_bitcoin_indexer_scope(&options.indexer, options.authentication.mode)?;
     reconcile_watches_for_scope(options, scope).await
 }
 
@@ -2384,7 +2497,9 @@ async fn reconcile_watches_for_scope(
     options.validate().map_err(RuntimeError::configuration)?;
     let storage = RocksDbStorage::open(&options.database.database_path)?;
     let repository = PersistentPaymentRepository::new(storage);
-    let client = IndexerClient::new(&options.indexer)?;
+    validate_maintenance_database(&repository, &scope, options.authentication.mode).await?;
+    let client = IndexerClient::new(&options.indexer, options.authentication.mode)?;
+    let _ready = client.readiness().await?;
     let no_address_generation = DisabledAddressGeneration;
     let coordinator =
         DepositWatchCoordinator::new(&repository, &client, &no_address_generation, scope);
@@ -2424,7 +2539,7 @@ pub async fn ingest_events(options: &IngestOptions) -> Result<IngestionReport, R
 pub async fn ingest_bitcoin_events(
     options: &IngestOptions,
 ) -> Result<IngestionReport, RuntimeError> {
-    let scope = validated_bitcoin_indexer_scope(&options.indexer)?;
+    let scope = validated_bitcoin_indexer_scope(&options.indexer, options.authentication.mode)?;
     ingest_events_for_scope(options, scope).await
 }
 
@@ -2435,7 +2550,9 @@ async fn ingest_events_for_scope(
     options.validate().map_err(RuntimeError::configuration)?;
     let storage = RocksDbStorage::open(&options.database.database_path)?;
     let repository = PersistentPaymentRepository::new(storage);
-    let client = IndexerClient::new(&options.indexer)?;
+    validate_maintenance_database(&repository, &scope, options.authentication.mode).await?;
+    let client = IndexerClient::new(&options.indexer, options.authentication.mode)?;
+    let _ready = client.readiness().await?;
     let checkpoint = repository
         .consumer_checkpoint(ConsumerCheckpointName::IxIngestion)
         .await?;
@@ -2524,6 +2641,29 @@ async fn ingest_events_for_scope(
     Ok(report)
 }
 
+async fn validate_maintenance_database(
+    repository: &Repository,
+    scope: &IndexScope,
+    authentication_mode: AuthenticationMode,
+) -> Result<(), RuntimeError> {
+    let metadata = repository.database_metadata().await?.ok_or_else(|| {
+        RuntimeError::configuration(
+            "Payment Service maintenance requires explicitly bound database metadata",
+        )
+    })?;
+    if metadata.scope != *scope {
+        return Err(RuntimeError::configuration(
+            "Payment Service database scope does not match the maintenance command",
+        ));
+    }
+    if metadata.principal_scope_mode != principal_scope_mode(authentication_mode) {
+        return Err(RuntimeError::configuration(
+            "Payment Service database principal-scope mode does not match the selected authentication mode",
+        ));
+    }
+    Ok(())
+}
+
 /// Projection intentionally remains separate: classifying mirrored IX facts
 /// requires PS deposit/collection/accounting policy that this maintenance
 /// runtime is not configured to invent. This command exposes the independent
@@ -2581,8 +2721,11 @@ fn bitcoin_scope(network: &str) -> Result<IndexScope, RuntimeError> {
     })
 }
 
-fn validated_bitcoin_indexer_scope(indexer: &IndexerOptions) -> Result<IndexScope, RuntimeError> {
-    if indexer.bearer_token.is_none() {
+fn validated_bitcoin_indexer_scope(
+    indexer: &IndexerOptions,
+    authentication_mode: AuthenticationMode,
+) -> Result<IndexScope, RuntimeError> {
+    if authentication_mode.is_strict() && indexer.bearer_token.is_none() {
         return Err(RuntimeError::configuration(
             "Bitcoin Indexer Service authentication is required even on loopback",
         ));
@@ -2667,7 +2810,7 @@ impl From<IndexError> for RuntimeError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::Mutex};
 
     use axum::{Json, Router, extract::Query, http::StatusCode, routing::get};
     use chain_identity::{CanonicalAddress, CanonicalTransactionId};
@@ -2692,7 +2835,27 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
-    use crate::config::{BearerSecret, DatabaseOptions, IndexerOptions};
+    use crate::config::{
+        AuthenticationOptions, BearerSecret, DatabaseOptions, IndexerOptions, WalletOptions,
+    };
+
+    #[derive(Default)]
+    struct RecordingTelemetry {
+        gauges: Mutex<Vec<(&'static str, f64, Vec<Attribute>)>>,
+    }
+
+    impl Telemetry for RecordingTelemetry {
+        fn count(&self, _name: &'static str, _value: u64, _attributes: &[Attribute]) {}
+
+        fn gauge(&self, name: &'static str, value: f64, attributes: &[Attribute]) {
+            self.gauges
+                .lock()
+                .expect("recording telemetry lock must be healthy")
+                .push((name, value, attributes.to_vec()));
+        }
+
+        fn duration(&self, _name: &'static str, _value: Duration, _attributes: &[Attribute]) {}
+    }
 
     async fn spawn(router: Router) -> String {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -2720,12 +2883,141 @@ mod tests {
     }
 
     #[test]
+    fn authentication_mode_metric_is_persistent_and_service_scoped() {
+        let telemetry = RecordingTelemetry::default();
+        record_authentication_mode_metric(&telemetry, AuthenticationMode::Strict);
+        record_authentication_mode_metric(&telemetry, AuthenticationMode::GlobalTrusted);
+
+        assert_eq!(
+            *telemetry
+                .gauges
+                .lock()
+                .expect("recording telemetry lock must be healthy"),
+            vec![
+                (
+                    "payment_sdk_strict_authentication_mode",
+                    1.0,
+                    vec![Attribute {
+                        key: "service".to_owned(),
+                        value: "payment-service".to_owned(),
+                    }],
+                ),
+                (
+                    "payment_sdk_strict_authentication_mode",
+                    0.0,
+                    vec![Attribute {
+                        key: "service".to_owned(),
+                        value: "payment-service".to_owned(),
+                    }],
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn dependency_mode_mismatch_does_not_bind_a_new_database()
+    -> Result<(), Box<dyn std::error::Error>> {
+        async fn global_readiness() -> (StatusCode, Json<Value>) {
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "ready",
+                    "authentication_mode": "global_trusted"
+                })),
+            )
+        }
+
+        let endpoint = spawn(Router::new().route("/health/ready", get(global_readiness))).await;
+        let directory = TempDir::new()?;
+        let policy_path = directory.path().join("policy.json");
+        std::fs::write(
+            &policy_path,
+            br#"{
+                "version": 1,
+                "scope": {"chain": "ethereum", "network": "test", "chain_id": 1},
+                "deposit_ttl_seconds": 3600,
+                "assets": [{
+                    "asset": "native",
+                    "master_destination": "0x1111111111111111111111111111111111111111",
+                    "minimum_collection_amount": "1000"
+                }],
+                "fees": {
+                    "max_fee_per_gas": "100",
+                    "max_priority_fee_per_gas": "10",
+                    "max_gas_limit": 200000,
+                    "max_total_fee": "20000000"
+                },
+                "gas_funder": {
+                    "address": "0x4444444444444444444444444444444444444444",
+                    "key_locator": "test:gas-funder",
+                    "maximum_funding_amount": "5000000"
+                }
+            }"#,
+        )?;
+        let database_path = directory.path().join("payment-service");
+        let token = || "test-secret".parse::<BearerSecret>().expect("test token");
+        let options = ServeOptions {
+            authentication: AuthenticationOptions {
+                mode: AuthenticationMode::Strict,
+            },
+            database: DatabaseOptions {
+                database_path: database_path.clone(),
+            },
+            indexer: IndexerOptions {
+                indexer_url: endpoint.parse()?,
+                network: "test".to_owned(),
+                bearer_token: Some(token()),
+                request_timeout_seconds: 2,
+                retry_attempts: 1,
+                retry_initial_millis: 0,
+                retry_max_millis: 0,
+            },
+            wallet: WalletOptions {
+                wallet_url: endpoint.parse()?,
+                bearer_token: Some(token()),
+                request_timeout_seconds: 2,
+                retry_attempts: 1,
+                retry_initial_millis: 0,
+                retry_max_millis: 0,
+            },
+            policy_path,
+            http_bind: "127.0.0.1:0".parse()?,
+            metrics_bind: "127.0.0.1:0".parse()?,
+            tls_terminated_upstream: false,
+            ordinary_bearer_token: Some("ordinary-secret".parse()?),
+            admin_bearer_token: Some("admin-secret".parse()?),
+            worker_interval_millis: 1_000,
+            worker_page_size: 100,
+            shutdown_grace_seconds: 10,
+        };
+
+        let error = serve(options)
+            .await
+            .expect_err("strict PS must reject global-trusted dependencies");
+        assert!(error.to_string().contains("does not match"));
+        assert!(
+            !database_path.exists(),
+            "dependency mismatch must fail before creating or binding the database"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn bitcoin_maintenance_requires_authentication_and_a_canonical_network() {
         let mut options = indexer("http://127.0.0.1:8080".to_owned());
         options.network = "regtest".to_owned();
-        let missing = validated_bitcoin_indexer_scope(&options)
+        let missing = validated_bitcoin_indexer_scope(&options, AuthenticationMode::Strict)
             .expect_err("Bitcoin maintenance must reject an unauthenticated IX");
         assert!(missing.to_string().contains("authentication is required"));
+
+        assert_eq!(
+            validated_bitcoin_indexer_scope(&options, AuthenticationMode::GlobalTrusted)
+                .expect("global-trusted maintenance does not send a bearer"),
+            IndexScope {
+                chain: ChainId("bitcoin".to_owned()),
+                network: "regtest".to_owned(),
+            }
+        );
 
         options.bearer_token = Some(
             "opaque-bitcoin-ix-token"
@@ -2733,7 +3025,7 @@ mod tests {
                 .expect("test token is valid"),
         );
         assert_eq!(
-            validated_bitcoin_indexer_scope(&options)
+            validated_bitcoin_indexer_scope(&options, AuthenticationMode::Strict)
                 .expect("authenticated canonical Bitcoin scope is valid"),
             IndexScope {
                 chain: ChainId("bitcoin".to_owned()),
@@ -2741,7 +3033,7 @@ mod tests {
             }
         );
         options.network = "testnet".to_owned();
-        let noncanonical = validated_bitcoin_indexer_scope(&options)
+        let noncanonical = validated_bitcoin_indexer_scope(&options, AuthenticationMode::Strict)
             .expect_err("Bitcoin maintenance must reject ambiguous network aliases");
         assert!(noncanonical.to_string().contains("testnet3"));
     }
@@ -3367,9 +3659,27 @@ mod tests {
             )
         }
 
-        let endpoint = spawn(Router::new().route("/v1/events", get(events))).await;
+        async fn readiness() -> (StatusCode, Json<Value>) {
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "ready",
+                    "authentication_mode": "global_trusted"
+                })),
+            )
+        }
+
+        let endpoint = spawn(
+            Router::new()
+                .route("/health/ready", get(readiness))
+                .route("/v1/events", get(events)),
+        )
+        .await;
         let directory = TempDir::new()?;
         let options = IngestOptions {
+            authentication: crate::config::AuthenticationOptions {
+                mode: AuthenticationMode::GlobalTrusted,
+            },
             database: DatabaseOptions {
                 database_path: directory.path().join("payment-service"),
             },
@@ -3377,6 +3687,23 @@ mod tests {
             page_size: 10,
             max_pages: 2,
         };
+        let repository = PersistentPaymentRepository::new(RocksDbStorage::open(
+            &options.database.database_path,
+        )?);
+        repository
+            .initialize_or_validate_principal_scope(
+                InitializePaymentDatabase {
+                    scope: ethereum_scope("test"),
+                    active_policy: deposits::PolicyIdentity {
+                        version: "test-policy".to_owned(),
+                        digest: [7; 32],
+                    },
+                    initialized_at: 1,
+                },
+                PrincipalScopeMode::GlobalTrusted,
+            )
+            .await?;
+        drop(repository);
 
         let first = ingest_events(&options).await?;
         assert_eq!(first.appended, 1);

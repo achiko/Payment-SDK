@@ -3,10 +3,18 @@ use indexing::IndexScope;
 use crate::{BoxFuture, DepositError};
 
 pub const PAYMENT_SERVICE_OWNER: &str = "payment-service";
-/// Version 3 adds multi-participant collection records plus exact active
-/// spend-resource ownership indexes. Older bound stores require explicit
-/// semantic migration before the normal runtime may open them.
-pub const PAYMENT_DOMAIN_SCHEMA_VERSION: u16 = 3;
+/// Version 4 binds the durable principal-scope model used for ownership and
+/// idempotency. Older bound stores require explicit semantic migration before
+/// the normal runtime may open them.
+pub const PAYMENT_DOMAIN_SCHEMA_VERSION: u16 = 4;
+
+/// Durable authorization-independent model for principal ownership and
+/// idempotency scopes. HTTP authentication types must not cross this boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrincipalScopeMode {
+    RoleScoped,
+    GlobalTrusted,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyIdentity {
@@ -22,6 +30,7 @@ pub struct PaymentDatabaseMetadata {
     pub domain_schema_version: u16,
     pub scope: IndexScope,
     pub active_policy: PolicyIdentity,
+    pub principal_scope_mode: PrincipalScopeMode,
     pub initialized_at: u64,
 }
 
@@ -68,6 +77,16 @@ pub trait PaymentDatabaseMetadataStore: Send + Sync {
     fn initialize_or_validate<'a>(
         &'a self,
         command: InitializePaymentDatabase,
+    ) -> BoxFuture<'a, Result<PaymentDatabaseMetadata, DepositError>> {
+        self.initialize_or_validate_principal_scope(command, PrincipalScopeMode::RoleScoped)
+    }
+
+    /// Initializes or validates a database against the explicitly selected
+    /// durable principal-scope model.
+    fn initialize_or_validate_principal_scope<'a>(
+        &'a self,
+        command: InitializePaymentDatabase,
+        principal_scope_mode: PrincipalScopeMode,
     ) -> BoxFuture<'a, Result<PaymentDatabaseMetadata, DepositError>>;
 
     fn database_metadata(
@@ -81,5 +100,17 @@ pub trait PaymentDatabaseMetadataStore: Send + Sync {
     fn migrate_and_bind<'a>(
         &'a self,
         command: MigratePaymentDatabase,
+    ) -> BoxFuture<'a, Result<PaymentDatabaseMigrationReport, DepositError>> {
+        self.migrate_and_bind_principal_scope(command, PrincipalScopeMode::RoleScoped)
+    }
+
+    /// Performs explicit semantic migration while binding the selected
+    /// principal-scope model. Implementations must reject populated mode
+    /// switches because persisted ownership and idempotency identities depend
+    /// on this value.
+    fn migrate_and_bind_principal_scope<'a>(
+        &'a self,
+        command: MigratePaymentDatabase,
+        principal_scope_mode: PrincipalScopeMode,
     ) -> BoxFuture<'a, Result<PaymentDatabaseMigrationReport, DepositError>>;
 }

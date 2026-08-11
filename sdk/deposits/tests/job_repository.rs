@@ -4,7 +4,8 @@ use deposits::{
     CreateDepositJob, CreateJob, CreateJobOutcome, DepositErrorKind, DepositId, IdempotencyKey,
     InitializePaymentDatabase, JobError, JobId, JobPageRequest, JobPayload, JobResource, JobState,
     JobStore, PAYMENT_DOMAIN_SCHEMA_VERSION, PAYMENT_SERVICE_OWNER, PaymentDatabaseMetadataStore,
-    PersistentPaymentRepository, PolicyIdentity, RequestHash, TransitionJob, UserId, UserStore,
+    PersistentPaymentRepository, PolicyIdentity, PrincipalScopeMode, RequestHash, TransitionJob,
+    UserId, UserStore,
 };
 use indexing::IndexScope;
 use storage::{Key, Namespace, Operation, Storage, Value, WriteBatch};
@@ -140,6 +141,43 @@ async fn database_metadata_binds_owner_scope_schema_and_policy()
         .await
         .expect_err("active policy identity is immutable without migration");
     assert_eq!(policy_error.kind, DepositErrorKind::Conflict);
+    Ok(())
+}
+
+#[tokio::test]
+async fn database_metadata_binds_principal_scope_mode_without_switching()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let initialized = repository
+        .initialize_or_validate_principal_scope(
+            metadata("sepolia", "policy-v1"),
+            PrincipalScopeMode::GlobalTrusted,
+        )
+        .await?;
+    assert_eq!(
+        initialized.principal_scope_mode,
+        PrincipalScopeMode::GlobalTrusted
+    );
+    assert_eq!(
+        repository
+            .initialize_or_validate_principal_scope(
+                metadata("sepolia", "policy-v1"),
+                PrincipalScopeMode::GlobalTrusted,
+            )
+            .await?,
+        initialized
+    );
+
+    let error = repository
+        .initialize_or_validate_principal_scope(
+            metadata("sepolia", "policy-v1"),
+            PrincipalScopeMode::RoleScoped,
+        )
+        .await
+        .expect_err("a bound principal-scope mode must not switch");
+    assert_eq!(error.kind, DepositErrorKind::Conflict);
+    assert_eq!(repository.database_metadata().await?, Some(initialized));
     Ok(())
 }
 

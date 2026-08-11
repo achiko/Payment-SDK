@@ -144,6 +144,7 @@ pub struct SignResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilitiesResponse {
+    pub authentication_mode: String,
     pub curves: Vec<Curve>,
     pub schemes: Vec<SignatureScheme>,
     #[serde(default)]
@@ -164,6 +165,7 @@ pub enum ReadinessStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReadinessResponse {
+    pub authentication_mode: String,
     pub status: ReadinessStatus,
 }
 

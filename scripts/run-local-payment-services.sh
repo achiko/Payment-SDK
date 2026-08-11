@@ -37,6 +37,7 @@ The script does NOT start Anvil or any other Ethereum node. An unauthenticated
 loopback HTTP JSON-RPC endpoint must already be running.
 
 Main environment variables:
+  STRICT_AUTHENTICATION_MODE       required exact true/false; no default
   ETHEREUM_RPC_URL                 default: http://127.0.0.1:8545
   ETHEREUM_CHAIN_ID                optional expected chain ID
   PAYMENT_NETWORK                  default: local
@@ -53,11 +54,12 @@ Main environment variables:
 
 Optional bind overrides use STACK_ prefixes:
   STACK_IX_HTTP_BIND, STACK_IX_METRICS_BIND, STACK_CUSTODY_BIND,
-  STACK_WS_HTTP_BIND, STACK_PS_HTTP_BIND, STACK_PS_METRICS_BIND
+  STACK_CUSTODY_METRICS_BIND, STACK_WS_HTTP_BIND, STACK_WS_METRICS_BIND,
+  STACK_PS_HTTP_BIND, STACK_PS_METRICS_BIND
 
 The launcher creates fresh private IX/PS databases, logs, a runtime policy,
-and generated local credentials under ./tmp/payment-sdk-stack.XXXXXX.
-Credentials are written to client.env with mode 600 and are never printed.
+under ./tmp/payment-sdk-stack.XXXXXX. Strict mode also creates local
+credentials, writes them to client.env with mode 600, and never prints them.
 
 Options:
   --no-build          Reuse already-built debug binaries.
@@ -99,6 +101,28 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+# Capture optional strict-mode inputs once, then remove every service-facing
+# credential alias before invoking Cargo, curl, or a child service. The copied
+# values are deliberately non-exported and are scoped again per child below.
+STACK_CUSTODY_BEARER_TOKEN_INPUT="${STACK_CUSTODY_BEARER_TOKEN-}"
+STACK_WALLET_BEARER_TOKEN_INPUT="${STACK_WALLET_BEARER_TOKEN-}"
+STACK_INDEXER_BEARER_TOKEN_INPUT="${STACK_INDEXER_BEARER_TOKEN-}"
+STACK_PS_API_BEARER_TOKEN_INPUT="${STACK_PS_API_BEARER_TOKEN-}"
+STACK_PS_ADMIN_BEARER_TOKEN_INPUT="${STACK_PS_ADMIN_BEARER_TOKEN-}"
+export -n STACK_CUSTODY_BEARER_TOKEN_INPUT STACK_WALLET_BEARER_TOKEN_INPUT
+export -n STACK_INDEXER_BEARER_TOKEN_INPUT STACK_PS_API_BEARER_TOKEN_INPUT
+export -n STACK_PS_ADMIN_BEARER_TOKEN_INPUT
+unset STACK_CUSTODY_BEARER_TOKEN STACK_WALLET_BEARER_TOKEN
+unset STACK_INDEXER_BEARER_TOKEN STACK_PS_API_BEARER_TOKEN
+unset STACK_PS_ADMIN_BEARER_TOKEN
+unset CUSTODY_BEARER_TOKEN IX_BEARER_TOKEN WS_BEARER_TOKEN
+unset WS_CUSTODY_BEARER_TOKEN WS_BITCOIN_IX_BEARER_TOKEN
+unset PS_API_BEARER_TOKEN PS_ADMIN_BEARER_TOKEN
+unset PS_INDEXER_BEARER_TOKEN PS_WALLET_BEARER_TOKEN
+unset CUSTODY_BEARER_TOKEN_VALUE WALLET_BEARER_TOKEN
+unset INDEXER_BEARER_TOKEN_VALUE PS_API_BEARER_TOKEN_VALUE
+unset PS_ADMIN_BEARER_TOKEN_VALUE
 
 require_command() {
   local command_name="$1"
@@ -259,11 +283,15 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-curl_with_bearer() {
+curl_service() {
   local token="$1"
   shift
-  printf 'header = "Authorization: Bearer %s"\n' "$token" \
-    | curl --disable --config - --noproxy '*' "$@"
+  if [[ "$AUTHENTICATION_MODE_VALUE" == true ]]; then
+    printf 'header = "Authorization: Bearer %s"\n' "$token" \
+      | curl --disable --config - --noproxy '*' "$@"
+  else
+    curl --disable --noproxy '*' "$@"
+  fi
 }
 
 rpc_request() {
@@ -288,7 +316,7 @@ http_status_is() {
   local response
 
   if [[ -n "$token" ]]; then
-    response="$(curl_with_bearer "$token" --fail --silent --show-error \
+    response="$(curl_service "$token" --fail --silent --show-error \
       --connect-timeout 2 --max-time 3 \
       "$url" 2>/dev/null)" || return 1
   else
@@ -298,7 +326,10 @@ http_status_is() {
   fi
 
   printf '%s' "$response" \
-    | jq --exit-status --arg expected "$expected" '.status == $expected' \
+    | jq --exit-status \
+      --arg expected "$expected" \
+      --arg mode "$AUTHENTICATION_MODE_NAME" \
+      '(.status == $expected) and (.authentication_mode == $mode)' \
       >/dev/null 2>&1
 }
 
@@ -341,7 +372,7 @@ provision_address() {
     --arg purpose "$purpose" \
     '{operation_id: $operation_id, asset: {kind: "native"}, key_purpose: $purpose}')"
 
-  curl_with_bearer "$WALLET_BEARER_TOKEN" \
+  curl_service "$WALLET_BEARER_TOKEN" \
     --fail --silent --show-error \
     --connect-timeout 2 --max-time 15 \
     --request POST \
@@ -369,11 +400,27 @@ write_export() {
 
 cd "$REPOSITORY_ROOT"
 
-for required in bash cargo curl jq lsof mktemp openssl tail; do
+for required in bash cargo curl jq lsof mktemp tail; do
   require_command "$required"
 done
 
 ETHEREUM_RPC_URL="${ETHEREUM_RPC_URL:-http://127.0.0.1:8545}"
+AUTHENTICATION_MODE_VALUE="${STRICT_AUTHENTICATION_MODE-}"
+case "$AUTHENTICATION_MODE_VALUE" in
+  true) AUTHENTICATION_MODE_NAME='strict' ;;
+  false) AUTHENTICATION_MODE_NAME='global_trusted' ;;
+  *) die "STRICT_AUTHENTICATION_MODE must be exactly true or false" ;;
+esac
+if [[ "$AUTHENTICATION_MODE_VALUE" == true ]]; then
+  require_command openssl
+fi
+export STRICT_AUTHENTICATION_MODE="$AUTHENTICATION_MODE_VALUE"
+if [[ "$AUTHENTICATION_MODE_VALUE" == false ]]; then
+  unset CUSTODY_BEARER_TOKEN IX_BEARER_TOKEN WS_BEARER_TOKEN
+  unset WS_CUSTODY_BEARER_TOKEN WS_BITCOIN_IX_BEARER_TOKEN
+  unset PS_API_BEARER_TOKEN PS_ADMIN_BEARER_TOKEN
+  unset PS_INDEXER_BEARER_TOKEN PS_WALLET_BEARER_TOKEN
+fi
 PAYMENT_NETWORK="${PAYMENT_NETWORK:-local}"
 IX_BOOTSTRAP_HEIGHT="${IX_BOOTSTRAP_HEIGHT:-0}"
 IX_STARTUP_TIMEOUT_SECONDS="${IX_STARTUP_TIMEOUT_SECONDS:-180}"
@@ -389,7 +436,9 @@ export NO_PROXY no_proxy
 IX_HTTP_BIND_VALUE="${STACK_IX_HTTP_BIND:-127.0.0.1:8080}"
 IX_METRICS_BIND_VALUE="${STACK_IX_METRICS_BIND:-127.0.0.1:9090}"
 CUSTODY_BIND_VALUE="${STACK_CUSTODY_BIND:-127.0.0.1:8181}"
+CUSTODY_METRICS_BIND_VALUE="${STACK_CUSTODY_METRICS_BIND:-127.0.0.1:9093}"
 WS_HTTP_BIND_VALUE="${STACK_WS_HTTP_BIND:-127.0.0.1:8082}"
+WS_METRICS_BIND_VALUE="${STACK_WS_METRICS_BIND:-127.0.0.1:9092}"
 PS_HTTP_BIND_VALUE="${STACK_PS_HTTP_BIND:-127.0.0.1:8081}"
 PS_METRICS_BIND_VALUE="${STACK_PS_METRICS_BIND:-127.0.0.1:9091}"
 
@@ -427,7 +476,9 @@ esac
 validate_loopback_bind STACK_IX_HTTP_BIND "$IX_HTTP_BIND_VALUE"
 validate_loopback_bind STACK_IX_METRICS_BIND "$IX_METRICS_BIND_VALUE"
 validate_loopback_bind STACK_CUSTODY_BIND "$CUSTODY_BIND_VALUE"
+validate_loopback_bind STACK_CUSTODY_METRICS_BIND "$CUSTODY_METRICS_BIND_VALUE"
 validate_loopback_bind STACK_WS_HTTP_BIND "$WS_HTTP_BIND_VALUE"
+validate_loopback_bind STACK_WS_METRICS_BIND "$WS_METRICS_BIND_VALUE"
 validate_loopback_bind STACK_PS_HTTP_BIND "$PS_HTTP_BIND_VALUE"
 validate_loopback_bind STACK_PS_METRICS_BIND "$PS_METRICS_BIND_VALUE"
 
@@ -435,7 +486,9 @@ OWNED_SERVICE_NAMES=(
   "Indexer API"
   "Indexer metrics"
   "Custody API"
+  "Custody metrics"
   "Wallet API"
+  "Wallet metrics"
   "Payment API"
   "Payment metrics"
 )
@@ -443,7 +496,9 @@ OWNED_PORTS=(
   "$(port_from_bind "$IX_HTTP_BIND_VALUE")"
   "$(port_from_bind "$IX_METRICS_BIND_VALUE")"
   "$(port_from_bind "$CUSTODY_BIND_VALUE")"
+  "$(port_from_bind "$CUSTODY_METRICS_BIND_VALUE")"
   "$(port_from_bind "$WS_HTTP_BIND_VALUE")"
+  "$(port_from_bind "$WS_METRICS_BIND_VALUE")"
   "$(port_from_bind "$PS_HTTP_BIND_VALUE")"
   "$(port_from_bind "$PS_METRICS_BIND_VALUE")"
 )
@@ -554,19 +609,36 @@ STACK_ROOT_DISPLAY="$(relative_to_repository "$STACK_ROOT")"
 mkdir -p "$STACK_ROOT/ix-db" "$STACK_ROOT/ps-db" "$STACK_ROOT/logs"
 : >"$STACK_ROOT/pids"
 
-CUSTODY_BEARER_TOKEN_VALUE="${STACK_CUSTODY_BEARER_TOKEN:-$(generate_token)}"
-WALLET_BEARER_TOKEN="${STACK_WALLET_BEARER_TOKEN:-$(generate_token)}"
-INDEXER_BEARER_TOKEN_VALUE="${STACK_INDEXER_BEARER_TOKEN:-$(generate_token)}"
-PS_API_BEARER_TOKEN_VALUE="${STACK_PS_API_BEARER_TOKEN:-$(generate_token)}"
-PS_ADMIN_BEARER_TOKEN_VALUE="${STACK_PS_ADMIN_BEARER_TOKEN:-$(generate_token)}"
+CUSTODY_BEARER_TOKEN_VALUE=""
+WALLET_BEARER_TOKEN=""
+INDEXER_BEARER_TOKEN_VALUE=""
+PS_API_BEARER_TOKEN_VALUE=""
+PS_ADMIN_BEARER_TOKEN_VALUE=""
+if [[ "$AUTHENTICATION_MODE_VALUE" == true ]]; then
+  CUSTODY_BEARER_TOKEN_VALUE="${STACK_CUSTODY_BEARER_TOKEN_INPUT:-$(generate_token)}"
+  WALLET_BEARER_TOKEN="${STACK_WALLET_BEARER_TOKEN_INPUT:-$(generate_token)}"
+  INDEXER_BEARER_TOKEN_VALUE="${STACK_INDEXER_BEARER_TOKEN_INPUT:-$(generate_token)}"
+  PS_API_BEARER_TOKEN_VALUE="${STACK_PS_API_BEARER_TOKEN_INPUT:-$(generate_token)}"
+  PS_ADMIN_BEARER_TOKEN_VALUE="${STACK_PS_ADMIN_BEARER_TOKEN_INPUT:-$(generate_token)}"
 
-validate_bearer_value STACK_CUSTODY_BEARER_TOKEN "$CUSTODY_BEARER_TOKEN_VALUE"
-validate_bearer_value STACK_WALLET_BEARER_TOKEN "$WALLET_BEARER_TOKEN"
-validate_bearer_value STACK_INDEXER_BEARER_TOKEN "$INDEXER_BEARER_TOKEN_VALUE"
-validate_bearer_value STACK_PS_API_BEARER_TOKEN "$PS_API_BEARER_TOKEN_VALUE"
-validate_bearer_value STACK_PS_ADMIN_BEARER_TOKEN "$PS_ADMIN_BEARER_TOKEN_VALUE"
-[[ "$PS_API_BEARER_TOKEN_VALUE" != "$PS_ADMIN_BEARER_TOKEN_VALUE" ]] \
-  || die "Payment Service API and administrator tokens must be different"
+  validate_bearer_value STACK_CUSTODY_BEARER_TOKEN "$CUSTODY_BEARER_TOKEN_VALUE"
+  validate_bearer_value STACK_WALLET_BEARER_TOKEN "$WALLET_BEARER_TOKEN"
+  validate_bearer_value STACK_INDEXER_BEARER_TOKEN "$INDEXER_BEARER_TOKEN_VALUE"
+  validate_bearer_value STACK_PS_API_BEARER_TOKEN "$PS_API_BEARER_TOKEN_VALUE"
+  validate_bearer_value STACK_PS_ADMIN_BEARER_TOKEN "$PS_ADMIN_BEARER_TOKEN_VALUE"
+  [[ "$PS_API_BEARER_TOKEN_VALUE" != "$PS_ADMIN_BEARER_TOKEN_VALUE" ]] \
+    || die "Payment Service API and administrator tokens must be different"
+fi
+
+# Keep each credential scoped to the one child subshell that explicitly
+# exports it. Values copied into these internal variables must not retain an
+# inherited export attribute.
+export -n CUSTODY_BEARER_TOKEN_VALUE WALLET_BEARER_TOKEN
+export -n INDEXER_BEARER_TOKEN_VALUE PS_API_BEARER_TOKEN_VALUE
+export -n PS_ADMIN_BEARER_TOKEN_VALUE
+unset STACK_CUSTODY_BEARER_TOKEN_INPUT STACK_WALLET_BEARER_TOKEN_INPUT
+unset STACK_INDEXER_BEARER_TOKEN_INPUT STACK_PS_API_BEARER_TOKEN_INPUT
+unset STACK_PS_ADMIN_BEARER_TOKEN_INPUT
 
 IX_URL="http://$IX_HTTP_BIND_VALUE"
 CUSTODY_URL="http://$CUSTODY_BIND_VALUE"
@@ -576,17 +648,20 @@ PS_URL="http://$PS_HTTP_BIND_VALUE"
 CLIENT_ENV_PATH="$STACK_ROOT/client.env"
 {
   write_export PAYMENT_STACK_ROOT "$STACK_ROOT"
+  write_export STRICT_AUTHENTICATION_MODE "$AUTHENTICATION_MODE_VALUE"
   write_export ETHEREUM_CHAIN_ID "$CHAIN_ID"
   write_export PAYMENT_NETWORK "$PAYMENT_NETWORK"
   write_export IX_URL "$IX_URL"
-  write_export IX_BEARER_TOKEN "$INDEXER_BEARER_TOKEN_VALUE"
   write_export CUSTODY_URL "$CUSTODY_URL"
-  write_export CUSTODY_BEARER_TOKEN "$CUSTODY_BEARER_TOKEN_VALUE"
   write_export WS_URL "$WS_URL"
-  write_export WS_BEARER_TOKEN "$WALLET_BEARER_TOKEN"
   write_export PS_URL "$PS_URL"
-  write_export PS_API_BEARER_TOKEN "$PS_API_BEARER_TOKEN_VALUE"
-  write_export PS_ADMIN_BEARER_TOKEN "$PS_ADMIN_BEARER_TOKEN_VALUE"
+  if [[ "$AUTHENTICATION_MODE_VALUE" == true ]]; then
+    write_export IX_BEARER_TOKEN "$INDEXER_BEARER_TOKEN_VALUE"
+    write_export CUSTODY_BEARER_TOKEN "$CUSTODY_BEARER_TOKEN_VALUE"
+    write_export WS_BEARER_TOKEN "$WALLET_BEARER_TOKEN"
+    write_export PS_API_BEARER_TOKEN "$PS_API_BEARER_TOKEN_VALUE"
+    write_export PS_ADMIN_BEARER_TOKEN "$PS_ADMIN_BEARER_TOKEN_VALUE"
+  fi
 } >"$CLIENT_ENV_PATH"
 chmod 600 "$CLIENT_ENV_PATH" "$STACK_ROOT/pids"
 
@@ -604,7 +679,9 @@ PS_LOG="$STACK_ROOT/logs/payment.log"
   export IX_RPC_HTTP_URL="$ETHEREUM_RPC_URL"
   export IX_HTTP_BIND="$IX_HTTP_BIND_VALUE"
   export IX_METRICS_BIND="$IX_METRICS_BIND_VALUE"
-  export IX_BEARER_TOKEN="$INDEXER_BEARER_TOKEN_VALUE"
+  if [[ "$AUTHENTICATION_MODE_VALUE" == true ]]; then
+    export IX_BEARER_TOKEN="$INDEXER_BEARER_TOKEN_VALUE"
+  fi
   export RUST_LOG="$STACK_RUST_LOG"
   exec "$INDEXER_BINARY" serve
 ) >"$IX_LOG" 2>&1 &
@@ -613,7 +690,10 @@ register_service "Indexer Service" "$IX_PID" "$IX_LOG"
 
 (
   export CUSTODY_BIND="$CUSTODY_BIND_VALUE"
-  export CUSTODY_BEARER_TOKEN="$CUSTODY_BEARER_TOKEN_VALUE"
+  export CUSTODY_METRICS_BIND="$CUSTODY_METRICS_BIND_VALUE"
+  if [[ "$AUTHENTICATION_MODE_VALUE" == true ]]; then
+    export CUSTODY_BEARER_TOKEN="$CUSTODY_BEARER_TOKEN_VALUE"
+  fi
   export CUSTODY_SHUTDOWN_GRACE_SECONDS=10
   export RUST_LOG="$STACK_RUST_LOG"
   exec "$CUSTODY_BINARY" serve
@@ -638,9 +718,13 @@ wait_for_service "Indexer Service" "$IX_PID" "$IX_LOG" \
   export WS_ETHEREUM_CHAIN_ID="$CHAIN_ID"
   export WS_ETHEREUM_RPC_URL="$ETHEREUM_RPC_URL"
   export WS_CUSTODY_URL="$CUSTODY_URL"
-  export WS_CUSTODY_BEARER_TOKEN="$CUSTODY_BEARER_TOKEN_VALUE"
-  export WS_BEARER_TOKEN="$WALLET_BEARER_TOKEN"
+  export WS_CUSTODY_AUTHENTICATION_POLICY='repository_mode_matched'
+  if [[ "$AUTHENTICATION_MODE_VALUE" == true ]]; then
+    export WS_CUSTODY_BEARER_TOKEN="$CUSTODY_BEARER_TOKEN_VALUE"
+    export WS_BEARER_TOKEN="$WALLET_BEARER_TOKEN"
+  fi
   export WS_HTTP_BIND="$WS_HTTP_BIND_VALUE"
+  export WS_METRICS_BIND="$WS_METRICS_BIND_VALUE"
   export WS_SHUTDOWN_GRACE_SECONDS=10
   export RUST_LOG="$STACK_RUST_LOG"
   exec "$WALLET_BINARY" serve
@@ -714,11 +798,13 @@ chmod 600 "$POLICY_PATH"
   export PS_POLICY_PATH="$POLICY_PATH"
   export PS_INDEXER_URL="$IX_URL"
   export PS_INDEXER_NETWORK="$PAYMENT_NETWORK"
-  export PS_INDEXER_BEARER_TOKEN="$INDEXER_BEARER_TOKEN_VALUE"
   export PS_WALLET_URL="$WS_URL"
-  export PS_WALLET_BEARER_TOKEN="$WALLET_BEARER_TOKEN"
-  export PS_API_BEARER_TOKEN="$PS_API_BEARER_TOKEN_VALUE"
-  export PS_ADMIN_BEARER_TOKEN="$PS_ADMIN_BEARER_TOKEN_VALUE"
+  if [[ "$AUTHENTICATION_MODE_VALUE" == true ]]; then
+    export PS_INDEXER_BEARER_TOKEN="$INDEXER_BEARER_TOKEN_VALUE"
+    export PS_WALLET_BEARER_TOKEN="$WALLET_BEARER_TOKEN"
+    export PS_API_BEARER_TOKEN="$PS_API_BEARER_TOKEN_VALUE"
+    export PS_ADMIN_BEARER_TOKEN="$PS_ADMIN_BEARER_TOKEN_VALUE"
+  fi
   export PS_HTTP_BIND="$PS_HTTP_BIND_VALUE"
   export PS_METRICS_BIND="$PS_METRICS_BIND_VALUE"
   export PS_SHUTDOWN_GRACE_SECONDS=10
@@ -735,7 +821,7 @@ probe_payment() {
 wait_for_service "Payment Service" "$PS_PID" "$PS_LOG" \
   "$SERVICE_STARTUP_TIMEOUT_SECONDS" probe_payment
 
-ADMIN_STATUS="$(curl_with_bearer "$PS_ADMIN_BEARER_TOKEN_VALUE" \
+ADMIN_STATUS="$(curl_service "$PS_ADMIN_BEARER_TOKEN_VALUE" \
   --fail --silent --show-error \
   --connect-timeout 2 --max-time 10 \
   "$PS_URL/v1/admin/status")" \
@@ -743,9 +829,11 @@ ADMIN_STATUS="$(curl_with_bearer "$PS_ADMIN_BEARER_TOKEN_VALUE" \
 printf '%s' "$ADMIN_STATUS" \
   | jq --exit-status \
     --arg network "$PAYMENT_NETWORK" \
+    --arg authentication_mode "$AUTHENTICATION_MODE_NAME" \
     --argjson chain_id "$CHAIN_ID" \
     '(.service == "payment-service")
       and (.ready == true)
+      and (.authentication_mode == $authentication_mode)
       and (.indexer_ready == true)
       and (.wallet_ready == true)
       and (.scope.chain == "ethereum")
@@ -756,9 +844,17 @@ printf '%s' "$ADMIN_STATUS" \
 
 info "all four services are ready"
 info "Payment Service: $PS_URL"
+info "authentication mode: $AUTHENTICATION_MODE_NAME"
+info "Indexer metrics: http://$IX_METRICS_BIND_VALUE/metrics"
+info "Custody metrics: http://$CUSTODY_METRICS_BIND_VALUE/metrics"
+info "Wallet metrics: http://$WS_METRICS_BIND_VALUE/metrics"
 info "Payment metrics: http://$PS_METRICS_BIND_VALUE/metrics"
 info "private client environment: $(relative_to_repository "$CLIENT_ENV_PATH")"
-info "from the repository root, source that file to use the generated tokens"
+if [[ "$AUTHENTICATION_MODE_VALUE" == true ]]; then
+  info "from the repository root, source that file to use the generated tokens"
+else
+  info "no repo-owned service credentials were created; source that file for URLs and mode"
+fi
 info "press Ctrl-C to stop IX, custody, WS, and PS; the Ethereum RPC is untouched"
 
 while :; do

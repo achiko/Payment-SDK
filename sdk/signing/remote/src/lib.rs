@@ -1,4 +1,4 @@
-//! Authenticated HTTP adapter for a process-separated custody service.
+//! Authentication-mode-aware HTTP adapter for process-separated custody.
 //!
 //! This crate depends only on the chain-independent signing contract. It sends
 //! opaque key locators, cryptographic payloads, explicit operation IDs, and

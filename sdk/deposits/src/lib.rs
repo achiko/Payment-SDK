@@ -65,7 +65,7 @@ pub use job::{
 pub use metadata::{
     InitializePaymentDatabase, MigratePaymentDatabase, PAYMENT_DOMAIN_SCHEMA_VERSION,
     PAYMENT_SERVICE_OWNER, PaymentDatabaseMetadata, PaymentDatabaseMetadataStore,
-    PaymentDatabaseMigrationReport, PolicyIdentity,
+    PaymentDatabaseMigrationReport, PolicyIdentity, PrincipalScopeMode,
 };
 pub use persistent::PersistentPaymentRepository;
 pub use reconciliation::{

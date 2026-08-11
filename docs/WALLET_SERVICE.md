@@ -15,16 +15,22 @@ selected-UTXO flow, and real-node acceptance status, use the focused
 
 ## Runtime safety
 
-- All operation routes require the configured bearer token.
-- `/health/live` and `/health/ready` are unauthenticated and detail-free.
+- `STRICT_AUTHENTICATION_MODE` is required and accepts exactly `true` or
+  `false`. In strict mode every operation route requires the configured bearer;
+  in global-trusted mode Authorization is ignored and every reachable caller
+  receives the same authority. Global-trusted mode is not identity isolation.
+- `/health/live` is unauthenticated and detail-free. `/health/ready` is also
+  public and adds only the sanitized `authentication_mode` posture.
 - Readiness is enabled only after the RPC reports the configured chain ID and
   custody reports the required signing capabilities and availability. Bitcoin
   additionally verifies Core 31, network, genesis, pruning, synchronization,
   transaction-index readiness, authenticated IX readiness/network status, and
   the IX checkpoint against its own Core node.
-- WS readiness is startup-latched in the current runtime. Later RPC, IX, or
-  custody outages can surface on operation calls without clearing
-  `/health/ready`; monitor dependencies and functional failures separately.
+- After startup, WS periodically rechecks custody availability and its reported
+  authentication mode. Bitcoin also rechecks IX readiness, network, and
+  authentication mode. `/health/ready` clears on a failed check and recovers
+  when those dependencies again report the configured posture. Ethereum RPC
+  and Bitcoin Core operation failures remain separate from this monitor.
 - Readiness is disabled before SIGINT/SIGTERM graceful drain.
 - Plain HTTP RPC and custody endpoints are accepted only on loopback. External
   endpoints require HTTPS. A non-loopback WS listener requires an explicit
@@ -33,6 +39,11 @@ selected-UTXO flow, and real-node acceptance status, use the focused
   are bounded by configuration.
 - RPC URLs, RPC header values, bearer tokens, custody URLs, signed envelopes,
   and custody credentials are redacted from `Debug` and logs.
+- WS verifies that repo-owned IX and repository-mode-matched custody report the
+  same mode and fails startup on missing or mismatched posture. Setting
+  `WS_CUSTODY_AUTHENTICATION_POLICY=independent_strict` instead requires a
+  custody bearer and a reported strict posture regardless of the repo-wide
+  mode. Bitcoin Core and other vendor authentication remain independent.
 
 ## Encoding rules
 
@@ -81,6 +92,12 @@ signing also returns `attribution`. These calls do not broadcast. PS can persist
 the exact envelope before calling the broadcast route, making response loss and
 retry recovery explicit without giving WS durable workflow ownership.
 
+Requests that already define an `operation_id` keep it mandatory in strict
+mode. Global-trusted direct callers may omit it; WS generates UUIDv7 identity
+before any custody/RPC effect and returns it in the response. Caller-supplied
+IDs preserve the previous response shape. Durable PS workflows continue to
+provide deterministic child identities.
+
 Error responses use stable JSON fields: `code`, `message`, `retryable`, and an
 opaque `request_id`. Transport, RPC, and custody internals are sanitized.
 
@@ -128,7 +145,15 @@ Run `wallet-worker serve --help` for the legacy Ethereum command and
   request timeout/retry/response bounds, gas margin, and gas/fee ceilings;
 - remote custody URL, bearer credential, timeouts, retries, and response bound;
 - WS bind address, WS bearer credential, upstream TLS assertion, request-body
-  bound, and graceful-shutdown deadline.
+  bound, `WS_METRICS_BIND` (default `127.0.0.1:9092`, loopback only), and
+  graceful-shutdown deadline.
+
+`STRICT_AUTHENTICATION_MODE` controls the repo-owned bearer fields above.
+They are required only for `true`; for `false` they are ignored without being
+logged. Node/RPC and vendor custody credentials are never disabled by this
+setting. The readiness/status output, startup log, and
+`payment_sdk_strict_authentication_mode{service="wallet"}` metric expose the
+selected posture.
 
 Bitcoin additionally requires the network and conventional genesis hash,
 authenticated Core and IX endpoints, an explicit confirmation threshold, fee
@@ -140,9 +165,10 @@ The maximum fee-rate setting may not exceed Bitcoin Core's 1 BTC/kvB
 The required Bitcoin-specific deployment variables are
 `WS_BITCOIN_NETWORK`, `WS_BITCOIN_EXPECTED_GENESIS_HASH`,
 `WS_BITCOIN_CORE_RPC_URL`, `WS_BITCOIN_IX_URL`,
-`WS_BITCOIN_IX_BEARER_TOKEN`, `WS_BITCOIN_MINIMUM_CONFIRMATIONS`, and
-`WS_BITCOIN_MAX_SATOSHIS_PER_KVB`, together with the shared custody and WS
-bearer settings. Core requires exactly one Authorization header after combining
+`WS_BITCOIN_MINIMUM_CONFIRMATIONS`, and
+`WS_BITCOIN_MAX_SATOSHIS_PER_KVB`, together with the shared authentication,
+custody, and WS settings. `WS_BITCOIN_IX_BEARER_TOKEN` is additionally required
+in strict mode. Core requires exactly one Authorization header after combining
 `WS_BITCOIN_CORE_RPC_HEADERS` with the optional dedicated
 `WS_BITCOIN_CORE_RPC_AUTHORIZATION` value. Embedded URL credentials, query
 strings, fragments, remote plaintext endpoints, injected header newlines, and

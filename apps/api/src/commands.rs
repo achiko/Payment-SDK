@@ -1,6 +1,11 @@
-use axum::http::{HeaderMap, HeaderName};
+use axum::{
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+};
 use deposits::{IdempotencyKey, RequestHash};
+use http_support::AuthenticationMode;
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::api_error::ApiError;
 
@@ -8,24 +13,60 @@ const IDEMPOTENCY_KEY_HEADER: HeaderName = HeaderName::from_static("idempotency-
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 const MAX_OPAQUE_ID_BYTES: usize = 256;
 
-pub fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, ApiError> {
-    let value = headers
-        .get(&IDEMPOTENCY_KEY_HEADER)
-        .ok_or_else(|| {
-            ApiError::bad_request(
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectiveIdempotencyKey {
+    pub key: IdempotencyKey,
+    pub generated: bool,
+}
+
+pub fn idempotency_key(
+    headers: &HeaderMap,
+    authentication_mode: AuthenticationMode,
+) -> Result<EffectiveIdempotencyKey, ApiError> {
+    let Some(value) = headers.get(&IDEMPOTENCY_KEY_HEADER) else {
+        return if authentication_mode.is_strict() {
+            Err(ApiError::bad_request(
                 "missing_idempotency_key",
                 "Idempotency-Key header is required",
-            )
-        })?
-        .to_str()
-        .map_err(|_| {
-            ApiError::bad_request(
-                "invalid_idempotency_key",
-                "Idempotency-Key must contain visible ASCII characters",
-            )
-        })?;
+            ))
+        } else {
+            Ok(EffectiveIdempotencyKey {
+                key: IdempotencyKey(Uuid::now_v7().to_string()),
+                generated: true,
+            })
+        };
+    };
+    let value = value.to_str().map_err(|_| {
+        ApiError::bad_request(
+            "invalid_idempotency_key",
+            "Idempotency-Key must contain visible ASCII characters",
+        )
+    })?;
     validate_token(value, MAX_IDEMPOTENCY_KEY_BYTES, "Idempotency-Key")?;
-    Ok(IdempotencyKey(value.to_owned()))
+    Ok(EffectiveIdempotencyKey {
+        key: IdempotencyKey(value.to_owned()),
+        generated: false,
+    })
+}
+
+pub fn idempotent_response(
+    response: impl IntoResponse,
+    generated_idempotency_key: Option<&IdempotencyKey>,
+) -> Result<Response, ApiError> {
+    let mut response = response.into_response();
+    let Some(idempotency_key) = generated_idempotency_key else {
+        return Ok(response);
+    };
+    let value = HeaderValue::from_str(&idempotency_key.0).map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid_stored_idempotency_key",
+            "stored idempotency identity cannot be represented as an HTTP header",
+            false,
+        )
+    })?;
+    response.headers_mut().insert(IDEMPOTENCY_KEY_HEADER, value);
+    Ok(response)
 }
 
 pub fn validate_opaque_id(value: &str, name: &str) -> Result<(), ApiError> {
@@ -78,7 +119,12 @@ mod tests {
 
     #[test]
     fn idempotency_header_is_required_and_bounded() {
-        assert!(idempotency_key(&HeaderMap::new()).is_err());
+        assert!(idempotency_key(&HeaderMap::new(), AuthenticationMode::Strict).is_err());
+
+        let generated = idempotency_key(&HeaderMap::new(), AuthenticationMode::GlobalTrusted)
+            .expect("global-trusted mode must generate a key");
+        assert!(generated.generated);
+        assert!(Uuid::parse_str(&generated.key.0).is_ok());
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -86,8 +132,11 @@ mod tests {
             HeaderValue::from_static("exchange-command-1"),
         );
         assert_eq!(
-            idempotency_key(&headers).expect("valid key must parse"),
-            IdempotencyKey("exchange-command-1".to_owned())
+            idempotency_key(&headers, AuthenticationMode::Strict).expect("valid key must parse"),
+            EffectiveIdempotencyKey {
+                key: IdempotencyKey("exchange-command-1".to_owned()),
+                generated: false,
+            }
         );
 
         let oversized = "a".repeat(MAX_IDEMPOTENCY_KEY_BYTES + 1);
@@ -95,7 +144,26 @@ mod tests {
             IDEMPOTENCY_KEY_HEADER,
             HeaderValue::from_str(&oversized).expect("visible ASCII must form a header"),
         );
-        assert!(idempotency_key(&headers).is_err());
+        assert!(idempotency_key(&headers, AuthenticationMode::GlobalTrusted).is_err());
+    }
+
+    #[test]
+    fn only_generated_idempotency_key_is_returned_as_a_response_header() {
+        let key = IdempotencyKey("caller-command-7".to_owned());
+        let response = idempotent_response(StatusCode::ACCEPTED, Some(&key))
+            .expect("validated idempotency key must form a response header");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            response
+                .headers()
+                .get(IDEMPOTENCY_KEY_HEADER)
+                .expect("response header must exist"),
+            "caller-command-7"
+        );
+
+        let response = idempotent_response(StatusCode::ACCEPTED, None)
+            .expect("caller-supplied identities do not alter the response");
+        assert!(response.headers().get(IDEMPOTENCY_KEY_HEADER).is_none());
     }
 
     #[test]

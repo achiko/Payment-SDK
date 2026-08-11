@@ -1246,6 +1246,7 @@ dependencies = [
  "signer",
  "signer-local",
  "signer-remote",
+ "telemetry",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1437,12 +1438,6 @@ dependencies = [
  "quote",
  "syn 3.0.3",
 ]
-
-[[package]]
-name = "dotenvy"
-version = "0.15.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "dunce"
@@ -2108,6 +2103,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -2612,7 +2608,6 @@ dependencies = [
  "chain-ethereum",
  "chain-identity",
  "deposits",
- "dotenvy",
  "http 0.1.0",
  "indexer-worker",
  "indexing",
@@ -3553,6 +3548,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "hex",
+ "http 0.1.0",
  "reqwest",
  "serde",
  "serde_json",

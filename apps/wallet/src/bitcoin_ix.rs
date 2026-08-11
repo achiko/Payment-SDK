@@ -1,4 +1,4 @@
-//! Bounded authenticated client for the Bitcoin IX active UTXO projection.
+//! Bounded, authentication-mode-aware client for the Bitcoin IX UTXO projection.
 
 use std::{fmt, net::IpAddr, time::Duration};
 
@@ -6,6 +6,7 @@ use chain_bitcoin::{
     BitcoinAddress, BitcoinNetwork, BitcoinRpcUtxo, BitcoinTransactionId, BitcoinUtxoSet,
     BitcoinUtxoSource, BoxFuture, Satoshi, parse_bitcoin_block_hash,
 };
+use http_support::AuthenticationMode;
 use indexing::{BlockHeight, BlockRef, SourceError};
 use reqwest::{
     StatusCode, Url,
@@ -16,6 +17,7 @@ use serde::Deserialize;
 #[derive(Clone)]
 pub struct BitcoinIxClientConfig {
     pub endpoint: String,
+    pub authentication_mode: AuthenticationMode,
     pub headers: Vec<(String, String)>,
     pub request_timeout: Duration,
     pub maximum_response_bytes: usize,
@@ -34,6 +36,7 @@ impl fmt::Debug for BitcoinIxClientConfig {
         formatter
             .debug_struct("BitcoinIxClientConfig")
             .field("endpoint", &"[REDACTED]")
+            .field("authentication_mode", &self.authentication_mode)
             .field("header_names", &names)
             .field("request_timeout", &self.request_timeout)
             .field("maximum_response_bytes", &self.maximum_response_bytes)
@@ -90,6 +93,11 @@ impl BitcoinIxClient {
         for (name, value) in &config.headers {
             let name = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| source("Bitcoin IX header name is invalid", false))?;
+            if config.authentication_mode == AuthenticationMode::GlobalTrusted
+                && name == reqwest::header::AUTHORIZATION
+            {
+                continue;
+            }
             if headers.contains_key(&name) {
                 return Err(source("Bitcoin IX header names must be unique", false));
             }
@@ -97,7 +105,9 @@ impl BitcoinIxClient {
                 .map_err(|_| source("Bitcoin IX header value is invalid", false))?;
             headers.insert(name, value);
         }
-        if !headers.contains_key(reqwest::header::AUTHORIZATION) {
+        if config.authentication_mode == AuthenticationMode::Strict
+            && !headers.contains_key(reqwest::header::AUTHORIZATION)
+        {
             return Err(source(
                 "Bitcoin IX requires exactly one authorization header",
                 false,
@@ -118,10 +128,7 @@ impl BitcoinIxClient {
     }
 
     pub async fn readiness(&self) -> Result<BitcoinIxReadiness, SourceError> {
-        let health: HealthDto = self.get_json(&["health", "ready"], &[]).await?;
-        if health.status != "ready" {
-            return Err(source("Bitcoin IX is not operationally ready", true));
-        }
+        self.require_ready_authentication_mode().await?;
         let response: StatusDto = self
             .get_json(
                 &[
@@ -170,6 +177,7 @@ impl BitcoinIxClient {
         address: &BitcoinAddress,
         expected_snapshot: &mut Option<IxProjectionSnapshot>,
     ) -> Result<Vec<BitcoinRpcUtxo>, SourceError> {
+        self.require_ready_authentication_mode().await?;
         let mut after = None;
         let mut outputs = Vec::new();
         for _ in 0..self.config.maximum_pages_per_address {
@@ -232,6 +240,15 @@ impl BitcoinIxClient {
             "Bitcoin IX UTXO pagination exceeded the configured page limit",
             false,
         ))
+    }
+
+    async fn require_ready_authentication_mode(&self) -> Result<(), SourceError> {
+        let health: HealthDto = self.get_json(&["health", "ready"], &[]).await?;
+        validate_authentication_mode(self.config.authentication_mode, &health.authentication_mode)?;
+        if health.status != "ready" {
+            return Err(source("Bitcoin IX is not operationally ready", true));
+        }
+        Ok(())
     }
 
     async fn get_json<T: for<'de> Deserialize<'de>>(
@@ -496,8 +513,23 @@ fn source(message: impl Into<String>, retryable: bool) -> SourceError {
     }
 }
 
+fn validate_authentication_mode(
+    expected: AuthenticationMode,
+    reported: &str,
+) -> Result<(), SourceError> {
+    if expected.as_str() == reported {
+        Ok(())
+    } else {
+        Err(source(
+            "Bitcoin IX authentication mode does not match client configuration",
+            false,
+        ))
+    }
+}
+
 #[derive(Deserialize)]
 struct HealthDto {
+    authentication_mode: String,
     status: String,
 }
 
@@ -551,6 +583,7 @@ mod tests {
     fn config(endpoint: &str) -> BitcoinIxClientConfig {
         BitcoinIxClientConfig {
             endpoint: endpoint.to_owned(),
+            authentication_mode: AuthenticationMode::Strict,
             headers: vec![("authorization".to_owned(), "Bearer hidden".to_owned())],
             request_timeout: Duration::from_secs(1),
             maximum_response_bytes: 1024,
@@ -596,6 +629,23 @@ mod tests {
         let mut missing = config("https://ix.example.test");
         missing.headers.clear();
         assert!(BitcoinIxClient::new(BitcoinNetwork::Mainnet, missing).is_err());
+
+        let mut global = config("https://ix.example.test");
+        global.authentication_mode = AuthenticationMode::GlobalTrusted;
+        global.headers[0].1 = "ignored\r\ninvalid".to_owned();
+        BitcoinIxClient::new(BitcoinNetwork::Mainnet, global)
+            .expect("global-trusted client must ignore Authorization headers");
+    }
+
+    #[test]
+    fn readiness_authentication_mode_comparison_fails_closed() {
+        validate_authentication_mode(AuthenticationMode::Strict, "strict")
+            .expect("matching strict mode must pass");
+        validate_authentication_mode(AuthenticationMode::GlobalTrusted, "global_trusted")
+            .expect("matching global-trusted mode must pass");
+        let error = validate_authentication_mode(AuthenticationMode::Strict, "global_trusted")
+            .expect_err("mode mismatch must fail");
+        assert!(!error.retryable);
     }
 
     #[test]

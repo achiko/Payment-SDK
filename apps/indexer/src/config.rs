@@ -3,6 +3,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use chain_bitcoin::{BitcoinNetwork, format_bitcoin_block_hash, parse_bitcoin_block_hash};
 use chain_identity::ChainId;
 use clap::{Args, Parser, Subcommand};
+use http::{AuthenticationMode, BearerToken};
 use indexing::{BlockHash, BlockHeight, ConfirmationPolicy, IndexError, IndexScope};
 use url::{Host, Url};
 
@@ -341,6 +342,13 @@ pub struct ServeOptions {
     #[arg(long, env = "IX_METRICS_BIND", default_value = "127.0.0.1:9090")]
     pub metrics_bind: SocketAddr,
 
+    /// Require service bearer authentication (`true`) or trust every reachable caller (`false`).
+    #[arg(
+        long = "strict-authentication-mode",
+        env = "STRICT_AUTHENTICATION_MODE"
+    )]
+    pub authentication_mode: AuthenticationMode,
+
     #[arg(long, env = "IX_BEARER_TOKEN", hide_env_values = true)]
     pub bearer_token: Option<String>,
 
@@ -362,24 +370,15 @@ impl ServeOptions {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.repository.validate()?;
         self.source.validate()?;
-        if self.poll_seconds == 0 || self.ready_max_age_seconds == 0 {
-            return Err(ConfigError::new(
-                "poll and readiness-age intervals must be greater than zero",
-            ));
-        }
-        if !self.metrics_bind.ip().is_loopback() {
-            return Err(ConfigError::new(
-                "the Prometheus listener must bind to loopback",
-            ));
-        }
-        if !self.http_bind.ip().is_loopback()
-            && (self.bearer_token.is_none() || !self.upstream_tls_terminated)
-        {
-            return Err(ConfigError::new(
-                "a non-loopback API bind requires a bearer token and trusted upstream TLS",
-            ));
-        }
-        Ok(())
+        validate_service_options(
+            self.http_bind,
+            self.metrics_bind,
+            self.authentication_mode,
+            self.bearer_token.as_deref(),
+            self.upstream_tls_terminated,
+            self.poll_seconds,
+            self.ready_max_age_seconds,
+        )
     }
 
     #[must_use]
@@ -407,6 +406,13 @@ pub struct BitcoinServeOptions {
     #[arg(long, env = "IX_METRICS_BIND", default_value = "127.0.0.1:9090")]
     pub metrics_bind: SocketAddr,
 
+    /// Require service bearer authentication (`true`) or trust every reachable caller (`false`).
+    #[arg(
+        long = "strict-authentication-mode",
+        env = "STRICT_AUTHENTICATION_MODE"
+    )]
+    pub authentication_mode: AuthenticationMode,
+
     #[arg(long, env = "IX_BEARER_TOKEN", hide_env_values = true)]
     pub bearer_token: Option<String>,
 
@@ -428,18 +434,10 @@ impl BitcoinServeOptions {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.repository.validate()?;
         self.source.validate()?;
-        if self
-            .bearer_token
-            .as_deref()
-            .is_none_or(|token| token.is_empty())
-        {
-            return Err(ConfigError::new(
-                "Bitcoin Indexer Service requires a bearer token",
-            ));
-        }
         validate_service_options(
             self.http_bind,
             self.metrics_bind,
+            self.authentication_mode,
             self.bearer_token.as_deref(),
             self.upstream_tls_terminated,
             self.poll_seconds,
@@ -707,6 +705,7 @@ fn parse_bitcoin_network(input: &str) -> Result<BitcoinNetwork, ConfigError> {
 fn validate_service_options(
     http_bind: SocketAddr,
     metrics_bind: SocketAddr,
+    authentication_mode: AuthenticationMode,
     bearer_token: Option<&str>,
     upstream_tls_terminated: bool,
     poll_seconds: u64,
@@ -722,9 +721,17 @@ fn validate_service_options(
             "the Prometheus listener must bind to loopback",
         ));
     }
-    if !http_bind.ip().is_loopback() && (bearer_token.is_none() || !upstream_tls_terminated) {
+    if authentication_mode.is_strict() {
+        let token = bearer_token.ok_or_else(|| {
+            ConfigError::new(
+                "Indexer Service bearer token is required in strict authentication mode",
+            )
+        })?;
+        BearerToken::new(token).map_err(|error| ConfigError::new(error.to_string()))?;
+    }
+    if !http_bind.ip().is_loopback() && !upstream_tls_terminated {
         return Err(ConfigError::new(
-            "a non-loopback API bind requires a bearer token and trusted upstream TLS",
+            "a non-loopback API bind requires trusted upstream TLS",
         ));
     }
     Ok(())
@@ -907,6 +914,8 @@ mod tests {
             "http://127.0.0.1:18443",
             "--rpc-header",
             "authorization=Basic hidden",
+            "--strict-authentication-mode",
+            "true",
             "--bearer-token",
             "indexer-hidden",
         ])
@@ -923,6 +932,7 @@ mod tests {
             .expect("complete Bitcoin serve options must validate");
         assert_eq!(options.repository.confirmation_depth, 2);
         assert_eq!(options.repository.reorg_retention, 100);
+        assert_eq!(options.authentication_mode, AuthenticationMode::Strict);
         assert_eq!(
             options
                 .source
@@ -964,6 +974,8 @@ mod tests {
             &"11".repeat(32),
             "--rpc-http-url",
             "http://127.0.0.1:18443",
+            "--strict-authentication-mode",
+            "true",
         ]) {
             Ok(_) => panic!("Bitcoin policy fields must be required"),
             Err(error) => error,

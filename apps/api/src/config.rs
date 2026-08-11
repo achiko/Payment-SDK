@@ -8,6 +8,7 @@ use std::{
 };
 
 use clap::{Args, Parser, Subcommand};
+use http_support::AuthenticationMode;
 use reqwest::Url;
 
 const MAX_PAGE_SIZE: usize = 1_000;
@@ -90,6 +91,9 @@ impl BackupOptions {
 #[derive(Args, Clone, Debug)]
 pub struct MigrationOptions {
     #[command(flatten)]
+    pub authentication: AuthenticationOptions,
+
+    #[command(flatten)]
     pub database: DatabaseOptions,
 
     /// Verified safety backup created before the first mutation.
@@ -103,6 +107,17 @@ pub struct MigrationOptions {
     /// Operator assertion used to bind legacy deposits that lacked network identity.
     #[arg(long, env = "PS_MIGRATION_NETWORK")]
     pub network: String,
+}
+
+#[derive(Args, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthenticationOptions {
+    /// Required repo-wide mode: true requires role/service bearer credentials;
+    /// false gives every reachable caller global ordinary and administrator authority.
+    #[arg(
+        long = "strict-authentication-mode",
+        env = "STRICT_AUTHENTICATION_MODE"
+    )]
+    pub mode: AuthenticationMode,
 }
 
 impl MigrationOptions {
@@ -222,21 +237,26 @@ impl BearerSecret {
     pub fn expose(&self) -> &str {
         &self.0
     }
+
+    fn validate(&self, name: &str) -> Result<(), ConfigError> {
+        if self.0.is_empty()
+            || self
+                .0
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        {
+            return Err(ConfigError::new(format!(
+                "{name} must be non-empty and contain no whitespace"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl FromStr for BearerSecret {
     type Err = ConfigError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        if input.is_empty()
-            || input
-                .bytes()
-                .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
-        {
-            return Err(ConfigError::new(
-                "bearer token must be non-empty and contain no whitespace",
-            ));
-        }
         Ok(Self(input.to_owned()))
     }
 }
@@ -259,7 +279,7 @@ pub struct WalletOptions {
         env = "PS_WALLET_BEARER_TOKEN",
         hide_env_values = true
     )]
-    pub bearer_token: BearerSecret,
+    pub bearer_token: Option<BearerSecret>,
 
     #[arg(
         id = "wallet_request_timeout_seconds",
@@ -295,8 +315,16 @@ pub struct WalletOptions {
 }
 
 impl WalletOptions {
-    pub fn validate(&self) -> Result<(), ConfigError> {
+    pub fn validate(&self, authentication_mode: AuthenticationMode) -> Result<(), ConfigError> {
         self.wallet_url.validate_transport("Wallet Service")?;
+        if authentication_mode.is_strict() {
+            self.bearer_token
+                .as_ref()
+                .ok_or_else(|| {
+                    ConfigError::new("strict authentication requires a Wallet Service bearer token")
+                })?
+                .validate("Wallet Service bearer token")?;
+        }
         let timeout = self.request_timeout();
         if timeout.is_zero() || timeout > MAX_REQUEST_TIMEOUT {
             return Err(ConfigError::new(
@@ -403,12 +431,17 @@ pub struct IndexerOptions {
 }
 
 impl IndexerOptions {
-    pub fn validate(&self) -> Result<(), ConfigError> {
+    pub fn validate(&self, authentication_mode: AuthenticationMode) -> Result<(), ConfigError> {
         self.indexer_url.validate_transport("Indexer Service")?;
-        if !self.indexer_url.is_loopback() && self.bearer_token.is_none() {
-            return Err(ConfigError::new(
-                "a non-loopback Indexer Service endpoint requires a bearer token",
-            ));
+        if authentication_mode.is_strict() {
+            self.bearer_token
+                .as_ref()
+                .ok_or_else(|| {
+                    ConfigError::new(
+                        "strict authentication requires an Indexer Service bearer token",
+                    )
+                })?
+                .validate("Indexer Service bearer token")?;
         }
         if self.network.trim().is_empty() {
             return Err(ConfigError::new("Indexer network must not be empty"));
@@ -471,6 +504,9 @@ impl fmt::Debug for IndexerOptions {
 #[derive(Args, Clone)]
 pub struct ServeOptions {
     #[command(flatten)]
+    pub authentication: AuthenticationOptions,
+
+    #[command(flatten)]
     pub database: DatabaseOptions,
 
     #[command(flatten)]
@@ -494,10 +530,10 @@ pub struct ServeOptions {
     pub tls_terminated_upstream: bool,
 
     #[arg(long, env = "PS_API_BEARER_TOKEN", hide_env_values = true)]
-    pub ordinary_bearer_token: BearerSecret,
+    pub ordinary_bearer_token: Option<BearerSecret>,
 
     #[arg(long, env = "PS_ADMIN_BEARER_TOKEN", hide_env_values = true)]
-    pub admin_bearer_token: BearerSecret,
+    pub admin_bearer_token: Option<BearerSecret>,
 
     #[arg(long, env = "PS_WORKER_INTERVAL_MILLIS", default_value_t = 1_000)]
     pub worker_interval_millis: u64,
@@ -512,8 +548,8 @@ pub struct ServeOptions {
 impl ServeOptions {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.database.validate()?;
-        self.indexer.validate()?;
-        self.wallet.validate()?;
+        self.indexer.validate(self.authentication.mode)?;
+        self.wallet.validate(self.authentication.mode)?;
         validate_policy_path(&self.policy_path)?;
         validate_page_size(self.worker_page_size)?;
 
@@ -527,10 +563,20 @@ impl ServeOptions {
                 "a non-loopback Payment Service listener requires trusted upstream TLS termination",
             ));
         }
-        if self.ordinary_bearer_token == self.admin_bearer_token {
-            return Err(ConfigError::new(
-                "ordinary and administrator bearer tokens must be different",
-            ));
+        if self.authentication.mode.is_strict() {
+            let ordinary = self.ordinary_bearer_token.as_ref().ok_or_else(|| {
+                ConfigError::new("strict authentication requires an ordinary bearer token")
+            })?;
+            let administrator = self.admin_bearer_token.as_ref().ok_or_else(|| {
+                ConfigError::new("strict authentication requires an administrator bearer token")
+            })?;
+            ordinary.validate("ordinary bearer token")?;
+            administrator.validate("administrator bearer token")?;
+            if ordinary == administrator {
+                return Err(ConfigError::new(
+                    "ordinary and administrator bearer tokens must be different",
+                ));
+            }
         }
         if self.worker_interval().is_zero() || self.worker_interval() > MAX_WORKER_INTERVAL {
             return Err(ConfigError::new(
@@ -560,6 +606,7 @@ impl fmt::Debug for ServeOptions {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ServeOptions")
+            .field("authentication", &self.authentication)
             .field("database", &self.database)
             .field("indexer", &self.indexer)
             .field("wallet", &self.wallet)
@@ -576,8 +623,8 @@ impl fmt::Debug for ServeOptions {
     }
 }
 
-/// Bitcoin uses the common PS transport and worker controls, with stricter IX
-/// authentication and canonical-network requirements.
+/// Bitcoin uses the common PS transport and worker controls, with canonical
+/// network requirements.
 #[derive(Args, Clone)]
 pub struct BitcoinServeOptions {
     #[command(flatten)]
@@ -587,11 +634,6 @@ pub struct BitcoinServeOptions {
 impl BitcoinServeOptions {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.common.validate()?;
-        if self.common.indexer.bearer_token.is_none() {
-            return Err(ConfigError::new(
-                "Bitcoin Indexer Service authentication is required even on loopback",
-            ));
-        }
         match self.common.indexer.network.as_str() {
             "mainnet" | "testnet3" | "testnet4" | "signet" | "regtest" => Ok(()),
             _ => Err(ConfigError::new(
@@ -613,6 +655,9 @@ impl fmt::Debug for BitcoinServeOptions {
 #[derive(Args, Clone, Debug)]
 pub struct ReconcileOptions {
     #[command(flatten)]
+    pub authentication: AuthenticationOptions,
+
+    #[command(flatten)]
     pub database: DatabaseOptions,
 
     #[command(flatten)]
@@ -628,7 +673,7 @@ pub struct ReconcileOptions {
 impl ReconcileOptions {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.database.validate()?;
-        self.indexer.validate()?;
+        self.indexer.validate(self.authentication.mode)?;
         validate_page_size(self.page_size)?;
         validate_bound(self.max_batches, "maximum reconcile batches")
     }
@@ -636,6 +681,9 @@ impl ReconcileOptions {
 
 #[derive(Args, Clone, Debug)]
 pub struct IngestOptions {
+    #[command(flatten)]
+    pub authentication: AuthenticationOptions,
+
     #[command(flatten)]
     pub database: DatabaseOptions,
 
@@ -652,7 +700,7 @@ pub struct IngestOptions {
 impl IngestOptions {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.database.validate()?;
-        self.indexer.validate()?;
+        self.indexer.validate(self.authentication.mode)?;
         validate_page_size(self.page_size)?;
         validate_bound(self.max_pages, "maximum ingestion pages")
     }
@@ -754,6 +802,25 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    #[derive(Parser)]
+    struct SecretParser {
+        #[arg(long)]
+        token: Option<BearerSecret>,
+    }
+
+    #[test]
+    fn raw_empty_bearer_value_reaches_mode_aware_validation() {
+        let parsed = SecretParser::try_parse_from(["test", "--token", ""])
+            .expect("raw ignored bearer must parse before mode validation");
+        assert_eq!(
+            parsed
+                .token
+                .expect("explicit value must be retained")
+                .expose(),
+            ""
+        );
+    }
+
     fn indexer_options(endpoint: &str, bearer_token: Option<&str>) -> IndexerOptions {
         IndexerOptions {
             indexer_url: endpoint.parse().expect("test URL must parse"),
@@ -769,7 +836,7 @@ mod tests {
     fn wallet_options(endpoint: &str) -> WalletOptions {
         WalletOptions {
             wallet_url: endpoint.parse().expect("test URL must parse"),
-            bearer_token: "wallet-secret".parse().expect("test token must parse"),
+            bearer_token: Some("wallet-secret".parse().expect("test token must parse")),
             request_timeout_seconds: 15,
             retry_attempts: 3,
             retry_initial_millis: 100,
@@ -825,10 +892,10 @@ mod tests {
             "http://[::1]:8080",
         ] {
             indexer_options(endpoint, None)
-                .validate()
+                .validate(AuthenticationMode::GlobalTrusted)
                 .expect("loopback Indexer endpoint may use plaintext without authentication");
             wallet_options(endpoint)
-                .validate()
+                .validate(AuthenticationMode::Strict)
                 .expect("loopback Wallet endpoint may use plaintext");
         }
 
@@ -836,12 +903,12 @@ mod tests {
             "http://indexer.example.invalid:8080",
             Some("indexer-secret"),
         )
-        .validate()
+        .validate(AuthenticationMode::Strict)
         .expect_err("non-loopback Indexer plaintext must be rejected");
         assert!(indexer_error.to_string().contains("HTTPS"));
 
         let wallet_error = wallet_options("http://wallet.example.invalid:8080")
-            .validate()
+            .validate(AuthenticationMode::Strict)
             .expect_err("non-loopback Wallet plaintext must be rejected");
         assert!(wallet_error.to_string().contains("HTTPS"));
 
@@ -849,24 +916,28 @@ mod tests {
             "http://localhost.example.invalid:8080",
             Some("indexer-secret"),
         )
-        .validate()
+        .validate(AuthenticationMode::Strict)
         .expect_err("a domain containing localhost is not itself a loopback host");
         assert!(deceptive_host.to_string().contains("HTTPS"));
     }
 
     #[test]
-    fn non_loopback_indexer_requires_bearer_authentication() {
+    fn strict_mode_requires_dependency_bearer_authentication() {
         let missing = indexer_options("https://indexer.example.invalid", None)
-            .validate()
-            .expect_err("remote Indexer endpoint without authentication must fail");
-        assert!(missing.to_string().contains("requires a bearer token"));
+            .validate(AuthenticationMode::Strict)
+            .expect_err("strict Indexer endpoint without authentication must fail");
+        assert!(missing.to_string().contains("strict authentication"));
 
         indexer_options("https://indexer.example.invalid", Some("indexer-secret"))
-            .validate()
+            .validate(AuthenticationMode::Strict)
             .expect("remote HTTPS Indexer endpoint with authentication must validate");
         wallet_options("https://wallet.example.invalid")
-            .validate()
+            .validate(AuthenticationMode::Strict)
             .expect("remote HTTPS Wallet endpoint must validate");
+
+        indexer_options("https://indexer.example.invalid", None)
+            .validate(AuthenticationMode::GlobalTrusted)
+            .expect("global-trusted Indexer client does not require a bearer");
     }
 
     #[test]
@@ -882,7 +953,7 @@ mod tests {
             retry_initial_millis: 200,
             retry_max_millis: 100,
         };
-        assert!(options.validate().is_err());
+        assert!(options.validate(AuthenticationMode::GlobalTrusted).is_err());
         assert!(validate_page_size(0).is_err());
         assert!(validate_page_size(1_001).is_err());
         assert!(validate_bound(0, "test bound").is_err());
@@ -891,6 +962,9 @@ mod tests {
     #[test]
     fn serve_configuration_requires_distinct_tokens_and_safe_bindings() {
         let mut options = ServeOptions {
+            authentication: AuthenticationOptions {
+                mode: AuthenticationMode::Strict,
+            },
             database: DatabaseOptions {
                 database_path: PathBuf::from("/tmp/payment-service-test"),
             },
@@ -899,7 +973,7 @@ mod tests {
                     .parse()
                     .expect("test URL must parse"),
                 network: "test".to_owned(),
-                bearer_token: None,
+                bearer_token: Some("indexer-secret".parse().expect("token must parse")),
                 request_timeout_seconds: 15,
                 retry_attempts: 3,
                 retry_initial_millis: 100,
@@ -909,7 +983,7 @@ mod tests {
                 wallet_url: "http://127.0.0.1:8082"
                     .parse()
                     .expect("test URL must parse"),
-                bearer_token: "wallet-secret".parse().expect("token must parse"),
+                bearer_token: Some("wallet-secret".parse().expect("token must parse")),
                 request_timeout_seconds: 15,
                 retry_attempts: 3,
                 retry_initial_millis: 100,
@@ -919,8 +993,8 @@ mod tests {
             http_bind: "127.0.0.1:8081".parse().expect("bind must parse"),
             metrics_bind: "127.0.0.1:9091".parse().expect("bind must parse"),
             tls_terminated_upstream: false,
-            ordinary_bearer_token: "ordinary-secret".parse().expect("token must parse"),
-            admin_bearer_token: "admin-secret".parse().expect("token must parse"),
+            ordinary_bearer_token: Some("ordinary-secret".parse().expect("token must parse")),
+            admin_bearer_token: Some("admin-secret".parse().expect("token must parse")),
             worker_interval_millis: 1_000,
             worker_page_size: 100,
             shutdown_grace_seconds: 10,
@@ -929,9 +1003,36 @@ mod tests {
             .validate()
             .expect("safe configuration must validate");
 
+        let mut global_trusted = options.clone();
+        global_trusted.authentication.mode = AuthenticationMode::GlobalTrusted;
+        global_trusted.indexer.bearer_token = None;
+        global_trusted.wallet.bearer_token = None;
+        global_trusted.ordinary_bearer_token = None;
+        global_trusted.admin_bearer_token = None;
+        global_trusted
+            .validate()
+            .expect("global-trusted configuration must not require repo bearer credentials");
+
+        global_trusted.indexer.bearer_token = Some("".parse().expect("raw token must parse"));
+        global_trusted.wallet.bearer_token = Some(
+            "ignored wallet token"
+                .parse()
+                .expect("raw token must parse"),
+        );
+        global_trusted.ordinary_bearer_token = Some("\t".parse().expect("raw token must parse"));
+        global_trusted.admin_bearer_token =
+            Some("ignored admin token".parse().expect("raw token must parse"));
+        global_trusted
+            .validate()
+            .expect("global-trusted mode must ignore even invalid configured bearer values");
+
+        let mut strict_invalid = global_trusted;
+        strict_invalid.authentication.mode = AuthenticationMode::Strict;
+        assert!(strict_invalid.validate().is_err());
+
         options.admin_bearer_token = options.ordinary_bearer_token.clone();
         assert!(options.validate().is_err());
-        options.admin_bearer_token = "admin-secret".parse().expect("token must parse");
+        options.admin_bearer_token = Some("admin-secret".parse().expect("token must parse"));
         options.http_bind = "0.0.0.0:8081".parse().expect("bind must parse");
         assert!(options.validate().is_err());
         options.tls_terminated_upstream = true;
@@ -942,6 +1043,9 @@ mod tests {
     #[test]
     fn bitcoin_serve_requires_authenticated_ix_and_canonical_network() {
         let common = ServeOptions {
+            authentication: AuthenticationOptions {
+                mode: AuthenticationMode::Strict,
+            },
             database: DatabaseOptions {
                 database_path: PathBuf::from("/tmp/bitcoin-payment-service-test"),
             },
@@ -960,7 +1064,7 @@ mod tests {
                 wallet_url: "http://127.0.0.1:18082"
                     .parse()
                     .expect("test URL must parse"),
-                bearer_token: "wallet-secret".parse().expect("token must parse"),
+                bearer_token: Some("wallet-secret".parse().expect("token must parse")),
                 request_timeout_seconds: 15,
                 retry_attempts: 3,
                 retry_initial_millis: 100,
@@ -970,8 +1074,8 @@ mod tests {
             http_bind: "127.0.0.1:18081".parse().expect("bind must parse"),
             metrics_bind: "127.0.0.1:19091".parse().expect("bind must parse"),
             tls_terminated_upstream: false,
-            ordinary_bearer_token: "ordinary-secret".parse().expect("token must parse"),
-            admin_bearer_token: "admin-secret".parse().expect("token must parse"),
+            ordinary_bearer_token: Some("ordinary-secret".parse().expect("token must parse")),
+            admin_bearer_token: Some("admin-secret".parse().expect("token must parse")),
             worker_interval_millis: 1_000,
             worker_page_size: 100,
             shutdown_grace_seconds: 10,
@@ -989,7 +1093,7 @@ mod tests {
         }
         .validate()
         .expect_err("Bitcoin IX authentication is mandatory even on loopback");
-        assert!(error.to_string().contains("authentication is required"));
+        assert!(error.to_string().contains("strict authentication"));
 
         let mut noncanonical = common;
         noncanonical.indexer.network = "test".to_owned();

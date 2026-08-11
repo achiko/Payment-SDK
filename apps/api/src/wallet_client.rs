@@ -8,6 +8,7 @@ use deposits::{
     BoxFuture, DepositAddressRequest, DepositAddressSource, DepositError, DepositErrorKind,
     GeneratedDepositAddress, SignedEnvelopeBytes,
 };
+use http_support::AuthenticationMode;
 use indexing::{BlockHash, BlockHeight, BlockRef};
 use reqwest::{Method, StatusCode, Url, redirect::Policy};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -19,10 +20,17 @@ const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 const ETHEREUM_CHAIN: &str = "ethereum";
 const NATIVE_ASSET: &str = "native";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestEffect {
+    ReadOnly,
+    Effectful,
+}
+
 #[derive(Clone)]
 pub struct WalletClient {
     endpoint: IndexerEndpoint,
-    bearer_token: BearerSecret,
+    bearer_token: Option<BearerSecret>,
+    authentication_mode: AuthenticationMode,
     request_timeout: Duration,
     retry_attempts: NonZeroU32,
     retry_initial_backoff: Duration,
@@ -206,9 +214,12 @@ pub struct WalletReceipt {
 }
 
 impl WalletClient {
-    pub(crate) fn new(options: &WalletOptions) -> Result<Self, DepositError> {
+    pub(crate) fn new(
+        options: &WalletOptions,
+        authentication_mode: AuthenticationMode,
+    ) -> Result<Self, DepositError> {
         options
-            .validate()
+            .validate(authentication_mode)
             .map_err(|error| invalid(error.to_string()))?;
         require_secure_endpoint(options.wallet_url.url())?;
         let client = reqwest::Client::builder()
@@ -220,6 +231,7 @@ impl WalletClient {
         Ok(Self {
             endpoint: options.wallet_url.clone(),
             bearer_token: options.bearer_token.clone(),
+            authentication_mode,
             request_timeout: options.request_timeout(),
             retry_attempts: options
                 .retry_attempts()
@@ -254,7 +266,9 @@ impl WalletClient {
         };
         // Retrying is safe because the exact caller-owned operation ID and body
         // are reused; this client never creates a replacement operation ID.
-        let response: AddressResponseDto = self.send_json_safe(Method::POST, url, &body).await?;
+        let response: AddressResponseDto = self
+            .send_json_safe(Method::POST, url, &body, RequestEffect::Effectful)
+            .await?;
         let address = canonical_address(&response.address)?;
         Ok(GeneratedDepositAddress {
             address,
@@ -277,13 +291,7 @@ impl WalletClient {
                     unavailable("Wallet Service readiness endpoint is unavailable")
                 }
             })?;
-        match response.status() {
-            StatusCode::OK => Ok(true),
-            StatusCode::SERVICE_UNAVAILABLE => Ok(false),
-            _ => Err(protocol(
-                "Wallet Service readiness endpoint returned an unexpected status",
-            )),
-        }
+        decode_readiness(response, self.authentication_mode).await
     }
 
     /// Reads a factual native or ERC-20 balance. This read-only call may be
@@ -302,6 +310,7 @@ impl WalletClient {
                 Method::POST,
                 self.route(&["v1", "ethereum", "balances"])?,
                 &body,
+                RequestEffect::ReadOnly,
             )
             .await?;
         Ok(WalletBalance {
@@ -333,6 +342,7 @@ impl WalletClient {
                 Method::POST,
                 self.route(&["v1", "ethereum", "collections", "requirements"])?,
                 &collection,
+                RequestEffect::ReadOnly,
             )
             .await?;
         if native && !response.requirements.is_empty() {
@@ -369,6 +379,7 @@ impl WalletClient {
                 Method::POST,
                 self.route(&["v1", "ethereum", "transfers", "native", "sign"])?,
                 &body,
+                RequestEffect::Effectful,
             )
             .await?;
         response.into_domain()
@@ -388,6 +399,7 @@ impl WalletClient {
                 Method::POST,
                 self.route(&["v1", "ethereum", "collections", "native", "sign"])?,
                 &body,
+                RequestEffect::Effectful,
             )
             .await?;
         response.into_domain(&expected_from, &expected_asset, None)
@@ -407,6 +419,7 @@ impl WalletClient {
                 Method::POST,
                 self.route(&["v1", "ethereum", "collections", "erc20", "sign"])?,
                 &body,
+                RequestEffect::Effectful,
             )
             .await?;
         response.into_domain(&expected_from, &expected_asset, request.amount.as_ref())
@@ -436,6 +449,7 @@ impl WalletClient {
                 Method::POST,
                 self.route(&["v1", "ethereum", "transactions", "broadcast"])?,
                 &body,
+                RequestEffect::Effectful,
             )
             .await?;
         let returned = canonical_transaction_id(&response.transaction_id)?;
@@ -461,6 +475,7 @@ impl WalletClient {
                 Method::POST,
                 self.route(&["v1", "ethereum", "receipts"])?,
                 &body,
+                RequestEffect::ReadOnly,
             )
             .await?;
         let returned = canonical_transaction_id(&response.transaction_id)?;
@@ -492,6 +507,7 @@ impl WalletClient {
         method: Method,
         url: Url,
         body: &B,
+        effect: RequestEffect,
     ) -> Result<T, DepositError>
     where
         T: DeserializeOwned,
@@ -501,10 +517,35 @@ impl WalletClient {
             .map_err(|_| invalid("failed to encode Wallet Service request"))?;
         let mut attempt = 1_u32;
         loop {
-            let response = self
-                .client
-                .request(method.clone(), url.clone())
-                .bearer_auth(self.bearer_token.expose())
+            match (self.readiness().await, effect) {
+                (Ok(true), _) | (Ok(false), RequestEffect::ReadOnly) => {}
+                (Ok(false), RequestEffect::Effectful) if attempt < self.retry_attempts.get() => {
+                    tokio::time::sleep(self.backoff_after(attempt)).await;
+                    attempt += 1;
+                    continue;
+                }
+                (Ok(false), RequestEffect::Effectful) => {
+                    return Err(unavailable(
+                        "Wallet Service is not ready for an effectful request",
+                    ));
+                }
+                (Err(error), _)
+                    if error.kind == DepositErrorKind::Other
+                        && attempt < self.retry_attempts.get() =>
+                {
+                    tokio::time::sleep(self.backoff_after(attempt)).await;
+                    attempt += 1;
+                    continue;
+                }
+                (Err(error), _) => return Err(error),
+            }
+            let mut request = self.client.request(method.clone(), url.clone());
+            if self.authentication_mode.is_strict() {
+                if let Some(token) = &self.bearer_token {
+                    request = request.bearer_auth(token.expose());
+                }
+            }
+            let response = request
                 .header(reqwest::header::ACCEPT, "application/json")
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .timeout(self.request_timeout)
@@ -555,6 +596,7 @@ impl fmt::Debug for WalletClient {
             .debug_struct("WalletClient")
             .field("endpoint", &self.endpoint)
             .field("bearer_token", &self.bearer_token)
+            .field("authentication_mode", &self.authentication_mode)
             .field("request_timeout", &self.request_timeout)
             .field("retry_attempts", &self.retry_attempts)
             .field("retry_initial_backoff", &self.retry_initial_backoff)
@@ -1007,6 +1049,49 @@ where
         .map_err(|_| protocol("Wallet Service returned an invalid JSON response"))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadinessDto {
+    status: String,
+    authentication_mode: String,
+}
+
+async fn decode_readiness(
+    response: reqwest::Response,
+    expected_mode: AuthenticationMode,
+) -> Result<bool, DepositError> {
+    let status = response.status();
+    if !matches!(status, StatusCode::OK | StatusCode::SERVICE_UNAVAILABLE) {
+        return Err(protocol(
+            "Wallet Service readiness endpoint returned an unexpected status",
+        ));
+    }
+    let body = bounded_body(response).await?;
+    let readiness: ReadinessDto = serde_json::from_slice(&body)
+        .map_err(|_| protocol("Wallet Service readiness response is invalid"))?;
+    let mode = match readiness.authentication_mode.as_str() {
+        "strict" => AuthenticationMode::Strict,
+        "global_trusted" => AuthenticationMode::GlobalTrusted,
+        _ => {
+            return Err(protocol(
+                "Wallet Service readiness returned an unknown authentication mode",
+            ));
+        }
+    };
+    if mode != expected_mode {
+        return Err(protocol(
+            "Wallet Service authentication mode does not match Payment Service",
+        ));
+    }
+    match (status, readiness.status.as_str()) {
+        (StatusCode::OK, "ready") => Ok(true),
+        (StatusCode::SERVICE_UNAVAILABLE, "not_ready") => Ok(false),
+        _ => Err(protocol(
+            "Wallet Service readiness status and body disagree",
+        )),
+    }
+}
+
 async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>, DepositError> {
     if response
         .content_length()
@@ -1352,7 +1437,7 @@ mod tests {
         extract::{Request, State},
         http::header,
         response::{IntoResponse, Response},
-        routing::any,
+        routing::{any, get},
     };
     use serde_json::{Value, json};
     use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
@@ -1379,8 +1464,18 @@ mod tests {
         broadcast_attempts: Arc<AtomicUsize>,
     }
 
+    async fn strict_readiness() -> impl IntoResponse {
+        Json(json!({
+            "status": "ready",
+            "authentication_mode": "strict"
+        }))
+    }
+
     async fn wallet_double(State(state): State<DoubleState>, request: Request) -> Response {
         let path = request.uri().path().to_owned();
+        if path == "/health/ready" {
+            return strict_readiness().await.into_response();
+        }
         let authorization = request
             .headers()
             .get(header::AUTHORIZATION)
@@ -1515,7 +1610,7 @@ mod tests {
     fn options(endpoint: &str, retry_attempts: u32) -> WalletOptions {
         WalletOptions {
             wallet_url: endpoint.parse().expect("endpoint must parse"),
-            bearer_token: "wallet-secret".parse().expect("token must parse"),
+            bearer_token: Some("wallet-secret".parse().expect("token must parse")),
             request_timeout_seconds: 2,
             retry_attempts,
             retry_initial_millis: 0,
@@ -1545,7 +1640,8 @@ mod tests {
             .fallback(any(wallet_double))
             .with_state(state.clone());
         let (endpoint, server) = spawn_double(router).await;
-        let client = WalletClient::new(&options(&endpoint, 2)).expect("client must build");
+        let client = WalletClient::new(&options(&endpoint, 2), AuthenticationMode::Strict)
+            .expect("client must build");
         let native = NativeCollectionRequest {
             operation_id: operation(),
             key_locator: locator(),
@@ -1673,6 +1769,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_trusted_omits_bearer_and_readiness_rejects_mode_mismatch()
+    -> Result<(), DepositError> {
+        async fn readiness(State(state): State<DoubleState>) -> impl IntoResponse {
+            if state.observed.lock().await.is_empty() {
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "status": "ready",
+                        "authentication_mode": "global_trusted"
+                    })),
+                )
+            } else {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "status": "not_ready",
+                        "authentication_mode": "global_trusted"
+                    })),
+                )
+            }
+        }
+
+        let state = DoubleState::default();
+        let router = Router::new()
+            .route("/health/ready", get(readiness))
+            .fallback(any(wallet_double))
+            .with_state(state.clone());
+        let (endpoint, server) = spawn_double(router).await;
+        let global = WalletClient::new(&options(&endpoint, 1), AuthenticationMode::GlobalTrusted)?;
+        assert!(global.readiness().await?);
+        let transfer = || NativeTransferRequest {
+            operation_id: OperationId::new("live-mode-preflight").expect("test operation ID"),
+            key_locator: locator(),
+            from: address(DESTINATION),
+            to: address(FROM),
+            value: AtomicAmount::from_decimal_str("2").expect("test amount"),
+        };
+        global.sign_native_transfer(&transfer()).await?;
+        assert!(
+            state
+                .observed
+                .lock()
+                .await
+                .iter()
+                .all(|request| request.authorization.is_none())
+        );
+        global.balance(&native_asset(), &address(FROM)).await?;
+        let protected_requests = state.observed.lock().await.len();
+        let not_ready = global
+            .sign_native_transfer(&transfer())
+            .await
+            .expect_err("not-ready dependency must block an effectful request");
+        assert_eq!(not_ready.kind, DepositErrorKind::Other);
+        assert!(not_ready.message.contains("not ready"));
+        assert_eq!(state.observed.lock().await.len(), protected_requests);
+
+        let strict = WalletClient::new(&options(&endpoint, 1), AuthenticationMode::Strict)?;
+        let mismatch = strict
+            .sign_native_transfer(&transfer())
+            .await
+            .expect_err("live mode mismatch must fail before signing");
+        assert_eq!(mismatch.kind, DepositErrorKind::InvariantViolation);
+        assert!(mismatch.message.contains("does not match"));
+        assert_eq!(state.observed.lock().await.len(), protected_requests);
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn malformed_or_oversized_wallet_responses_are_rejected() {
         async fn malformed() -> impl IntoResponse {
             Json(json!({
@@ -1686,8 +1851,14 @@ mod tests {
                 "unexpected": true
             }))
         }
-        let (endpoint, server) = spawn_double(Router::new().fallback(any(malformed))).await;
-        let client = WalletClient::new(&options(&endpoint, 1)).expect("client must build");
+        let (endpoint, server) = spawn_double(
+            Router::new()
+                .route("/health/ready", get(strict_readiness))
+                .fallback(any(malformed)),
+        )
+        .await;
+        let client = WalletClient::new(&options(&endpoint, 1), AuthenticationMode::Strict)
+            .expect("client must build");
         let error = client
             .sign_native_collection(&NativeCollectionRequest {
                 operation_id: operation(),
@@ -1703,8 +1874,14 @@ mod tests {
         async fn oversized() -> Bytes {
             Bytes::from(vec![b'x'; MAX_RESPONSE_BYTES + 1])
         }
-        let (endpoint, server) = spawn_double(Router::new().fallback(any(oversized))).await;
-        let client = WalletClient::new(&options(&endpoint, 1)).expect("client must build");
+        let (endpoint, server) = spawn_double(
+            Router::new()
+                .route("/health/ready", get(strict_readiness))
+                .fallback(any(oversized)),
+        )
+        .await;
+        let client = WalletClient::new(&options(&endpoint, 1), AuthenticationMode::Strict)
+            .expect("client must build");
         let error = client
             .balance(&native_asset(), &address(FROM))
             .await
@@ -1721,7 +1898,8 @@ mod tests {
             .fallback(any(wallet_double))
             .with_state(state.clone());
         let (endpoint, server) = spawn_double(router).await;
-        let client = WalletClient::new(&options(&endpoint, 1)).expect("client must build");
+        let client = WalletClient::new(&options(&endpoint, 1), AuthenticationMode::Strict)
+            .expect("client must build");
         let wrong_id = CanonicalTransactionId {
             chain: ChainId(ETHEREUM_CHAIN.to_owned()),
             value: format!("0x{}", "00".repeat(32)),
@@ -1744,7 +1922,7 @@ mod tests {
             wallet_url: "http://127.0.0.1:8082"
                 .parse()
                 .expect("endpoint must parse"),
-            bearer_token: "wallet-secret".parse().expect("token must parse"),
+            bearer_token: Some("wallet-secret".parse().expect("token must parse")),
             request_timeout_seconds: 1,
             retry_attempts: 1,
             retry_initial_millis: 0,
@@ -1752,7 +1930,7 @@ mod tests {
         };
         let output = format!(
             "{:?}",
-            WalletClient::new(&options).expect("client must build")
+            WalletClient::new(&options, AuthenticationMode::Strict).expect("client must build")
         );
         assert!(!output.contains("wallet-secret"));
         assert!(!output.contains("127.0.0.1"));
@@ -1792,8 +1970,11 @@ mod tests {
 
     #[test]
     fn non_loopback_plain_http_and_noncanonical_values_are_rejected() {
-        let error = WalletClient::new(&options("http://example.com", 1))
-            .expect_err("external plaintext endpoint must fail");
+        let error = WalletClient::new(
+            &options("http://example.com", 1),
+            AuthenticationMode::Strict,
+        )
+        .expect_err("external plaintext endpoint must fail");
         assert_eq!(error.kind, DepositErrorKind::InvariantViolation);
         assert!(canonical_address("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").is_err());
         assert!(canonical_amount("01", "amount").is_err());

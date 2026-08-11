@@ -24,8 +24,8 @@ use chain_ethereum::{
     EthereumNewHeadsConnectionEvent,
 };
 use http::{
-    BearerToken, HealthState, HttpServerConfig, HttpTransport, HttpTransportConfig, RequestLimits,
-    RetryPolicy, TransportSecurity,
+    AuthenticationMode, BearerToken, HealthState, HttpServerConfig, HttpTransport,
+    HttpTransportConfig, RequestLimits, RetryPolicy, TransportSecurity,
 };
 use indexing::{
     AbortRebuildCommand, ActivateRebuildCommand, BeginRebuildCommand, BlockCommitObservation,
@@ -84,6 +84,7 @@ enum BackfillProjectionPolicy {
 struct ServiceRuntimeOptions {
     http_bind: std::net::SocketAddr,
     metrics_bind: std::net::SocketAddr,
+    authentication_mode: AuthenticationMode,
     bearer_token: Option<String>,
     ready_max_lag: u64,
     ready_max_age: Duration,
@@ -397,7 +398,11 @@ where
     } else {
         WakeSource::PollOnly
     };
-    tracing::info!(network = %options.repository.network, "Indexer Service started");
+    tracing::info!(
+        network = %options.repository.network,
+        authentication_mode = %options.authentication_mode,
+        "Indexer Service started"
+    );
     let ready_max_age = options.ready_max_age();
     run_service_until(
         runtime,
@@ -407,6 +412,7 @@ where
         ServiceRuntimeOptions {
             http_bind: options.http_bind,
             metrics_bind: options.metrics_bind,
+            authentication_mode: options.authentication_mode,
             bearer_token: options.bearer_token,
             ready_max_lag: options.ready_max_lag,
             ready_max_age,
@@ -520,7 +526,11 @@ where
         backfill_projection_policy: BackfillProjectionPolicy::DropBitcoinConditionalSpendCandidates,
     };
 
-    tracing::info!(network = %options.repository.network, "Bitcoin Indexer Service started");
+    tracing::info!(
+        network = %options.repository.network,
+        authentication_mode = %options.authentication_mode,
+        "Bitcoin Indexer Service started"
+    );
     let ready_max_age = options.ready_max_age();
     run_service_until(
         runtime,
@@ -530,6 +540,7 @@ where
         ServiceRuntimeOptions {
             http_bind: options.http_bind,
             metrics_bind: options.metrics_bind,
+            authentication_mode: options.authentication_mode,
             bearer_token: options.bearer_token,
             ready_max_lag: options.ready_max_lag,
             ready_max_age,
@@ -566,24 +577,36 @@ where
     R: IndexRepository + Clone + Send + Sync + 'static,
     F: Future<Output = AppResult<()>>,
 {
-    let bearer_token = options
-        .bearer_token
-        .as_deref()
-        .map(BearerToken::new)
-        .transpose()?;
+    let bearer_token = if options.authentication_mode.is_strict() {
+        options
+            .bearer_token
+            .as_deref()
+            .map(BearerToken::new)
+            .transpose()?
+    } else {
+        tracing::warn!(
+            authentication_mode = %options.authentication_mode,
+            ignored_bearer_variable = "IX_BEARER_TOKEN",
+            "STRICT AUTHENTICATION IS DISABLED: every reachable Indexer caller is globally trusted"
+        );
+        None
+    };
     let security = if options.http_bind.ip().is_loopback() {
         TransportSecurity::PlaintextLoopback
     } else {
         TransportSecurity::TlsTerminatedUpstream
     };
-    let server_config = HttpServerConfig::new(options.http_bind, security, bearer_token, limits);
+    let server_config = HttpServerConfig::new(options.http_bind, security, bearer_token, limits)
+        .with_authentication_mode(options.authentication_mode);
     let application_router = http::service_router(api_router, &server_config, health.clone())?;
+    record_authentication_mode_metric(&telemetry, options.authentication_mode);
     let metrics_config = HttpServerConfig::new(
         options.metrics_bind,
         TransportSecurity::PlaintextLoopback,
         None,
         RequestLimits::default(),
-    );
+    )
+    .with_authentication_mode(AuthenticationMode::GlobalTrusted);
     let metrics_router = Router::new()
         .route("/metrics", get(metrics))
         .with_state(telemetry.clone());
@@ -655,6 +678,17 @@ where
     }
 
     supervise_tasks_until(&mut tasks, shutdown_tx, wake_tx, shutdown).await
+}
+
+fn record_authentication_mode_metric(telemetry: &dyn Telemetry, mode: AuthenticationMode) {
+    telemetry.gauge(
+        "payment_sdk_strict_authentication_mode",
+        if mode.is_strict() { 1.0 } else { 0.0 },
+        &[Attribute {
+            key: "service".to_owned(),
+            value: "indexer".to_owned(),
+        }],
+    );
 }
 
 async fn startup_or_shutdown<T, F, S>(startup: F, shutdown: Pin<&mut S>) -> AppResult<Option<T>>
@@ -1540,10 +1574,12 @@ mod tests {
     use super::*;
 
     type RecordedMetric = (&'static str, Vec<Attribute>);
+    type RecordedGauge = (&'static str, f64, Vec<Attribute>);
 
     #[derive(Clone, Default)]
     struct RecordingTelemetry {
         records: Arc<Mutex<Vec<RecordedMetric>>>,
+        gauges: Arc<Mutex<Vec<RecordedGauge>>>,
     }
 
     impl RecordingTelemetry {
@@ -1571,6 +1607,16 @@ mod tests {
                 .expect("recording telemetry lock must be healthy")
                 .push((name, attributes.to_vec()));
         }
+
+        fn gauge_values(&self, name: &'static str) -> Vec<(f64, Vec<Attribute>)> {
+            self.gauges
+                .lock()
+                .expect("recording telemetry lock must be healthy")
+                .iter()
+                .filter(|(recorded_name, _, _)| *recorded_name == name)
+                .map(|(_, value, attributes)| (*value, attributes.clone()))
+                .collect()
+        }
     }
 
     impl Telemetry for RecordingTelemetry {
@@ -1578,8 +1624,12 @@ mod tests {
             self.record(name, attributes);
         }
 
-        fn gauge(&self, name: &'static str, _value: f64, attributes: &[Attribute]) {
+        fn gauge(&self, name: &'static str, value: f64, attributes: &[Attribute]) {
             self.record(name, attributes);
+            self.gauges
+                .lock()
+                .expect("recording telemetry lock must be healthy")
+                .push((name, value, attributes.to_vec()));
         }
 
         fn duration(&self, name: &'static str, _value: Duration, attributes: &[Attribute]) {
@@ -1875,6 +1925,33 @@ mod tests {
     fn metrics_listener_constant_is_loopback() {
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9090);
         assert!(address.ip().is_loopback());
+    }
+
+    #[test]
+    fn authentication_mode_metric_is_persistent_and_service_scoped() {
+        let telemetry = RecordingTelemetry::default();
+        record_authentication_mode_metric(&telemetry, AuthenticationMode::Strict);
+        record_authentication_mode_metric(&telemetry, AuthenticationMode::GlobalTrusted);
+
+        assert_eq!(
+            telemetry.gauge_values("payment_sdk_strict_authentication_mode"),
+            vec![
+                (
+                    1.0,
+                    vec![Attribute {
+                        key: "service".to_owned(),
+                        value: "indexer".to_owned(),
+                    }],
+                ),
+                (
+                    0.0,
+                    vec![Attribute {
+                        key: "service".to_owned(),
+                        value: "indexer".to_owned(),
+                    }],
+                ),
+            ]
+        );
     }
 
     #[tokio::test]

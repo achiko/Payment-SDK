@@ -7,6 +7,7 @@ use axum::{
         rejection::{JsonRejection, QueryRejection},
     },
     http::{HeaderMap, StatusCode},
+    response::Response,
     routing::{get, post},
 };
 use chain_ethereum::EthereumAddress;
@@ -25,7 +26,7 @@ use deposits::{
     ReconciliationResolution, ReconciliationState, ReconciliationStore, ResolveReconciliation,
     RetryCollectionJob, RetryUtxoBatchCollectionJob, UserId, UserStore,
 };
-use http_support::{HealthState, RequestLimits};
+use http_support::{AuthenticationMode, HealthState, RequestLimits};
 use indexing::{
     BlockRef, ConfirmationProof, EventCursor, MovementKind, ObservationEvent, TransactionStatus,
     ValueMovement,
@@ -37,9 +38,9 @@ use crate::{
     active_policy::ActivePaymentPolicy,
     api_error::ApiError,
     auth::{
-        AuthenticatedPrincipal, Credentials, PrincipalRole, administrator_routes, ordinary_routes,
+        AuthenticatedPrincipal, Authorizer, PrincipalRole, administrator_routes, ordinary_routes,
     },
-    commands::{idempotency_key, request_hash, validate_opaque_id},
+    commands::{idempotency_key, idempotent_response, request_hash, validate_opaque_id},
     ids::ServerIdGenerator,
 };
 
@@ -57,6 +58,7 @@ pub struct ApiState {
     health: HealthState,
     indexer_health: HealthState,
     wallet_health: HealthState,
+    authentication_mode: AuthenticationMode,
 }
 
 impl ApiState {
@@ -74,6 +76,7 @@ impl ApiState {
             health: HealthState::new(false),
             indexer_health: HealthState::new(false),
             wallet_health: HealthState::new(false),
+            authentication_mode: AuthenticationMode::Strict,
         }
     }
 
@@ -89,9 +92,18 @@ impl ApiState {
         self.wallet_health = wallet_health;
         self
     }
+
+    #[must_use]
+    pub const fn with_authentication_mode(
+        mut self,
+        authentication_mode: AuthenticationMode,
+    ) -> Self {
+        self.authentication_mode = authentication_mode;
+        self
+    }
 }
 
-pub fn router(state: Arc<ApiState>, credentials: Arc<Credentials>) -> Router {
+pub fn router(state: Arc<ApiState>, authorizer: Arc<Authorizer>) -> Router {
     let administrator = administrator_routes(
         Router::new()
             .route(
@@ -105,7 +117,7 @@ pub fn router(state: Arc<ApiState>, credentials: Arc<Credentials>) -> Router {
                 post(resolve_reconciliation),
             )
             .route("/v1/admin/status", get(admin_status)),
-        Arc::clone(&credentials),
+        Arc::clone(&authorizer),
     );
     let routes = Router::new()
         .route("/v1/deposits", post(create_deposit).get(deposits))
@@ -125,7 +137,7 @@ pub fn router(state: Arc<ApiState>, credentials: Arc<Credentials>) -> Router {
         .fallback(route_not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state);
-    ordinary_routes(routes, credentials)
+    ordinary_routes(routes, authorizer)
 }
 
 async fn route_not_found() -> ApiError {
@@ -164,6 +176,8 @@ struct ScopeDto {
 struct AcceptedDepositJobDto {
     job_id: String,
     deposit_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    idempotency_key: Option<String>,
 }
 
 async fn create_deposit(
@@ -171,8 +185,8 @@ async fn create_deposit(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     headers: HeaderMap,
     body: Result<Json<CreateDepositDto>, JsonRejection>,
-) -> Result<(StatusCode, Json<AcceptedDepositJobDto>), ApiError> {
-    let client_key = idempotency_key(&headers)?;
+) -> Result<Response, ApiError> {
+    let effective_idempotency = idempotency_key(&headers, state.authentication_mode)?;
     let Json(body) = body.map_err(|_| {
         ApiError::bad_request("invalid_json", "deposit request body is not valid JSON")
     })?;
@@ -198,7 +212,7 @@ async fn create_deposit(
     let command = CommandIdentity {
         principal: command_principal(principal),
         operation: CommandOperation::CreateDeposit,
-        client_key,
+        client_key: effective_idempotency.key.clone(),
         request_hash: request_hash(
             "create_deposit",
             &[
@@ -216,7 +230,11 @@ async fn create_deposit(
         .await
         .map_err(ApiError::from_deposit)?
     {
-        return accepted_deposit_job(&job, JobKind::CreateDeposit);
+        return accepted_deposit_job(
+            &job,
+            JobKind::CreateDeposit,
+            effective_idempotency.generated,
+        );
     }
     let now = unix_timestamp()?;
     let expires_at = now
@@ -244,13 +262,17 @@ async fn create_deposit(
                 created_at: now,
                 key_purpose: DEPOSIT_KEY_PURPOSE.to_owned(),
             }),
-            user_owner: exchange_user_owner(),
+            user_owner: user_owner(principal),
             policy: state.policy.identity(),
             created_at: now,
         })
         .await
         .map_err(ApiError::from_deposit)?;
-    accepted_deposit_job(outcome.job(), JobKind::CreateDeposit)
+    accepted_deposit_job(
+        outcome.job(),
+        JobKind::CreateDeposit,
+        effective_idempotency.generated,
+    )
 }
 
 #[derive(Default, Deserialize)]
@@ -344,15 +366,15 @@ async fn close_deposit(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Path(deposit_id): Path<String>,
     headers: HeaderMap,
-) -> Result<(StatusCode, Json<AcceptedDepositJobDto>), ApiError> {
+) -> Result<Response, ApiError> {
     validate_opaque_id(&deposit_id, "deposit_id")?;
-    let client_key = idempotency_key(&headers)?;
+    let effective_idempotency = idempotency_key(&headers, state.authentication_mode)?;
     let deposit = find_deposit(&state, &deposit_id).await?;
     authorize_user(&state, principal, &deposit.user_id).await?;
     let command = CommandIdentity {
         principal: command_principal(principal),
         operation: CommandOperation::CloseDeposit,
-        client_key,
+        client_key: effective_idempotency.key.clone(),
         request_hash: request_hash("close_deposit", &[&deposit_id]),
     };
     if let Some(job) = state
@@ -361,7 +383,7 @@ async fn close_deposit(
         .await
         .map_err(ApiError::from_deposit)?
     {
-        return accepted_deposit_job(&job, JobKind::CloseDeposit);
+        return accepted_deposit_job(&job, JobKind::CloseDeposit, effective_idempotency.generated);
     }
     let now = unix_timestamp()?;
     let outcome = state
@@ -373,19 +395,24 @@ async fn close_deposit(
                 deposit_id: deposit.id.clone(),
                 user_id: deposit.user_id,
             }),
-            user_owner: exchange_user_owner(),
+            user_owner: user_owner(principal),
             policy: state.policy.identity(),
             created_at: now,
         })
         .await
         .map_err(ApiError::from_deposit)?;
-    accepted_deposit_job(outcome.job(), JobKind::CloseDeposit)
+    accepted_deposit_job(
+        outcome.job(),
+        JobKind::CloseDeposit,
+        effective_idempotency.generated,
+    )
 }
 
 fn accepted_deposit_job(
     job: &Job,
     expected_kind: JobKind,
-) -> Result<(StatusCode, Json<AcceptedDepositJobDto>), ApiError> {
+    generated_idempotency: bool,
+) -> Result<Response, ApiError> {
     if job.kind != expected_kind {
         return Err(internal_invariant(
             "deposit command resolved to another job kind",
@@ -403,13 +430,18 @@ fn accepted_deposit_job(
             ));
         }
     };
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(AcceptedDepositJobDto {
-            job_id: job.id.0.clone(),
-            deposit_id: deposit_id.0.clone(),
-        }),
-    ))
+    let generated_key = generated_idempotency.then_some(&job.command.client_key);
+    idempotent_response(
+        (
+            StatusCode::ACCEPTED,
+            Json(AcceptedDepositJobDto {
+                job_id: job.id.0.clone(),
+                deposit_id: deposit_id.0.clone(),
+                idempotency_key: generated_key.map(|key| key.0.clone()),
+            }),
+        ),
+        generated_key,
+    )
 }
 
 async fn job(
@@ -740,9 +772,9 @@ async fn record_accounting(
     Path(deposit_id): Path<String>,
     headers: HeaderMap,
     body: Result<Json<AccountingDto>, JsonRejection>,
-) -> Result<Json<AccountingResultDto>, ApiError> {
+) -> Result<Response, ApiError> {
     validate_opaque_id(&deposit_id, "deposit_id")?;
-    let client_key = idempotency_key(&headers)?;
+    let effective_idempotency = idempotency_key(&headers, state.authentication_mode)?;
     let Json(body) = body.map_err(|_| {
         ApiError::bad_request("invalid_json", "accounting request body is not valid JSON")
     })?;
@@ -757,7 +789,7 @@ async fn record_accounting(
             command: CommandIdentity {
                 principal: command_principal(principal),
                 operation: CommandOperation::Accounting,
-                client_key,
+                client_key: effective_idempotency.key.clone(),
                 request_hash: request_hash(
                     "accounting",
                     &[
@@ -779,10 +811,16 @@ async fn record_accounting(
     let entry = match result {
         ApplyResult::Appended { entry } | ApplyResult::AlreadyPresent { entry } => entry,
     };
-    Ok(Json(AccountingResultDto {
-        deposit_id,
-        ledger_entry: LedgerEntryDto::from(&entry),
-    }))
+    let generated_key = effective_idempotency
+        .generated
+        .then_some(&effective_idempotency.key);
+    idempotent_response(
+        Json(AccountingResultDto {
+            deposit_id,
+            ledger_entry: LedgerEntryDto::from(&entry),
+        }),
+        generated_key,
+    )
 }
 
 #[derive(Serialize)]
@@ -1132,6 +1170,8 @@ impl CollectionJobRequest {
 struct AcceptedCollectionJobDto {
     job_id: String,
     collection_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    idempotency_key: Option<String>,
 }
 
 async fn create_collection(
@@ -1139,8 +1179,8 @@ async fn create_collection(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     headers: HeaderMap,
     body: Result<Json<CreateCollectionDto>, JsonRejection>,
-) -> Result<(StatusCode, Json<AcceptedCollectionJobDto>), ApiError> {
-    let client_key = idempotency_key(&headers)?;
+) -> Result<Response, ApiError> {
+    let effective_idempotency = idempotency_key(&headers, state.authentication_mode)?;
     let Json(body) = body.map_err(|_| {
         ApiError::bad_request("invalid_json", "collection request body is not valid JSON")
     })?;
@@ -1227,7 +1267,7 @@ async fn create_collection(
     let command = CommandIdentity {
         principal: command_principal(principal),
         operation: CommandOperation::CreateCollection,
-        client_key,
+        client_key: effective_idempotency.key.clone(),
         request_hash: request_hash(
             "create_collection",
             &hash_fields.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -1239,7 +1279,11 @@ async fn create_collection(
         .await
         .map_err(ApiError::from_deposit)?
     {
-        return accepted_collection_job(&job, JobKind::CreateCollection);
+        return accepted_collection_job(
+            &job,
+            JobKind::CreateCollection,
+            effective_idempotency.generated,
+        );
     }
     let outcome = state
         .repository
@@ -1247,13 +1291,17 @@ async fn create_collection(
             id: JobId(state.ids.job_id()),
             command,
             payload: payload.into_payload(CollectionId(state.ids.collection_id())),
-            user_owner: exchange_user_owner(),
+            user_owner: user_owner(principal),
             policy: state.policy.identity(),
             created_at: unix_timestamp()?,
         })
         .await
         .map_err(ApiError::from_deposit)?;
-    accepted_collection_job(outcome.job(), JobKind::CreateCollection)
+    accepted_collection_job(
+        outcome.job(),
+        JobKind::CreateCollection,
+        effective_idempotency.generated,
+    )
 }
 
 #[derive(Deserialize)]
@@ -1326,9 +1374,9 @@ async fn retry_collection(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Path(collection_id): Path<String>,
     headers: HeaderMap,
-) -> Result<(StatusCode, Json<AcceptedCollectionJobDto>), ApiError> {
+) -> Result<Response, ApiError> {
     validate_opaque_id(&collection_id, "collection_id")?;
-    let client_key = idempotency_key(&headers)?;
+    let effective_idempotency = idempotency_key(&headers, state.authentication_mode)?;
     let collection = find_collection(&state, &collection_id).await?;
     for participant in &collection.participants {
         authorize_user(&state, principal, &participant.user_id).await?;
@@ -1341,7 +1389,7 @@ async fn retry_collection(
     let command = CommandIdentity {
         principal: command_principal(principal),
         operation: CommandOperation::RetryCollection,
-        client_key,
+        client_key: effective_idempotency.key.clone(),
         request_hash: request_hash("retry_collection", &[&collection_id]),
     };
     if let Some(job) = state
@@ -1350,7 +1398,11 @@ async fn retry_collection(
         .await
         .map_err(ApiError::from_deposit)?
     {
-        return accepted_collection_job(&job, JobKind::RetryCollection);
+        return accepted_collection_job(
+            &job,
+            JobKind::RetryCollection,
+            effective_idempotency.generated,
+        );
     }
     let payload = if collection.mode == CollectionMode::UtxoBatch {
         JobPayload::RetryUtxoBatchCollection(RetryUtxoBatchCollectionJob {
@@ -1374,19 +1426,24 @@ async fn retry_collection(
             id: JobId(state.ids.job_id()),
             command,
             payload,
-            user_owner: exchange_user_owner(),
+            user_owner: user_owner(principal),
             policy: state.policy.identity(),
             created_at: unix_timestamp()?,
         })
         .await
         .map_err(ApiError::from_deposit)?;
-    accepted_collection_job(outcome.job(), JobKind::RetryCollection)
+    accepted_collection_job(
+        outcome.job(),
+        JobKind::RetryCollection,
+        effective_idempotency.generated,
+    )
 }
 
 fn accepted_collection_job(
     job: &Job,
     expected_kind: JobKind,
-) -> Result<(StatusCode, Json<AcceptedCollectionJobDto>), ApiError> {
+    generated_idempotency: bool,
+) -> Result<Response, ApiError> {
     if job.kind != expected_kind {
         return Err(internal_invariant(
             "collection command resolved to another job kind",
@@ -1403,13 +1460,18 @@ fn accepted_collection_job(
             ));
         }
     };
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(AcceptedCollectionJobDto {
-            job_id: job.id.0.clone(),
-            collection_id: collection_id.0.clone(),
-        }),
-    ))
+    let generated_key = generated_idempotency.then_some(&job.command.client_key);
+    idempotent_response(
+        (
+            StatusCode::ACCEPTED,
+            Json(AcceptedCollectionJobDto {
+                job_id: job.id.0.clone(),
+                collection_id: collection_id.0.clone(),
+                idempotency_key: generated_key.map(|key| key.0.clone()),
+            }),
+        ),
+        generated_key,
+    )
 }
 
 #[derive(Serialize)]
@@ -1728,9 +1790,9 @@ async fn resolve_reconciliation(
     Path(case_id): Path<String>,
     headers: HeaderMap,
     body: Result<Json<ResolveReconciliationDto>, JsonRejection>,
-) -> Result<Json<ReconciliationDto>, ApiError> {
+) -> Result<Response, ApiError> {
     validate_opaque_id(&case_id, "case_id")?;
-    let client_key = idempotency_key(&headers)?;
+    let effective_idempotency = idempotency_key(&headers, state.authentication_mode)?;
     let Json(body) = body.map_err(|_| {
         ApiError::bad_request(
             "invalid_json",
@@ -1803,7 +1865,7 @@ async fn resolve_reconciliation(
             command: CommandIdentity {
                 principal: command_principal(principal),
                 operation: CommandOperation::ResolveReconciliation,
-                client_key,
+                client_key: effective_idempotency.key.clone(),
                 request_hash: request_hash(
                     "resolve_reconciliation",
                     &[
@@ -1821,7 +1883,10 @@ async fn resolve_reconciliation(
         })
         .await
         .map_err(ApiError::from_deposit)?;
-    Ok(Json(ReconciliationDto::from(&case)))
+    let generated_key = effective_idempotency
+        .generated
+        .then_some(&effective_idempotency.key);
+    idempotent_response(Json(ReconciliationDto::from(&case)), generated_key)
 }
 
 #[derive(Serialize)]
@@ -1949,6 +2014,7 @@ impl From<&ReconciliationReason> for ReconciliationReasonDto {
 #[derive(Serialize)]
 struct AdminStatusDto {
     service: &'static str,
+    authentication_mode: &'static str,
     scope: AdminScopeResponseDto,
     policy_version: String,
     policy_digest: String,
@@ -2009,6 +2075,7 @@ async fn admin_status(
     };
     Ok(Json(AdminStatusDto {
         service: "payment-service",
+        authentication_mode: state.authentication_mode.as_str(),
         scope: AdminScopeResponseDto {
             chain: state.policy.scope().chain.0.clone(),
             network: state.policy.scope().network.clone(),
@@ -2076,8 +2143,7 @@ fn authorize_owner(
     principal: AuthenticatedPrincipal,
     owner: &CommandPrincipal,
 ) -> Result<(), ApiError> {
-    if principal.role() == PrincipalRole::Administrator || owner.0 == principal.idempotency_scope()
-    {
+    if principal.can_administer() || owner.0 == principal.idempotency_scope() {
         Ok(())
     } else {
         Err(ApiError::new(
@@ -2091,6 +2157,13 @@ fn authorize_owner(
 
 fn command_principal(principal: AuthenticatedPrincipal) -> CommandPrincipal {
     CommandPrincipal(principal.idempotency_scope().to_owned())
+}
+
+fn user_owner(principal: AuthenticatedPrincipal) -> CommandPrincipal {
+    match principal.role() {
+        PrincipalRole::GlobalTrusted => command_principal(principal),
+        PrincipalRole::Exchange | PrincipalRole::Administrator => exchange_user_owner(),
+    }
 }
 
 fn exchange_user_owner() -> CommandPrincipal {
@@ -2298,7 +2371,7 @@ mod tests {
     use chain_identity::{CanonicalAddress, CanonicalTransactionId, ChainId};
     use deposits::{
         CreateDeposit, CreateDepositWithLedger, DepositBalances, EnsureUser, IdempotencyKey,
-        InitializePaymentDatabase, PaymentDatabaseMetadataStore,
+        InitializePaymentDatabase, PaymentDatabaseMetadataStore, PrincipalScopeMode,
     };
     use http_support::BearerToken;
     use indexing::{
@@ -2309,9 +2382,10 @@ mod tests {
     use signer::KeyLocator;
     use tempfile::TempDir;
     use tower::ServiceExt;
+    use uuid::Uuid;
 
     use super::*;
-    use crate::{bitcoin_policy::BitcoinPaymentPolicy, policy::PaymentPolicy};
+    use crate::{auth::Credentials, bitcoin_policy::BitcoinPaymentPolicy, policy::PaymentPolicy};
 
     fn amount(value: u64) -> AtomicAmount {
         value.to_string().parse().expect("test amount must parse")
@@ -2527,17 +2601,17 @@ mod tests {
             })
             .await
             .expect("typed reconciliation fixture must persist");
-        let credentials = Arc::new(Credentials::new(
+        let authorizer = Arc::new(Authorizer::strict(Credentials::new(
             BearerToken::new("exchange-secret").expect("test token must parse"),
             BearerToken::new("administrator-secret").expect("test token must parse"),
-        ));
+        )));
         let router = router(
             Arc::new(ApiState::new(
                 repository.clone(),
                 policy,
                 RequestLimits::new(1024 * 1024, 25, 100).expect("test limits must be valid"),
             )),
-            credentials,
+            authorizer,
         );
         HttpFixture {
             _directory: directory,
@@ -2659,17 +2733,17 @@ mod tests {
         }
         create_test_bitcoin_deposit(&repository, "bitcoin-deposit-a", "bitcoin-user-a", 1).await;
         create_test_bitcoin_deposit(&repository, "bitcoin-deposit-b", "bitcoin-user-b", 2).await;
-        let credentials = Arc::new(Credentials::new(
+        let authorizer = Arc::new(Authorizer::strict(Credentials::new(
             BearerToken::new("exchange-secret").expect("test token must parse"),
             BearerToken::new("administrator-secret").expect("test token must parse"),
-        ));
+        )));
         let router = router(
             Arc::new(ApiState::new(
                 repository.clone(),
                 policy,
                 RequestLimits::new(1024 * 1024, 25, 100).expect("test limits must be valid"),
             )),
-            credentials,
+            authorizer,
         );
         BitcoinHttpFixture {
             _directory: directory,
@@ -2788,6 +2862,108 @@ mod tests {
             .expect("response body must be readable");
         let body = serde_json::from_slice(&bytes).expect("response must be JSON");
         (status, body)
+    }
+
+    #[tokio::test]
+    async fn global_trusted_generates_returns_and_persists_one_typed_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TempDir::new()?;
+        let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+        let policy = Arc::new(ActivePaymentPolicy::Ethereum(test_policy()));
+        repository
+            .initialize_or_validate_principal_scope(
+                InitializePaymentDatabase {
+                    scope: policy.scope().clone(),
+                    active_policy: policy.identity(),
+                    initialized_at: 1,
+                },
+                PrincipalScopeMode::GlobalTrusted,
+            )
+            .await?;
+        let router = router(
+            Arc::new(
+                ApiState::new(
+                    repository.clone(),
+                    policy,
+                    RequestLimits::new(1024 * 1024, 25, 100)?,
+                )
+                .with_authentication_mode(AuthenticationMode::GlobalTrusted),
+            ),
+            Arc::new(Authorizer::global_trusted()),
+        );
+        let request_body = json!({
+            "user_id": "global-user",
+            "scope": {"chain": "ethereum", "network": "test"},
+            "asset": "native",
+            "expected_amount": "1"
+        });
+
+        let call = |authorization: Option<&'static str>, idempotency_key: Option<&'static str>| {
+            let router = router.clone();
+            let body = request_body.clone();
+            async move {
+                let mut builder = Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/deposits")
+                    .header(header::CONTENT_TYPE, "application/json");
+                if let Some(authorization) = authorization {
+                    builder = builder.header(header::AUTHORIZATION, authorization);
+                }
+                if let Some(idempotency_key) = idempotency_key {
+                    builder = builder.header("Idempotency-Key", idempotency_key);
+                }
+                let response = router
+                    .oneshot(
+                        builder
+                            .body(Body::from(serde_json::to_vec(&body).expect("test JSON")))
+                            .expect("test request"),
+                    )
+                    .await
+                    .expect("router response");
+                let status = response.status();
+                let response_key = response
+                    .headers()
+                    .get("Idempotency-Key")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let bytes = to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .expect("response body");
+                let body: Value = serde_json::from_slice(&bytes).expect("response JSON");
+                (status, response_key, body)
+            }
+        };
+
+        let generated = call(Some("Bearer deliberately-ignored"), None).await;
+        assert_eq!(generated.0, StatusCode::ACCEPTED);
+        let generated_key = generated.1.as_ref().expect("response key must exist");
+        assert_eq!(generated.2["idempotency_key"], generated_key.as_str());
+        assert_eq!(
+            Uuid::parse_str(generated_key)?.get_version_num(),
+            7,
+            "server-generated identity must be UUIDv7"
+        );
+        let job = repository
+            .job(&JobId(
+                generated.2["job_id"].as_str().expect("job ID").to_owned(),
+            ))
+            .await?
+            .expect("generated command job must persist");
+        assert_eq!(job.command.principal.0, "global_trusted");
+        assert_eq!(job.user_owner.0, "global_trusted");
+
+        let another = call(None, None).await;
+        assert_eq!(another.0, StatusCode::ACCEPTED);
+        assert_ne!(another.1, generated.1);
+        assert_ne!(another.2["job_id"], generated.2["job_id"]);
+
+        let explicit = call(None, Some("caller-retry-safe-key")).await;
+        let replay = call(Some("Basic ignored"), Some("caller-retry-safe-key")).await;
+        assert_eq!(explicit.0, StatusCode::ACCEPTED);
+        assert!(explicit.1.is_none());
+        assert!(explicit.2.get("idempotency_key").is_none());
+        assert_eq!(replay, explicit);
+        Ok(())
     }
 
     #[tokio::test]
@@ -3210,6 +3386,7 @@ mod tests {
             response.1,
             json!({
                 "service": "payment-service",
+                "authentication_mode": "strict",
                 "scope": {"chain": "ethereum", "network": "test", "chain_id": 1},
                 "policy_version": "1",
                 "policy_digest": test_policy().digest_hex(),

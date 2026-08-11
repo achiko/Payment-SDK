@@ -66,6 +66,9 @@ chmod 600 .env
 
 Edit `.env` and fill these empty values:
 
+- set `STRICT_AUTHENTICATION_MODE='true'`; this manual sequence intentionally
+  exercises strict authentication (the checked-in template instead contains
+  an explicit `false` selection for disposable loopback use);
 - `LOCAL_RUN_ID`: a new identifier for this Anvil and custody lifecycle, such
   as `anvil-20260807-01`; use letters, digits, and hyphens only.
 - `IX_BEARER_TOKEN`
@@ -194,8 +197,9 @@ curl --connect-timeout 2 --max-time 10 \
   http://127.0.0.1:8080/health/ready
 ```
 
-Checkpoint: readiness returns HTTP 200 with `{"status":"ready"}`. A 503 means
-IX is reachable but not ready yet; inspect terminal B.
+Checkpoint: readiness returns HTTP 200 with
+`{"status":"ready","authentication_mode":"strict"}`. A 503 means IX is
+reachable but not ready yet; inspect terminal B.
 
 ## Step 4: start and verify ephemeral custody
 
@@ -222,10 +226,11 @@ curl --connect-timeout 2 --max-time 10 \
   http://127.0.0.1:8181/v1/readiness
 ```
 
-Checkpoint: readiness returns `{"status":"available"}`. This custody adapter
-accepts only loopback binds and keeps keys and idempotency state in process
-memory. If it stops, discard this run's policy and both databases and begin a
-new run with a new `LOCAL_RUN_ID`.
+Checkpoint: readiness returns a status of `available` and
+`authentication_mode` of `strict`. This custody adapter accepts only loopback
+binds and keeps keys and idempotency state in process memory. If it stops,
+discard this run's policy and both databases and begin a new run with a new
+`LOCAL_RUN_ID`.
 
 ## Step 5: start and verify Wallet Service
 
@@ -249,7 +254,8 @@ curl --connect-timeout 2 --max-time 10 \
   http://127.0.0.1:8082/health/ready
 ```
 
-Checkpoint: readiness returns HTTP 200 with `{"status":"ready"}`.
+Checkpoint: readiness returns HTTP 200 with
+`{"status":"ready","authentication_mode":"strict"}`.
 
 ## Step 6: create the gas-funder identity and policy
 
@@ -379,9 +385,10 @@ then
 fi
 ```
 
-Checkpoint: health returns `{"status":"ready"}` and administrator status
-reports `ready`, `indexer_ready`, and `wallet_ready` as `true`, with network
-`anvil` and chain ID `31337`.
+Checkpoint: health returns
+`{"status":"ready","authentication_mode":"strict"}` and administrator
+status reports `ready`, `indexer_ready`, and `wallet_ready` as `true`, with
+network `anvil` and chain ID `31337`.
 
 ## Step 8: stop the stack
 

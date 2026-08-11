@@ -19,6 +19,7 @@ umask 077
 # cannot inherit them. Each service subshell exports only what it requires.
 ETHEREUM_RPC_URL_VALUE="${ETHEREUM_RPC_URL-}"
 ETHEREUM_RPC_WS_URL_VALUE="${ETHEREUM_RPC_WS_URL-}"
+AUTHENTICATION_MODE_VALUE="${STRICT_AUTHENTICATION_MODE-}"
 CUSTODY_BEARER_TOKEN_VALUE="${CUSTODY_BEARER_TOKEN-}"
 IX_BEARER_TOKEN_VALUE="${IX_BEARER_TOKEN-}"
 WS_BEARER_TOKEN_VALUE="${WS_BEARER_TOKEN-}"
@@ -35,6 +36,7 @@ no_proxy_VALUE="$NO_PROXY_VALUE"
 SSL_CERT_FILE_VALUE="${SSL_CERT_FILE-}"
 SSL_CERT_DIR_VALUE="${SSL_CERT_DIR-}"
 export -n ETHEREUM_RPC_URL_VALUE ETHEREUM_RPC_WS_URL_VALUE
+export -n AUTHENTICATION_MODE_VALUE
 export -n CUSTODY_BEARER_TOKEN_VALUE IX_BEARER_TOKEN_VALUE
 export -n WS_BEARER_TOKEN_VALUE PS_API_BEARER_TOKEN_VALUE
 export -n PS_ADMIN_BEARER_TOKEN_VALUE
@@ -42,10 +44,11 @@ export -n HTTP_PROXY_VALUE HTTPS_PROXY_VALUE ALL_PROXY_VALUE
 export -n http_proxy_VALUE https_proxy_VALUE all_proxy_VALUE
 export -n NO_PROXY_VALUE no_proxy_VALUE SSL_CERT_FILE_VALUE SSL_CERT_DIR_VALUE
 unset ETHEREUM_RPC_URL ETHEREUM_RPC_WS_URL
+unset STRICT_AUTHENTICATION_MODE
 unset CUSTODY_BEARER_TOKEN IX_BEARER_TOKEN WS_BEARER_TOKEN
 unset PS_API_BEARER_TOKEN PS_ADMIN_BEARER_TOKEN
 unset IX_RPC_HTTP_URL IX_RPC_WS_URL
-unset WS_ETHEREUM_RPC_URL WS_CUSTODY_BEARER_TOKEN
+unset WS_ETHEREUM_RPC_URL WS_CUSTODY_AUTHENTICATION_POLICY WS_CUSTODY_BEARER_TOKEN
 unset PS_INDEXER_BEARER_TOKEN PS_WALLET_BEARER_TOKEN
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
 unset NO_PROXY no_proxy SSL_CERT_FILE SSL_CERT_DIR
@@ -95,17 +98,23 @@ Required non-secret environment:
   PAYMENT_NETWORK         exact policy/IX network slug
   IX_BOOTSTRAP_HEIGHT     explicit non-negative decimal height
 
-Required credentials, supplied by a secret manager or private parent shell:
+Authentication mode:
+  STRICT_AUTHENTICATION_MODE       required exact true/false; no default
+
+Required credentials in strict mode, supplied by a secret manager or private
+parent shell:
   CUSTODY_BEARER_TOKEN
   IX_BEARER_TOKEN
   WS_BEARER_TOKEN
   PS_API_BEARER_TOKEN
   PS_ADMIN_BEARER_TOKEN
 
-All five credentials must be distinct. The launcher removes their exported
-input names before running tools, gives each service only the credentials it
-needs, and passes authenticated probe headers through curl configuration on
-standard input. It never prints credentials or writes a client.env file.
+All five credentials must be distinct in strict mode. The launcher removes
+their exported input names before running tools, gives each service only the
+credentials it needs, and passes authenticated probe headers through curl
+configuration on standard input. Global-trusted mode neither requires nor
+forwards these service credentials. The launcher never prints credentials or
+writes a client.env file.
 
 Optional environment:
   ETHEREUM_RPC_WS_URL              WSS remote URL or loopback WS URL
@@ -118,7 +127,8 @@ Optional environment:
 
 Optional loopback bind overrides:
   STACK_IX_HTTP_BIND, STACK_IX_METRICS_BIND, STACK_CUSTODY_BIND,
-  STACK_WS_HTTP_BIND, STACK_PS_HTTP_BIND, STACK_PS_METRICS_BIND
+  STACK_CUSTODY_METRICS_BIND, STACK_WS_HTTP_BIND, STACK_WS_METRICS_BIND,
+  STACK_PS_HTTP_BIND, STACK_PS_METRICS_BIND
 
 All service and metrics listeners remain on 127.0.0.1. Put a separately
 reviewed TLS reverse proxy in front of Payment Service when remote access is
@@ -430,11 +440,15 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-curl_with_bearer() {
+curl_service() {
   local token="$1"
   shift
-  printf 'header = "Authorization: Bearer %s"\n' "$token" \
-    | curl --disable --config - --noproxy '*' "$@"
+  if [[ "$AUTHENTICATION_MODE_VALUE" == true ]]; then
+    printf 'header = "Authorization: Bearer %s"\n' "$token" \
+      | curl --disable --config - --noproxy '*' "$@"
+  else
+    curl --disable --noproxy '*' "$@"
+  fi
 }
 
 rpc_request() (
@@ -459,15 +473,18 @@ http_status_is() {
   local token="${3:-}"
   local response
 
-  if [[ -n "$token" ]]; then
-    response="$(curl_with_bearer "$token" --fail --silent --show-error \
+  if [[ "$AUTHENTICATION_MODE_VALUE" == true && -n "$token" ]]; then
+    response="$(curl_service "$token" --fail --silent --show-error \
       --connect-timeout 2 --max-time 3 "$url" 2>/dev/null)" || return 1
   else
     response="$(curl --disable --noproxy '*' --fail --silent --show-error \
       --connect-timeout 2 --max-time 3 "$url" 2>/dev/null)" || return 1
   fi
   printf '%s' "$response" \
-    | jq --exit-status --arg expected "$expected" '.status == $expected' \
+    | jq --exit-status \
+      --arg expected "$expected" \
+      --arg authentication_mode "$AUTHENTICATION_MODE_NAME" \
+      '(.status == $expected) and (.authentication_mode == $authentication_mode)' \
       >/dev/null 2>&1
 }
 
@@ -508,7 +525,7 @@ provision_address() {
     --arg operation_id "$operation_id" \
     --arg purpose "$purpose" \
     '{operation_id: $operation_id, asset: {kind: "native"}, key_purpose: $purpose}')"
-  curl_with_bearer "$WS_BEARER_TOKEN_VALUE" \
+  curl_service "$WS_BEARER_TOKEN_VALUE" \
     --fail --silent --show-error \
     --connect-timeout 2 --max-time 15 \
     --request POST \
@@ -540,17 +557,25 @@ SERVICE_STARTUP_TIMEOUT_SECONDS="${SERVICE_STARTUP_TIMEOUT_SECONDS:-90}"
 STACK_SHUTDOWN_TIMEOUT_SECONDS="${STACK_SHUTDOWN_TIMEOUT_SECONDS:-60}"
 STACK_RUST_LOG="${RUST_LOG:-info}"
 
+case "$AUTHENTICATION_MODE_VALUE" in
+  true) AUTHENTICATION_MODE_NAME="strict" ;;
+  false) AUTHENTICATION_MODE_NAME="global_trusted" ;;
+  *) die "STRICT_AUTHENTICATION_MODE must be exactly true or false" ;;
+esac
+
 for required_name in \
   STACK_ENVIRONMENT STACK_RUN_ROOT STACK_POLICY_TEMPLATE \
   ETHEREUM_CHAIN_ID ETHEREUM_GENESIS_HASH PAYMENT_NETWORK IX_BOOTSTRAP_HEIGHT; do
   require_value "$required_name" "${!required_name:-}"
 done
 require_value ETHEREUM_RPC_URL "$ETHEREUM_RPC_URL_VALUE"
-require_value CUSTODY_BEARER_TOKEN "$CUSTODY_BEARER_TOKEN_VALUE"
-require_value IX_BEARER_TOKEN "$IX_BEARER_TOKEN_VALUE"
-require_value WS_BEARER_TOKEN "$WS_BEARER_TOKEN_VALUE"
-require_value PS_API_BEARER_TOKEN "$PS_API_BEARER_TOKEN_VALUE"
-require_value PS_ADMIN_BEARER_TOKEN "$PS_ADMIN_BEARER_TOKEN_VALUE"
+if [[ "$AUTHENTICATION_MODE_VALUE" == true ]]; then
+  require_value CUSTODY_BEARER_TOKEN "$CUSTODY_BEARER_TOKEN_VALUE"
+  require_value IX_BEARER_TOKEN "$IX_BEARER_TOKEN_VALUE"
+  require_value WS_BEARER_TOKEN "$WS_BEARER_TOKEN_VALUE"
+  require_value PS_API_BEARER_TOKEN "$PS_API_BEARER_TOKEN_VALUE"
+  require_value PS_ADMIN_BEARER_TOKEN "$PS_ADMIN_BEARER_TOKEN_VALUE"
+fi
 
 case "$STACK_ENVIRONMENT" in
   development|staging) ;;
@@ -632,22 +657,24 @@ if [[ "$CHECK_ONLY" -eq 0 ]]; then
   POLICY_SOURCE_PATH="$POLICY_SNAPSHOT_PATH"
 fi
 
-TOKEN_NAMES=(
-  CUSTODY_BEARER_TOKEN IX_BEARER_TOKEN WS_BEARER_TOKEN
-  PS_API_BEARER_TOKEN PS_ADMIN_BEARER_TOKEN
-)
-TOKEN_VALUES=(
-  "$CUSTODY_BEARER_TOKEN_VALUE" "$IX_BEARER_TOKEN_VALUE"
-  "$WS_BEARER_TOKEN_VALUE" "$PS_API_BEARER_TOKEN_VALUE"
-  "$PS_ADMIN_BEARER_TOKEN_VALUE"
-)
-for ((i=0; i<${#TOKEN_VALUES[@]}; i++)); do
-  validate_bearer_value "${TOKEN_NAMES[$i]}" "${TOKEN_VALUES[$i]}"
-  for ((j=i + 1; j<${#TOKEN_VALUES[@]}; j++)); do
-    [[ "${TOKEN_VALUES[$i]}" != "${TOKEN_VALUES[$j]}" ]] \
-      || die "${TOKEN_NAMES[$i]} and ${TOKEN_NAMES[$j]} must be distinct"
+if [[ "$AUTHENTICATION_MODE_VALUE" == true ]]; then
+  TOKEN_NAMES=(
+    CUSTODY_BEARER_TOKEN IX_BEARER_TOKEN WS_BEARER_TOKEN
+    PS_API_BEARER_TOKEN PS_ADMIN_BEARER_TOKEN
+  )
+  TOKEN_VALUES=(
+    "$CUSTODY_BEARER_TOKEN_VALUE" "$IX_BEARER_TOKEN_VALUE"
+    "$WS_BEARER_TOKEN_VALUE" "$PS_API_BEARER_TOKEN_VALUE"
+    "$PS_ADMIN_BEARER_TOKEN_VALUE"
+  )
+  for ((i=0; i<${#TOKEN_VALUES[@]}; i++)); do
+    validate_bearer_value "${TOKEN_NAMES[$i]}" "${TOKEN_VALUES[$i]}"
+    for ((j=i + 1; j<${#TOKEN_VALUES[@]}; j++)); do
+      [[ "${TOKEN_VALUES[$i]}" != "${TOKEN_VALUES[$j]}" ]] \
+        || die "${TOKEN_NAMES[$i]} and ${TOKEN_NAMES[$j]} must be distinct"
+    done
   done
-done
+fi
 
 POLICY_LIMITS="$(jq --slurp --exit-status --raw-output \
   --arg network "$PAYMENT_NETWORK" \
@@ -712,26 +739,32 @@ unset POLICY_LIMITS
 IX_HTTP_BIND_VALUE="${STACK_IX_HTTP_BIND:-127.0.0.1:8080}"
 IX_METRICS_BIND_VALUE="${STACK_IX_METRICS_BIND:-127.0.0.1:9090}"
 CUSTODY_BIND_VALUE="${STACK_CUSTODY_BIND:-127.0.0.1:8181}"
+CUSTODY_METRICS_BIND_VALUE="${STACK_CUSTODY_METRICS_BIND:-127.0.0.1:9093}"
 WS_HTTP_BIND_VALUE="${STACK_WS_HTTP_BIND:-127.0.0.1:8082}"
+WS_METRICS_BIND_VALUE="${STACK_WS_METRICS_BIND:-127.0.0.1:9092}"
 PS_HTTP_BIND_VALUE="${STACK_PS_HTTP_BIND:-127.0.0.1:8081}"
 PS_METRICS_BIND_VALUE="${STACK_PS_METRICS_BIND:-127.0.0.1:9091}"
 
 validate_loopback_bind STACK_IX_HTTP_BIND "$IX_HTTP_BIND_VALUE"
 validate_loopback_bind STACK_IX_METRICS_BIND "$IX_METRICS_BIND_VALUE"
 validate_loopback_bind STACK_CUSTODY_BIND "$CUSTODY_BIND_VALUE"
+validate_loopback_bind STACK_CUSTODY_METRICS_BIND "$CUSTODY_METRICS_BIND_VALUE"
 validate_loopback_bind STACK_WS_HTTP_BIND "$WS_HTTP_BIND_VALUE"
+validate_loopback_bind STACK_WS_METRICS_BIND "$WS_METRICS_BIND_VALUE"
 validate_loopback_bind STACK_PS_HTTP_BIND "$PS_HTTP_BIND_VALUE"
 validate_loopback_bind STACK_PS_METRICS_BIND "$PS_METRICS_BIND_VALUE"
 
 OWNED_SERVICE_NAMES=(
-  "Indexer API" "Indexer metrics" "Custody API"
-  "Wallet API" "Payment API" "Payment metrics"
+  "Indexer API" "Indexer metrics" "Custody API" "Custody metrics"
+  "Wallet API" "Wallet metrics" "Payment API" "Payment metrics"
 )
 OWNED_PORTS=(
   "$(port_from_bind "$IX_HTTP_BIND_VALUE")"
   "$(port_from_bind "$IX_METRICS_BIND_VALUE")"
   "$(port_from_bind "$CUSTODY_BIND_VALUE")"
+  "$(port_from_bind "$CUSTODY_METRICS_BIND_VALUE")"
   "$(port_from_bind "$WS_HTTP_BIND_VALUE")"
+  "$(port_from_bind "$WS_METRICS_BIND_VALUE")"
   "$(port_from_bind "$PS_HTTP_BIND_VALUE")"
   "$(port_from_bind "$PS_METRICS_BIND_VALUE")"
 )
@@ -863,7 +896,10 @@ PS_LOG="$STACK_RUN_ROOT/logs/payment.log"
   fi
   export IX_HTTP_BIND="$IX_HTTP_BIND_VALUE"
   export IX_METRICS_BIND="$IX_METRICS_BIND_VALUE"
-  export IX_BEARER_TOKEN="$IX_BEARER_TOKEN_VALUE"
+  export STRICT_AUTHENTICATION_MODE="$AUTHENTICATION_MODE_VALUE"
+  if [[ "$AUTHENTICATION_MODE_VALUE" == true ]]; then
+    export IX_BEARER_TOKEN="$IX_BEARER_TOKEN_VALUE"
+  fi
   export IX_UPSTREAM_TLS_TERMINATED=false
   export RUST_LOG="$STACK_RUST_LOG"
   exec "$INDEXER_BINARY" serve
@@ -875,7 +911,11 @@ register_service "Indexer Service" "$IX_PID" "$IX_LOG"
   clear_exported_environment
   export_loopback_environment
   export CUSTODY_BIND="$CUSTODY_BIND_VALUE"
-  export CUSTODY_BEARER_TOKEN="$CUSTODY_BEARER_TOKEN_VALUE"
+  export CUSTODY_METRICS_BIND="$CUSTODY_METRICS_BIND_VALUE"
+  export STRICT_AUTHENTICATION_MODE="$AUTHENTICATION_MODE_VALUE"
+  if [[ "$AUTHENTICATION_MODE_VALUE" == true ]]; then
+    export CUSTODY_BEARER_TOKEN="$CUSTODY_BEARER_TOKEN_VALUE"
+  fi
   export CUSTODY_SHUTDOWN_GRACE_SECONDS=10
   export RUST_LOG="$STACK_RUST_LOG"
   exec "$CUSTODY_BINARY" serve
@@ -902,9 +942,14 @@ wait_for_service "Indexer Service" "$IX_PID" "$IX_LOG" \
   export WS_ETHEREUM_CHAIN_ID="$ETHEREUM_CHAIN_ID"
   export WS_ETHEREUM_RPC_URL="$ETHEREUM_RPC_URL_VALUE"
   export WS_CUSTODY_URL="$CUSTODY_URL"
-  export WS_CUSTODY_BEARER_TOKEN="$CUSTODY_BEARER_TOKEN_VALUE"
-  export WS_BEARER_TOKEN="$WS_BEARER_TOKEN_VALUE"
+  export WS_CUSTODY_AUTHENTICATION_POLICY='repository_mode_matched'
+  export STRICT_AUTHENTICATION_MODE="$AUTHENTICATION_MODE_VALUE"
+  if [[ "$AUTHENTICATION_MODE_VALUE" == true ]]; then
+    export WS_CUSTODY_BEARER_TOKEN="$CUSTODY_BEARER_TOKEN_VALUE"
+    export WS_BEARER_TOKEN="$WS_BEARER_TOKEN_VALUE"
+  fi
   export WS_HTTP_BIND="$WS_HTTP_BIND_VALUE"
+  export WS_METRICS_BIND="$WS_METRICS_BIND_VALUE"
   export WS_UPSTREAM_TLS_TERMINATED=false
   export WS_MAX_GAS_LIMIT="$POLICY_MAX_GAS_LIMIT"
   export WS_MAX_FEE_PER_GAS_WEI="$POLICY_MAX_FEE_PER_GAS"
@@ -953,11 +998,14 @@ chmod 600 "$POLICY_PATH"
   export PS_POLICY_PATH="$POLICY_PATH"
   export PS_INDEXER_URL="$IX_URL"
   export PS_INDEXER_NETWORK="$PAYMENT_NETWORK"
-  export PS_INDEXER_BEARER_TOKEN="$IX_BEARER_TOKEN_VALUE"
   export PS_WALLET_URL="$WS_URL"
-  export PS_WALLET_BEARER_TOKEN="$WS_BEARER_TOKEN_VALUE"
-  export PS_API_BEARER_TOKEN="$PS_API_BEARER_TOKEN_VALUE"
-  export PS_ADMIN_BEARER_TOKEN="$PS_ADMIN_BEARER_TOKEN_VALUE"
+  export STRICT_AUTHENTICATION_MODE="$AUTHENTICATION_MODE_VALUE"
+  if [[ "$AUTHENTICATION_MODE_VALUE" == true ]]; then
+    export PS_INDEXER_BEARER_TOKEN="$IX_BEARER_TOKEN_VALUE"
+    export PS_WALLET_BEARER_TOKEN="$WS_BEARER_TOKEN_VALUE"
+    export PS_API_BEARER_TOKEN="$PS_API_BEARER_TOKEN_VALUE"
+    export PS_ADMIN_BEARER_TOKEN="$PS_ADMIN_BEARER_TOKEN_VALUE"
+  fi
   export PS_HTTP_BIND="$PS_HTTP_BIND_VALUE"
   export PS_METRICS_BIND="$PS_METRICS_BIND_VALUE"
   export PS_TLS_TERMINATED_UPSTREAM=false
@@ -975,7 +1023,7 @@ probe_payment() {
 wait_for_service "Payment Service" "$PS_PID" "$PS_LOG" \
   "$SERVICE_STARTUP_TIMEOUT_SECONDS" probe_payment
 
-ADMIN_STATUS="$(curl_with_bearer "$PS_ADMIN_BEARER_TOKEN_VALUE" \
+ADMIN_STATUS="$(curl_service "$PS_ADMIN_BEARER_TOKEN_VALUE" \
   --fail --silent --show-error \
   --connect-timeout 2 --max-time 10 \
   "$PS_URL/v1/admin/status")" \
@@ -983,11 +1031,13 @@ ADMIN_STATUS="$(curl_with_bearer "$PS_ADMIN_BEARER_TOKEN_VALUE" \
 printf '%s' "$ADMIN_STATUS" \
   | jq --exit-status \
     --arg network "$PAYMENT_NETWORK" \
+    --arg authentication_mode "$AUTHENTICATION_MODE_NAME" \
     --argjson chain_id "$ETHEREUM_CHAIN_ID" \
     '(.service == "payment-service")
       and (.ready == true)
       and (.indexer_ready == true)
       and (.wallet_ready == true)
+      and (.authentication_mode == $authentication_mode)
       and (.scope.chain == "ethereum")
       and (.scope.network == $network)
       and (.scope.chain_id == $chain_id)' \
@@ -998,9 +1048,17 @@ warn "release binaries are running with EPHEMERAL MOCK CUSTODY; test funds only"
 warn "service logs are not rotated; configure external rotation and disk monitoring"
 info "all four services are ready for $STACK_ENVIRONMENT"
 info "Payment Service (loopback): $PS_URL"
+info "authentication mode: $AUTHENTICATION_MODE_NAME"
+info "Indexer metrics (loopback): http://$IX_METRICS_BIND_VALUE/metrics"
+info "Custody metrics (loopback): http://$CUSTODY_METRICS_BIND_VALUE/metrics"
+info "Wallet metrics (loopback): http://$WS_METRICS_BIND_VALUE/metrics"
 info "Payment metrics (loopback): http://$PS_METRICS_BIND_VALUE/metrics"
 info "one-shot runtime root: $(display_path "$STACK_RUN_ROOT")"
-info "credentials were not written; keep the invoking environment private"
+if [[ "$AUTHENTICATION_MODE_VALUE" == true ]]; then
+  info "credentials were not written; keep the invoking environment private"
+else
+  info "no repo-owned service credentials were required or written"
+fi
 info "press Ctrl-C to stop services; the external Ethereum RPC is untouched"
 
 while :; do

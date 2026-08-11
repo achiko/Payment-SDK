@@ -1,4 +1,5 @@
 use crate::{BearerSecret, RemoteRetryPolicy, RemoteSignerConfig, RemoteSignerEndpoint, wire};
+use http_support::AuthenticationMode;
 use reqwest::{Method, StatusCode, redirect::Policy};
 use serde::{Serialize, de::DeserializeOwned};
 use signer::{
@@ -17,14 +18,15 @@ pub const CAPABILITIES_PATH: &str = "v1/capabilities";
 
 const MAX_OPERATION_ID_BYTES: usize = 256;
 
-/// Authenticated, chain-independent client for a process-separated custody service.
+/// Authentication-mode-aware client for a process-separated custody service.
 ///
 /// Construction fetches and caches capabilities because [`Signer::capabilities`]
 /// is synchronous. Readiness remains a live request through [`Signer::status`].
 #[derive(Clone)]
 pub struct RemoteSignerClient {
     endpoint: RemoteSignerEndpoint,
-    bearer_secret: BearerSecret,
+    authentication_mode: AuthenticationMode,
+    bearer_secret: Option<BearerSecret>,
     request_timeout: Duration,
     max_response_bytes: usize,
     retry_policy: RemoteRetryPolicy,
@@ -46,6 +48,7 @@ impl RemoteSignerClient {
             .map_err(|_| unavailable("failed to construct remote custody HTTP client"))?;
         let mut result = Self {
             endpoint: config.endpoint,
+            authentication_mode: config.authentication_mode,
             bearer_secret: config.bearer_secret,
             request_timeout: config.request_timeout,
             max_response_bytes: config.max_response_bytes,
@@ -80,6 +83,7 @@ impl RemoteSignerClient {
             public_key_format: public_key_format_to_wire(request.public_key_format),
             purpose: request.purpose,
         };
+        self.require_available().await?;
         let response: wire::ProvisionResponse = self
             .send_json(Method::POST, PROVISION_PATH, &body, RetryMode::Operation)
             .await?;
@@ -106,6 +110,7 @@ impl RemoteSignerClient {
             curve: curve_to_wire(curve),
             format: public_key_format_to_wire(format),
         };
+        self.require_available().await?;
         let response: wire::PublicKeyResponse = self
             .send_json(Method::POST, PUBLIC_KEY_PATH, &body, RetryMode::Never)
             .await?;
@@ -131,6 +136,7 @@ impl RemoteSignerClient {
             key_tweak: request.key_tweak.map(key_tweak_to_wire),
             user_interaction: user_interaction_to_wire(request.user_interaction),
         };
+        self.require_available().await?;
         let response: wire::SignResponse = self
             .send_json(Method::POST, SIGN_PATH, &body, RetryMode::Operation)
             .await?;
@@ -146,6 +152,7 @@ impl RemoteSignerClient {
     pub async fn readiness(&self) -> Result<SignerStatus, SignerError> {
         let response: wire::ReadinessResponse =
             self.send_without_body(Method::GET, READINESS_PATH).await?;
+        self.validate_authentication_mode(&response.authentication_mode)?;
         Ok(match response.status {
             wire::ReadinessStatus::Available => SignerStatus::Available,
             wire::ReadinessStatus::InteractionRequired => SignerStatus::InteractionRequired,
@@ -159,6 +166,7 @@ impl RemoteSignerClient {
         let response: wire::CapabilitiesResponse = self
             .send_without_body(Method::GET, CAPABILITIES_PATH)
             .await?;
+        self.validate_authentication_mode(&response.authentication_mode)?;
         Ok(SignerCapabilities {
             curves: response.curves.into_iter().map(curve_from_wire).collect(),
             schemes: response
@@ -175,6 +183,15 @@ impl RemoteSignerClient {
             can_sign_digests: response.can_sign_digests,
             requires_user_interaction: response.requires_user_interaction,
         })
+    }
+
+    async fn require_available(&self) -> Result<(), SignerError> {
+        match self.readiness().await? {
+            SignerStatus::Available => Ok(()),
+            SignerStatus::InteractionRequired | SignerStatus::Unavailable { .. } => Err(
+                unavailable("remote custody is not available for this operation"),
+            ),
+        }
     }
 
     async fn send_without_body<T>(&self, method: Method, path: &str) -> Result<T, SignerError>
@@ -243,9 +260,11 @@ impl RemoteSignerClient {
         let mut request = self
             .client
             .request(method, url)
-            .bearer_auth(self.bearer_secret.expose())
             .header(reqwest::header::ACCEPT, "application/json")
             .timeout(self.request_timeout);
+        if let Some(secret) = &self.bearer_secret {
+            request = request.bearer_auth(secret.expose());
+        }
         if let Some(body) = body {
             request = request
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -262,6 +281,16 @@ impl RemoteSignerClient {
             retryable: false,
         })
     }
+
+    fn validate_authentication_mode(&self, reported_mode: &str) -> Result<(), SignerError> {
+        if reported_mode == self.authentication_mode.as_str() {
+            Ok(())
+        } else {
+            Err(protocol_error(
+                "remote custody authentication mode does not match client configuration",
+            ))
+        }
+    }
 }
 
 const fn key_tweak_kind_from_wire(value: wire::KeyTweakKind) -> KeyTweakKind {
@@ -275,6 +304,7 @@ impl fmt::Debug for RemoteSignerClient {
         formatter
             .debug_struct("RemoteSignerClient")
             .field("endpoint", &self.endpoint)
+            .field("authentication_mode", &self.authentication_mode)
             .field("bearer_secret", &self.bearer_secret)
             .field("request_timeout", &self.request_timeout)
             .field("max_response_bytes", &self.max_response_bytes)

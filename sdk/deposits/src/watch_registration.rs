@@ -10,6 +10,11 @@ use crate::{
     LEGACY_DEPOSIT_KEY_PURPOSE, UserId,
 };
 
+// These exact prefixes are the durable v1 domain encoding. Keep their bytes
+// unchanged for replay compatibility; a future version must use new prefixes.
+const DEPOSIT_WATCH_IDEMPOTENCY_DOMAIN_V1: &str = "ps-deposit";
+const DEPOSIT_ADDRESS_OPERATION_DOMAIN_V1: &str = "ps:deposit-address";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DepositAddressRequest {
     pub scope: IndexScope,
@@ -228,11 +233,11 @@ where
 }
 
 fn watch_idempotency_key(id: &DepositId) -> String {
-    format!("ps-deposit:{}", id.0)
+    format!("{DEPOSIT_WATCH_IDEMPOTENCY_DOMAIN_V1}:{}", id.0)
 }
 
 fn address_operation_id(id: &DepositId) -> String {
-    format!("ps:deposit-address:{}", id.0)
+    format!("{DEPOSIT_ADDRESS_OPERATION_DOMAIN_V1}:{}", id.0)
 }
 
 fn validate_command(command: &RegisterDeposit) -> Result<(), DepositError> {
@@ -302,5 +307,21 @@ fn invariant(message: impl Into<String>) -> DepositError {
     DepositError {
         kind: DepositErrorKind::InvariantViolation,
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deposit_child_identity_v1_bytes_are_frozen() {
+        let deposit_id = DepositId("deposit-1".to_owned());
+
+        assert_eq!(
+            address_operation_id(&deposit_id),
+            "ps:deposit-address:deposit-1"
+        );
+        assert_eq!(watch_idempotency_key(&deposit_id), "ps-deposit:deposit-1");
     }
 }

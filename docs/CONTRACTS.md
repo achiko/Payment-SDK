@@ -73,10 +73,12 @@ custody. `Arc<T>` delegates both signer contracts so one custody instance can
 provision and later sign for the same locator.
 
 [`signer-remote`](../sdk/signing/remote/src/lib.rs) implements both contracts
-over authenticated versioned JSON endpoints. It enforces HTTPS outside
-loopback, disables redirects, bounds response bodies and timeouts, redacts its
-endpoint and bearer credential, and retries only operation-ID-bearing
-provision/sign calls.
+over versioned JSON endpoints. Its configuration selects explicit bearer or
+repo-owned global-trusted transport; a missing secret never implies the latter.
+It enforces HTTPS outside loopback, disables redirects, bounds response bodies
+and timeouts, redacts endpoints and credentials, verifies the sanitized remote
+mode, and retries only operation-ID-bearing provision/sign calls. Vendor
+custody authentication remains independent of the repo-wide switch.
 
 Current flow:
 
@@ -119,7 +121,8 @@ collection calculates native maximum gas cost and encodes ERC-20 `transfer`.
 
 [`apps/wallet`](../apps/wallet) composes chain-specific Ethereum or Bitcoin
 runtime modes, production RPC/IX clients, and the remote custody adapter behind
-authenticated versioned HTTP APIs. Signing and collection preparation return a
+versioned HTTP APIs using the required global authentication mode. Signing and
+collection preparation return a
 canonical transaction ID plus the exact opaque signed bytes without
 broadcasting. The separate broadcast operation validates the expected hash
 before submitting the same bytes. This lets PS durably record a transaction
@@ -127,13 +130,16 @@ before the external side effect.
 The generic `Collector<C>` convenience operation remains compatible by
 preparing and then broadcasting within one stateless call.
 
-The process has no storage dependency. Its health routes are detail-free;
+The process has no storage dependency. Liveness is detail-free and readiness
+exposes only sanitized mode/readiness posture;
 readiness is enabled only after RPC chain-identity and custody capability/status
 probes succeed; Bitcoin also requires authenticated IX readiness/network status
-and verifies the IX checkpoint against Core. Readiness is startup-latched in the
-current WS runtime and is disabled before graceful shutdown, so later dependency
-failures can surface on operations without clearing `/health/ready`. The
-concrete wire contract and deployment settings are documented in
+and verifies the IX checkpoint against Core. After startup, WS periodically
+rechecks custody availability/mode and, for Bitcoin, IX readiness/network/mode;
+it clears readiness on failure and restores it after recovery. Existing
+per-operation preflights remain the fail-closed effect gate, and readiness is
+disabled before graceful shutdown. The concrete wire contract and deployment
+settings are documented in
 [`WALLET_SERVICE.md`](./WALLET_SERVICE.md).
 
 ## PS deposit and accounting contracts
@@ -185,8 +191,8 @@ future multi-reservation/archival contract. UTXO-batch v1 deliberately rejects
 the generic fail-leg/reservation-release operations; an unsigned required batch
 remains active and retryable until a future explicit cancellation contract.
 
-[`apps/api`](../apps/api) composes that repository with RocksDB, authenticated
-chain-specific IX and WS HTTP clients, a required Ethereum or Bitcoin policy,
+[`apps/api`](../apps/api) composes that repository with RocksDB,
+mode-negotiating chain-specific IX and WS HTTP clients, a required Ethereum or Bitcoin policy,
 public/admin HTTP routes, and supervised job, watch-reconciliation, ingestion,
 projection, expiration, collection, readiness, and maintenance workers. It
 inspects exact signed EIP-1559 envelopes in `chain-ethereum` or finalized raw
@@ -198,7 +204,8 @@ and always owns a Bitcoin-only database.
 The `payment-api migrate` composition creates and verifies a physical RocksDB
 backup before invoking semantic validation. It checks PS ownership and record
 references, rebuilds deposit association and deposit-observation indexes, and
-only then binds schema v2, the selected chain scope, and active policy.
+only then binds the current domain schema, selected chain scope, active policy,
+and principal-scope mode.
 Normal serving refuses old, unbound, IX-owned, or mismatched databases.
 
 IX and concrete chain crates do not depend on `deposits`.

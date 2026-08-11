@@ -7,7 +7,9 @@ against the single-network Ethereum Payment Service (PS).
 The collection covers all 17 authenticated PS operations, public health
 endpoints, loopback metrics, three supported reconciliation bodies, and safe
 authentication/routing checks. It intentionally contains no bearer-token
-values.
+values. Its role-specific request layout assumes
+`STRICT_AUTHENTICATION_MODE=true`; global-trusted deployments should use a
+separate environment and omit bearer headers.
 
 For local service startup, follow
 [PAYMENT_SERVICE_USAGE.md](./PAYMENT_SERVICE_USAGE.md#step-by-step-run-the-service)
@@ -65,7 +67,7 @@ curl --fail-with-body --silent --show-error http://127.0.0.1:8081/health/ready
 Expected:
 
 ~~~json
-{"status":"ready"}
+{"status":"ready","authentication_mode":"strict"}
 ~~~
 
 ## 2. Import the collection
@@ -142,7 +144,7 @@ Run these requests from **00 - Health and status**:
    - expected body {"status":"live"}.
 2. **Readiness**
    - expected HTTP 200;
-   - expected body {"status":"ready"}.
+   - expected body {"status":"ready","authentication_mode":"strict"}.
 3. **Administrator status**
    - expected HTTP 200;
    - service is payment-service;

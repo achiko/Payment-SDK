@@ -12,6 +12,7 @@ mod service;
 
 use clap::Parser;
 
+pub use http::AuthenticationMode;
 pub use service::{
     BitcoinIndexerService, BitcoinIndexerServiceConfig, IndexerService, IndexerServiceConfig,
     IndexerServiceConfigError, IndexerServiceError,

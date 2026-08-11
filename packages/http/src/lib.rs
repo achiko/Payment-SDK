@@ -9,6 +9,7 @@ use std::{
     future::Future,
     net::SocketAddr,
     num::NonZeroU32,
+    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -31,6 +32,61 @@ use transport::{
 
 pub const LIVENESS_PATH: &str = "/health/live";
 pub const READINESS_PATH: &str = "/health/ready";
+
+/// Application-layer authentication selected consistently by every repo-owned
+/// HTTP service and matching client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthenticationMode {
+    Strict,
+    GlobalTrusted,
+}
+
+impl AuthenticationMode {
+    #[must_use]
+    pub const fn is_strict(self) -> bool {
+        matches!(self, Self::Strict)
+    }
+
+    /// Sanitized value exposed through readiness, status, logs, and metrics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::GlobalTrusted => "global_trusted",
+        }
+    }
+}
+
+impl fmt::Display for AuthenticationMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for AuthenticationMode {
+    type Err = AuthenticationModeParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "true" => Ok(Self::Strict),
+            "false" => Ok(Self::GlobalTrusted),
+            _ => Err(AuthenticationModeParseError),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthenticationModeParseError;
+
+impl fmt::Display for AuthenticationModeParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "authentication mode must be exactly `true` (strict) or `false` (global trusted)",
+        )
+    }
+}
+
+impl Error for AuthenticationModeParseError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransportSecurity {
@@ -186,6 +242,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 pub struct HttpServerConfig {
     bind_addr: SocketAddr,
     transport_security: TransportSecurity,
+    authentication_mode: AuthenticationMode,
     bearer_token: Option<BearerToken>,
     custom_authentication: bool,
     limits: RequestLimits,
@@ -202,10 +259,20 @@ impl HttpServerConfig {
         Self {
             bind_addr,
             transport_security,
+            authentication_mode: AuthenticationMode::Strict,
             bearer_token,
             custom_authentication: false,
             limits,
         }
+    }
+
+    #[must_use]
+    pub const fn with_authentication_mode(
+        mut self,
+        authentication_mode: AuthenticationMode,
+    ) -> Self {
+        self.authentication_mode = authentication_mode;
+        self
     }
 
     /// Declares that the application router installs its own authentication
@@ -225,13 +292,13 @@ impl HttpServerConfig {
                 "a non-loopback listener requires upstream TLS termination",
             ));
         }
-        if !self.bind_addr.ip().is_loopback()
+        if self.authentication_mode.is_strict()
             && self.bearer_token.is_none()
             && !self.custom_authentication
         {
             return Err(HttpServerConfigError::new(
                 HttpServerConfigErrorKind::MissingBearerToken,
-                "a non-loopback listener requires bearer authentication",
+                "strict authentication requires a bearer or a declared application authorizer",
             ));
         }
         Ok(())
@@ -245,6 +312,11 @@ impl HttpServerConfig {
     #[must_use]
     pub const fn limits(&self) -> &RequestLimits {
         &self.limits
+    }
+
+    #[must_use]
+    pub const fn authentication_mode(&self) -> AuthenticationMode {
+        self.authentication_mode
     }
 }
 
@@ -311,15 +383,34 @@ impl fmt::Debug for HealthState {
     }
 }
 
+#[derive(Clone)]
+struct ReadinessState {
+    health: HealthState,
+    authentication_mode: AuthenticationMode,
+}
+
 async fn liveness() -> Response {
     json_status(StatusCode::OK, r#"{"status":"live"}"#)
 }
 
-async fn readiness(State(health): State<HealthState>) -> Response {
-    if health.is_ready() {
-        json_status(StatusCode::OK, r#"{"status":"ready"}"#)
-    } else {
-        json_status(StatusCode::SERVICE_UNAVAILABLE, r#"{"status":"not_ready"}"#)
+async fn readiness(State(state): State<ReadinessState>) -> Response {
+    match (state.health.is_ready(), state.authentication_mode) {
+        (true, AuthenticationMode::Strict) => json_status(
+            StatusCode::OK,
+            r#"{"status":"ready","authentication_mode":"strict"}"#,
+        ),
+        (true, AuthenticationMode::GlobalTrusted) => json_status(
+            StatusCode::OK,
+            r#"{"status":"ready","authentication_mode":"global_trusted"}"#,
+        ),
+        (false, AuthenticationMode::Strict) => json_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"status":"not_ready","authentication_mode":"strict"}"#,
+        ),
+        (false, AuthenticationMode::GlobalTrusted) => json_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"status":"not_ready","authentication_mode":"global_trusted"}"#,
+        ),
     }
 }
 
@@ -358,6 +449,15 @@ async fn require_bearer(
     }
 }
 
+async fn inject_authentication_mode(
+    State(mode): State<AuthenticationMode>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    request.extensions_mut().insert(mode);
+    next.run(request).await
+}
+
 /// Applies request limits and authentication to application routes, then adds
 /// unauthenticated, detail-free health endpoints.
 pub fn service_router(
@@ -367,15 +467,25 @@ pub fn service_router(
 ) -> Result<Router, HttpServerConfigError> {
     config.validate()?;
 
-    let mut protected = protected.layer(DefaultBodyLimit::max(config.limits.max_body_bytes));
-    if let Some(token) = config.bearer_token.clone() {
-        protected = protected.layer(middleware::from_fn_with_state(token, require_bearer));
+    let mut protected = protected
+        .layer(middleware::from_fn_with_state(
+            config.authentication_mode,
+            inject_authentication_mode,
+        ))
+        .layer(DefaultBodyLimit::max(config.limits.max_body_bytes));
+    if config.authentication_mode.is_strict() {
+        if let Some(token) = config.bearer_token.clone() {
+            protected = protected.layer(middleware::from_fn_with_state(token, require_bearer));
+        }
     }
 
     let health_routes = Router::new()
         .route(LIVENESS_PATH, get(liveness))
         .route(READINESS_PATH, get(readiness))
-        .with_state(health);
+        .with_state(ReadinessState {
+            health,
+            authentication_mode: config.authentication_mode,
+        });
 
     Ok(protected.merge(health_routes))
 }
@@ -841,6 +951,7 @@ mod tests {
     use super::*;
     use axum::{
         body::{Body, to_bytes},
+        extract::Extension,
         routing::post,
     };
     use tower::ServiceExt;
@@ -854,6 +965,16 @@ mod tests {
             token,
             limits,
         )
+    }
+
+    #[test]
+    fn authentication_mode_accepts_only_exact_lowercase_boolean_values() {
+        assert_eq!("true".parse(), Ok(AuthenticationMode::Strict));
+        assert_eq!("false".parse(), Ok(AuthenticationMode::GlobalTrusted));
+
+        for invalid in ["", " true", "true ", "TRUE", "False", "1", "yes"] {
+            assert!(invalid.parse::<AuthenticationMode>().is_err());
+        }
     }
 
     #[test]
@@ -937,6 +1058,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_trusted_routes_ignore_authorization_headers() {
+        let token = BearerToken::new("configured-but-ignored").expect("test token must be valid");
+        let config = loopback_config(Some(token), RequestLimits::default())
+            .with_authentication_mode(AuthenticationMode::GlobalTrusted);
+        let router = service_router(
+            Router::new().route(
+                "/private",
+                get(|Extension(mode): Extension<AuthenticationMode>| async move { mode.as_str() }),
+            ),
+            &config,
+            HealthState::new(true),
+        )
+        .expect("global-trusted router configuration must be valid");
+
+        for authorization in [None, Some("Bearer wrong-secret")] {
+            let mut request = axum::http::Request::builder().uri("/private");
+            if let Some(value) = authorization {
+                request = request.header(axum::http::header::AUTHORIZATION, value);
+            }
+            let response = router
+                .clone()
+                .oneshot(
+                    request
+                        .body(Body::empty())
+                        .expect("test request must build"),
+                )
+                .await
+                .expect("router must respond");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 1024)
+                .await
+                .expect("response body must be readable");
+            assert_eq!(body.as_ref(), b"global_trusted");
+        }
+
+        let readiness = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(READINESS_PATH)
+                    .body(Body::empty())
+                    .expect("test request must build"),
+            )
+            .await
+            .expect("router must respond");
+        let body = to_bytes(readiness.into_body(), 1024)
+            .await
+            .expect("readiness body must be readable");
+        assert_eq!(
+            body.as_ref(),
+            br#"{"status":"ready","authentication_mode":"global_trusted"}"#
+        );
+    }
+
+    #[tokio::test]
     async fn health_routes_are_unauthenticated_and_sanitized() {
         let token = BearerToken::new("secret").expect("test token must be valid");
         let health = HealthState::new(false);
@@ -977,7 +1152,10 @@ mod tests {
         let body = to_bytes(not_ready.into_body(), 1024)
             .await
             .expect("health body must be readable");
-        assert_eq!(body.as_ref(), br#"{"status":"not_ready"}"#);
+        assert_eq!(
+            body.as_ref(),
+            br#"{"status":"not_ready","authentication_mode":"strict"}"#
+        );
 
         health.set_ready(true);
         let ready = router
@@ -990,6 +1168,13 @@ mod tests {
             .await
             .expect("router must respond");
         assert_eq!(ready.status(), StatusCode::OK);
+        let body = to_bytes(ready.into_body(), 1024)
+            .await
+            .expect("health body must be readable");
+        assert_eq!(
+            body.as_ref(),
+            br#"{"status":"ready","authentication_mode":"strict"}"#
+        );
     }
 
     #[tokio::test]
@@ -997,7 +1182,8 @@ mod tests {
         let limits = RequestLimits::new(4, 10, 20).expect("test limits must be valid");
         let router = service_router(
             Router::new().route("/echo", post(|body: String| async move { body })),
-            &loopback_config(None, limits),
+            &loopback_config(None, limits)
+                .with_authentication_mode(AuthenticationMode::GlobalTrusted),
             HealthState::new(true),
         )
         .expect("test router configuration must be valid");
@@ -1017,7 +1203,7 @@ mod tests {
     }
 
     #[test]
-    fn non_loopback_listener_requires_tls_termination_and_authentication() {
+    fn listeners_require_mode_appropriate_security() {
         let address = "0.0.0.0:8080"
             .parse()
             .expect("test non-loopback socket address must parse");
@@ -1048,6 +1234,32 @@ mod tests {
                 .kind,
             HttpServerConfigErrorKind::MissingBearerToken
         );
+
+        let loopback_without_bearer = HttpServerConfig::new(
+            "127.0.0.1:8080"
+                .parse()
+                .expect("test loopback socket address must parse"),
+            TransportSecurity::PlaintextLoopback,
+            None,
+            RequestLimits::default(),
+        );
+        assert_eq!(
+            loopback_without_bearer
+                .validate()
+                .expect_err("strict loopback routes must not fail open")
+                .kind,
+            HttpServerConfigErrorKind::MissingBearerToken
+        );
+
+        HttpServerConfig::new(
+            address,
+            TransportSecurity::TlsTerminatedUpstream,
+            None,
+            RequestLimits::default(),
+        )
+        .with_authentication_mode(AuthenticationMode::GlobalTrusted)
+        .validate()
+        .expect("global-trusted non-loopback listener still requires TLS but not a bearer");
     }
 
     #[test]
