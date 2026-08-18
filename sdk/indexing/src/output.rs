@@ -2,7 +2,7 @@ use base::Decimal;
 
 use crate::{
     AssetId, BlockHeight, BlockRef, BoxFuture, CanonicalAddress, IndexError, IndexScope,
-    RebuildGeneration, TransactionRef,
+    TransactionRef,
 };
 
 /// Stable position in a snapshot-consistent output listing.
@@ -18,7 +18,6 @@ pub struct OutputCursor {
 /// Canonical state against which an output page was read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputSnapshot {
-    pub generation: RebuildGeneration,
     pub revision: u64,
     pub checkpoint: Option<BlockRef>,
 }

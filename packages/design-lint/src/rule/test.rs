@@ -1,0 +1,312 @@
+use super::{repository, rust};
+use crate::{
+    Policy,
+    policy::{Dependency, Layer, PackageLayer, Repository, Source, VocabularyOwner},
+    source::Workspace,
+};
+use std::{
+    fs,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+fn fixture(files: &[(&str, &str)]) -> (std::path::PathBuf, Workspace) {
+    let root = std::env::temp_dir().join(format!(
+        "design-lint-focused-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&root).unwrap();
+    for (path, text) in files {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    let workspace = Workspace::load(vec![root.clone()], &Source::default()).unwrap();
+    (root, workspace)
+}
+
+fn clean(root: std::path::PathBuf) {
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn version_suffix_is_not_a_word() {
+    assert_eq!(rust::name_words("HTTPServerV2"), ["http", "server"]);
+    assert_eq!(rust::name_words("RecordV1"), ["record"]);
+    assert_eq!(
+        rust::name_words("BitcoinRPCClientV1"),
+        ["bitcoin", "rpc", "client"]
+    );
+}
+
+#[test]
+fn api_rules_reject_only_requested_shapes() {
+    let (root, workspace) = fixture(&[
+        ("Cargo.toml", "[package]\nname='sample'\nversion='0.0.0'"),
+        (
+            "src/lib.rs",
+            "trait Large { fn a(&self); fn b(&self); fn c(&self); fn d(&self); } struct Empty; struct ThreeWordRecord { x: u8 } struct RecordV2 { x: u8 }",
+        ),
+    ]);
+    let policy = Policy::default();
+    assert_eq!(
+        rust::check_kind(&workspace, &policy, "traits")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        rust::check_kind(&workspace, &policy, "empty")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        rust::check_kind(&workspace, &policy, "names")
+            .unwrap()
+            .len(),
+        1
+    );
+    clean(root);
+}
+
+#[test]
+fn constructor_suppression_requires_reason() {
+    let source = "struct Value(u8); impl Value {\n// design-lint: allow self-constructor-static -- consuming parser convention\nfn parse(self) -> Result<Self, ()> { Ok(self) }\n\n\nfn new(self) -> Self { self }\n}";
+    let (root, workspace) = fixture(&[
+        ("Cargo.toml", "[package]\nname='sample'\nversion='0.0.0'"),
+        ("src/lib.rs", source),
+    ]);
+    let findings = rust::check_kind(&workspace, &Policy::default(), "constructors").unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].subject, "new");
+    clean(root);
+}
+
+#[test]
+fn vocabulary_understands_camel_case_and_ownership() {
+    let (root, workspace) = fixture(&[
+        ("Cargo.toml", "[package]\nname='sample'\nversion='0.0.0'"),
+        ("src/lib.rs", "struct BitcoinClient { value: u8 }"),
+    ]);
+    let mut policy = Policy::default();
+    policy.vocabulary.owners.push(VocabularyOwner {
+        words: vec!["bitcoin".into(), "btc".into()],
+        allowed_paths: vec!["sdk/chains/bitcoin/".into()],
+    });
+    assert_eq!(
+        repository::vocabulary(&workspace, &policy).unwrap().len(),
+        1
+    );
+    clean(root);
+}
+
+#[test]
+fn dependencies_follow_configured_layers() {
+    let files = [
+        (
+            "packages/low/Cargo.toml",
+            "[package]\nname='low'\nversion='0.0.0'\n[dependencies]\nhigh={path='../../sdk/high'}",
+        ),
+        ("packages/low/src/lib.rs", ""),
+        (
+            "sdk/high/Cargo.toml",
+            "[package]\nname='high'\nversion='0.0.0'",
+        ),
+        ("sdk/high/src/lib.rs", ""),
+    ];
+    let (root, workspace) = fixture(&files);
+    let policy = Policy {
+        dependency: Dependency {
+            ignored_packages: vec![],
+            layers: vec![
+                Layer {
+                    name: "package".into(),
+                    directory: Some("packages".into()),
+                    may_depend_on: vec!["package".into()],
+                },
+                Layer {
+                    name: "sdk".into(),
+                    directory: Some("sdk".into()),
+                    may_depend_on: vec!["package".into()],
+                },
+            ],
+            package_layers: vec![PackageLayer {
+                package: "high".into(),
+                layer: "sdk".into(),
+            }],
+        },
+        ..Policy::default()
+    };
+    assert_eq!(
+        repository::dependencies(&workspace, &policy).unwrap().len(),
+        1
+    );
+    clean(root);
+}
+
+#[test]
+fn repository_limits_are_policy_owned() {
+    let (root, workspace) = fixture(&[
+        ("Cargo.toml", "[package]\nname='sample'\nversion='0.0.0'"),
+        ("src/lib.rs", "fn a() {}\nfn b() {}"),
+    ]);
+    let policy = Policy {
+        repository: Repository {
+            maximum_rust_lines: 1,
+            forbidden_paths: vec![],
+            ..Repository::default()
+        },
+        ..Policy::default()
+    };
+    assert_eq!(
+        repository::file_length(&workspace, &policy).unwrap().len(),
+        1
+    );
+    clean(root);
+}
+
+#[test]
+fn chain_layout_reports_missing_paths() {
+    let (root, workspace) = fixture(&[
+        (
+            "sdk/chains/base/Cargo.toml",
+            "[package]\nname='base'\nversion='0.0.0'",
+        ),
+        ("sdk/chains/base/src/lib.rs", ""),
+        (
+            "sdk/chains/coin/Cargo.toml",
+            "[package]\nname='coin'\nversion='0.0.0'",
+        ),
+        ("sdk/chains/coin/src/lib.rs", ""),
+    ]);
+    let findings = repository::chain_layout(&workspace, &Policy::default()).unwrap();
+    assert_eq!(findings.len(), 9);
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding.subject.starts_with("coin/"))
+    );
+    clean(root);
+}
+
+#[test]
+fn chain_layout_rejects_file_form_complex_module() {
+    let files = [
+        (
+            "sdk/chains/coin/Cargo.toml",
+            "[package]\nname='coin'\nversion='0.0.0'",
+        ),
+        ("sdk/chains/coin/src/lib.rs", ""),
+        ("sdk/chains/coin/src/address.rs", ""),
+        ("sdk/chains/coin/src/batch.rs", ""),
+        ("sdk/chains/coin/src/error.rs", ""),
+        ("sdk/chains/coin/src/indexer.rs", ""),
+    ];
+    let (root, workspace) = fixture(&files);
+    let policy = Policy {
+        repository: Repository {
+            chain_skeleton: vec!["src/indexer/mod.rs".to_owned()],
+            chain_directories: vec!["src/indexer".to_owned()],
+            ..Repository::default()
+        },
+        ..Policy::default()
+    };
+    let findings = repository::chain_layout(&workspace, &policy).unwrap();
+    assert_eq!(findings.len(), 1);
+    assert!(findings[0].message.contains("src/indexer.rs"));
+    assert!(findings[0].message.contains("src/indexer/mod.rs"));
+    clean(root);
+}
+
+#[test]
+fn chain_layout_rejects_unexpected_nested_directory() {
+    let files = [
+        (
+            "sdk/chains/coin/Cargo.toml",
+            "[package]\nname='coin'\nversion='0.0.0'",
+        ),
+        ("sdk/chains/coin/src/rpc/mod.rs", ""),
+        ("sdk/chains/coin/src/rpc/internal/mod.rs", ""),
+    ];
+    let (root, workspace) = fixture(&files);
+    let policy = Policy {
+        repository: Repository {
+            chain_skeleton: vec!["src/rpc/mod.rs".to_owned()],
+            chain_directories: vec!["src/rpc".to_owned()],
+            ..Repository::default()
+        },
+        ..Policy::default()
+    };
+    let findings = repository::chain_layout(&workspace, &policy).unwrap();
+    assert_eq!(findings.len(), 1);
+    assert!(findings[0].message.contains("unexpected nested directory"));
+    assert!(findings[0].message.contains("src/rpc/internal"));
+    clean(root);
+}
+
+#[test]
+fn concrete_chains_cannot_depend_on_siblings() {
+    let files = [
+        (
+            "sdk/chains/alpha/Cargo.toml",
+            "[package]\nname='alpha'\nversion='0.0.0'\n[dependencies]\nbeta={path='../beta'}",
+        ),
+        ("sdk/chains/alpha/src/lib.rs", ""),
+        (
+            "sdk/chains/beta/Cargo.toml",
+            "[package]\nname='beta'\nversion='0.0.0'",
+        ),
+        ("sdk/chains/beta/src/lib.rs", ""),
+    ];
+    let (root, workspace) = fixture(&files);
+    let findings = repository::dependencies(&workspace, &Policy::default()).unwrap();
+    assert_eq!(findings.len(), 1);
+    assert!(findings[0].message.contains("sibling concrete chain"));
+    clean(root);
+}
+
+#[test]
+fn single_file_source_directory_is_rejected() {
+    let (root, workspace) = fixture(&[
+        ("Cargo.toml", "[package]\nname='sample'\nversion='0.0.0'"),
+        ("src/lib.rs", ""),
+        ("src/model.rs", ""),
+        ("src/operation/mod.rs", ""),
+    ]);
+    let findings = repository::single_file_directories(&workspace, &Policy::default()).unwrap();
+    assert_eq!(findings.len(), 1);
+    assert!(findings[0].message.contains("src/operation"));
+    clean(root);
+}
+
+#[test]
+fn source_directory_with_two_rust_files_is_allowed() {
+    let (root, workspace) = fixture(&[
+        ("Cargo.toml", "[package]\nname='sample'\nversion='0.0.0'"),
+        ("src/lib.rs", ""),
+        ("src/model.rs", ""),
+    ]);
+    assert!(
+        repository::single_file_directories(&workspace, &Policy::default())
+            .unwrap()
+            .is_empty()
+    );
+    clean(root);
+}
+
+#[test]
+fn crate_source_root_with_only_lib_is_allowed() {
+    let (root, workspace) = fixture(&[
+        ("Cargo.toml", "[package]\nname='sample'\nversion='0.0.0'"),
+        ("src/lib.rs", ""),
+    ]);
+    assert!(
+        repository::single_file_directories(&workspace, &Policy::default())
+            .unwrap()
+            .is_empty()
+    );
+    clean(root);
+}

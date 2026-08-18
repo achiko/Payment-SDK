@@ -27,8 +27,7 @@ pub use key_pair::KeyPair;
 pub use network::{NetworkId, NetworkKind};
 pub use signer::{Digest, SignFuture, SignRequest, SignablePayload, SignedPayload, Signer};
 pub use transaction::{
-    Broadcaster, BuilderCast, Envelope as TransactionEnvelope, Error as TransactionError,
-    ErrorKind as TransactionErrorKind, Id as TransactionId, InputPolicy, SignedTransaction,
+    Broadcaster, Envelope as TransactionEnvelope, Error as TransactionError,
+    ErrorKind as TransactionErrorKind, Id, Id as TransactionId, SignedTransaction,
     Snapshot as TransactionSnapshot, Submission, TransactionBuilder, TransactionFuture,
-    TransactionRestore, UtxoBuilder,
 };

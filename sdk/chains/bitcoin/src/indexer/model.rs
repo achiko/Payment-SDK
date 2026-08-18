@@ -3,18 +3,21 @@ use std::{
     fmt,
 };
 
-use bitcoin::{
-    BlockHash as NativeBlockHash, ScriptBuf, Transaction as NativeTransaction, Txid, consensus,
-    hashes::Hash, hex::FromHex,
-};
+use bitcoin::{ScriptBuf, Transaction as NativeTransaction, Txid, consensus, hex::FromHex};
 use indexing::{BlockHash, BlockHeight, BlockRef};
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Value};
 
 use crate::{Network, Satoshi, TransactionId};
 
 use super::Outpoint;
 
-const SATOSHIS_PER_BITCOIN: u64 = 100_000_000;
+#[path = "model_value.rs"]
+mod value;
+
+use value::{
+    as_object, parse_block_hash, parse_btc_amount, parse_script, parse_txid, required_bool,
+    required_string, required_u32, required_u64,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct BlockData {
@@ -387,122 +390,4 @@ pub(super) fn address_for_script(script: &ScriptBuf, network: Network) -> Option
     bitcoin::Address::from_script(script, network.native())
         .ok()
         .map(|address| crate::Address::from_encoded(address.to_string()))
-}
-
-fn parse_script(object: &Map<String, Value>) -> Result<ScriptBuf, ParseError> {
-    let hex = object
-        .get("hex")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ParseError::new("Bitcoin scriptPubKey hex is missing or invalid"))?;
-    let bytes = Vec::<u8>::from_hex(hex)
-        .map_err(|_| ParseError::new("Bitcoin scriptPubKey hex is invalid"))?;
-    Ok(ScriptBuf::from_bytes(bytes))
-}
-
-fn as_object<'a>(
-    value: &'a Value,
-    message: &'static str,
-) -> Result<&'a Map<String, Value>, ParseError> {
-    value.as_object().ok_or_else(|| ParseError::new(message))
-}
-
-fn required_string<'a>(
-    object: &'a Map<String, Value>,
-    field: &'static str,
-    context: &'static str,
-) -> Result<&'a str, ParseError> {
-    object
-        .get(field)
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ParseError::new(format!("{context} is missing or invalid")))
-}
-
-fn required_u64(
-    object: &Map<String, Value>,
-    field: &'static str,
-    context: &'static str,
-) -> Result<u64, ParseError> {
-    object
-        .get(field)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| ParseError::new(format!("{context} is missing or invalid")))
-}
-
-fn required_u32(
-    object: &Map<String, Value>,
-    field: &'static str,
-    context: &'static str,
-) -> Result<u32, ParseError> {
-    required_u64(object, field, context).and_then(|value| {
-        u32::try_from(value).map_err(|_| ParseError::new(format!("{context} exceeds u32")))
-    })
-}
-
-fn required_bool(
-    object: &Map<String, Value>,
-    field: &'static str,
-    context: &'static str,
-) -> Result<bool, ParseError> {
-    object
-        .get(field)
-        .and_then(Value::as_bool)
-        .ok_or_else(|| ParseError::new(format!("{context} is missing or invalid")))
-}
-
-fn parse_txid(value: &str) -> Result<TransactionId, ParseError> {
-    value
-        .parse::<TransactionId>()
-        .map_err(|_| ParseError::new("Bitcoin transaction ID is invalid"))
-}
-
-fn parse_block_hash(value: &str) -> Result<BlockHash, ParseError> {
-    value
-        .parse::<NativeBlockHash>()
-        .map(|hash| BlockHash(hash.to_byte_array().to_vec()))
-        .map_err(|_| ParseError::new("Bitcoin block hash is invalid"))
-}
-
-fn parse_btc_amount(value: &Value, context: &'static str) -> Result<u64, ParseError> {
-    let lexical = value
-        .as_number()
-        .map(Number::to_string)
-        .ok_or_else(|| ParseError::new(format!("{context} must be a JSON number")))?;
-    if lexical.starts_with('-') || lexical.contains(['e', 'E', '+']) {
-        return Err(ParseError::new(format!(
-            "{context} must be a non-negative fixed-point decimal"
-        )));
-    }
-    let mut parts = lexical.split('.');
-    let whole = parts.next().unwrap_or_default();
-    let fraction = parts.next().unwrap_or_default();
-    if parts.next().is_some()
-        || whole.is_empty()
-        || !whole.bytes().all(|byte| byte.is_ascii_digit())
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-        || fraction.len() > 8
-    {
-        return Err(ParseError::new(format!(
-            "{context} is not an exact Bitcoin amount"
-        )));
-    }
-    let whole = whole
-        .parse::<u64>()
-        .map_err(|_| ParseError::new(format!("{context} exceeds u64 satoshis")))?;
-    let fractional = if fraction.is_empty() {
-        0
-    } else {
-        let value = fraction
-            .parse::<u64>()
-            .map_err(|_| ParseError::new(format!("{context} is invalid")))?;
-        let padding = u32::try_from(8_usize.saturating_sub(fraction.len()))
-            .map_err(|_| ParseError::new(format!("{context} precision is invalid")))?;
-        value
-            .checked_mul(10_u64.pow(padding))
-            .ok_or_else(|| ParseError::new(format!("{context} exceeds u64 satoshis")))?
-    };
-    whole
-        .checked_mul(SATOSHIS_PER_BITCOIN)
-        .and_then(|value| value.checked_add(fractional))
-        .ok_or_else(|| ParseError::new(format!("{context} exceeds u64 satoshis")))
 }

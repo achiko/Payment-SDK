@@ -1,6 +1,7 @@
 //! Ethereum-owned contracts and chain-native types.
 
 mod address;
+mod batch;
 mod error;
 mod indexer;
 mod rpc;
@@ -10,16 +11,13 @@ mod wallet;
 pub use address::Address as EthereumAddress;
 pub use address::{Address, AddressParseError};
 pub use error::{ChainError, ChainErrorKind};
-pub use indexer::{
-    Block, BlockClient, BlockInterpreter, Head, HeadConnection, HeadConnector, HeadEvent,
-    HeadsClient, HeadsConfig, Source, SourceConfig, TokioConnector, parse_new_heads_wake,
-};
+pub use indexer::{Block, BlockClient, BlockInterpreter, Source, SourceConfig};
 pub use rpc::{
     AccountClient, Accounts, BuildError, BuildErrorKind, Client as RpcClient, HttpAccounts,
     HttpConfig, HttpTransactions, Limits, TransactionClient, Transactions,
 };
 pub use transaction::{
-    BuildContext, FeeInspection, IdError, InspectionError, Receipt, SignedError, SignedTransaction,
+    BuildContext, FeeInspection, IdError, InspectionError, SignedError, SignedTransaction,
     TransactionBuilder, TransactionId, TransferRequest, UnsignedTransaction,
 };
 pub use wallet::{WalletConfig, WalletProvider};

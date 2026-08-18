@@ -2,26 +2,18 @@ use std::{
     fs,
     io::{self, Write},
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::{
-    LintError, Result,
-    model::{Finding, ReviewState, Summary},
-    report::Reporter,
-    source::{Workspace, domain, package, snake_case},
-};
+use crate::{Finding, LintError, Result, Summary, report::Reporter};
 
-/// Replaces the flat `errors` and `check` Markdown review queues.
+/// Refreshes persistent Markdown findings under `errors` and `check`.
 pub struct Cases<Output = io::Stderr> {
     root: PathBuf,
-    written: usize,
+    count: usize,
     output: Output,
 }
 
 impl Cases<io::Stderr> {
-    /// Creates a case reporter with status written to standard error.
     #[must_use]
     pub fn new(root: PathBuf) -> Self {
         Self::with_output(root, io::stderr())
@@ -29,75 +21,61 @@ impl Cases<io::Stderr> {
 }
 
 impl<Output> Cases<Output> {
-    /// Creates a case reporter with an injected status output.
     pub fn with_output(root: PathBuf, output: Output) -> Self {
         Self {
             root,
-            written: 0,
+            count: 0,
             output,
         }
     }
-
-    /// Returns the injected status output.
     pub fn into_inner(self) -> Output {
         self.output
-    }
-
-    fn queue(&self, finding: &Finding) -> Option<(PathBuf, String)> {
-        match finding.review.as_ref().map(|review| &review.state) {
-            Some(ReviewState::Check(classification)) => {
-                Some((self.root.join("check"), classification.clone()))
-            }
-            Some(ReviewState::Error) => Some((self.root.join("errors"), "unclassified".to_owned())),
-            None if finding.is_violation() => {
-                Some((self.root.join("errors"), "unclassified".to_owned()))
-            }
-            None => None,
-        }
-    }
-
-    fn write(&self, finding: &Finding) -> Result<()> {
-        let Some((queue, classification)) = self.queue(finding) else {
-            return Ok(());
-        };
-        fs::create_dir_all(&queue).map_err(|error| LintError::io("create", &queue, error))?;
-        let timestamp = timestamp();
-        let domain = domain(&finding.location.path);
-        let package = package(&finding.location.path)
-            .map_or_else(|| "unknown_package".to_owned(), |name| snake_case(&name));
-        let output = queue.join(format!(
-            "{}_{}_{}_{}.md",
-            timestamp,
-            domain,
-            package,
-            snake_case(&finding.subject)
-        ));
-        fs::write(
-            &output,
-            document(finding, timestamp, &domain, &package, &classification),
-        )
-        .map_err(|error| LintError::io("write", &output, error))
     }
 }
 
 impl<Output: Write> Reporter for Cases<Output> {
-    fn begin(&mut self, _workspace: &Workspace) -> Result<()> {
-        self.written = 0;
-        for name in ["errors", "check"] {
-            let queue = self.root.join(name);
-            if queue.exists() {
-                clear_queue(&queue)?;
-            }
+    fn begin(&mut self, _workspace: &crate::source::Workspace) -> Result<()> {
+        self.count = 0;
+        for queue in [self.root.join("errors"), self.root.join("check")] {
             fs::create_dir_all(&queue).map_err(|error| LintError::io("create", &queue, error))?;
+            for entry in
+                fs::read_dir(&queue).map_err(|error| LintError::io("read", &queue, error))?
+            {
+                let path = entry
+                    .map_err(|error| LintError::io("read", &queue, error))?
+                    .path();
+                if path.file_name().and_then(|name| name.to_str()) != Some(".gitkeep")
+                    && path.is_file()
+                {
+                    fs::remove_file(&path).map_err(|error| LintError::io("clear", &path, error))?;
+                }
+            }
         }
         Ok(())
     }
 
     fn finding(&mut self, finding: &Finding) -> Result<()> {
-        if self.queue(finding).is_some() {
-            self.write(finding)?;
-            self.written += 1;
+        if !finding.is_violation() {
+            return Ok(());
         }
+        let name = safe(&format!(
+            "{}_{}_{}",
+            finding.rule, finding.subject, self.count
+        ));
+        let path = self.root.join("errors").join(format!("{name}.md"));
+        let text = format!(
+            "# `{}`\n\n- [ ] Resolved\n- Rule: `{}`\n- Source: `{}:{}:{}`\n\n{}\n\nHelp: {}\n\n```rust\n{}\n```\n",
+            finding.subject,
+            finding.rule,
+            finding.location.path.display(),
+            finding.location.line,
+            finding.location.column,
+            finding.message,
+            finding.help,
+            finding.location.source
+        );
+        fs::write(&path, text).map_err(|error| LintError::io("write", &path, error))?;
+        self.count += 1;
         Ok(())
     }
 
@@ -105,120 +83,24 @@ impl<Output: Write> Reporter for Cases<Output> {
         writeln!(
             self.output,
             "wrote {} case(s) to {}",
-            self.written,
+            self.count,
             self.root.display()
         )
         .map_err(|error| LintError::report("case summary", error))
     }
 }
 
-fn clear_queue(queue: &std::path::Path) -> Result<()> {
-    let entries = fs::read_dir(queue).map_err(|error| LintError::io("read", queue, error))?;
-    for entry in entries {
-        let entry = entry.map_err(|error| LintError::io("read", queue, error))?;
-        if entry.file_name() == ".gitkeep" {
-            continue;
-        }
-        let path = entry.path();
-        if path.is_dir() {
-            fs::remove_dir_all(&path).map_err(|error| LintError::io("clear", &path, error))?;
-        } else {
-            fs::remove_file(&path).map_err(|error| LintError::io("clear", &path, error))?;
-        }
-    }
-    Ok(())
-}
-
-fn document(
-    finding: &Finding,
-    timestamp: u64,
-    domain: &str,
-    package: &str,
-    classification: &str,
-) -> String {
-    let metadata = finding
-        .review
-        .as_ref()
-        .into_iter()
-        .flat_map(|review| &review.metadata)
-        .map(|(name, value)| format!("- {name}: `{value}`"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let dependencies = finding
-        .review
-        .as_ref()
-        .map_or(&[][..], |review| review.dependencies.as_slice());
-    let dependencies = if dependencies.is_empty() {
-        "- None detected".to_owned()
-    } else {
-        dependencies
-            .iter()
-            .map(|dependency| format!("- `{dependency}`"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let questions = finding
-        .review
-        .as_ref()
-        .map_or(&[][..], |review| review.questions.as_slice());
-    let questions = if questions.is_empty() {
-        "- Confirm whether the finding represents the intended design.".to_owned()
-    } else {
-        questions
-            .iter()
-            .map(|question| format!("- {question}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let related = finding
-        .related
-        .iter()
-        .map(|related| {
-            format!(
-                "### {}\n\n`{}:{}:{}`\n\n````rust\n{}\n````",
-                related.label,
-                related.location.path.display(),
-                related.location.line,
-                related.location.column,
-                related.location.source
-            )
+fn safe(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
         })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    format!(
-        "# `{}`\n\n- [ ] Approved\n- Timestamp: `{timestamp}`\n- Domain: `{domain}`\n- Package: `{package}`\n- Rule: `{}`\n- Severity: `{}`\n- Source: `{}:{}:{}`\n- Queue: `{classification}`\n{}\n\n## Finding\n\n{}\n\nHelp: {}\n\n## Review\n\n{}\n\n## Decision\n\n\n## Dependencies\n\n{}\n\n## Source\n\n````rust\n{}\n````\n\n## Related context\n\n{}\n",
-        finding.subject,
-        finding.rule,
-        finding.severity.as_str(),
-        finding.location.path.display(),
-        finding.location.line,
-        finding.location.column,
-        metadata,
-        finding.message,
-        finding.help,
-        questions,
-        dependencies,
-        finding.location.source,
-        if related.is_empty() {
-            "No related locations found in the scanned tree."
-        } else {
-            &related
-        },
-    )
-}
-
-fn timestamp() -> u64 {
-    static LAST: AtomicU64 = AtomicU64::new(0);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    let mut previous = LAST.load(Ordering::Relaxed);
-    loop {
-        let next = now.max(previous.saturating_add(1));
-        match LAST.compare_exchange_weak(previous, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return next,
-            Err(current) => previous = current,
-        }
-    }
+        .collect::<String>()
+        .trim_matches('_')
+        .to_owned()
 }

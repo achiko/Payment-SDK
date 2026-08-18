@@ -4,47 +4,56 @@ mod changes;
 mod error;
 mod indexer;
 mod observation;
-mod observer;
 mod output;
+mod planning;
+mod planning_revert;
+mod planning_watch;
 mod service;
 mod source;
 mod store;
+mod synchronizer;
+#[cfg(test)]
+mod synchronizer_test;
 mod value;
 mod watch;
-mod worker;
 
 pub use base::{BlockHash, BlockHeight, BlockRef};
-pub use changes::{CommitBlock, InterpretedBlock, RawBlock};
-pub use error::{IndexError, IndexErrorKind, SourceError};
-pub use indexer::{Checkpoint, Composer, History, Indexer, Observer, Watcher};
-pub use observation::{
-    AddressQuery, ConfirmationPolicy, ConfirmationProof, DeactivateWatch, EventCursor, EventId,
-    EventPage, EventQuery, HistoryQuery, MovementId, MovementKind, NetworkFee, ObservationDraft,
-    ObservationDraftStatus, ObservationEvent, ObservationRevision, ObservedTransaction,
-    RegisterWatch, TransactionPage, TransactionQuery, TransactionStatus, UnwatchOutcome,
-    UnwatchRequest, ValueMovement, WatchOutcome, WatchReceipt, WatchRequest, WatchSelector,
+pub use changes::{
+    CommitBlock, CommitContext, CommitPlan, InterpretedBlock, ObservationTransition, PendingChange,
+    RevertBlock, RevertContext, RevertDecision, RevertObservation, RevertPlan, StoredObservation,
 };
-pub use observer::{
-    CommitObservation, CommitStatus, NoopWorkerObserver, ReorgDepth, ReorgObservation,
-    WorkerObserver,
+pub use error::{IndexError, IndexErrorKind, SourceError};
+pub use indexer::{Checkpoint, History, Index, Watcher};
+pub use observation::{
+    ConfirmationPolicy, ConfirmationProof, HistoryQuery, MovementId, MovementKind, NetworkFee,
+    ObservationDraft, ObservationDraftStatus, ObservationRevision, ObservedTransaction,
+    RegisterWatch, TransactionPage, TransactionQuery, TransactionStatus, ValueMovement,
+    WatchReceipt, WatchRequest, WatchSelector,
 };
 pub use output::{
     IndexChanges, IndexUndo, IndexedOutput, OutputChanges, OutputCursor, OutputId, OutputKey,
     OutputPage, OutputQuery, OutputRequest, OutputSnapshot,
 };
-pub use service::{RebuildReason, SyncPhase, SyncRequest, SyncStatus, Worker};
+#[doc(hidden)]
+pub use planning::{
+    addresses as observation_addresses, commit as plan_commit, confirmation as plan_confirmation,
+    observation as plan_observation, validate_draft,
+};
+#[doc(hidden)]
+pub use planning_revert::revert as plan_revert;
+#[doc(hidden)]
+pub use planning_watch::watch as plan_watch;
+pub use service::{SyncPhase, SyncRequest, SyncStatus};
 pub use source::{BlockInterpreter, BlockSource, IndexedBlock};
 pub use store::{
-    AbortRebuild, BackfillOutcome, BackfillReader, BackfillWriter, BeginRebuild, BlockOutcome,
-    CanonicalReader, ChainWriter, CleanupGeneration, CleanupOutcome, CommitBackfill, EventReader,
-    IndexTypes, PrepareActivation, RebuildActivation, RebuildAdmin, RebuildBlock, RebuildBuilder,
-    RebuildGeneration, RebuildPhase, RebuildPublisher, RebuildReader, RebuildState,
-    RebuildValidation, RevertOutcome, RevertTip, StatusStore, TransactionReader, WatchLookup,
-    WatchReader, WatchStore,
+    BlockOutcome, BlockStore, CanonicalStore, HistoryStore, RevertTip, StatusStore, WatchStore,
 };
+pub use synchronizer::{DEFAULT_CONFIRMATIONS, DEFAULT_REORG_RETENTION, SyncConfig, Synchronizer};
 pub use value::{AssetId, CanonicalAddress, ChainId, TransactionRef};
-pub use watch::{IndexScope, WatchBackfill, WatchId, WatchSnapshot, WatchTarget, WatchVersion};
-pub use worker::{SyncConfig, SyncWorker, V1_CONFIRMATION_DEPTH, V1_REORG_RETENTION};
+pub use watch::{
+    IndexScope, WatchContext, WatchDecision, WatchId, WatchPlan, WatchSnapshot, WatchTarget,
+    WatchVersion,
+};
 
 use std::{future::Future, pin::Pin};
 

@@ -1,28 +1,23 @@
 # Positive design examples
 
-## Keep chain-native transaction ownership
-
-Chain-specific construction and signing logic stays on the concrete chain type. The signer receives only a cryptographic payload.
+## Small reusable capability
 
 ```rust
-let unsigned = ethereum.build(request).await?;
-let digest = ethereum.signing_digest(&unsigned)?;
-let signature = signer.sign(&key, &digest).await?;
-let signed = ethereum.apply_signature(unsigned, signature)?;
-```
-
-## Model finite state explicitly
-
-```rust
-enum DepositState {
-    AwaitingWatch,
-    Watching,
-    Confirmed,
+trait Addresser {
+    fn address(&self) -> Address;
 }
 ```
 
-An enum prevents unsupported string values and gives transitions a typed vocabulary.
+The trait names one reusable capability and stays independent of concrete
+chains.
 
-## Keep tests beside their owner
+## Chain-native execution
 
-Focused unit tests belong in the production module they validate. Integration tests belong under a kebab-case suite directory only when they exercise public APIs across crate boundaries.
+Concrete transaction construction remains in its owning chain. Generic wallet
+code invokes a small transaction capability and never interprets scripts,
+UTXOs, nonces, gas, envelopes, or signatures.
+
+## One composition root
+
+`apps/api` constructs concrete RPC clients, embedded indexers, storage, and
+wallet providers once. Handlers depend on wallet and indexing abstractions.

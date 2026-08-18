@@ -1,33 +1,29 @@
 # Negative design examples
 
-## Do not replace chain-native transactions with one universal model
+## God trait
 
 ```rust
-struct Transaction {
-    from: String,
-    to: String,
-    amount: u64,
+trait ChainService {
+    fn wallet(&self);
+    fn index(&self);
+    fn build(&self);
+    fn broadcast(&self);
 }
 ```
 
-Bitcoin inputs, outputs, scripts, and fee rules are not interchangeable with Ethereum nonces, gas, envelopes, and receipts. Keep these models in their owning chain crates.
+This couples unrelated responsibilities and exceeds the three-function trait
+limit. Use existing wallet, transaction, and indexing capabilities.
 
-## Do not encode workflow state as strings
-
-```rust
-struct Deposit {
-    state: String,
-}
-```
-
-String state admits invalid values and hides the valid transition set. Use a domain enum.
-
-## Do not ignore fallible operations
+## Empty namespace type
 
 ```rust
-fn persist(store: &Store, value: Value) {
-    store.write(value);
-}
+struct TransactionCodec;
 ```
 
-Return or deliberately handle the result so persistence failure cannot be mistaken for success.
+Use a module or functions unless the type owns meaningful state.
+
+## Repeated chain vocabulary
+
+Inside a concrete chain crate, use `Address` rather than repeating the chain
+name in every type. Outside that crate, do not mention the concrete chain at
+all except at the application composition boundary.

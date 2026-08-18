@@ -110,6 +110,40 @@ pub struct BuildRequest {
     pub drain_wallet: bool,
 }
 
+#[derive(Clone)]
+pub(crate) struct Funding {
+    pub available: Vec<SpendSource>,
+    pub recipients: Vec<Output>,
+    pub change_address: Address,
+}
+
+pub(crate) struct BatchBuilder {
+    network: Network,
+    groups: Vec<Funding>,
+    fee_rate: FeeRate,
+}
+
+impl BatchBuilder {
+    pub(crate) const fn new(network: Network, groups: Vec<Funding>, fee_rate: FeeRate) -> Self {
+        Self {
+            network,
+            groups,
+            fee_rate,
+        }
+    }
+
+    pub(crate) fn sign_each<'a, S: base::Signer + ?Sized>(
+        &'a self,
+        signers: &'a [&'a S],
+    ) -> TransactionFuture<'a, Result<super::SignedTransaction, ChainError>> {
+        Box::pin(async move {
+            let unsigned =
+                super::operations::build_grouped(self.network, self.groups.clone(), self.fee_rate)?;
+            super::operations::sign_each(self.network, unsigned, signers).await
+        })
+    }
+}
+
 /// Fully specified Bitcoin transaction construction ready for signing.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Builder {
@@ -139,7 +173,12 @@ impl Builder {
         })
     }
 
-    pub(crate) fn sign_each<'a, S: base::Signer + ?Sized>(
+    /// Signs each input with the corresponding owner in transaction-input order.
+    ///
+    /// This is the chain-native primitive for a single transaction funded by
+    /// several independently owned UTXOs. Application code decides which
+    /// wallets participate; Bitcoin keeps input ordering and sighash rules.
+    pub fn sign_each<'a, S: base::Signer + ?Sized>(
         &'a self,
         signers: &'a [&'a S],
     ) -> TransactionFuture<'a, Result<super::SignedTransaction, ChainError>> {
@@ -159,7 +198,7 @@ fn invalid_selection(message: impl Into<String>) -> ChainError {
 
 #[cfg(test)]
 mod tests {
-    use bitcoin::{Address as NativeAddress, CompressedPublicKey, PublicKey};
+    use bitcoin::{Address as NativeAddress, CompressedPublicKey, PublicKey, secp256k1::Secp256k1};
 
     use super::*;
 
@@ -174,6 +213,20 @@ mod tests {
             &CompressedPublicKey::try_from(public_key).expect("test public key must be compressed"),
             bitcoin::Network::Regtest,
         );
+        (
+            Address::from_encoded(address.to_string()),
+            address.script_pubkey().into_bytes(),
+        )
+    }
+
+    fn seeded_address(seed: u8) -> (Address, Vec<u8>) {
+        let secp = Secp256k1::new();
+        let secret = bitcoin::secp256k1::SecretKey::from_slice(&[seed; 32])
+            .expect("fixture secret must be valid");
+        let public = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+        let public = CompressedPublicKey::try_from(PublicKey::new(public))
+            .expect("fixture public key must be compressed");
+        let address = NativeAddress::p2wpkh(&public, bitcoin::Network::Regtest);
         (
             Address::from_encoded(address.to_string()),
             address.script_pubkey().into_bytes(),
@@ -212,5 +265,114 @@ mod tests {
         .expect_err("mismatched selection script must fail");
 
         assert_eq!(error.kind, ChainErrorKind::InvalidTransaction);
+    }
+
+    #[test]
+    fn grouped_funding_preserves_each_sources_change() {
+        let (alice, alice_script) = seeded_address(1);
+        let (bob, bob_script) = seeded_address(2);
+        let (recipient, _) = seeded_address(3);
+        let groups = vec![
+            Funding {
+                available: vec![
+                    SpendSource::from_exact_selection(
+                        Network::Regtest,
+                        &alice,
+                        TransactionId([1; 32]),
+                        0,
+                        Satoshi(100_000),
+                        alice_script,
+                    )
+                    .expect("Alice input must be valid"),
+                ],
+                recipients: vec![Output::from_atomic(recipient.clone(), Satoshi(40_000))],
+                change_address: alice.clone(),
+            },
+            Funding {
+                available: vec![
+                    SpendSource::from_exact_selection(
+                        Network::Regtest,
+                        &bob,
+                        TransactionId([2; 32]),
+                        0,
+                        Satoshi(100_000),
+                        bob_script,
+                    )
+                    .expect("Bob input must be valid"),
+                ],
+                recipients: vec![Output::from_atomic(recipient, Satoshi(30_000))],
+                change_address: bob.clone(),
+            },
+        ];
+
+        let transaction = crate::transaction::operations::build_grouped(
+            Network::Regtest,
+            groups,
+            FeeRate::new(1_000),
+        )
+        .expect("both sources must fund one transaction");
+
+        assert_eq!(transaction.inputs.len(), 2);
+        assert_eq!(transaction.outputs.len(), 4);
+        assert!(
+            transaction
+                .outputs
+                .iter()
+                .any(|output| output.address == alice)
+        );
+        assert!(
+            transaction
+                .outputs
+                .iter()
+                .any(|output| output.address == bob)
+        );
+    }
+
+    #[test]
+    fn grouped_funding_does_not_cross_subsidize_sources() {
+        let (alice, alice_script) = seeded_address(1);
+        let (bob, bob_script) = seeded_address(2);
+        let (recipient, _) = seeded_address(3);
+        let groups = vec![
+            Funding {
+                available: vec![
+                    SpendSource::from_exact_selection(
+                        Network::Regtest,
+                        &alice,
+                        TransactionId([1; 32]),
+                        0,
+                        Satoshi(10_000),
+                        alice_script,
+                    )
+                    .expect("Alice input must be valid"),
+                ],
+                recipients: vec![Output::from_atomic(recipient.clone(), Satoshi(20_000))],
+                change_address: alice,
+            },
+            Funding {
+                available: vec![
+                    SpendSource::from_exact_selection(
+                        Network::Regtest,
+                        &bob,
+                        TransactionId([2; 32]),
+                        0,
+                        Satoshi(1_000_000),
+                        bob_script,
+                    )
+                    .expect("Bob input must be valid"),
+                ],
+                recipients: vec![Output::from_atomic(recipient, Satoshi(1_000))],
+                change_address: bob,
+            },
+        ];
+
+        let error = crate::transaction::operations::build_grouped(
+            Network::Regtest,
+            groups,
+            FeeRate::new(1_000),
+        )
+        .expect_err("Bob's funds must not pay Alice's requested output");
+
+        assert_eq!(error.kind, ChainErrorKind::InsufficientFunds);
     }
 }

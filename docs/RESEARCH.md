@@ -1,233 +1,153 @@
 # Upstream architecture research
 
-The repositories listed below are shallow local checkouts under `reference/`.
-They are research sources, not workspace dependencies or vendored production
-code.
+This document records design lessons from established open-source chain and
+wallet projects. They are research sources, not workspace dependencies or
+vendored code.
 
 ## Alloy
 
-Relevant sources:
+Reviewed concepts: `Network`, `TransactionBuilder`, `NetworkWallet`,
+`TxSigner`, and `Signer`.
 
-- [`Network`](../reference/alloy/crates/network/src/lib.rs)
-- [`TransactionBuilder`](../reference/alloy/crates/network/src/transaction/builder.rs)
-- [`NetworkWallet` and `TxSigner`](../reference/alloy/crates/network/src/transaction/signer.rs)
-- [`Signer`](../reference/alloy/crates/signer/src/signer.rs)
+Useful lessons:
 
-Useful decisions:
+- focused crates compose through a facade;
+- associated types keep network-native requests, unsigned transactions,
+  envelopes, receipts, headers, and RPC responses connected;
+- building is distinct from signing; and
+- concrete signer implementations can remain optional.
 
-- focused crates with a composition/facade layer;
-- associated types keep network-native request, unsigned transaction, signed
-  envelope, receipt, header, and RPC response types connected;
-- building an unsigned transaction is distinct from signing it;
-- concrete signer implementations are optional dependencies.
-
-Decisions not copied:
-
-- Alloy's signer is Ethereum-oriented: it owns an Ethereum address and chain
-  ID. Our generic signer must not own either;
-- Alloy's network abstraction is designed for EVM-family networks, not a
-  universal Bitcoin/Ethereum/Solana transaction model;
-- provider fillers are useful for EVM request population but are not yet a
-  justified universal layer for this payment indexer.
+Alloy's network and signer abstractions are EVM-oriented. They are not a
+universal Bitcoin/Ethereum model, and an Ethereum address or chain ID does not
+belong in this workspace's minimal generic signer.
 
 ## ethers.js
 
-Relevant source:
+Reviewed concept: `AbstractSigner`.
 
-- [`AbstractSigner`](../reference/ethers-js/src.ts/providers/abstract-signer.ts)
-
-ethers connects many signers to a provider and lets the signer populate nonce,
-gas, chain ID, and fees before broadcasting. This is convenient for an
-application SDK but couples key authority to network access. Our signer remains
-network-free; concrete chain transaction services perform RPC population.
+ethers connects a signer to a provider and lets it populate nonce, gas, chain
+ID, and fees. That is convenient but couples key authority to network access.
+Here the signer remains network-free; the concrete chain builder performs RPC
+population and asks the signer for only the cryptographic operation.
 
 ## rust-bitcoin and BDK
 
-Relevant sources:
-
-- [`Psbt`](../reference/rust-bitcoin/bitcoin/src/psbt/mod.rs)
-- [`SighashCache`](../reference/rust-bitcoin/bitcoin/src/crypto/sighash.rs)
-- [`SyncRequest`](../reference/bdk/crates/core/src/spk_client.rs)
-- [`CheckPoint`](../reference/bdk/crates/core/src/checkpoint.rs)
-- [`Indexer`](../reference/bdk/crates/chain/src/indexer.rs)
-- [`TxGraph`](../reference/bdk/crates/chain/src/tx_graph.rs)
+Reviewed concepts: `Psbt`, `SighashCache`, `SyncRequest`, `CheckPoint`,
+`Indexer`, and `TxGraph`.
 
 Findings:
 
-- a Bitcoin signing input needs previous-output data, script information,
-  derivation/key origin, and a sighash policy;
-- partially signed transactions and multiple signers are real states, even if
-  the first payment workflow uses one signer;
-- sync targets may include scripts, transaction IDs, and outpoints;
-- checkpoints represent chain identity, while change sets separate in-memory
-  mutation from durable persistence;
-- confirmed anchors and mempool `last_seen`/eviction data are different facts;
-- transaction conflicts must coexist until canonicalization decides which one
-  is effective.
+- Bitcoin signing needs previous-output, script, key-origin, and sighash data;
+- partially signed and multiple-signer transactions are valid protocol states;
+- sync targets may be scripts, transaction IDs, and outpoints;
+- checkpoints represent chain identity, while change sets separate mutation
+  from persistence;
+- confirmed anchors and mempool last-seen/eviction are different facts; and
+- conflicting transactions coexist until canonicalization resolves them.
 
-The scaffold borrows checkpoint and reversible-change ideas without moving
-Bitcoin script or transaction graph types into generic indexing.
+The SDK adopts checkpoint and reversible-effect ideas without putting Bitcoin
+scripts or transaction graphs into generic indexing.
 
 ## Trezor Blockbook
 
-Relevant sources:
-
-- [`BlockChain` interface](../reference/blockbook/bchain/types.go)
-- [`ResyncIndex`](../reference/blockbook/db/sync.go)
-- [database connect/disconnect](../reference/blockbook/db/rocksdb.go)
+Reviewed concepts: the chain interface, resynchronization, and RocksDB block
+connect/disconnect behavior.
 
 Findings:
 
-- synchronization compares local and remote hashes at the same height;
-- a fork is handled by finding a common ancestor, disconnecting blocks, and
-  reconnecting the canonical branch;
-- fetch can be parallel but durable block connection is ordered;
-- Bitcoin-type and Ethereum-type index data have materially different connect
-  and disconnect behavior.
+- compare local and remote hashes at the same height;
+- find a common ancestor, disconnect, then reconnect on forks;
+- fetching may be parallel but durable connection is ordered; and
+- Bitcoin and Ethereum projections have materially different rollback data.
 
-Blockbook's daemon interface is intentionally not copied as one Rust trait: it
-mixes lifecycle, RPC, mempool, fees, parsing, token, and chain-specific methods.
-Our source, interpreter, storage, and service contracts remain separate.
+Blockbook's broad daemon interface mixes lifecycle, RPC, mempool, fees,
+parsing, tokens, and chain-specific methods. This workspace keeps source,
+interpreter, repository, and worker contracts separate.
 
 ## NBXplorer and BTCPay Server
 
-Relevant sources:
-
-- [`NewTransactionEvent`](../reference/nbxplorer/NBXplorer.Client/Models/NewTransactionEvent.cs)
-- [`GetTransactionsResponse`](../reference/nbxplorer/NBXplorer.Client/Models/GetTransactionsResponse.cs)
-- [`UTXOChanges`](../reference/nbxplorer/NBXplorer.Client/Models/UTXOChanges.cs)
-- [NBXplorer transaction query](../reference/nbxplorer/NBXplorer/Controllers/MainController.cs)
-- [`NBXplorerListener`](../reference/btcpayserver/BTCPayServer/Payments/Bitcoin/NBXplorerListener.cs)
-- [BTCPay payment persistence](../reference/btcpayserver/BTCPayServer/Services/Invoices/PaymentService.cs)
+Reviewed concepts: transaction events, transaction queries, UTXO changes,
+listeners, and payment persistence.
 
 Findings:
 
-- NBXplorer is infrastructure for tracked sources rather than a full explorer;
-- its transaction events retain matched inputs and outputs, key paths,
-  confirmations, replacement links, and block identity;
-- its API separates event delivery (polling, long polling, WebSocket),
-  transaction queries, UTXO queries, PSBT construction, and broadcast;
-- BTCPay consumes NBXplorer events but queries again after restarts to find
-  payments that arrived while offline;
-- BTCPay associates matched outputs with invoice records in its own database;
-- confirmations can move a payment from processing to settled, while replaced
-  or orphaned transactions can become unaccounted.
+- watched-source infrastructure can remain smaller than a full explorer;
+- events retain matched inputs/outputs, key paths, confirmations, replacement
+  links, and block identity;
+- event delivery, transaction/UTXO query, construction, and broadcast are
+  separate capabilities;
+- consumers query again after restart instead of trusting ephemeral events;
+  and
+- invoice/payment meaning is owned above the indexer.
 
-This directly supports an IX event/query boundary with durable replay and a
-separate PS classifier. We do not copy NBXplorer's Bitcoin-only tracked-source
-types into generic indexing; IX normalizes chain facts and preserves stable
-movement IDs so Bitcoin inputs/outputs remain attributable.
+The embedded indexer adopts replayable events and exact movements without
+copying Bitcoin-only tracked-source types or invoice semantics.
 
 ## SHKeeper
 
-Relevant sources:
+Reviewed concepts: invoice/address persistence, callbacks, confirmation work,
+and payout submission.
 
-- [invoice and callback contract](../reference/shkeeper/README.md)
-- [invoice/transaction persistence](../reference/shkeeper/shkeeper/models.py)
-- [confirmation/callback worker](../reference/shkeeper/shkeeper/callback.py)
-- [payout service](../reference/shkeeper/shkeeper/services/payout_service.py)
+Its business workflows are outside the current workspace. The retained lesson
+is that transaction delivery must be replayable, idempotent, and queryable
+after consumer restarts. Partial/paid/overpaid are business classifications,
+not indexing statuses.
 
-Findings:
+## Hardware-wallet protocols
 
-- invoices map unique external IDs to generated asset addresses;
-- callbacks include every transaction associated with the invoice and are
-  retried until acknowledged;
-- partial, paid, and overpaid are business classifications above transaction
-  observations;
-- payout submission is asynchronous and is followed by status/confirmation
-  polling;
-- current persistence deduplicates transactions using invoice/asset/txid-like
-  keys.
+Trezor's Bitcoin transaction signing is a repeated request/acknowledgement
+protocol that may request current inputs, outputs, previous transactions, and
+replacement data. The device also verifies and displays intent. Blind digest
+signing is not an equivalent abstraction.
 
-The useful behavior is retained: idempotent address issuance, partial deposits,
-late additional transactions, callbacks/replay, and asynchronous collection.
-Its invoice/chain/payout coupling is not used as the package boundary here;
-PS classification, IX facts, and WS operations remain independent.
+Hardware wallets are outside the current workspace. If added later, their
+native interactive protocols must not be forced through an inadequate generic
+digest-only implementation.
 
-## Why both Blockbook and NBXplorer matter
+## Solana SDK and keychain
 
-Blockbook is the stronger model for a multi-chain address/balance index and
-ordered connect/disconnect mechanics. NBXplorer is the stronger model for a
-private watched-source service with exact input/output matches, replayable
-events, and transaction/UTXO queries. The proposed IX combines those lessons:
-
-- Blockbook-style canonical checkpoint and reorg rollback;
-- NBXplorer-style watch/query/event surface;
-- chain-owned parsing rather than a universal transaction parser;
-- no payment/invoice semantics in IX.
-
-## Trezor firmware
-
-Relevant sources:
-
-- [Bitcoin protobuf messages](../reference/trezor-firmware/common/protob/messages-bitcoin.proto)
-- [Ethereum protobuf messages](../reference/trezor-firmware/common/protob/messages-ethereum.proto)
+Reviewed concepts: signer, transaction, and Solana-specific signer traits.
 
 Findings:
 
-- public-key and arbitrary-message operations fit a generic key/signer API;
-- Bitcoin transaction signing does not: the device drives a `SignTx` / repeated
-  `TxRequest` / `TxAck` protocol and may request current inputs, outputs,
-  previous transactions, and replacement transaction data;
-- the device verifies amounts and displays transaction intent, so replacing
-  the native flow with blind digest signing can weaken hardware-wallet policy.
+- public key plus message signing is a useful small boundary;
+- a Solana transaction contains signatures plus a serialized message and may
+  require several signers;
+- partial signing is valid;
+- a signer may be interactive or unavailable; and
+- “account based” is not synonymous with Ethereum-shaped transactions.
 
-This creates a deliberate open architecture decision rather than permission to
-put Trezor directly inside the Bitcoin chain crate.
+This reinforces preservation of chain-native transactions and argues against a
+universal account-chain builder.
 
-## Solana SDK and Solana Keychain
+## Resulting principles
 
-Relevant sources:
-
-- [`Signer`](../reference/solana-sdk/signer/src/lib.rs)
-- [`Transaction`](../reference/solana-sdk/transaction/src/lib.rs)
-- [`SolanaSigner`](../reference/solana-keychain/rust/src/traits.rs)
-
-Findings:
-
-- public key plus message signing is a small, useful signer boundary;
-- a Solana transaction is signatures plus a serialized message and can require
-  multiple signers;
-- partial signing is a valid state;
-- signer implementations may be interactive or unavailable;
-- “account-based” does not mean Ethereum-shaped: Solana uses instructions,
-  account metadata, fee payer, recent blockhash, and possibly address lookup
-  tables.
-
-This validates keeping the account builder narrow and preserving chain-native
-transaction associated types.
-
-## Resulting design principles
-
-1. Preserve chain-native types with associated types instead of normalizing
-   transactions prematurely.
-2. Keep signer identity/key operations independent from providers and chains.
-3. Let concrete chains combine pure builders with signers.
-4. Make indexing block-hash aware and explicitly reversible.
+1. Preserve chain-native transaction types instead of normalizing too early.
+2. Keep cryptographic signing independent from providers and chains.
+3. Let concrete chains combine pure protocol construction with injected
+   signers.
+4. Make indexing block-hash aware and reversible.
 5. Persist block effects and checkpoint movement atomically.
-6. Keep mempool observations separate from canonical confirmation.
-7. Model backend capabilities so missing trace/history support is visible.
-8. Keep partial/multiple signatures possible even if not implemented first.
-9. Treat block inclusion and accounting-grade confirmation as distinct states.
-10. Make observation delivery replayable and idempotent by revision.
-11. Keep long-lived collection workflow state in PS, not stateless WS.
+6. Keep mempool observations distinct from canonical inclusion.
+7. Make missing trace and historical-query capabilities explicit.
+8. Do not design away partial or multiple signatures.
+9. Treat inclusion and configured confirmation as different states.
+10. Preserve corrected observations as stable revisions queryable in history.
+11. Compose concrete chain, indexing, storage, and wallet implementations only
+    in `apps/api`.
 
-## Ethereum Indexer v1 application of the research
+## Current application
 
-The approved first implementation applies those principles as follows:
+The current Bitcoin/Ethereum implementation applies those principles with:
 
-- Blockbook's same-height hash comparison and ordered disconnect/connect model
-  becomes HTTP-authoritative reconciliation with a 50-block rollback window.
-- NBXplorer's durable watch/query/replay separation becomes a composite IX
-  repository with immutable revisions and a global event cursor.
-- Geth `newHeads` is treated as a wake-up hint because subscriptions can skip,
-  repeat, and cannot replay missed heads; polling remains authoritative.
-- Standard Execution API blocks, receipts, and logs cover top-level ETH, fees,
-  failures, contract creation, and ERC-20 transfers. Missing trace support is
-  reported instead of silently claiming internal-transfer completeness.
-- RocksDB supplies one-process path locking and atomic batches; the adapter
-  adds a serialized writer, synchronous WAL durability, explicit record
-  framing, migrations, backup, and staged generation activation.
+- same-height hash comparison and ordered reorg rollback;
+- durable address watches, transaction queries, and immutable revisions;
+- polling as authoritative synchronization, with websocket heads only as an
+  optional wake-up hint;
+- standard Ethereum blocks/receipts/logs with missing trace completeness made
+  explicit;
+- chain-owned parsing and semantic projection effects; and
+- one embedded RocksDB adapter owning physical records and atomic batches.
 
-The concrete operations and limitations are recorded in
-[`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md).
+See [`INDEXING.md`](INDEXING.md) for the concrete indexing design and
+[`CHAIN_RESEARCH.md`](CHAIN_RESEARCH.md) for additional-chain constraints.

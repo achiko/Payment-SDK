@@ -10,11 +10,11 @@ use super::{
     transport::Client as Transport,
     wire::{
         CallError, address_hex, data_hex, gas_limit_with_margin, invalid_rpc_response,
-        is_already_known, map_json_rpc_error, parse_quantity_wei, parse_receipt,
-        parse_transaction_id, source_error, transaction_id_hex, wei_quantity,
+        is_already_known, map_json_rpc_error, parse_quantity_wei, parse_transaction_id,
+        source_error, wei_quantity,
     },
 };
-use crate::{BuildContext, Receipt, SignedTransaction, TransactionId, TransferRequest};
+use crate::{BuildContext, SignedTransaction, TransactionId, TransferRequest};
 
 pub type HttpAccounts = AccountClient<ProductionClient>;
 pub type HttpTransactions = TransactionClient<ProductionClient>;
@@ -39,17 +39,12 @@ impl<C> TransactionClient<C> {
     }
 }
 
-/// Transaction preparation, submission, and receipt lookup.
+/// Transaction preparation and submission.
 pub trait Transactions: Send + Sync {
     fn build_context<'a>(
         &'a self,
         request: &'a TransferRequest,
     ) -> BoxFuture<'a, Result<BuildContext, SourceError>>;
-
-    fn receipt<'a>(
-        &'a self,
-        id: &'a TransactionId,
-    ) -> BoxFuture<'a, Result<Option<Receipt>, SourceError>>;
 
     fn broadcast<'a>(
         &'a self,
@@ -172,46 +167,6 @@ where
         })
     }
 
-    fn receipt<'a>(
-        &'a self,
-        id: &'a TransactionId,
-    ) -> BoxFuture<'a, Result<Option<Receipt>, SourceError>> {
-        Box::pin(async move {
-            let raw = self
-                .request_result("eth_getTransactionReceipt", json!([transaction_id_hex(id)]))
-                .await?;
-            let value: Value = raw.deserialize().map_err(map_json_rpc_error)?;
-            if value.is_null() {
-                return Ok(None);
-            }
-            let receipt = parse_receipt(&value, id)?;
-            let confirmations = match &receipt.included_in {
-                Some(block) => {
-                    let tip = self.rpc_u64("eth_blockNumber", json!([])).await?;
-                    if tip < block.height.0 {
-                        return Err(source_error(
-                            "Ethereum RPC tip is below the transaction receipt block",
-                            true,
-                        ));
-                    }
-                    tip.checked_sub(block.height.0)
-                        .and_then(|distance| distance.checked_add(1))
-                        .ok_or_else(|| {
-                            invalid_rpc_response(
-                                "eth_blockNumber",
-                                "receipt confirmation count overflowed u64",
-                            )
-                        })?
-                }
-                None => 0,
-            };
-            Ok(Some(Receipt {
-                confirmations,
-                ..receipt
-            }))
-        })
-    }
-
     fn broadcast<'a>(
         &'a self,
         transaction: SignedTransaction,
@@ -265,13 +220,6 @@ where
         request: &'a TransferRequest,
     ) -> BoxFuture<'a, Result<BuildContext, SourceError>> {
         self.methods.build_context(request)
-    }
-
-    fn receipt<'a>(
-        &'a self,
-        id: &'a TransactionId,
-    ) -> BoxFuture<'a, Result<Option<Receipt>, SourceError>> {
-        self.methods.receipt(id)
     }
 
     fn broadcast<'a>(

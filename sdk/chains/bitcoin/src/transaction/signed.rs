@@ -1,6 +1,5 @@
 use crate::{ChainError, ChainErrorKind};
 use bitcoin::{Transaction, Txid, consensus, hashes::Hash};
-use indexing::BlockRef;
 use std::{fmt, str::FromStr};
 
 use crate::{Outpoint, Satoshi};
@@ -206,14 +205,6 @@ impl fmt::Debug for RedactedBytes {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "<redacted: {} bytes>", self.0)
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Receipt {
-    pub id: Id,
-    pub included_in: Option<BlockRef>,
-    pub confirmations: u64,
-    pub replaced_by: Option<Id>,
 }
 
 fn invalid_transaction(message: impl Into<String>) -> ChainError {

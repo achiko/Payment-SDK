@@ -1,4 +1,4 @@
-use indexing::{BlockRef, BoxFuture, IndexError, IndexScope, RebuildGeneration};
+use indexing::{BlockRef, IndexScope};
 
 /// One adapter-owned record mutation applied in the canonical block commit.
 ///
@@ -40,11 +40,6 @@ impl ProjectionBatch {
     pub const fn new(mutations: Vec<ProjectionMutation>) -> Self {
         Self { mutations }
     }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.mutations.is_empty()
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,7 +51,6 @@ pub struct ProjectionGet {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectionSnapshot {
-    pub generation: RebuildGeneration,
     pub revision: u64,
     pub checkpoint: Option<BlockRef>,
 }
@@ -92,17 +86,4 @@ pub struct ProjectionPage {
     pub snapshot: ProjectionSnapshot,
     pub entries: Vec<ProjectionEntry>,
     pub next: Option<ProjectionCursor>,
-}
-
-/// Low-level access used only to build composition-owned semantic readers.
-pub trait ProjectionQuery: Send + Sync {
-    fn projection_get<'a>(
-        &'a self,
-        request: ProjectionGet,
-    ) -> BoxFuture<'a, Result<ProjectionResult, IndexError>>;
-
-    fn projection_scan<'a>(
-        &'a self,
-        request: ProjectionScan,
-    ) -> BoxFuture<'a, Result<ProjectionPage, IndexError>>;
 }

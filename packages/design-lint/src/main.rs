@@ -36,6 +36,13 @@ fn main() -> ExitCode {
 impl Arguments {
     fn run(mut self) -> Result<bool> {
         let output = self.output();
+        if self
+            .paths
+            .first()
+            .is_some_and(|path| path == std::path::Path::new("check"))
+        {
+            self.paths.remove(0);
+        }
         if self.paths.is_empty() {
             self.paths.push(PathBuf::from("src"));
         }
@@ -77,7 +84,7 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn legacy_modes_and_paths() {
+    fn output_modes_and_paths() {
         let mut markdown =
             Arguments::try_parse_from(["design-lint", "--markdown", "src", "tests"]).unwrap();
         assert!(matches!(markdown.output(), Output::Markdown));
@@ -100,6 +107,15 @@ mod tests {
         assert_eq!(
             arguments.paths,
             [PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("a")]
+        );
+    }
+
+    #[test]
+    fn check_command_is_accepted() {
+        let arguments = Arguments::try_parse_from(["design-lint", "check", "."]).unwrap();
+        assert_eq!(
+            arguments.paths,
+            [PathBuf::from("check"), PathBuf::from(".")]
         );
     }
 

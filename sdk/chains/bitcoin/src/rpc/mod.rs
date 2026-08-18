@@ -10,7 +10,7 @@ mod transport;
 mod types;
 mod wire;
 
-pub use capability::{FeeClient, Fees, Node, TransactionClient, Transactions, Utxos};
+pub use capability::{FeeClient, Fees, Node, TransactionClient, Transactions};
 pub use client::Client;
 pub use config::CoreConfig;
 pub(crate) use error::source_error;

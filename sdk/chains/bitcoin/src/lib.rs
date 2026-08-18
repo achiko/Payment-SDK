@@ -1,6 +1,7 @@
 //! Bitcoin-owned contracts and chain-native types.
 
 mod address;
+mod batch;
 mod error;
 mod indexer;
 mod network;
@@ -15,11 +16,11 @@ pub use indexer::{Block, BlockInterpreter, Blocks, IndexEvent, Outpoint, Source,
 pub use network::Network;
 pub use rpc::{
     BITCOIN_CORE_MAX_FEE_RATE_SATOSHIS_PER_KVB, Client as RpcClient, CoreConfig, FeeClient, Fees,
-    Node, NodeStatus, Preflight, TransactionClient, Transactions, UnspentOutput, UtxoSet, Utxos,
+    Node, NodeStatus, Preflight, TransactionClient, Transactions, UnspentOutput, UtxoSet,
     format_bitcoin_block_hash, parse_bitcoin_block_hash,
 };
 pub use transaction::{
-    BuildRequest, FeeRate, Input, InputInspection, Output, OutputInspection, Receipt, SighashType,
+    BuildRequest, FeeRate, Input, InputInspection, Output, OutputInspection, SighashType,
     SignedTransaction, SpendSource, TransactionBuilder, TransactionId, TransactionInspection,
     UnsignedTransaction,
 };

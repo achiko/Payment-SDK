@@ -6,4 +6,4 @@
 //! repository's transport packages while using `rust-bitcoin` for protocol
 //! parsing and consensus types.
 
-pub(crate) use json_rpc::{Client, Error, Failure, RawJson, Request, RequestId};
+pub(crate) use json_rpc::{Client, Error, Failure, RawJson};

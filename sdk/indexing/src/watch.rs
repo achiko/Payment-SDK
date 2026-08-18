@@ -1,5 +1,5 @@
 use crate::ChainId;
-use crate::{BlockHeight, BlockRef, WatchSelector};
+use crate::{BlockHeight, BlockRef, WatchReceipt, WatchSelector};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IndexScope {
@@ -26,18 +26,12 @@ pub struct WatchTarget<T> {
     pub start_height: BlockHeight,
     /// The observed tip when the watch was registered, if available.
     pub registered_at: Option<BlockRef>,
-    /// First height at which this watch is inactive. Historical scans below it
-    /// continue to see the watch, which makes soft unwatch reorg-safe.
-    pub inactive_from: Option<BlockHeight>,
 }
 
 impl<T> WatchTarget<T> {
     #[must_use]
     pub fn is_active_at(&self, height: BlockHeight) -> bool {
         self.start_height <= height
-            && self
-                .inactive_from
-                .is_none_or(|inactive_from| height < inactive_from)
     }
 }
 
@@ -47,13 +41,23 @@ pub struct WatchSnapshot<T> {
     pub watches: Vec<WatchTarget<T>>,
 }
 
-/// Durable historical scan work created when a watch birthday precedes the
-/// canonical checkpoint observed during registration.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WatchBackfill {
-    pub scope: IndexScope,
-    pub watch_id: WatchId,
-    pub from_height: BlockHeight,
-    pub next_height: BlockHeight,
-    pub through: BlockRef,
+pub struct WatchContext<T> {
+    pub checkpoint: Option<BlockRef>,
+    pub version: WatchVersion,
+    pub next_id: u64,
+    pub existing: Option<WatchTarget<T>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatchPlan<T> {
+    pub watch: WatchTarget<T>,
+    pub expected_checkpoint: Option<BlockRef>,
+    pub expected_version: WatchVersion,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatchDecision<T> {
+    pub receipt: WatchReceipt,
+    pub plan: Option<WatchPlan<T>>,
 }

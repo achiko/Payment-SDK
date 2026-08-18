@@ -1,35 +1,29 @@
 //! Runtime wallet composition without concrete protocol dependencies.
 
 mod address;
-mod amount;
-mod collection;
-mod collector;
 mod error;
 mod history_serde;
 mod provider;
+mod registries;
+mod sender;
 mod wallet;
 
 pub use address::{AddressEncoding, AddressFormat, AddressText};
-pub use amount::AmountFormat;
-pub use collection::Wallets;
-pub use collector::{Collector, PreparedCollection, PreparedFee, SelectedOutput, Sweeper};
 pub use crypto::SecretBytes;
 pub use error::{Error, ErrorKind};
 pub use provider::Provider;
+pub use registries::{Providers, Wallets};
+pub use sender::{SendError, SendFuture, Sender, Transfer};
 pub use wallet::{
-    Balance, BalanceReader, CollectionFactory, FutureResult, History, HistoryAsset, HistoryEntry,
-    HistoryFee, HistoryMovement, HistoryReader, HistoryRequest, HistoryStatus, TransactionFactory,
-    Wallet,
+    Balance, BalanceReader, FutureResult, History, HistoryAsset, HistoryEntry, HistoryFee,
+    HistoryMovement, HistoryReader, HistoryRequest, HistoryStatus, TransactionFactory, Wallet,
 };
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use base::{
-        Address, Addresser, Broadcaster, Decimal, TransactionBuilder, TransactionError,
-        TransactionRestore, TransactionSnapshot,
-    };
+    use base::{Address, Addresser, Broadcaster, TransactionBuilder};
 
     use super::*;
 
@@ -65,31 +59,19 @@ mod tests {
         }
     }
 
-    impl AmountFormat for NeverWallet {
-        fn display_amount(&self, atomic: &Decimal) -> Result<Decimal, Error> {
-            Ok(atomic.clone())
-        }
-    }
-
     impl TransactionFactory for NeverWallet {
         fn transaction(&self) -> Box<dyn TransactionBuilder> {
             unreachable!("fixture operation must not run")
         }
 
-        fn broadcaster(&self) -> &dyn Broadcaster {
-            unreachable!("fixture operation must not run")
-        }
-    }
-
-    impl CollectionFactory for NeverWallet {}
-
-    impl Sweeper for NeverWallet {}
-
-    impl TransactionRestore for NeverWallet {
         fn restore(
             &self,
-            _snapshot: &TransactionSnapshot,
-        ) -> Result<Box<dyn TransactionBuilder>, TransactionError> {
+            _snapshot: &base::TransactionSnapshot,
+        ) -> Result<Box<dyn TransactionBuilder>, base::TransactionError> {
+            unreachable!("fixture operation must not run")
+        }
+
+        fn broadcaster(&self) -> &dyn Broadcaster {
             unreachable!("fixture operation must not run")
         }
     }
@@ -112,14 +94,27 @@ mod tests {
 
     #[test]
     fn creates_wallet_through_the_only_matching_provider() {
-        let mut wallets = Wallets::new();
-        wallets
+        let mut providers = Providers::new();
+        providers
             .register("fixture", FixtureProvider::Value)
             .expect("fixture key must be unique");
 
         let wallet =
-            futures_executor::block_on(wallets.new_wallet(&"fixture", SecretBytes::new([7; 32])))
+            futures_executor::block_on(providers.create(&"fixture", SecretBytes::new([7; 32])))
                 .expect("the fixture provider must create a wallet");
+
+        assert_eq!(wallet.address(), Address::from([1]));
+    }
+
+    #[test]
+    fn generates_wallet_without_returning_secret_material() {
+        let mut providers = Providers::new();
+        providers
+            .register("fixture", FixtureProvider::Value)
+            .expect("fixture key must be unique");
+
+        let wallet = futures_executor::block_on(providers.generate(&"fixture"))
+            .expect("OS-backed generation must create a wallet");
 
         assert_eq!(wallet.address(), Address::from([1]));
     }
@@ -127,19 +122,54 @@ mod tests {
     #[test]
     fn rejects_missing_and_duplicate_providers() {
         let missing = futures_executor::block_on(
-            Wallets::<&str>::new().new_wallet(&"fixture", SecretBytes::new([7; 32])),
+            Providers::<&str>::new().create(&"fixture", SecretBytes::new([7; 32])),
         )
         .err()
         .expect("missing provider must fail");
         assert_eq!(missing.kind, ErrorKind::Unsupported);
 
-        let mut wallets = Wallets::new();
-        wallets
+        let mut providers = Providers::new();
+        providers
             .register("fixture", FixtureProvider::Value)
             .expect("first provider must register");
-        let duplicate = wallets
+        let duplicate = providers
             .register("fixture", FixtureProvider::Value)
             .expect_err("duplicate provider must fail during startup");
         assert_eq!(duplicate.kind, ErrorKind::Duplicate);
+    }
+
+    #[test]
+    fn stores_created_wallets_separately_from_providers() {
+        let wallet = Arc::new(NeverWallet::Value) as Arc<dyn Wallet>;
+        let mut wallets = Wallets::new();
+        wallets
+            .insert("alice", wallet.clone())
+            .expect("wallet key must be unique");
+
+        assert_eq!(
+            wallets.get(&"alice").expect("wallet must exist").address(),
+            wallet.address()
+        );
+        assert_eq!(
+            wallets
+                .insert("alice", wallet)
+                .expect_err("duplicate wallet must fail")
+                .kind,
+            ErrorKind::Duplicate
+        );
+    }
+
+    #[test]
+    fn send_error_preserves_the_accepted_prefix() {
+        let error = SendError::at(
+            2,
+            vec![base::Id::new("first"), base::Id::new("second")],
+            Error::new(ErrorKind::Transaction, "third transfer failed"),
+        );
+
+        assert_eq!(error.failed_index, 2);
+        assert_eq!(error.accepted[0].as_str(), "first");
+        assert_eq!(error.accepted[1].as_str(), "second");
+        assert!(error.to_string().contains("third transfer failed"));
     }
 }

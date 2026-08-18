@@ -1,18 +1,18 @@
 use std::fmt;
 
-use http::client::{Config as TransportConfig, Reqwest as HttpClient};
 use indexing::SourceError;
+use json_rpc::{Config as TransportConfig, Http as HttpClient};
 use serde_json::{Value, json};
 
 use super::{
     Client, HttpConfig, Limits,
     error::{BuildError, BuildErrorKind},
-    transport::{Client as JsonClient, Failover, RawJson, TransportClient},
+    transport::{Client as JsonClient, RawJson},
     wire::{CallError, invalid_rpc_response, map_json_rpc_error, source_error},
 };
 use crate::{TransactionId, Wei};
 
-pub(super) type ProductionClient = Failover<TransportClient<HttpClient>>;
+pub(super) type ProductionClient = HttpClient;
 
 /// Shared chain identity and block-level JSON-RPC methods.
 pub(super) struct Methods<C> {
@@ -23,25 +23,15 @@ pub(super) struct Methods<C> {
 
 impl Methods<ProductionClient> {
     pub(super) fn http(config: HttpConfig) -> Result<Self, BuildError> {
-        let clients = config
-            .endpoints
-            .iter()
-            .map(|endpoint| {
-                let mut transport_config =
-                    TransportConfig::new(endpoint.clone(), config.request_timeout);
-                transport_config.max_response_bytes = config.max_response_bytes;
-                transport_config.default_headers = config.headers.clone();
-                transport_config.retry_policy = config.retry_policy;
-                let transport = HttpClient::new(transport_config).map_err(|_| BuildError {
-                    kind: BuildErrorKind::HttpTransport,
-                    message: "failed to construct Ethereum RPC HTTP transport".to_owned(),
-                })?;
-                Ok(TransportClient::new(transport, endpoint.clone()))
-            })
-            .collect::<Result<Vec<_>, BuildError>>()?;
-        let client = Failover::new(clients).map_err(|_| BuildError {
-            kind: BuildErrorKind::InvalidConfiguration,
-            message: "Ethereum RPC requires at least one HTTP endpoint".to_owned(),
+        let mut transport =
+            TransportConfig::new(config.endpoints[0].clone(), config.request_timeout);
+        transport.endpoints = config.endpoints;
+        transport.max_response_bytes = config.max_response_bytes;
+        transport.headers = config.headers;
+        transport.retry = config.retry_policy;
+        let client = HttpClient::new(transport).map_err(|_| BuildError {
+            kind: BuildErrorKind::HttpTransport,
+            message: "failed to construct Ethereum RPC HTTP transport".to_owned(),
         })?;
         Self::with_client(client, config.expected_chain_id, config.limits)
     }

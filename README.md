@@ -1,85 +1,61 @@
 # Payment SDK
 
-A Rust workspace for composing chain-native wallets, durable transaction
-observation, and payment workflows behind small protocol-neutral contracts.
+This workspace is a design-stage Rust SDK and one executable API for Bitcoin
+and Ethereum wallets. The API embeds indexing synchronizers and RocksDB storage in
+the same process. There are no internal HTTP hops and no separately deployed
+wallet or indexer services.
 
-## Current workspace
+The current scope is deliberately small:
 
-- `sdk/chains/base` contains the approved neutral address, network, asset,
-  decimal, block, signing, and transaction boundaries.
-- `sdk/chains/bitcoin` and `sdk/chains/ethereum` own every protocol-specific
-  address, RPC, transaction, signing, and indexing rule.
-- `sdk/wallets` provides `Wallet`, its small capabilities, provider selection,
-  and the `Wallets` composition collection.
-- `sdk/indexing` provides synchronization and the consumer-facing `Watcher`,
-  `History`, `Observer`, and `Indexer` contracts.
-- `sdk/indexing/rocksdb` implements indexing persistence; `sdk/indexing/http`
-  implements the chain-neutral remote consumer.
-- `apps/indexer` is the runnable Bitcoin/Ethereum indexer composition root.
-- `apps/wallet` is a runnable stateless HTTP composition root for configured
-  Bitcoin/Ethereum wallets; with no chain variables it is live but not ready.
-- `apps/api` provides durable orchestration plus a configured payment binary
-  that composes wallets, remote indexing, RocksDB, authenticated HTTP,
-  supervised reconciliation, and one optional finite BTC-native, ETH-native,
-  or ERC-20 deposit-key set with server-derived collection planning.
-- `packages/*` contains generic crypto, HTTP, JSON-RPC, storage, and design-lint
-  infrastructure and may not import SDK code.
+- create Bitcoin and Ethereum wallets through one chain-neutral wallet API;
+- watch addresses and index blocks with reorg-safe checkpoints;
+- read wallet balances and complete transaction history; and
+- send one or several transfers through the same wallet abstraction; and
+- compose concrete RPC clients, indexers, storage, and wallet providers once
+  in `apps/api`.
 
-The current workspace has no production custody process. The optional local
-deposit resolver keeps explicitly configured keys in-process and is suitable
-only where that custody policy is accepted. TLS termination remains a
-deployment responsibility. Do not infer production readiness from public
-traits or a successful build.
+Deposit accounting, collections, payment workflows, custody services,
+hardware wallets, remote signers, and service-to-service transports are not in
+the workspace. They may be designed later on top of the wallet and indexing
+contracts, but are not retained as dormant V1/V2 code.
 
-## Core flow
+## Workspace
 
 ```text
-wallet.transaction()
-  -> chain-native builder
-  -> prepare() returns durable exact signed bytes
-  -> persist SignedTransaction
-  -> register transaction watch
-  -> broadcast the same bytes
-  -> reconcile confirmation and reorg events through Indexer
+apps/api                 one process and composition root
+sdk/chains/base          approved chain-neutral values and small capabilities
+sdk/chains/bitcoin       Bitcoin-native RPC, transactions, wallets, indexing
+sdk/chains/ethereum      Ethereum-native RPC, transactions, wallets, indexing
+sdk/wallets              chain-neutral wallet capabilities and provider map
+sdk/indexing             chain-neutral indexing contracts and synchronizer
+sdk/indexing/rocksdb     indexing repository implementation
+packages/*               generic HTTP, JSON-RPC, crypto, and storage mechanics
+apps/api/tests           deterministic composed-binary tests
 ```
 
-Wallets never poll for finality. Indexing is the source of transaction history,
-confirmation, and reorg corrections. Bitcoin UTXO selection consumes the
-generic snapshot-consistent output query but retains Bitcoin validation in the
-Bitcoin crate.
-
-## Documentation
-
-- [`ARCHITECTURE.md`](./ARCHITECTURE.md): ownership and dependency rules
-- [`docs/CONTRACTS.md`](./docs/CONTRACTS.md): current public API composition
-- [`docs/SYSTEM_REQUIREMENTS.md`](./docs/SYSTEM_REQUIREMENTS.md): canonical
-  requirements and open decisions
-- [`docs/INDEXING.md`](./docs/INDEXING.md): indexing model
-- [`docs/refactoring.md`](./docs/refactoring.md): detailed refactoring design
-- [`docs/CHAIN_RESEARCH.md`](./docs/CHAIN_RESEARCH.md): cross-chain research
+Dependencies point inward: `packages/*` are generic, SDK crates implement
+reusable domain behavior, and `apps/api` chooses concrete implementations.
+Concrete chain crates never leak into generic indexing, wallets, or packages.
+They retain chain-native transaction/signing implementations; the wallet/API
+surface exposes one small send capability without inventing one universal
+Bitcoin/Ethereum transaction representation.
 
 ## Validation
 
-Use locked dependencies. On this macOS workspace the `mac` wrapper runs host
-Cargo:
+Use locked dependencies:
 
 ```bash
-mac cargo fmt --all -- --check
-mac cargo check --locked --workspace --all-targets
-mac cargo test --locked --workspace
-mac cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-mac cargo doc --locked --workspace --no-deps
+cargo fmt --all -- --check
+cargo check --locked --workspace --all-targets
+cargo test --locked --workspace
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo doc --locked --workspace --no-deps
+cargo run --locked -p design-lint -- check .
+git diff --check
 ```
 
-The deterministic indexer runtime tests run loopback mock Bitcoin/Ethereum RPC,
-the actual HTTP runtime, and temporary RocksDB storage. They do not broadcast
-funds or prove production node compatibility.
+The deterministic tests use loopback RPC doubles. Do not point tests or
+examples at a funded key or live broadcast endpoint.
 
-The cross-service Ethereum acceptance test additionally composes payment HTTP,
-the concrete wallet and signer, RPC broadcast, Indexer HTTP, reconciliation,
-restart recovery, and a canonical reorg correction over real temporary RocksDB
-databases:
-
-```bash
-mac cargo test --locked -p system-tests --test ethereum_payment
-```
+See [`docs/API.md`](docs/API.md) for the current single-process configuration
+and public wallet routes.

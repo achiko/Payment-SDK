@@ -1,9 +1,9 @@
 use std::fmt;
 
-use indexing::{BlockHash, BlockHeight, BlockRef, SourceError};
+use indexing::{BlockRef, SourceError};
 use serde_json::{Value, json};
 
-use crate::{Address, Receipt, TransactionId, Wei};
+use crate::{Address, TransactionId, Wei};
 
 use super::{
     BASIS_POINTS_DENOMINATOR, ERC20_BALANCE_OF_SELECTOR,
@@ -51,93 +51,6 @@ pub(super) fn remote_failure_is_retryable(failure: &Failure) -> bool {
 pub(super) fn is_already_known(failure: &Failure) -> bool {
     let message = failure.message.to_ascii_lowercase();
     message.contains("already known") || message.contains("known transaction")
-}
-
-pub(super) fn parse_receipt(
-    value: &Value,
-    expected_id: &TransactionId,
-) -> Result<Receipt, SourceError> {
-    let object = value.as_object().ok_or_else(|| {
-        invalid_rpc_response("eth_getTransactionReceipt", "receipt is not an object")
-    })?;
-    let transaction_hash = object
-        .get("transactionHash")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            invalid_rpc_response(
-                "eth_getTransactionReceipt",
-                "receipt has no transaction hash",
-            )
-        })?;
-    let transaction_id = parse_transaction_id(transaction_hash, "eth_getTransactionReceipt")?;
-    if &transaction_id != expected_id {
-        return Err(invalid_rpc_response(
-            "eth_getTransactionReceipt",
-            "receipt transaction hash does not match the request",
-        ));
-    }
-
-    let block_number = optional_string(object.get("blockNumber"), "receipt block number")?;
-    let block_hash = optional_string(object.get("blockHash"), "receipt block hash")?;
-    let included_in = match (block_number, block_hash) {
-        (None, None) => None,
-        (Some(number), Some(hash)) => Some(BlockRef {
-            height: BlockHeight(
-                parse_quantity_u64(number).map_err(|message| {
-                    invalid_rpc_response("eth_getTransactionReceipt", message)
-                })?,
-            ),
-            hash: BlockHash(
-                parse_fixed_data::<32>(hash, "receipt block hash")
-                    .map_err(|message| invalid_rpc_response("eth_getTransactionReceipt", message))?
-                    .to_vec(),
-            ),
-            parent_hash: None,
-            timestamp: None,
-        }),
-        _ => {
-            return Err(invalid_rpc_response(
-                "eth_getTransactionReceipt",
-                "receipt block number and hash must both be present or null",
-            ));
-        }
-    };
-    let succeeded = match optional_string(object.get("status"), "receipt status")? {
-        None => None,
-        Some(status) => match parse_quantity_u64(status)
-            .map_err(|message| invalid_rpc_response("eth_getTransactionReceipt", message))?
-        {
-            0 => Some(false),
-            1 => Some(true),
-            _ => {
-                return Err(invalid_rpc_response(
-                    "eth_getTransactionReceipt",
-                    "receipt status must be 0x0 or 0x1",
-                ));
-            }
-        },
-    };
-
-    Ok(Receipt {
-        id: transaction_id,
-        included_in,
-        succeeded,
-        confirmations: 0,
-    })
-}
-
-pub(super) fn optional_string<'a>(
-    value: Option<&'a Value>,
-    field: &'static str,
-) -> Result<Option<&'a str>, SourceError> {
-    match value {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) => Ok(Some(value)),
-        Some(_) => Err(invalid_rpc_response(
-            "eth_getTransactionReceipt",
-            format!("{field} is not a string or null"),
-        )),
-    }
 }
 
 pub(super) fn block_parameter(at: Option<BlockRef>) -> Result<Value, SourceError> {

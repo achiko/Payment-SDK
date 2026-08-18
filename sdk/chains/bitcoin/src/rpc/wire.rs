@@ -146,17 +146,6 @@ pub(super) fn required_u64(
         .ok_or_else(|| source_error(format!("{context} is missing or invalid"), true))
 }
 
-pub(super) fn required_i64(
-    object: &Map<String, Value>,
-    field: &'static str,
-    context: &'static str,
-) -> Result<i64, SourceError> {
-    object
-        .get(field)
-        .and_then(Value::as_i64)
-        .ok_or_else(|| source_error(format!("{context} is missing or invalid"), true))
-}
-
 pub(super) fn required_bool(
     object: &Map<String, Value>,
     field: &'static str,

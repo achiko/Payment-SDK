@@ -46,17 +46,6 @@ impl<Output: Write> Reporter for Diagnostic<Output> {
             finding.help,
         )
         .map_err(|error| LintError::report("diagnostic", error))?;
-        for related in &finding.related {
-            writeln!(
-                self.output,
-                "   = {}: {}:{}:{}",
-                related.label,
-                related.location.path.display(),
-                related.location.line,
-                related.location.column,
-            )
-            .map_err(|error| LintError::report("diagnostic", error))?;
-        }
         Ok(())
     }
 

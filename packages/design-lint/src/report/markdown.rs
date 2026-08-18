@@ -55,18 +55,6 @@ impl<Output: Write> Reporter for Markdown<Output> {
             finding.location.source,
         )
         .map_err(|error| LintError::report("Markdown finding", error))?;
-        for related in &finding.related {
-            writeln!(
-                self.output,
-                "### {}\n\n- Location: `{}:{}:{}`\n\n````rust\n{}\n````\n",
-                related.label,
-                related.location.path.display(),
-                related.location.line,
-                related.location.column,
-                related.location.source,
-            )
-            .map_err(|error| LintError::report("Markdown context", error))?;
-        }
         Ok(())
     }
 

@@ -7,12 +7,6 @@ use crate::{BlockHeight, BlockRef, IndexScope, WatchId};
 pub struct ObservationRevision(pub u64);
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EventId(pub String);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EventCursor(pub u64);
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MovementId(pub String);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -206,17 +200,6 @@ pub struct ObservedTransaction {
     pub observed_at: u64,
 }
 
-/// A revision, not `(txid, status)`, is the idempotency boundary. The same status
-/// can legitimately occur again after a reorg and re-inclusion.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ObservationEvent {
-    pub id: EventId,
-    pub cursor: EventCursor,
-    pub watch_ids: Vec<WatchId>,
-    pub previous_status: Option<TransactionStatus>,
-    pub transaction: ObservedTransaction,
-}
-
 /// Chain-interpreted state before the repository assigns durable identity.
 ///
 /// Revisions, event IDs, cursors, and previous state are deliberately absent:
@@ -243,11 +226,7 @@ pub enum ObservationDraftStatus {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WatchSelector {
-    Address(CanonicalAddress),
-    Transaction(TransactionRef),
-}
+pub type WatchSelector = CanonicalAddress;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WatchRequest {
@@ -266,8 +245,6 @@ pub struct WatchReceipt {
     pub selector: WatchSelector,
     pub start_height: BlockHeight,
     pub registered_at: Option<BlockRef>,
-    pub inactive_from: Option<BlockHeight>,
-    pub confirmation_policy: ConfirmationPolicy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -275,33 +252,6 @@ pub struct RegisterWatch<T> {
     pub request: WatchRequest,
     pub target: T,
     pub registered_at: Option<BlockRef>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WatchOutcome {
-    Registered(WatchReceipt),
-    Existing(WatchReceipt),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnwatchRequest {
-    pub scope: IndexScope,
-    pub watch_id: WatchId,
-}
-
-/// Persistence command that deactivates a watch at an exact canonical boundary.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeactivateWatch {
-    pub scope: IndexScope,
-    pub watch_id: WatchId,
-    pub inactive_from: BlockHeight,
-    pub expected_checkpoint: Option<BlockRef>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UnwatchOutcome {
-    Deactivated,
-    AlreadyInactive,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -319,26 +269,7 @@ pub struct HistoryQuery {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AddressQuery {
-    pub scope: IndexScope,
-    pub address: CanonicalAddress,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransactionPage {
     pub transactions: Vec<ObservedTransaction>,
     pub next: Option<TransactionRef>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EventQuery {
-    pub scope: IndexScope,
-    pub after: Option<EventCursor>,
-    pub limit: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EventPage {
-    pub events: Vec<ObservationEvent>,
-    pub next: Option<EventCursor>,
 }

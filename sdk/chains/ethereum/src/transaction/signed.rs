@@ -3,7 +3,6 @@ use std::{error::Error, fmt, str::FromStr};
 use alloy_consensus::TxEnvelope;
 use alloy_eips::Decodable2718;
 use alloy_primitives::keccak256;
-use indexing::BlockRef;
 
 use crate::Wei;
 
@@ -195,14 +194,6 @@ impl fmt::Display for InspectionError {
 }
 
 impl Error for InspectionError {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Receipt {
-    pub id: Id,
-    pub included_in: Option<BlockRef>,
-    pub succeeded: Option<bool>,
-    pub confirmations: u64,
-}
 
 #[cfg(test)]
 mod tests {

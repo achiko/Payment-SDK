@@ -1,165 +1,179 @@
 # Repository guide for coding agents
 
-## Scope and source of truth
+## Source of truth
 
 This file applies to the entire repository. Read it before changing code.
 
-Use these sources in this order:
+Use these sources in order:
 
-1. `docs/SYSTEM_REQUIREMENTS.md` for canonical system requirements and acceptance criteria.
-2. `ARCHITECTURE.md` for concise ownership and dependency rules.
-3. `docs/CONTRACTS.md` for how the current Rust traits compose.
-4. `docs/FEATURE_VALIDATION.md` for requirement traceability and accounting corrections.
-5. `docs/INDEXING.md`, `docs/REQUIREMENTS.md`, and `docs/RESEARCH.md` for focused design context and open decisions.
+1. `docs/SYSTEM_REQUIREMENTS.md` for canonical scope and acceptance criteria.
+2. `ARCHITECTURE.md` for ownership and dependency rules.
+3. `docs/CONTRACTS.md` for current reusable Rust boundaries.
+4. `docs/FEATURE_VALIDATION.md` for evidence and honest implementation status.
+5. `docs/INDEXING.md`, `docs/REQUIREMENTS.md`, and research documents for
+   focused context.
 6. Current code and tests for implemented behavior.
 
-Do not silently resolve an item listed as an open decision. Record or propose the decision first, then update the canonical docs together with the implementation when approval is in scope.
+The project is pre-release and in active design. Remove superseded code
+directly; do not add legacy decoders, compatibility aliases, migrations, or
+`V1`/`V2` project DTOs. Protocol-defined version names are unaffected.
 
-The repository remains contract-first at its reusable boundaries, but the
-concrete implementation is no longer only a scaffold. Bitcoin and Ethereum
-wallet implementations, the Wallet Service runtime, Bitcoin and Ethereum
-Indexer Service runtimes, protocol-neutral payment orchestration, and the
-generic and indexing-specific RocksDB adapters are implemented in source.
-The workspace contains no custody service, hardware-wallet integration, or
-remote signer. The Payment Service binary composes outgoing Bitcoin/Ethereum
-payments and may compose one finite local deposit scope for Bitcoin native,
-Ethereum native, or ERC-20, including server-derived collection planning. It
-requires inbound bearer authentication; TLS
-termination is external. HA and production deployment readiness are not
-implemented or claimed. Do not infer production readiness from trait presence
-or compilation alone.
+`old/` and `reference/` are excluded from the workspace. `reference/` contains
+research checkouts, not production dependencies. Do not copy their architecture
+or edit either directory unless a task explicitly targets it.
 
-`old/` is a recoverable previous design and `reference/` contains upstream research material. Both are excluded from the workspace. Do not copy their architecture into production code or edit them unless the task explicitly targets them.
+## CodeGraph
 
-## Workspace map
+If `.codegraph/` exists at the repository root, use `codegraph explore` before
+grep/find or broad file reading when locating or understanding code. If it does
+not exist, skip CodeGraph; indexing the repository is the user's decision.
+
+## Workspace ownership
 
 | Path | Ownership |
 |---|---|
-| `apps/api` | Payment orchestration and configured payment/deposit composition root |
-| `apps/indexer` | Indexer Service (IX) composition root |
-| `apps/wallet` | Stateless Wallet Service (WS) composition root and facade |
+| `apps/api` | Only executable; composes public HTTP, BTC/ETH wallets, embedded indexing synchronizers, and storage |
 | `sdk/chains/base` | Approved chain-neutral values, signing, transaction, and broadcast capabilities |
-| `sdk/chains/bitcoin` | All Bitcoin RPC, address, UTXO, transaction, signing-payload, collection, and indexing types |
-| `sdk/chains/ethereum` | All Ethereum RPC, address, EIP-1559, ERC-20, collection, and indexing types |
-| `sdk/wallets` | Chain-neutral wallet capabilities, providers, history, collection, and `Wallets` composition |
-| `sdk/indexing` | Chain-independent sync, checkpoint, watch, observation, finality, replay, and reorg contracts |
-| `sdk/indexing/http` | Chain-neutral remote Indexer client |
-| `sdk/indexing/rocksdb` | RocksDB implementation of indexing repositories |
-| `sdk/deposits` | PS-owned deposits, event mirror, classification, ledger, and durable collection workflows |
-| `packages/storage` | Backend-independent atomic persistence mechanics |
-| `packages/storage/rocksdb` | Generic RocksDB storage engine adapter |
+| `sdk/chains/bitcoin` | Bitcoin-native RPC, addresses, UTXOs, transactions, wallets, and indexing |
+| `sdk/chains/ethereum` | Ethereum-native RPC, addresses, transactions, wallets, and indexing |
+| `sdk/wallets` | Chain-neutral wallet capabilities, providers, history, batch sending, and `Wallets` composition |
+| `sdk/indexing` | Chain-independent synchronization, address-watch, history, checkpoint, and repository contracts |
+| `sdk/indexing/rocksdb` | RocksDB implementation of indexing repository contracts |
 | `packages/crypto` | Transferable cryptographic primitives without chain policy |
-| `packages/http` | Generic HTTP client/server extensions |
-| `packages/json-rpc` | Generic JSON-RPC framing and client mechanics |
+| `packages/http` | Generic HTTP server mechanics |
+| `packages/json-rpc` | Generic JSON-RPC mechanics while retained |
+| `packages/storage` | Backend-independent atomic persistence mechanics |
+| `packages/storage/rocksdb` | Generic RocksDB engine adapter |
 | `packages/design-lint` | Repository architecture and Rust API linter |
-| `packages/*` | Transportable non-blockchain infrastructure; may depend only on other `packages/*` |
+| `apps/api/tests` | Deterministic tests of the composed application binary |
 
-## Architectural rules
+There is no deposit/accounting/collection SDK, wallet service, indexer service,
+remote indexing client, or payment workflow. Do not reintroduce those without a
+new approved design.
 
-- Preserve chain-native types through build, signing, broadcast, and receipt handling. Do not invent a universal Bitcoin/Ethereum transaction or wallet model.
-- Keep chain-neutral values and capabilities small in `sdk/chains/base`. Do not add a god `ChainService` or universal chain transaction model.
-- Keep composition roots thin. Applications select concrete chains, signers, storage, transport, and workers; SDK crates implement reusable behavior.
-- WS is stateless. It may expose addresses, read indexed balances/history, build, sign, broadcast, and execute one collection transaction. It must not own deposits, watches, retries, reservations, ledgers, databases, or multi-leg token workflow state.
-- PS owns users, deposits, idempotency, the IX event mirror, movement classification, accounting, reservations, retries, collection legs, and master destinations.
-- IX owns watches, canonical checkpoints, chain facts, confirmation/finality, replay cursors, undo data, and reorg processing. IX must not label facts as deposits, sweeps, gas funding, or user credits.
-- Generic signing knows keys, curves, payloads/digests, schemes, encodings, and tweaks only. It must not import chain transactions, RPC, wallets, indexing types, hardware capabilities, or user-interaction workflows.
-- A concrete chain may receive `&dyn Signer`; it must not select a custody technology or construct a hardware, HSM, KMS, or remote signer.
-- Concrete Bitcoin/Ethereum RPC methods stay in their chain crates. `packages/json-rpc` owns framing only.
-- `packages/*` must not import `sdk/*`.
-- Do not introduce flat `crates/`, catch-all `core`/`common`/`utils` packages, chain-specific signer packages, or a `signing_plan` layer.
-- The chain deletion test is mandatory: removing one concrete chain crate should remove all of that chain's types without breaking base, wallets, generic indexing, storage, HTTP, JSON-RPC, or crypto.
+## Architecture rules
 
-## Transaction and custody invariants
+- `apps/api` is the sole process and composition root. It directly constructs
+  chain RPC clients, RocksDB repositories, synchronizers, and wallet
+  providers. There are no internal HTTP hops.
+- Keep application handlers dependent on wallet/indexing abstractions.
+  Concrete composition belongs in startup.
+- Preserve chain-native types through build, signing, broadcast, and receipt
+  handling. Do not invent a universal Bitcoin/Ethereum transaction model.
+- The wallet batch boundary is generic, but execution remains chain-native:
+  Bitcoin may combine compatible transfers into one multi-input/output
+  transaction; Ethereum submits nonce-ordered transactions. Never model this as
+  deposit collection or accounting.
+- Keep `sdk/chains/base` small and approved. Do not add a god `ChainService`,
+  RPC interface, indexing type, or concrete-chain convenience type there.
+- A concrete chain owns all its address parsing, RPC DTOs/methods, blocks,
+  transactions, fee/gas/script/UTXO rules, and indexing interpretation.
+- Every concrete chain uses the required `address.rs`, `batch.rs`, `error.rs`,
+  and `lib.rs` files plus directory modules `indexer`, `rpc`, `transaction`, and
+  `wallet`. The `chain-layout` design-lint rule enforces this ownership map.
+- Indexing owns no transport. `sdk/indexing` has no Axum routes, URLs,
+  authentication, or remote client.
+- Chain interpreters produce semantic facts/effects, never RocksDB keys.
+  Physical encoding belongs exclusively to `sdk/indexing/rocksdb`.
+- `packages/*` must remain useful outside blockchain projects and must not
+  import SDK/application crates.
+- Prefer established protocol libraries over handwritten standards. Local
+  wrappers need a clear abstraction, policy, or error-isolation purpose.
+- The chain deletion test is mandatory: removing one concrete chain must leave
+  base, wallets, indexing, storage, HTTP, JSON-RPC, crypto, and the other chain
+  usable.
+
+## Transaction and security invariants
 
 The required flow is:
 
 ```text
 chain-native request
   -> unsigned chain-native transaction
-  -> chain computes message/digest
-  -> injected signer signs the cryptographic payload
-  -> chain validates and inserts the signature
-  -> signed chain-native transaction
+  -> chain computes payload/digest
+  -> injected Signer signs it
+  -> chain validates and inserts signature
+  -> signed chain-native bytes
   -> broadcast
+  -> embedded indexing observes confirmation/reorg
 ```
 
-- Bitcoin owns scripts, address/network checks, UTXOs, dust, fee/weight calculations, RBF sequences, sighashes, witnesses, consensus encoding, and any future PSBT integration.
-- Current Bitcoin signing supports native SegWit v0 P2WPKH and Taproot key-path inputs. Verify that every input script belongs to the requested key before signing.
-- Taproot address generation uses the untweaked x-only internal key; the chain code applies the BIP341 tweak. Only public tweak material crosses the signer boundary.
-- Ethereum owns chain ID, nonce, gas, EIP-1559 fees/envelopes, ERC-20 calldata, receipts, logs, and trace capability reporting.
-- Verify Ethereum build context chain ID and recover the signer from the signature before accepting a signed envelope.
-- Use integer atomic units only. Never use floating point for money. Keep checked arithmetic and reject overflow, underflow, dust, zero-value collections, and insufficient fee/gas balances explicitly.
-- `base::KeyPair` is an in-process signer, not production custody. It must not export, log, serialize, or debug-print private keys.
-- Native hardware-wallet transaction protocols are outside the current workspace. Do not make Bitcoin depend on a hardware-wallet implementation or teach the base signer Bitcoin types.
+- Bitcoin owns scripts, network checks, UTXOs, dust, fees/weight, sighashes,
+  witnesses, and consensus encoding.
+- Ethereum owns chain ID, nonce, gas, EIP-1559 envelopes, token calldata,
+  receipts, logs, and signer recovery.
+- Use checked integer atomic units. Never use floating point for money.
+- `base::KeyPair` is development in-process custody, not production custody.
+  Never export, log, serialize, clone, or debug-print private keys.
+- A concrete chain may receive `&dyn Signer`; it must not select hardware,
+  remote, HSM, or KMS custody.
+- RPC acceptance is submission, not confirmation. Confirmation comes from
+  indexing. RPC outage does not prove a transaction was dropped.
+- Do not run against a funded key or public broadcast endpoint unless the user
+  explicitly requests that exact external action and reviews the transaction.
 
-## Indexing, deposits, and accounting invariants
+## Indexing invariants
 
-- A canonical checkpoint includes height and hash, not height alone. Block effects, undo data, observation revisions, event-feed rows, and checkpoint movement must be committed atomically by a real IX store.
-- Mempool state is non-canonical and remains separate from block inclusion. RPC outages are unknown/retryable states, not proof that a transaction was dropped.
-- Reorgs append new revisions and corrected absolute ledger rows. Never delete historical IX events or PS ledger rows.
-- Observation idempotency uses event ID/revision, not `(txid, status)`, because a status may recur after reorg and re-inclusion.
-- IX facts support multiple stable movements. Never collapse a UTXO transaction into a fake single `from -> to -> amount` record.
-- A deposit address is not returned until PS has persisted `AwaitingWatch` and IX has durably acknowledged the idempotent watch. Preserve the retry window.
-- Every PS ledger entry is a complete absolute snapshot of `received`, `confirmed`, `balance`, `collected`, and `accounted`; it is not a delta.
-- Only an explicit PS accounting command may change `accounted`. Only confirmation-qualified collection facts may change `collected`.
-- `collected` is gross deposit debit. Keep net master credit and allocated network fee separately.
-- Do not use `received - collected - accounted` as sweepable value. Collection eligibility comes from current spendable balance minus reservations, fee reserve, dust, and chain-specific minimums.
-- Token gas funding and token sweep are separate durable PS legs. WS performs each stateless operation but never sequences the workflow in memory.
+- A checkpoint includes height and hash.
+- Watches are durable, idempotent, scope-safe, and birthday-height aware.
+- One atomic block commit includes effects, undo, observation revisions, and
+  checkpoint movement.
+- Reorgs append correction revisions and restore chain projection. Never erase
+  prior observation history to make the new branch look original.
+- Transactions retain multiple stable movements. Never collapse a UTXO
+  transaction into a fake single `from -> to -> amount` record.
+- RocksDB record structs and codecs stay private to its adapter.
+- Future storage adapters must be able to implement the same semantic
+  repository contracts without changing chain interpreters.
 
-## Rust conventions
+## Rust and API conventions
 
-- The workspace uses Rust 2024, resolver 3, and MSRV 1.85. Respect pinned dependency versions in the root manifest and `Cargo.lock`.
-- `unsafe_code` is forbidden workspace-wide. Do not weaken this lint.
-- Prefer precise domain newtypes/enums over strings and booleans when behavior differs by state, chain, asset, network, or transaction stage.
-- Keep public interfaces chain-typed and return structured error kinds plus contextual messages. Preserve retryability where source errors expose it.
-- Async boundary traits currently use object-safe `BoxFuture<'a, T>` aliases. Follow the existing style unless a repository-wide API change is explicitly approved.
-- Derive `Clone`, `Debug`, `PartialEq`, and `Eq` when they support boundary DTOs and deterministic tests. Do not derive or implement `Debug` in a way that exposes secrets.
-- Add `#[must_use]` to pure constructors/accessors where ignoring the value is likely a mistake.
-- Use `Result`/`Option` and checked arithmetic in production code. `expect` is acceptable in tests when its message states the invariant; avoid `unwrap` and panic-driven runtime handling.
-- Keep modules focused. Re-export intentional public API from each crate's `lib.rs`; leave helpers private or `pub(crate)`.
-- Put focused unit tests beside the implementation. Use deterministic RPC doubles and offline signers; test success plus wrong-network/key, invalid encoding, overflow, insufficient funds/gas, dust, and duplicate-input boundaries as relevant.
-- Comments should explain protocol or ownership invariants, not restate the code.
-
-## Security and external effects
-
-- Never print or commit private keys, seed phrases, signed transaction envelopes, auth headers, API keys, or custody credentials.
-- Offline examples may print addresses and public keys only.
-- Do not run an example, test, or application against a funded key or live broadcast endpoint unless the user explicitly requests that exact external action and has reviewed the transaction fields.
-- Treat RPC acceptance as submission, not confirmation. Durable callers must monitor IX/receipts and handle replacement, reorg, and broadcast-response-loss windows.
-- Do not add a production network call to a unit test. Integration tests requiring a node must be opt-in and clearly documented.
+- Rust 2024, resolver 3, MSRV 1.85, locked dependencies.
+- Workspace-wide `unsafe_code = "forbid"` must not be weakened.
+- Prefer precise newtypes/enums over strings/booleans when behavior differs.
+- Keep public traits to one to three cohesive methods. Do not split naturally
+  paired operations merely to reach one method.
+- Use short, obvious names. Within `bitcoin`, prefer `Address` over
+  `BitcoinAddress`. Do not retain empty marker structs.
+- Keep modules focused, public re-exports intentional, and helpers private.
+- Return structured errors; preserve retryability at source boundaries.
+- Use `Result`/`Option` and checked arithmetic. Avoid runtime `unwrap`/panic.
+- Derive boundary DTO traits only when useful and never where secrets leak.
+- Add focused unit tests beside implementations and deterministic system tests
+  for composed behavior.
+- Comments explain ownership/protocol invariants, not syntax.
 
 ## Change workflow
 
-1. Inspect `git status --short` and preserve unrelated user changes.
-2. Read the relevant canonical docs and the target crate's manifest, public API, implementation, and tests.
-3. Identify the owning layer before editing. If a change needs a reverse dependency or crosses PS/WS/IX ownership, stop and revisit the design.
-4. Keep the smallest coherent change. Update docs when behavior, ownership, a public contract, or an open decision changes.
-5. Add focused tests in the owning crate. Do not claim scaffolded components are implemented because their traits compile.
-6. Run scope-appropriate validation and report pre-existing failures separately from failures caused by the change.
+1. Inspect `git status --short`; preserve unrelated concurrent/user changes.
+2. Read canonical docs plus the target manifests, APIs, implementation, tests.
+3. Identify the owning layer before editing.
+4. Make the smallest coherent change toward the approved architecture; delete
+   stale code rather than retaining compatibility scaffolding.
+5. Update docs for public contracts or ownership changes.
+6. Add focused tests and run scope-appropriate validation.
+7. Report pre-existing/concurrent failures separately and do not weaken gates.
 
 ## Validation
 
-Use locked dependencies for reproducibility.
+Use locked dependencies:
 
 ```bash
-# Always
 cargo fmt --all -- --check
 git diff --check
 
-# Fast package-focused checks (replace package names)
 cargo check --locked -p chain-bitcoin --all-targets
 cargo test --locked -p chain-bitcoin
 cargo clippy --locked -p chain-bitcoin --all-targets --no-deps -- -D warnings
 
-# Full workspace before handing off substantial or cross-crate Rust changes
 cargo check --locked --workspace --all-targets
 cargo test --locked --workspace
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo doc --locked --workspace --no-deps
+cargo run --locked -p design-lint -- check .
 ```
 
-For Markdown-only changes, `git diff --check` plus a link/path review is normally sufficient. For Cargo or public-API changes, run full workspace check and tests. For chain transaction/signing changes, also run the changed chain's Clippy and focused tests. If full-workspace Clippy exposes a baseline failure outside the change, do not suppress it globally; document it and provide the passing targeted command.
-
-The deterministic workspace tests use loopback RPC doubles. No checked-in
-example should be assumed safe merely because it compiles; inspect its endpoint
-and key source before running it.
+For Markdown-only changes, `git diff --check` plus a link/path review is enough.
+For Cargo/public-API changes, run full checks and tests. Chain transaction or
+signing changes also require focused chain Clippy/tests. System tests must use
+loopback RPC doubles and temporary databases, never public networks.

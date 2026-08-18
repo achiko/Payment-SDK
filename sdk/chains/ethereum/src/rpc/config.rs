@@ -1,6 +1,6 @@
 use std::{fmt, time::Duration};
 
-use http::client::Retry;
+use json_rpc::Retry;
 
 use crate::Wei;
 
@@ -209,7 +209,7 @@ impl fmt::Debug for HttpConfig {
 mod tests {
     use std::time::Duration;
 
-    use http::client::Retry;
+    use json_rpc::Retry;
 
     use super::*;
     use crate::Wei;

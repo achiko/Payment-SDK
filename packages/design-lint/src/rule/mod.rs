@@ -1,86 +1,54 @@
-use crate::{
-    Result,
-    model::{Finding, Severity},
-    source::Workspace,
-};
-
 mod repository;
 mod rust;
-mod support;
 
-pub use repository::{
-    CatchAllSourcePath, DependencyDirection, Documentation, EmptyDirectory, FileLength, FileName,
-    FolderNoun, ModulePrefix, OwnedVocabulary, ParentName, PrefixDirectory, RepositoryEscape,
-    RuntimeTool, SingleFileDirectory, TestDependency, TestDirectory, TestName, TestSuiteKebabPath,
-};
-pub use rust::{
-    AccessorBloat, AsyncBlocking, BooleanState, BroadTrait, CatchAllModule, CeremonialStructure,
-    ConstructorOwnership, DuplicateEntity, EmptyStruct, EnvironmentAccess, FiniteStateString,
-    FreeFunction, GodObject, IgnoredResult, IntegrationCandidate, ManualDispatch, MaximumNesting,
-    ModelDuplication, PackagePrefix, PathModules, PlatformCommand, ReceiverRepetition,
-    StructNaming, StructWordCount, SuffixRole, TraitMethodCount, UnsafeBoundary,
-};
+use crate::{Finding, Location, Policy, Result, Severity, source::Workspace};
 
-/// One independently executable design check.
+type CheckFn = fn(&Workspace, &Policy) -> Result<Vec<Finding>>;
+
 pub trait Rule {
-    /// Returns the stable diagnostic identifier.
     fn id(&self) -> &'static str;
-    /// Returns the severity assigned to active findings.
     fn severity(&self) -> Severity;
-    /// Analyzes the parsed workspace.
-    fn check(&self, workspace: &Workspace) -> Result<Vec<Finding>>;
+    fn check(&self, workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>>;
 }
 
-/// Ordered collection of lint rules.
-pub struct Registry {
-    rules: Vec<Box<dyn Rule>>,
+struct Check {
+    id: &'static str,
+    run: CheckFn,
 }
 
-impl Registry {
-    /// Creates an empty registry.
-    #[must_use]
-    pub fn new() -> Self {
-        Self { rules: Vec::new() }
+impl Rule for Check {
+    fn id(&self) -> &'static str {
+        self.id
     }
-
-    /// Appends a rule in execution order.
-    #[must_use]
-    pub fn register(mut self, rule: impl Rule + 'static) -> Self {
-        self.rules.push(Box::new(rule));
-        self
+    fn severity(&self) -> Severity {
+        Severity::Error
     }
-
-    /// Iterates over registered rules in execution order.
-    pub fn rules(&self) -> impl Iterator<Item = &dyn Rule> {
-        self.rules.iter().map(Box::as_ref)
+    fn check(&self, workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
+        (self.run)(workspace, policy)
     }
 }
 
-impl Default for Registry {
-    fn default() -> Self {
-        Self::new()
-    }
+pub fn standard(_policy: &Policy) -> Vec<Box<dyn Rule>> {
+    repository::checks()
+        .into_iter()
+        .chain(rust::checks())
+        .map(|(id, run)| Box::new(Check { id, run }) as Box<dyn Rule>)
+        .collect()
+}
+
+fn finding(
+    rule: &'static str,
+    subject: impl Into<String>,
+    location: Location,
+    message: impl Into<String>,
+    help: impl Into<String>,
+) -> Finding {
+    let mut finding = Finding::error(rule, subject, location);
+    finding.message = message.into();
+    finding.help = help.into();
+    finding
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{collections::BTreeSet, fs, path::Path};
-
-    #[test]
-    fn rule_tree_has_only_language_repository_and_support_domains() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/rule");
-        let entries = fs::read_dir(root)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            entries,
-            BTreeSet::from([
-                "mod.rs".into(),
-                "repository".into(),
-                "rust".into(),
-                "support".into()
-            ])
-        );
-    }
-}
+#[path = "test.rs"]
+mod tests;

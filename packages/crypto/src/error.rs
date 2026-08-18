@@ -8,6 +8,7 @@ pub struct Error {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
+    KeyGeneration,
     InvalidKey,
     InvalidDigest,
     InvalidTweak,

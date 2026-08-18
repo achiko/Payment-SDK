@@ -3,6 +3,7 @@ use base::{NetworkId, NetworkKind};
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum Network {
     Mainnet,
     Testnet3,

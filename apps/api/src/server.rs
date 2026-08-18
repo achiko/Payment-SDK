@@ -1,297 +1,314 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::{collections::BTreeMap, sync::Arc};
 
-use axum::{
-    Json, Router,
-    extract::{Path, State},
-    http::StatusCode,
-    response::{IntoResponse, Response as HttpResponse},
-    routing::{get, post},
-};
-use serde::{Deserialize, Serialize};
-use wallets::AddressText;
+use axum::Router;
+use tokio::sync::RwLock;
+use wallets::HistoryRequest;
 
-use crate::{
-    Clock, Deposits, Error, ErrorKind, Payment, Payments, Planner, Request, Stage, Sweeps,
-    deposit_routes, plan_routes, sweep_routes,
-};
+use crate::{Balance, BatchError, Chain, Error, ErrorKind, Wallet};
 
-pub const LIVE_PATH: &str = "/health/live";
-pub const READY_PATH: &str = "/health/ready";
-
-/// Builds an HTTP-only router.
-///
-/// This unsupervised surface deliberately remains unready because it does not
-/// run reconciliation. Operational hosts should use [`crate::Service`].
-pub fn router(payments: Arc<Payments>) -> Router {
-    service_router(payments, HealthState::new())
+pub struct WalletSend {
+    pub wallet_id: String,
+    pub destination: wallets::AddressText,
+    pub amount: base::Decimal,
 }
 
-/// Builds the complete Payment Service HTTP surface from explicitly composed
-/// capabilities. Deposit and collection routes exist only when their backing
-/// facades are supplied by the application composition root.
-pub fn gateway_router(
-    payments: Arc<Payments>,
-    deposits: Option<Arc<Deposits>>,
-    planner: Option<Arc<Planner>>,
-    sweeps: Option<(Arc<Sweeps>, Arc<dyn Clock>)>,
-) -> Router {
-    let mut app = router(payments);
-    if let Some(deposits) = deposits {
-        app = app.merge(deposit_routes(deposits));
+#[derive(Clone)]
+pub struct WalletFamily {
+    pub chain: Chain,
+    pub network: String,
+    pub scope: indexing::IndexScope,
+    pub watcher: Arc<dyn indexing::Watcher>,
+    pub checkpoint: Arc<dyn indexing::Checkpoint>,
+    pub transactions: Arc<dyn wallets::Sender>,
+}
+
+#[derive(Clone)]
+pub struct Gateway {
+    providers: Arc<wallets::Providers<Chain>>,
+    families: BTreeMap<Chain, WalletFamily>,
+    wallets: Arc<RwLock<wallets::Wallets<String>>>,
+    summaries: Arc<RwLock<BTreeMap<String, Wallet>>>,
+}
+
+impl Gateway {
+    #[must_use]
+    pub fn new(providers: wallets::Providers<Chain>) -> Self {
+        Self {
+            providers: Arc::new(providers),
+            families: BTreeMap::new(),
+            wallets: Arc::new(RwLock::new(wallets::Wallets::new())),
+            summaries: Arc::new(RwLock::new(BTreeMap::new())),
+        }
     }
-    if let Some(planner) = planner {
-        app = app.merge(plan_routes(planner));
+
+    pub async fn initialize(
+        &self,
+        id: String,
+        chain: Chain,
+        secret: wallets::SecretBytes,
+    ) -> Result<Wallet, Error> {
+        let wallet = self
+            .providers
+            .create(&chain, secret)
+            .await
+            .map_err(|error| Error::new(ErrorKind::InvalidRequest, error.to_string()))?;
+        self.store(id, chain, wallet, Some(indexing::BlockHeight(0)))
+            .await
     }
-    if let Some((sweeps, clock)) = sweeps {
-        app = app.merge(sweep_routes(sweeps, clock));
+
+    pub async fn generate(&self, chain: Chain) -> Result<Wallet, Error> {
+        let wallet = self
+            .providers
+            .generate(&chain)
+            .await
+            .map_err(wallet_error)?;
+        self.store(uuid::Uuid::now_v7().to_string(), chain, wallet, None)
+            .await
     }
-    app
-}
 
-/// Applies the shared HTTP server's bearer authentication, request-size
-/// limits, and detail-free health endpoints to the complete gateway surface.
-/// Strict mode fails construction unless a bearer token (or an explicitly
-/// declared application authorizer) is configured.
-pub fn authenticated_gateway(
-    payments: Arc<Payments>,
-    deposits: Option<Arc<Deposits>>,
-    planner: Option<Arc<Planner>>,
-    sweeps: Option<(Arc<Sweeps>, Arc<dyn Clock>)>,
-    config: &http_kit::server::Config,
-    health: http_kit::server::HealthState,
-) -> Result<Router, http_kit::server::ConfigError> {
-    let protected = payment_routes(payments)
-        .merge(deposits.map(deposit_routes).unwrap_or_default())
-        .merge(planner.map(plan_routes).unwrap_or_default())
-        .merge(
-            sweeps
-                .map(|(sweeps, clock)| sweep_routes(sweeps, clock))
-                .unwrap_or_default(),
-        );
-    http_kit::server::service_router(protected, config, health)
-}
-
-pub(crate) fn service_router(payments: Arc<Payments>, health: HealthState) -> Router {
-    payment_routes(payments).merge(
-        Router::new()
-            .route(LIVE_PATH, get(live))
-            .route(READY_PATH, get(ready))
-            .with_state(ReadyState { health }),
-    )
-}
-
-fn payment_routes(payments: Arc<Payments>) -> Router {
-    Router::new()
-        .route("/v1/payments", post(pay))
-        .route("/v1/payments/{id}", get(get_payment))
-        .with_state(StateData { payments })
-}
-
-pub async fn serve(
-    listener: tokio::net::TcpListener,
-    payments: Arc<Payments>,
-) -> std::io::Result<()> {
-    axum::serve(listener, router(payments)).await
-}
-
-#[derive(Serialize)]
-struct Health {
-    status: &'static str,
-}
-
-async fn live() -> Json<Health> {
-    Json(Health { status: "ok" })
-}
-
-async fn ready(State(state): State<ReadyState>) -> HttpResponse {
-    if state.health.is_ready() {
-        (StatusCode::OK, Json(Health { status: "ok" })).into_response()
-    } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(Health {
-                status: "not_ready",
-            }),
-        )
-            .into_response()
+    pub async fn wallet(&self, id: &str) -> Result<Wallet, Error> {
+        self.summaries
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "wallet does not exist"))
     }
-}
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PayBody {
-    id: String,
-    wallet: String,
-    destination: AddressText,
-    amount: String,
-    confirmations: u64,
-    #[serde(default)]
-    require_finality: bool,
-}
-
-async fn pay(
-    State(state): State<StateData>,
-    Json(request): Json<PayBody>,
-) -> Result<Json<Response>, ResponseError> {
-    state
-        .payments
-        .pay(Request {
-            id: request.id,
-            wallet: request.wallet,
-            destination: request.destination,
-            amount: request.amount,
-            confirmations: request.confirmations,
-            require_finality: request.require_finality,
+    pub async fn balance(&self, id: &str) -> Result<Balance, Error> {
+        let balance = self
+            .instance(id)
+            .await?
+            .balance()
+            .await
+            .map_err(wallet_error)?;
+        Ok(Balance {
+            amount: balance.amount.to_string(),
+            observed_height: balance.observed_at.map(|block| block.height.0),
         })
-        .await
-        .map(Response::from)
-        .map(Json)
-        .map_err(ResponseError::from)
-}
+    }
 
-async fn get_payment(
-    State(state): State<StateData>,
-    Path(id): Path<String>,
-) -> Result<Json<Response>, ResponseError> {
-    state
-        .payments
-        .get(&id)
-        .await
-        .map_err(ResponseError::from)?
-        .map(Response::from)
-        .map(Json)
-        .ok_or_else(|| ResponseError::not_found("payment does not exist"))
-}
+    pub async fn history(
+        &self,
+        id: &str,
+        request: HistoryRequest,
+    ) -> Result<wallets::History, Error> {
+        self.instance(id)
+            .await?
+            .history(request)
+            .await
+            .map_err(wallet_error)
+    }
 
-#[derive(Clone)]
-struct StateData {
-    payments: Arc<Payments>,
-}
-
-#[derive(Clone)]
-struct ReadyState {
-    health: HealthState,
-}
-
-#[derive(Clone)]
-pub(crate) struct HealthState {
-    ready: Arc<AtomicBool>,
-}
-
-impl HealthState {
-    pub(crate) fn new() -> Self {
-        Self {
-            ready: Arc::new(AtomicBool::new(false)),
+    pub async fn send(
+        &self,
+        id: &str,
+        destination: wallets::AddressText,
+        amount: base::Decimal,
+    ) -> Result<base::TransactionId, Error> {
+        if amount <= base::Decimal::zero() {
+            return Err(Error::new(
+                ErrorKind::InvalidRequest,
+                "amount must be positive",
+            ));
         }
-    }
-
-    fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
-    }
-}
-
-struct ResponseError {
-    status: StatusCode,
-    message: String,
-}
-
-impl ResponseError {
-    fn not_found(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            message: message.into(),
+        let wallet = self.instance(id).await?;
+        let destination = wallet
+            .parse_address(&destination)
+            .map_err(|error| Error::new(ErrorKind::InvalidRequest, error.to_string()))?;
+        let mut transaction = wallet.transaction();
+        transaction
+            .transfer(destination, amount)
+            .map_err(transaction_error)?;
+        let signed = transaction.prepare().await.map_err(transaction_error)?;
+        let submitted = wallet
+            .broadcaster()
+            .broadcast(&signed)
+            .await
+            .map_err(transaction_error)?;
+        if submitted.id != *signed.id() {
+            return Err(Error::new(
+                ErrorKind::Transaction,
+                "broadcaster returned a different transaction ID",
+            ));
         }
+        Ok(submitted.id)
     }
-}
 
-impl From<Error> for ResponseError {
-    fn from(error: Error) -> Self {
-        let status = match error.kind {
-            ErrorKind::InvalidRequest => StatusCode::BAD_REQUEST,
-            ErrorKind::UnknownWallet => StatusCode::NOT_FOUND,
-            ErrorKind::Conflict => StatusCode::CONFLICT,
-            ErrorKind::Transaction => StatusCode::UNPROCESSABLE_ENTITY,
-            ErrorKind::Indexer | ErrorKind::Store => StatusCode::SERVICE_UNAVAILABLE,
+    pub async fn send_all(
+        &self,
+        requests: Vec<WalletSend>,
+    ) -> Result<Vec<base::TransactionId>, BatchError> {
+        if requests.is_empty() {
+            return Err(batch_error(0, "at least one transfer is required"));
+        }
+        let mut chain = None;
+        let mut transfers = Vec::with_capacity(requests.len());
+        for (index, request) in requests.into_iter().enumerate() {
+            if request.amount <= base::Decimal::zero() {
+                return Err(batch_error(index, "amount must be positive"));
+            }
+            let summary = self
+                .wallet(&request.wallet_id)
+                .await
+                .map_err(|error| BatchError {
+                    transaction_ids: Vec::new(),
+                    failed_index: index,
+                    error,
+                })?;
+            if chain.is_some_and(|expected| expected != summary.chain) {
+                return Err(batch_error(
+                    index,
+                    "all transfers must use the same chain and network",
+                ));
+            }
+            chain = Some(summary.chain);
+            let wallet = self
+                .instance(&request.wallet_id)
+                .await
+                .map_err(|error| BatchError {
+                    transaction_ids: Vec::new(),
+                    failed_index: index,
+                    error,
+                })?;
+            transfers.push(wallets::Transfer {
+                wallet,
+                to: request.destination,
+                amount: request.amount,
+            });
+        }
+        let chain = chain.ok_or_else(|| batch_error(0, "transfer chain is missing"))?;
+        let transactions = &self
+            .families
+            .get(&chain)
+            .ok_or_else(|| batch_error(0, "transfer chain is not configured"))?
+            .transactions;
+        transactions
+            .send(transfers)
+            .await
+            .map_err(|error| BatchError {
+                transaction_ids: error
+                    .accepted
+                    .into_iter()
+                    .map(|id| id.to_string())
+                    .collect(),
+                failed_index: error.failed_index,
+                error: wallet_error(error.source),
+            })
+    }
+
+    pub fn register(&mut self, family: WalletFamily) -> Result<(), Error> {
+        if family.scope.chain.0 != family.chain.name() || family.scope.network != family.network {
+            return Err(Error::new(
+                ErrorKind::InvalidRequest,
+                "wallet family and index scope must agree",
+            ));
+        }
+        if self.families.insert(family.chain, family).is_some() {
+            return Err(Error::new(
+                ErrorKind::Conflict,
+                "wallet chain is already configured",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn router(
+        self,
+        config: &http_support::server::Config,
+    ) -> Result<Router, http_support::server::ConfigError> {
+        crate::api::router(self, config)
+    }
+
+    async fn instance(&self, id: &str) -> Result<Arc<dyn wallets::Wallet>, Error> {
+        self.wallets
+            .read()
+            .await
+            .get(id)
+            .map_err(|_| Error::new(ErrorKind::NotFound, "wallet does not exist"))
+    }
+
+    async fn store(
+        &self,
+        id: String,
+        chain: Chain,
+        wallet: Arc<dyn wallets::Wallet>,
+        configured_start: Option<indexing::BlockHeight>,
+    ) -> Result<Wallet, Error> {
+        let family = self
+            .families
+            .get(&chain)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "chain is not configured"))?;
+        let address = wallet
+            .address_text(&wallet.address())
+            .map_err(|error| Error::new(ErrorKind::InvalidRequest, error.to_string()))?;
+        let checkpoint = family
+            .checkpoint
+            .checkpoint(&family.scope)
+            .await
+            .map_err(|error| Error::new(ErrorKind::Unavailable, error.to_string()))?;
+        let start_height = configured_start.unwrap_or_else(|| {
+            checkpoint.map_or(indexing::BlockHeight(0), |block| {
+                indexing::BlockHeight(block.height.0.saturating_add(1))
+            })
+        });
+        family
+            .watcher
+            .watch(indexing::WatchRequest {
+                scope: family.scope.clone(),
+                selector: indexing::CanonicalAddress {
+                    scope: family.scope.clone(),
+                    value: address.text.clone(),
+                },
+                start_height,
+                idempotency_key: id.clone(),
+            })
+            .await
+            .map_err(|error| Error::new(ErrorKind::Unavailable, error.to_string()))?;
+        let summary = Wallet {
+            id: id.clone(),
+            chain,
+            network: family.network.clone(),
+            address: address.text,
         };
-        Self {
-            status,
-            message: error.message,
-        }
+        self.wallets
+            .write()
+            .await
+            .insert(id.clone(), wallet)
+            .map_err(|error| Error::new(ErrorKind::Conflict, error.to_string()))?;
+        self.summaries.write().await.insert(id, summary.clone());
+        Ok(summary)
     }
 }
 
-/// Public payment state deliberately excludes signed transaction envelopes.
-#[derive(Serialize)]
-struct Response {
-    id: String,
-    request: Request,
-    stage: StageResponse,
+fn wallet_error(error: wallets::Error) -> Error {
+    let kind = match error.kind {
+        wallets::ErrorKind::Unsupported
+        | wallets::ErrorKind::InvalidSecret
+        | wallets::ErrorKind::InvalidAddress
+        | wallets::ErrorKind::InvalidAmount
+        | wallets::ErrorKind::AddressMismatch => ErrorKind::InvalidRequest,
+        wallets::ErrorKind::Duplicate => ErrorKind::Conflict,
+        wallets::ErrorKind::Transaction => ErrorKind::Transaction,
+        wallets::ErrorKind::Generation
+        | wallets::ErrorKind::Balance
+        | wallets::ErrorKind::History => ErrorKind::Unavailable,
+    };
+    Error::new(kind, error.to_string())
 }
 
-#[derive(Serialize)]
-enum StageResponse {
-    Requested,
-    Prepared {
-        transaction_id: String,
-    },
-    Watched {
-        transaction_id: String,
-    },
-    Submitted {
-        transaction_id: String,
-    },
-    Confirmed {
-        transaction_id: String,
-        confirmations: u64,
-    },
+fn transaction_error(error: base::TransactionError) -> Error {
+    Error::new(ErrorKind::Transaction, error.to_string())
 }
 
-impl From<Payment> for Response {
-    fn from(payment: Payment) -> Self {
-        let stage = match payment.stage {
-            Stage::Requested => StageResponse::Requested,
-            Stage::Prepared { prepared, .. } => StageResponse::Prepared {
-                transaction_id: prepared.id().to_string(),
-            },
-            Stage::Watched { prepared, .. } => StageResponse::Watched {
-                transaction_id: prepared.id().to_string(),
-            },
-            Stage::Submitted { transaction_id, .. } => StageResponse::Submitted {
-                transaction_id: transaction_id.to_string(),
-            },
-            Stage::Confirmed {
-                transaction_id,
-                confirmations,
-                ..
-            } => StageResponse::Confirmed {
-                transaction_id: transaction_id.to_string(),
-                confirmations,
-            },
-        };
-        Self {
-            id: payment.id,
-            request: payment.request,
-            stage,
-        }
+fn batch_error(failed_index: usize, message: impl Into<String>) -> BatchError {
+    BatchError {
+        transaction_ids: Vec::new(),
+        failed_index,
+        error: Error::new(ErrorKind::InvalidRequest, message),
     }
 }
 
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: String,
-}
-
-impl IntoResponse for ResponseError {
-    fn into_response(self) -> HttpResponse {
-        (
-            self.status,
-            Json(ErrorResponse {
-                error: self.message,
-            }),
-        )
-            .into_response()
-    }
-}
+#[cfg(test)]
+#[path = "server_test.rs"]
+mod tests;

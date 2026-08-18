@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, str::FromStr};
+use std::{cmp::Ordering, error::Error, fmt, str::FromStr};
 
 use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::{Signed, Zero};
@@ -66,10 +66,27 @@ impl Error for DecimalError {}
 ///
 /// No binary floating-point conversion is provided. Currency values therefore
 /// remain exact regardless of their magnitude or number of fractional digits.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Decimal {
     coefficient: BigInt,
     scale: u32,
+}
+
+impl Ord for Decimal {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self.coefficient.sign(), other.coefficient.sign()) {
+            (Sign::Minus, Sign::Minus) => compare_magnitude(other, self),
+            (Sign::Minus, _) => Ordering::Less,
+            (_, Sign::Minus) => Ordering::Greater,
+            _ => compare_magnitude(self, other),
+        }
+    }
+}
+
+impl PartialOrd for Decimal {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl Decimal {
@@ -149,6 +166,7 @@ impl Decimal {
     }
 
     /// Adds two exact decimal values after aligning their base-10 scales.
+    /// todo would this be better add?
     pub fn checked_add(&self, other: &Self) -> Result<Self, DecimalError> {
         let scale = self.scale.max(other.scale);
         let left = scaled_coefficient(self, scale)?;
@@ -157,6 +175,7 @@ impl Decimal {
     }
 
     /// Subtracts two exact decimal values after aligning their base-10 scales.
+    /// todo just sub?
     pub fn checked_sub(&self, other: &Self) -> Result<Self, DecimalError> {
         let scale = self.scale.max(other.scale);
         let left = scaled_coefficient(self, scale)?;
@@ -306,6 +325,37 @@ fn power_of_ten(exponent: u32) -> BigUint {
     BigUint::from(10_u8).pow(exponent)
 }
 
+fn compare_magnitude(left: &Decimal, right: &Decimal) -> Ordering {
+    if left.coefficient.is_zero() || right.coefficient.is_zero() {
+        return left
+            .coefficient
+            .magnitude()
+            .cmp(right.coefficient.magnitude());
+    }
+
+    let left_digits = left.coefficient.magnitude().to_str_radix(10).len();
+    let right_digits = right.coefficient.magnitude().to_str_radix(10).len();
+    let left_exponent = left_digits as i128 - i128::from(left.scale);
+    let right_exponent = right_digits as i128 - i128::from(right.scale);
+    match left_exponent.cmp(&right_exponent) {
+        Ordering::Equal => {}
+        ordering => return ordering,
+    }
+
+    match left.scale.cmp(&right.scale) {
+        Ordering::Equal => left
+            .coefficient
+            .magnitude()
+            .cmp(right.coefficient.magnitude()),
+        Ordering::Less => (left.coefficient.magnitude() * power_of_ten(right.scale - left.scale))
+            .cmp(right.coefficient.magnitude()),
+        Ordering::Greater => left
+            .coefficient
+            .magnitude()
+            .cmp(&(right.coefficient.magnitude() * power_of_ten(left.scale - right.scale))),
+    }
+}
+
 fn scaled_coefficient(value: &Decimal, scale: u32) -> Result<BigInt, DecimalError> {
     let exponent = scale.checked_sub(value.scale).ok_or_else(|| {
         DecimalError::new(
@@ -317,129 +367,5 @@ fn scaled_coefficient(value: &Decimal, scale: u32) -> Result<BigInt, DecimalErro
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn converts_human_units_to_exact_atomic_units() {
-        assert_eq!(
-            "1".parse::<Decimal>().unwrap().to_atomic_u64(8).unwrap(),
-            100_000_000
-        );
-        assert_eq!(
-            "1".parse::<Decimal>()
-                .unwrap()
-                .to_atomic(18)
-                .unwrap()
-                .to_string(),
-            "1000000000000000000"
-        );
-        assert_eq!(
-            "0.00000001"
-                .parse::<Decimal>()
-                .unwrap()
-                .to_atomic_u64(8)
-                .unwrap(),
-            1
-        );
-    }
-
-    #[test]
-    fn preserves_unbounded_magnitude_and_exact_display() {
-        let value = "123456789012345678901234567890.000000000000000001"
-            .parse::<Decimal>()
-            .unwrap();
-        assert_eq!(
-            value.to_string(),
-            "123456789012345678901234567890.000000000000000001"
-        );
-    }
-
-    #[test]
-    fn rejects_negative_currency_and_excess_precision() {
-        assert_eq!(
-            "-1".parse::<Decimal>()
-                .unwrap()
-                .to_atomic(8)
-                .unwrap_err()
-                .kind,
-            DecimalErrorKind::NegativeAmount
-        );
-        assert_eq!(
-            "0.000000001"
-                .parse::<Decimal>()
-                .unwrap()
-                .to_atomic(8)
-                .unwrap_err()
-                .kind,
-            DecimalErrorKind::ExcessPrecision
-        );
-    }
-
-    #[test]
-    fn zero_is_canonical_and_nonnegative() {
-        let zero = Decimal::zero();
-        assert!(zero.is_zero());
-        assert_eq!(zero.scale(), 0);
-        assert_eq!(zero.to_string(), "0");
-        assert_eq!(zero.validate_amount(), Ok(()));
-    }
-
-    #[test]
-    fn checked_arithmetic_aligns_scales_and_normalizes_results() {
-        let left = "12345678901234567890.125".parse::<Decimal>().unwrap();
-        let right = "0.875".parse::<Decimal>().unwrap();
-        assert_eq!(
-            left.checked_add(&right).unwrap().to_string(),
-            "12345678901234567891"
-        );
-        assert_eq!(
-            right.checked_sub(&left).unwrap().to_string(),
-            "-12345678901234567889.25"
-        );
-    }
-
-    #[test]
-    fn monetary_validation_rejects_negative_arithmetic_results() {
-        let result = Decimal::from(1).checked_sub(&Decimal::from(2)).unwrap();
-        assert_eq!(
-            result.validate_amount().unwrap_err().kind,
-            DecimalErrorKind::NegativeAmount
-        );
-    }
-
-    #[test]
-    fn persistence_parts_round_trip_without_precision_loss() {
-        for value in [
-            "0",
-            "-0.000000000000000001",
-            "123456789012345678901234567890.000000000000000001",
-        ] {
-            let decimal = value.parse::<Decimal>().unwrap();
-            assert_eq!(Decimal::from_parts(decimal.parts()).unwrap(), decimal);
-        }
-    }
-
-    #[test]
-    fn persistence_parts_reject_noncanonical_sign_and_magnitude() {
-        let negative_zero = DecimalParts {
-            sign: DecimalSign::Negative,
-            magnitude: Vec::new(),
-            scale: 0,
-        };
-        assert_eq!(
-            Decimal::from_parts(negative_zero).unwrap_err().kind,
-            DecimalErrorKind::Invalid
-        );
-
-        let leading_zero = DecimalParts {
-            sign: DecimalSign::Positive,
-            magnitude: vec![0, 1],
-            scale: 0,
-        };
-        assert_eq!(
-            Decimal::from_parts(leading_zero).unwrap_err().kind,
-            DecimalErrorKind::Invalid
-        );
-    }
-}
+#[path = "decimal_test.rs"]
+mod tests;

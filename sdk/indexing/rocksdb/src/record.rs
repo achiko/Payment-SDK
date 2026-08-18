@@ -1,10 +1,8 @@
 use crate::{
     AssetId, BlockHash, BlockHeight, BlockRef as DomainBlock, CanonicalAddress, ChainId,
-    ConfirmationPolicy, ConfirmationProof, EventCursor, EventId as DomainEventId, IndexError,
-    IndexErrorKind, IndexScope, NetworkFee, ObservationEvent, ObservationRevision,
-    ObservedTransaction, RebuildGeneration, RebuildPhase, RebuildReason as DomainRebuildReason,
-    RebuildState as DomainRebuild, SyncPhase, SyncStatus as DomainSync, TransactionRef,
-    TransactionStatus, WatchId, WatchSelector,
+    ConfirmationPolicy, ConfirmationProof, IndexError, IndexErrorKind, IndexScope, NetworkFee,
+    ObservationRevision, ObservedTransaction, SyncPhase, SyncStatus as DomainSync, TransactionRef,
+    TransactionStatus,
 };
 use bincode::{Decode, Encode};
 
@@ -12,10 +10,6 @@ use bincode::{Decode, Encode};
 pub(super) struct RepositoryMeta {
     pub format: u16,
     pub scope: ScopeRecord,
-    pub bootstrap_height: u64,
-    pub confirmation_depth: u64,
-    pub require_chain_finality: bool,
-    pub reorg_retention: u64,
 }
 
 #[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
@@ -56,44 +50,18 @@ pub(super) struct PolicyRecord {
 }
 
 #[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
-pub(super) enum SelectorRecord {
-    Address(ScopedValue),
-    Transaction(ScopedValue),
-}
-
-#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
 pub(super) struct WatchRecord {
     pub id: String,
     pub scope: ScopeRecord,
-    pub selector: SelectorRecord,
+    pub selector: ScopedValue,
     pub encoded_target: Vec<u8>,
     pub idempotency_key: String,
     pub start_height: u64,
     pub registered_at: Option<BlockRecord>,
-    pub inactive_from: Option<u64>,
 }
 
 #[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
 pub(super) struct WatchIdentity {
-    pub watch_id: String,
-}
-
-#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
-pub(super) struct BackfillRecord {
-    pub scope: ScopeRecord,
-    pub watch_id: String,
-    pub from_height: u64,
-    pub next_height: u64,
-    pub through: BlockRecord,
-}
-
-#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
-pub(super) struct BackfillMarker {
-    pub block: BlockRecord,
-}
-
-#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
-pub(super) struct HeightMarker {
     pub watch_id: String,
 }
 
@@ -174,20 +142,6 @@ pub(super) struct CurrentObservation {
 }
 
 #[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
-pub(super) struct EventRecord {
-    pub id: String,
-    pub cursor: u64,
-    pub watch_ids: Vec<String>,
-    pub previous_status: Option<TransactionStatusRecord>,
-    pub transaction: ObservationRecord,
-}
-
-#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
-pub(super) struct EventPointer {
-    pub cursor: u64,
-}
-
-#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
 pub(super) struct PendingConfirmation {
     pub transaction_id: ScopedValue,
     pub inclusion_height: u64,
@@ -205,18 +159,7 @@ pub(super) struct BundleRecord {
     pub block: BlockRecord,
     pub prior_checkpoint: Option<BlockRecord>,
     pub encoded_undo: Vec<u8>,
-    pub raw_block: Vec<u8>,
-    pub raw_receipts: Vec<Vec<u8>>,
     pub changes: Vec<BundleChange>,
-}
-
-/// Projection keys first materialized by historical watch backfill for one
-/// retained canonical block. Reverting that block deletes these keys after
-/// the chain-owned rollback has been decoded and validated.
-#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
-pub(super) struct BackfillRollback {
-    pub block: BlockRecord,
-    pub relative_keys: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
@@ -226,16 +169,7 @@ pub(super) enum SyncPhaseRecord {
     CatchingUp,
     Ready,
     Reverting,
-    Replaying,
-    RebuildRequired,
     Halted,
-}
-
-#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
-pub(super) struct RebuildCause {
-    pub checkpoint: BlockRecord,
-    pub oldest_retained: u64,
-    pub message: String,
 }
 
 #[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
@@ -245,25 +179,7 @@ pub(super) struct SyncRecord {
     pub observed_tip: Option<BlockRecord>,
     pub confirmation_policy: PolicyRecord,
     pub phase: SyncPhaseRecord,
-    pub rebuild_reason: Option<RebuildCause>,
     pub halted_reason: Option<String>,
-}
-
-#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
-pub(super) enum RebuildPhaseRecord {
-    Building,
-    Validating,
-    ReadyToActivate,
-}
-
-#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq)]
-pub(super) struct RebuildRecord {
-    pub scope: ScopeRecord,
-    pub generation: u64,
-    pub phase: RebuildPhaseRecord,
-    pub bootstrap_height: u64,
-    pub checkpoint: Option<BlockRecord>,
-    pub published_event_high_water: u64,
 }
 
 impl ScopeRecord {
@@ -354,28 +270,6 @@ impl PolicyRecord {
         ConfirmationPolicy {
             minimum_confirmations: self.minimum_confirmations,
             require_chain_finality: self.require_chain_finality,
-        }
-    }
-}
-
-impl SelectorRecord {
-    #[must_use]
-    pub(super) fn from_domain(value: &WatchSelector) -> Self {
-        match value {
-            WatchSelector::Address(address) => Self::Address(ScopedValue::from_address(address)),
-            WatchSelector::Transaction(transaction) => {
-                Self::Transaction(ScopedValue::from_transaction(transaction))
-            }
-        }
-    }
-
-    #[must_use]
-    pub(super) fn into_domain(self) -> WatchSelector {
-        match self {
-            Self::Address(address) => WatchSelector::Address(address.into_address()),
-            Self::Transaction(transaction) => {
-                WatchSelector::Transaction(transaction.into_transaction())
-            }
         }
     }
 }
@@ -523,20 +417,6 @@ impl ObservationRecord {
     }
 }
 
-impl EventRecord {
-    pub(super) fn into_domain(self) -> Result<ObservationEvent, IndexError> {
-        Ok(ObservationEvent {
-            id: DomainEventId(self.id),
-            cursor: EventCursor(self.cursor),
-            watch_ids: self.watch_ids.into_iter().map(WatchId).collect(),
-            previous_status: self
-                .previous_status
-                .map(TransactionStatusRecord::into_domain),
-            transaction: self.transaction.into_domain()?,
-        })
-    }
-}
-
 impl SyncPhaseRecord {
     fn from_domain(value: SyncPhase) -> Self {
         match value {
@@ -545,8 +425,6 @@ impl SyncPhaseRecord {
             SyncPhase::CatchingUp => Self::CatchingUp,
             SyncPhase::Ready => Self::Ready,
             SyncPhase::Reverting => Self::Reverting,
-            SyncPhase::Replaying => Self::Replaying,
-            SyncPhase::RebuildRequired => Self::RebuildRequired,
             SyncPhase::Halted => Self::Halted,
         }
     }
@@ -558,8 +436,6 @@ impl SyncPhaseRecord {
             Self::CatchingUp => SyncPhase::CatchingUp,
             Self::Ready => SyncPhase::Ready,
             Self::Reverting => SyncPhase::Reverting,
-            Self::Replaying => SyncPhase::Replaying,
-            Self::RebuildRequired => SyncPhase::RebuildRequired,
             Self::Halted => SyncPhase::Halted,
         }
     }
@@ -574,11 +450,6 @@ impl SyncRecord {
             observed_tip: value.observed_tip.as_ref().map(BlockRecord::from_domain),
             confirmation_policy: PolicyRecord::from_domain(value.confirmation_policy),
             phase: SyncPhaseRecord::from_domain(value.phase),
-            rebuild_reason: value.rebuild_reason.as_ref().map(|reason| RebuildCause {
-                checkpoint: BlockRecord::from_domain(&reason.checkpoint),
-                oldest_retained: reason.oldest_retained.0,
-                message: reason.message.clone(),
-            }),
             halted_reason: value.halted_reason.clone(),
         }
     }
@@ -591,56 +462,7 @@ impl SyncRecord {
             observed_tip: self.observed_tip.map(BlockRecord::into_domain),
             confirmation_policy: self.confirmation_policy.into_domain(),
             phase: self.phase.into_domain(),
-            rebuild_reason: self.rebuild_reason.map(|reason| DomainRebuildReason {
-                checkpoint: BlockRecord::into_domain(reason.checkpoint),
-                oldest_retained: BlockHeight(reason.oldest_retained),
-                message: reason.message,
-            }),
             halted_reason: self.halted_reason,
-        }
-    }
-}
-
-impl RebuildPhaseRecord {
-    fn from_domain(value: RebuildPhase) -> Self {
-        match value {
-            RebuildPhase::Building => Self::Building,
-            RebuildPhase::Validating => Self::Validating,
-            RebuildPhase::ReadyToActivate => Self::ReadyToActivate,
-        }
-    }
-
-    fn into_domain(self) -> RebuildPhase {
-        match self {
-            Self::Building => RebuildPhase::Building,
-            Self::Validating => RebuildPhase::Validating,
-            Self::ReadyToActivate => RebuildPhase::ReadyToActivate,
-        }
-    }
-}
-
-impl RebuildRecord {
-    #[must_use]
-    pub(super) fn from_domain(value: &DomainRebuild) -> Self {
-        Self {
-            scope: ScopeRecord::from_domain(&value.scope),
-            generation: value.generation.0,
-            phase: RebuildPhaseRecord::from_domain(value.phase),
-            bootstrap_height: value.bootstrap_height.0,
-            checkpoint: value.checkpoint.as_ref().map(BlockRecord::from_domain),
-            published_event_high_water: value.published_event_high_water.0,
-        }
-    }
-
-    #[must_use]
-    pub(super) fn into_domain(self) -> DomainRebuild {
-        DomainRebuild {
-            scope: self.scope.into_domain(),
-            generation: RebuildGeneration(self.generation),
-            phase: self.phase.into_domain(),
-            bootstrap_height: BlockHeight(self.bootstrap_height),
-            checkpoint: self.checkpoint.map(BlockRecord::into_domain),
-            published_event_high_water: EventCursor(self.published_event_high_water),
         }
     }
 }

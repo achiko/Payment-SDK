@@ -5,7 +5,6 @@ mod unsigned;
 
 pub use builder::{BuildContext, Builder as TransactionBuilder, TransferRequest};
 pub use signed::{
-    FeeInspection, Id as TransactionId, IdError, InspectionError, Receipt, SignedError,
-    SignedTransaction,
+    FeeInspection, Id as TransactionId, IdError, InspectionError, SignedError, SignedTransaction,
 };
 pub use unsigned::UnsignedTransaction;

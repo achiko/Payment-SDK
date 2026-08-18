@@ -4,6 +4,7 @@ use std::{error, fmt};
 pub enum ErrorKind {
     Unsupported,
     Duplicate,
+    Generation,
     InvalidSecret,
     InvalidAddress,
     InvalidAmount,

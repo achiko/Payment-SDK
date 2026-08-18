@@ -59,7 +59,7 @@ impl InterpretedTransaction {
         watches: &ValidatedWatches,
         all_spent_outpoints: &mut BTreeSet<Outpoint>,
     ) -> Result<InterpretedTransaction, IndexError> {
-        let mut facts = TransactionFacts::new(transaction, watches, scope)?;
+        let mut facts = TransactionFacts::new(transaction, scope)?;
         for (index, input) in transaction.inputs.iter().enumerate() {
             facts.input(
                 input,
@@ -92,11 +92,7 @@ struct TransactionFacts {
 }
 
 impl TransactionFacts {
-    fn new(
-        transaction: &Transaction,
-        watches: &ValidatedWatches,
-        scope: &indexing::IndexScope,
-    ) -> Result<Self, IndexError> {
+    fn new(transaction: &Transaction, scope: &indexing::IndexScope) -> Result<Self, IndexError> {
         let movement_capacity = transaction
             .inputs
             .len()
@@ -106,11 +102,7 @@ impl TransactionFacts {
             scope: scope.clone(),
             transaction_id: transaction.id.to_string(),
             movements: Vec::with_capacity(movement_capacity),
-            watch_ids: watches
-                .transactions
-                .get(&transaction.id)
-                .cloned()
-                .unwrap_or_default(),
+            watch_ids: BTreeSet::new(),
             input_total: 0,
             output_total: 0,
             payer: None,

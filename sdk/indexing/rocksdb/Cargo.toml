@@ -13,6 +13,7 @@ storage-rocksdb = { path = "../../../packages/storage/rocksdb" }
 
 [dev-dependencies]
 futures-executor.workspace = true
+tempfile = "=3.27.0"
 
 [lints]
 workspace = true

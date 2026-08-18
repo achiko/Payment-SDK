@@ -5,9 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+jsonrpsee.workspace = true
+http-types = { package = "http", version = "=1.5.0" }
 serde = { version = "=1.0.219", default-features = false }
 serde_json = { workspace = true, features = ["raw_value"] }
-http-support = { package = "http", path = "../http" }
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 futures-executor.workspace = true

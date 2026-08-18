@@ -1,10 +1,6 @@
 use super::*;
 
-impl<S, C> Repository<S, C>
-where
-    S: Store,
-    C: IndexRecordCodec,
-{
+impl Repository {
     pub(super) fn encode<T: Encode>(value: &T) -> Result<Value, IndexError> {
         bincode::encode_to_vec(value, config::standard())
             .map(Value)
@@ -47,7 +43,7 @@ where
     }
 
     pub(super) fn check_scope(&self, scope: &IndexScope) -> Result<(), IndexError> {
-        if scope == &self.config.scope {
+        if scope == &self.scope {
             Ok(())
         } else {
             Err(IndexError::new(
@@ -56,28 +52,6 @@ where
                 false,
             ))
         }
-    }
-
-    pub(super) fn validate_policy(
-        &self,
-        confirmation_policy: crate::ConfirmationPolicy,
-        reorg_retention: u64,
-    ) -> Result<(), IndexError> {
-        if confirmation_policy != self.config.confirmation_policy {
-            return Err(IndexError::new(
-                IndexErrorKind::PolicyMismatch,
-                "commit confirmation policy differs from persisted configuration",
-                false,
-            ));
-        }
-        if reorg_retention != self.config.reorg_retention {
-            return Err(IndexError::new(
-                IndexErrorKind::PolicyMismatch,
-                "commit reorg retention differs from persisted configuration",
-                false,
-            ));
-        }
-        Ok(())
     }
 
     pub(super) async fn get_record<T: Decode<()>>(
@@ -150,7 +124,7 @@ where
     }
 
     pub(super) async fn verify_metadata(&self) -> Result<(), IndexError> {
-        let key = keys::meta(&self.config.scope);
+        let key = keys::meta(&self.scope);
         if let Some(meta) = self.get_record::<RepositoryMeta>(&key).await? {
             self.validate_meta(&meta.value)?;
         }
@@ -160,11 +134,7 @@ where
     pub(crate) fn expected_meta(&self) -> RepositoryMeta {
         RepositoryMeta {
             format: REPOSITORY_FORMAT,
-            scope: record::ScopeRecord::from_domain(&self.config.scope),
-            bootstrap_height: self.config.bootstrap_height.0,
-            confirmation_depth: self.config.confirmation_policy.minimum_confirmations,
-            require_chain_finality: self.config.confirmation_policy.require_chain_finality,
-            reorg_retention: self.config.reorg_retention,
+            scope: record::ScopeRecord::from_domain(&self.scope),
         }
     }
 
@@ -192,8 +162,8 @@ where
 
     pub(super) async fn mutation_batch(&self) -> Result<WriteBatch, IndexError> {
         let namespace = keys::namespace();
-        let meta_key = keys::meta(&self.config.scope);
-        let guard_key = keys::mutation_guard(&self.config.scope);
+        let meta_key = keys::meta(&self.scope);
+        let guard_key = keys::mutation_guard(&self.scope);
         let meta = self.get_record::<RepositoryMeta>(&meta_key).await?;
         let guard = self.get_record::<CounterRecord>(&guard_key).await?;
         let mut batch = WriteBatch::default();

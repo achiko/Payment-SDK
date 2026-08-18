@@ -3,29 +3,39 @@ name = "payment-api"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+autotests = false
+
+[[test]]
+name = "wallet_api"
+path = "tests/wallet_api.rs"
 
 [dependencies]
 axum = "=0.8.4"
 base = { path = "../../sdk/chains/base" }
+base64 = "=0.22.1"
 chain-bitcoin = { path = "../../sdk/chains/bitcoin" }
 chain-ethereum = { path = "../../sdk/chains/ethereum" }
-deposits = { path = "../../sdk/deposits" }
-indexing = { path = "../../sdk/indexing" }
-indexing-http = { path = "../../sdk/indexing/http" }
-json-rpc = { path = "../../packages/json-rpc" }
-wallets = { path = "../../sdk/wallets" }
+http-support = { package = "http", path = "../../packages/http" }
 hex.workspace = true
-http-kit = { package = "http", path = "../../packages/http" }
+indexing = { path = "../../sdk/indexing" }
+indexing-rocksdb = { path = "../../sdk/indexing/rocksdb" }
+storage-rocksdb = { path = "../../packages/storage/rocksdb" }
+json-rpc = { path = "../../packages/json-rpc" }
 serde = { version = "=1.0.219", features = ["derive"] }
 serde_json.workspace = true
-sha2.workspace = true
-storage = { path = "../../packages/storage" }
-storage-rocksdb = { path = "../../packages/storage/rocksdb" }
-tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "net", "process", "rt", "signal", "sync", "time"] }
+utoipa = { version = "=5.5.0", features = ["axum_extras"] }
+utoipa-axum = "=0.2.0"
+uuid.workspace = true
+wallets = { path = "../../sdk/wallets" }
 
 [dev-dependencies]
+alloy-primitives.workspace = true
+bitcoin.workspace = true
+http-body-util = "=0.1.4"
 reqwest.workspace = true
 tempfile = "=3.27.0"
+tower = { version = "=0.5.2", features = ["util"] }
 
 [lints]
 workspace = true

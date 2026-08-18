@@ -1,16 +1,12 @@
 use super::*;
-use super::{
-    transport::{Client as Transport, Request},
-    wire::fee_rate_json,
-};
+use super::{transport::Client as Transport, wire::fee_rate_json};
 use crate::{FeeRate, Network, Satoshi, SignedTransaction, TransactionId};
 use bitcoin::{
     Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, absolute,
     consensus, hashes::Hash, transaction::Version,
 };
 use futures_executor::block_on;
-use indexing::BlockHeight;
-use json_rpc::{RawJson, Response};
+use json_rpc::{Call, RawJson};
 use serde_json::{Number, Value};
 use std::str::FromStr;
 use std::{
@@ -40,14 +36,18 @@ impl ScriptedClient {
 }
 
 impl Transport for ScriptedClient {
-    fn request<'a>(&'a self, request: Request) -> BoxFuture<'a, Result<Response, Error>> {
+    fn request<'a>(
+        &'a self,
+        method: &'a str,
+        _params: Value,
+    ) -> BoxFuture<'a, Result<Result<RawJson, Failure>, Error>> {
         let expected = self
             .replies
             .lock()
             .expect("script lock must be healthy")
             .pop_front()
             .expect("Core client made more calls than scripted");
-        assert_eq!(request.method, expected.method);
+        assert_eq!(method, expected.method);
         let result = expected
             .result
             .map(|value| RawJson::from_serializable(&value).expect("reply JSON must encode"))
@@ -56,15 +56,13 @@ impl Transport for ScriptedClient {
                 message: "scripted failure".to_owned(),
                 data: None,
             });
-        Box::pin(async move {
-            Ok(Response {
-                id: request.id,
-                result,
-            })
-        })
+        Box::pin(async move { Ok(result) })
     }
 
-    fn batch<'a>(&'a self, _requests: Vec<Request>) -> BoxFuture<'a, Result<Vec<Response>, Error>> {
+    fn batch<'a>(
+        &'a self,
+        _requests: Vec<Call>,
+    ) -> BoxFuture<'a, Result<Vec<Result<RawJson, Failure>>, Error>> {
         Box::pin(async move { Ok(Vec::new()) })
     }
 }
@@ -240,165 +238,4 @@ fn broadcast_rejects_a_mismatched_returned_txid() {
         .expect_err("mismatched broadcast ID must fail");
 
     assert!(error.message.contains("different transaction ID"));
-}
-
-#[test]
-fn receipt_uses_txindex_result_and_canonical_block_header() {
-    let signed = signed_transaction();
-    let block_hash = format!("{:064x}", 7);
-    let parent_hash = format!("{:064x}", 6);
-    let mut replies = readiness_replies();
-    replies.extend([
-        success(
-            "getrawtransaction",
-            serde_json::json!({
-                "txid": signed.id().to_string(),
-                "blockhash": block_hash.clone(),
-                "confirmations": 2
-            }),
-        ),
-        success(
-            "getblockheader",
-            serde_json::json!({
-                "hash": block_hash.clone(),
-                "height": 10,
-                "previousblockhash": parent_hash,
-                "time": 100,
-                "confirmations": 2
-            }),
-        ),
-        success("getblockhash", Value::String(block_hash)),
-    ]);
-    let core = block_on(Client::connect(ScriptedClient::new(replies), config()))
-        .expect("valid scripted Core node must connect");
-
-    let receipt = block_on(core.receipt(&signed.id()))
-        .expect("receipt lookup must succeed")
-        .expect("txindex transaction must exist");
-
-    assert_eq!(receipt.id, signed.id());
-    assert_eq!(receipt.confirmations, 2);
-    assert_eq!(
-        receipt
-            .included_in
-            .expect("confirmed transaction has a block")
-            .height,
-        BlockHeight(10)
-    );
-}
-
-#[test]
-fn receipt_rejects_a_header_that_left_the_active_chain() {
-    let signed = signed_transaction();
-    let block_hash = format!("{:064x}", 7);
-    let mut replies = readiness_replies();
-    replies.extend([
-        success(
-            "getrawtransaction",
-            serde_json::json!({
-                "txid": signed.id().to_string(),
-                "blockhash": block_hash.clone(),
-                "confirmations": 2
-            }),
-        ),
-        success(
-            "getblockheader",
-            serde_json::json!({
-                "hash": block_hash,
-                "height": 10,
-                "previousblockhash": format!("{:064x}", 6),
-                "time": 100,
-                "confirmations": -1
-            }),
-        ),
-    ]);
-    let core = block_on(Client::connect(ScriptedClient::new(replies), config()))
-        .expect("valid scripted Core node must connect");
-
-    let error =
-        block_on(core.receipt(&signed.id())).expect_err("inactive block receipt must fail closed");
-    assert!(error.retryable);
-    assert!(error.message.contains("canonical chain"));
-}
-
-#[test]
-fn receipt_treats_a_noncanonical_txindex_hit_as_absent() {
-    let signed = signed_transaction();
-    let mut replies = readiness_replies();
-    replies.push(success(
-        "getrawtransaction",
-        serde_json::json!({
-            "txid": signed.id().to_string(),
-            "blockhash": format!("{:064x}", 7),
-            "confirmations": 0
-        }),
-    ));
-    let core = block_on(Client::connect(ScriptedClient::new(replies), config()))
-        .expect("valid scripted Core node must connect");
-
-    assert_eq!(
-        block_on(core.receipt(&signed.id())).expect("receipt lookup must succeed"),
-        None
-    );
-}
-
-#[test]
-fn receipt_rejects_a_header_for_a_different_block_hash() {
-    let signed = signed_transaction();
-    let transaction_block_hash = format!("{:064x}", 7);
-    let mut replies = readiness_replies();
-    replies.extend([
-        success(
-            "getrawtransaction",
-            serde_json::json!({
-                "txid": signed.id().to_string(),
-                "blockhash": transaction_block_hash,
-                "confirmations": 2
-            }),
-        ),
-        success(
-            "getblockheader",
-            serde_json::json!({
-                "hash": format!("{:064x}", 8),
-                "height": 10,
-                "previousblockhash": format!("{:064x}", 6),
-                "time": 100,
-                "confirmations": 2
-            }),
-        ),
-    ]);
-    let core = block_on(Client::connect(ScriptedClient::new(replies), config()))
-        .expect("valid scripted Core node must connect");
-
-    let error =
-        block_on(core.receipt(&signed.id())).expect_err("mismatched header hash must fail closed");
-    assert!(error.retryable);
-    assert!(error.message.contains("does not match"));
-}
-
-#[test]
-fn receipt_treats_a_disappearing_block_header_as_retryable() {
-    let signed = signed_transaction();
-    let mut replies = readiness_replies();
-    replies.extend([
-        success(
-            "getrawtransaction",
-            serde_json::json!({
-                "txid": signed.id().to_string(),
-                "blockhash": format!("{:064x}", 7),
-                "confirmations": 2
-            }),
-        ),
-        ExpectedReply {
-            method: "getblockheader",
-            result: Err(-5),
-        },
-    ]);
-    let core = block_on(Client::connect(ScriptedClient::new(replies), config()))
-        .expect("valid scripted Core node must connect");
-
-    let error = block_on(core.receipt(&signed.id()))
-        .expect_err("a reorged-away block header must be retried");
-    assert!(error.retryable);
-    assert!(error.message.contains("disappeared"));
 }

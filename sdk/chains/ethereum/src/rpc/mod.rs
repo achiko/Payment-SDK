@@ -40,12 +40,11 @@ mod tests {
 
     use alloy_primitives::keccak256;
     use futures_executor::block_on;
-    use http::client::Retry;
     use indexing::{BlockHash, BlockHeight, BlockRef};
-    use json_rpc::Response;
+    use json_rpc::Retry;
     use serde_json::{Value, json};
 
-    use super::transport::{Client as JsonClient, Error, Failure, RawJson, Request};
+    use super::transport::{Call, Client as JsonClient, Error, Failure, RawJson};
     use super::wire::{data_hex, transaction_id_hex};
     use super::*;
     use crate::{Address, AssetKind, SignedTransaction, TransactionId, TransferRequest, Wei};
@@ -87,32 +86,26 @@ mod tests {
     impl JsonClient for ScriptedClient {
         fn request<'a>(
             &'a self,
-            request: Request,
-        ) -> crate::BoxFuture<'a, Result<Response, Error>> {
+            method: &'a str,
+            params: Value,
+        ) -> crate::BoxFuture<'a, Result<Result<RawJson, Failure>, Error>> {
             let response = {
                 let mut state = self.state.lock().expect("script lock must be healthy");
                 let expected = state
                     .replies
                     .pop_front()
                     .expect("adapter made more requests than scripted");
-                assert_eq!(request.method, expected.method);
-                let params = request
-                    .params
-                    .deserialize::<Value>()
-                    .expect("adapter params must be valid JSON");
-                state.requests.push((request.method, params));
-                Response {
-                    id: request.id,
-                    result: expected.result,
-                }
+                assert_eq!(method, expected.method);
+                state.requests.push((method.to_owned(), params));
+                expected.result
             };
             Box::pin(async move { Ok(response) })
         }
 
         fn batch<'a>(
             &'a self,
-            _requests: Vec<Request>,
-        ) -> crate::BoxFuture<'a, Result<Vec<Response>, Error>> {
+            _requests: Vec<Call>,
+        ) -> crate::BoxFuture<'a, Result<Vec<Result<RawJson, Failure>>, Error>> {
             Box::pin(async { panic!("wallet RPC adapter does not issue JSON-RPC batches") })
         }
     }
@@ -165,14 +158,11 @@ mod tests {
 
     #[test]
     fn focused_adapters_reuse_the_same_rpc() {
-        let client = ScriptedClient::new(vec![
-            success("eth_getBalance", json!("0x2a")),
-            success("eth_getTransactionReceipt", Value::Null),
-        ]);
+        let client = ScriptedClient::new(vec![success("eth_getBalance", json!("0x2a"))]);
         let shared = Client::new(client.clone());
         let accounts = AccountClient::new(shared.clone(), 31_337)
             .expect("account adapter configuration must be valid");
-        let transactions = TransactionClient::new(shared, 31_337, limits())
+        let _transactions = TransactionClient::new(shared, 31_337, limits())
             .expect("transaction adapter configuration must be valid");
 
         assert_eq!(
@@ -181,17 +171,12 @@ mod tests {
             Wei::from_u128(42)
         );
         assert_eq!(
-            block_on(transactions.receipt(&TransactionId([0x22; 32])))
-                .expect("focused transaction call must succeed"),
-            None
-        );
-        assert_eq!(
             client
                 .requests()
                 .into_iter()
                 .map(|(method, _)| method)
                 .collect::<Vec<_>>(),
-            ["eth_getBalance", "eth_getTransactionReceipt"]
+            ["eth_getBalance"]
         );
     }
 
@@ -324,39 +309,6 @@ mod tests {
         for secret in ["Bearer secret", "password", "example.invalid"] {
             assert!(!error.message.contains(secret));
         }
-    }
-
-    #[test]
-    fn reads_and_validates_receipt_with_confirmations() {
-        let id = TransactionId([0xcc; 32]);
-        let client = ScriptedClient::new(vec![
-            success(
-                "eth_getTransactionReceipt",
-                json!({
-                    "transactionHash": transaction_id_hex(&id),
-                    "blockNumber": "0xa",
-                    "blockHash": format!("0x{}", "aa".repeat(32)),
-                    "status": "0x1",
-                }),
-            ),
-            success("eth_blockNumber", json!("0xc")),
-        ]);
-        let rpc = rpc(client);
-
-        let receipt = block_on(rpc.receipt(&id))
-            .expect("receipt request must succeed")
-            .expect("scripted receipt must exist");
-
-        assert_eq!(receipt.id, id);
-        assert_eq!(receipt.confirmations, 3);
-        assert_eq!(receipt.succeeded, Some(true));
-        assert_eq!(
-            receipt
-                .included_in
-                .expect("receipt must be included")
-                .height,
-            BlockHeight(10)
-        );
     }
 
     #[test]

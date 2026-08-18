@@ -3,7 +3,7 @@ use indexing::{
     IndexUndo, IndexedOutput, OutputId, OutputKey, TransactionRef, WatchSelector,
 };
 
-use crate::{ProjectionBatch, ProjectionMutation, Projector, RecordTypes, TargetCodec, UndoCodec};
+use crate::{ProjectionBatch, ProjectionMutation};
 
 const RECORD_MAGIC: &[u8; 4] = b"IXRC";
 const OUTPUT_MAGIC: &[u8; 4] = b"IXOP";
@@ -13,154 +13,115 @@ const RECORD_ENCODING: u8 = 1;
 const VALUE_ENCODING: u8 = 1;
 const TARGET_RECORD: u8 = 1;
 const UNDO_RECORD: u8 = 2;
-const ADDRESS_TARGET: u8 = 1;
-const TRANSACTION_TARGET: u8 = 2;
 const CREATED_OUTPUT: u8 = 1;
 const SPENT_OUTPUT: u8 = 2;
 
-#[derive(Clone, Copy, Debug, Default)]
-pub enum IndexRecords {
-    #[default]
-    Canonical,
+pub(crate) fn output_prefix(address: &CanonicalAddress) -> Result<Vec<u8>, IndexError> {
+    let mut encoded = Vec::new();
+    write_output_header(&mut encoded, CREATED_OUTPUT);
+    write_address(&mut encoded, address)?;
+    Ok(encoded)
 }
 
-impl IndexRecords {
-    pub fn output_prefix(address: &CanonicalAddress) -> Result<Vec<u8>, IndexError> {
-        let mut encoded = Vec::new();
-        write_output_header(&mut encoded, CREATED_OUTPUT);
-        write_address(&mut encoded, address)?;
-        Ok(encoded)
-    }
-
-    pub fn spent_key(key: &OutputKey) -> Result<Vec<u8>, IndexError> {
-        output_key(key, SPENT_OUTPUT)
-    }
-
-    pub fn decode_output(key: &[u8], value: &[u8]) -> Result<IndexedOutput, IndexError> {
-        let (kind, key) = decode_output_key(key)?;
-        if kind != CREATED_OUTPUT {
-            return Err(record_error("output value uses a non-creation key"));
-        }
-        decode_output_value(key, value)
-    }
-
-    pub fn decode_spent(key: &[u8], value: &[u8]) -> Result<OutputKey, IndexError> {
-        let (kind, key) = decode_output_key(key)?;
-        if kind != SPENT_OUTPUT || value != [SPENT_MAGIC.as_slice(), &[RECORD_ENCODING]].concat() {
-            return Err(record_error("spent-output marker is invalid"));
-        }
-        Ok(key)
-    }
+pub(crate) fn spent_key(key: &OutputKey) -> Result<Vec<u8>, IndexError> {
+    output_key(key, SPENT_OUTPUT)
 }
 
-impl RecordTypes for IndexRecords {
-    type Target = WatchSelector;
-    type Effect = IndexChanges;
-    type Undo = IndexUndo;
+pub(crate) fn decode_output(key: &[u8], value: &[u8]) -> Result<IndexedOutput, IndexError> {
+    let (kind, key) = decode_output_key(key)?;
+    if kind != CREATED_OUTPUT {
+        return Err(record_error("output value uses a non-creation key"));
+    }
+    decode_output_value(key, value)
 }
 
-impl Projector for IndexRecords {
-    fn project(&self, effect: &IndexChanges) -> Result<ProjectionBatch, IndexError> {
-        let outputs = &effect.outputs;
-        let mut mutations = Vec::with_capacity(
-            outputs
-                .created
-                .len()
-                .checked_add(outputs.spent.len())
-                .and_then(|count| count.checked_add(outputs.tracked_spends.len()))
-                .ok_or_else(|| record_error("output projection count overflowed"))?,
-        );
-        for output in &outputs.created {
-            mutations.push(ProjectionMutation::Put {
-                key: output_key(&output.key(), CREATED_OUTPUT)?,
-                value: encode_output(output)?,
-            });
-        }
-        let marker = [SPENT_MAGIC.as_slice(), &[RECORD_ENCODING]].concat();
-        for key in &outputs.spent {
-            mutations.push(ProjectionMutation::Put {
-                key: output_key(key, SPENT_OUTPUT)?,
-                value: marker.clone(),
-            });
-        }
-        for key in &outputs.tracked_spends {
-            mutations.push(ProjectionMutation::PutIfPresent {
-                required_key: output_key(key, CREATED_OUTPUT)?,
-                key: output_key(key, SPENT_OUTPUT)?,
-                value: marker.clone(),
-            });
-        }
-        Ok(ProjectionBatch::new(mutations))
+pub(crate) fn decode_spent(key: &[u8], value: &[u8]) -> Result<OutputKey, IndexError> {
+    let (kind, key) = decode_output_key(key)?;
+    if kind != SPENT_OUTPUT || value != [SPENT_MAGIC.as_slice(), &[RECORD_ENCODING]].concat() {
+        return Err(record_error("spent-output marker is invalid"));
     }
+    Ok(key)
 }
-
-impl TargetCodec for IndexRecords {
-    fn encode_target(&self, target: &WatchSelector) -> Result<Vec<u8>, IndexError> {
-        let mut encoded = Vec::new();
-        write_record_header(&mut encoded, TARGET_RECORD);
-        match target {
-            WatchSelector::Address(address) => {
-                encoded.push(ADDRESS_TARGET);
-                write_address(&mut encoded, address)?;
-            }
-            WatchSelector::Transaction(transaction) => {
-                encoded.push(TRANSACTION_TARGET);
-                write_transaction(&mut encoded, transaction)?;
-            }
-        }
-        Ok(encoded)
-    }
-
-    fn decode_target(&self, encoded: &[u8]) -> Result<WatchSelector, IndexError> {
-        let mut reader = Reader::new(record_payload(encoded, TARGET_RECORD)?);
-        let target = match reader.byte()? {
-            ADDRESS_TARGET => WatchSelector::Address(reader.address()?),
-            TRANSACTION_TARGET => WatchSelector::Transaction(reader.transaction()?),
-            _ => return Err(record_error("watch selector kind is unsupported")),
-        };
-        reader.finish()?;
-        Ok(target)
-    }
-}
-
-impl UndoCodec for IndexRecords {
-    fn encode_undo(&self, undo: &IndexUndo) -> Result<Vec<u8>, IndexError> {
-        let mut encoded = Vec::new();
-        write_record_header(&mut encoded, UNDO_RECORD);
-        write_keys(&mut encoded, &undo.created)?;
-        write_keys(&mut encoded, &undo.spent)?;
-        Ok(encoded)
-    }
-
-    fn decode_undo(&self, encoded: &[u8]) -> Result<IndexUndo, IndexError> {
-        let mut reader = Reader::new(record_payload(encoded, UNDO_RECORD)?);
-        let undo = IndexUndo {
-            created: reader.keys()?,
-            spent: reader.keys()?,
-        };
-        reader.finish()?;
-        Ok(undo)
-    }
-
-    fn rollback_projection(&self, undo: &IndexUndo) -> Result<ProjectionBatch, IndexError> {
-        let spent = undo.spent.iter().map(|key| {
-            Ok(ProjectionMutation::Delete {
-                key: output_key(key, SPENT_OUTPUT)?,
-            })
+pub(crate) fn project(effect: &IndexChanges) -> Result<ProjectionBatch, IndexError> {
+    let outputs = &effect.outputs;
+    let mut mutations = Vec::with_capacity(
+        outputs
+            .created
+            .len()
+            .checked_add(outputs.spent.len())
+            .and_then(|count| count.checked_add(outputs.tracked_spends.len()))
+            .ok_or_else(|| record_error("output projection count overflowed"))?,
+    );
+    for output in &outputs.created {
+        mutations.push(ProjectionMutation::Put {
+            key: output_key(&output.key(), CREATED_OUTPUT)?,
+            value: encode_output(output)?,
         });
-        let created = undo.created.iter().map(|key| {
-            Ok(ProjectionMutation::Delete {
-                key: output_key(key, CREATED_OUTPUT)?,
-            })
-        });
-        Ok(ProjectionBatch::new(
-            spent
-                .chain(created)
-                .collect::<Result<Vec<_>, IndexError>>()?,
-        ))
     }
+    let marker = [SPENT_MAGIC.as_slice(), &[RECORD_ENCODING]].concat();
+    for key in &outputs.spent {
+        mutations.push(ProjectionMutation::Put {
+            key: output_key(key, SPENT_OUTPUT)?,
+            value: marker.clone(),
+        });
+    }
+    for key in &outputs.tracked_spends {
+        mutations.push(ProjectionMutation::PutIfPresent {
+            required_key: output_key(key, CREATED_OUTPUT)?,
+            key: output_key(key, SPENT_OUTPUT)?,
+            value: marker.clone(),
+        });
+    }
+    Ok(ProjectionBatch::new(mutations))
+}
+pub(crate) fn encode_target(target: &WatchSelector) -> Result<Vec<u8>, IndexError> {
+    let mut encoded = Vec::new();
+    write_record_header(&mut encoded, TARGET_RECORD);
+    write_address(&mut encoded, target)?;
+    Ok(encoded)
 }
 
+pub(crate) fn decode_target(encoded: &[u8]) -> Result<WatchSelector, IndexError> {
+    let mut reader = Reader::new(record_payload(encoded, TARGET_RECORD)?);
+    let target = reader.address()?;
+    reader.finish()?;
+    Ok(target)
+}
+pub(crate) fn encode_undo(undo: &IndexUndo) -> Result<Vec<u8>, IndexError> {
+    let mut encoded = Vec::new();
+    write_record_header(&mut encoded, UNDO_RECORD);
+    write_keys(&mut encoded, &undo.created)?;
+    write_keys(&mut encoded, &undo.spent)?;
+    Ok(encoded)
+}
+
+pub(crate) fn decode_undo(encoded: &[u8]) -> Result<IndexUndo, IndexError> {
+    let mut reader = Reader::new(record_payload(encoded, UNDO_RECORD)?);
+    let undo = IndexUndo {
+        created: reader.keys()?,
+        spent: reader.keys()?,
+    };
+    reader.finish()?;
+    Ok(undo)
+}
+
+pub(crate) fn rollback_projection(undo: &IndexUndo) -> Result<ProjectionBatch, IndexError> {
+    let spent = undo.spent.iter().map(|key| {
+        Ok(ProjectionMutation::Delete {
+            key: output_key(key, SPENT_OUTPUT)?,
+        })
+    });
+    let created = undo.created.iter().map(|key| {
+        Ok(ProjectionMutation::Delete {
+            key: output_key(key, CREATED_OUTPUT)?,
+        })
+    });
+    Ok(ProjectionBatch::new(
+        spent
+            .chain(created)
+            .collect::<Result<Vec<_>, IndexError>>()?,
+    ))
+}
 fn output_key(key: &OutputKey, kind: u8) -> Result<Vec<u8>, IndexError> {
     let mut encoded = Vec::new();
     write_output_header(&mut encoded, kind);
@@ -402,133 +363,5 @@ fn record_error(message: impl Into<String>) -> IndexError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn chain() -> ChainId {
-        ChainId("test-chain".to_owned())
-    }
-
-    fn scope() -> indexing::IndexScope {
-        indexing::IndexScope {
-            chain: chain(),
-            network: "testnet".to_owned(),
-        }
-    }
-
-    fn address() -> CanonicalAddress {
-        CanonicalAddress {
-            scope: scope(),
-            value: "address-1".to_owned(),
-        }
-    }
-
-    fn output() -> IndexedOutput {
-        IndexedOutput {
-            id: OutputId {
-                transaction: TransactionRef {
-                    scope: scope(),
-                    value: "transaction-1".to_owned(),
-                },
-                index: 7,
-            },
-            address: address(),
-            asset: AssetId {
-                chain: chain(),
-                asset: "native".to_owned(),
-            },
-            amount: "123456789.000000000000000001"
-                .parse()
-                .expect("test amount must parse"),
-            evidence: vec![1, 2, 3, 4],
-            created_at: BlockHeight(42),
-            coinbase: false,
-        }
-    }
-
-    #[test]
-    fn selectors_round_trip_without_chain_native_types() {
-        let records = IndexRecords::default();
-        for selector in [
-            WatchSelector::Address(address()),
-            WatchSelector::Transaction(TransactionRef {
-                scope: scope(),
-                value: "transaction-1".to_owned(),
-            }),
-        ] {
-            let encoded = records
-                .encode_target(&selector)
-                .expect("selector must encode");
-            assert_eq!(
-                records
-                    .decode_target(&encoded)
-                    .expect("selector must decode"),
-                selector
-            );
-        }
-    }
-
-    #[test]
-    fn output_projection_round_trips_typed_values_and_markers() {
-        let records = IndexRecords::default();
-        let output = output();
-        let effect = IndexChanges {
-            outputs: indexing::OutputChanges {
-                created: vec![output.clone()],
-                spent: vec![output.key()],
-                tracked_spends: Vec::new(),
-            },
-        };
-        let projection = records.project(&effect).expect("effect must project");
-        let ProjectionMutation::Put { key, value } = &projection.mutations[0] else {
-            panic!("creation must be an unconditional put");
-        };
-        assert_eq!(
-            IndexRecords::decode_output(key, value).expect("output must decode"),
-            output
-        );
-        let ProjectionMutation::Put { key, value } = &projection.mutations[1] else {
-            panic!("spend must be an unconditional put");
-        };
-        assert_eq!(
-            IndexRecords::decode_spent(key, value).expect("marker must decode"),
-            output.key()
-        );
-    }
-
-    #[test]
-    fn undo_round_trips_and_rejects_trailing_bytes() {
-        let records = IndexRecords::default();
-        let key = output().key();
-        let undo = IndexUndo {
-            created: vec![key.clone()],
-            spent: vec![key],
-        };
-        let encoded = records.encode_undo(&undo).expect("undo must encode");
-        assert_eq!(
-            records.decode_undo(&encoded).expect("undo must decode"),
-            undo
-        );
-        let mut malformed = encoded;
-        malformed.push(0);
-        assert!(records.decode_undo(&malformed).is_err());
-    }
-
-    #[test]
-    fn output_rejects_negative_and_corrupt_amounts() {
-        let output = output();
-        let key = output_key(&output.key(), CREATED_OUTPUT).expect("key must encode");
-        for amount in ["-1", "01", "invalid"] {
-            let mut value = Vec::new();
-            value.extend_from_slice(VALUE_MAGIC);
-            value.push(VALUE_ENCODING);
-            write_text(&mut value, amount).expect("test amount must encode");
-            value.extend_from_slice(&output.created_at.0.to_be_bytes());
-            value.push(0);
-            write_asset(&mut value, &output.asset).expect("asset must encode");
-            write_bytes(&mut value, &output.evidence).expect("evidence must encode");
-
-            assert!(IndexRecords::decode_output(&key, &value).is_err());
-        }
-    }
-}
+#[path = "index_record_test.rs"]
+mod tests;

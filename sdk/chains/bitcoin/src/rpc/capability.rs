@@ -1,8 +1,8 @@
 use indexing::{BoxFuture, SourceError};
 
-use crate::{Address, FeeRate, Receipt, SignedTransaction, TransactionId};
+use crate::{FeeRate, SignedTransaction, TransactionId};
 
-use super::{Client, NodeStatus, Preflight, UtxoSet, transport::Client as Transport};
+use super::{Client, NodeStatus, Preflight, transport::Client as Transport};
 
 /// Node identity and canonical-chain reads.
 pub struct Node<C> {
@@ -14,7 +14,7 @@ pub struct FeeClient<C> {
     client: Client<C>,
 }
 
-/// Transaction validation, submission, and receipt calls.
+/// Transaction validation and submission calls.
 pub struct TransactionClient<C> {
     client: Client<C>,
 }
@@ -101,16 +101,6 @@ pub trait Transactions: Send + Sync {
         transaction: SignedTransaction,
         max_fee_rate: FeeRate,
     ) -> BoxFuture<'a, Result<TransactionId, SourceError>>;
-
-    fn receipt<'a>(
-        &'a self,
-        id: &'a TransactionId,
-    ) -> BoxFuture<'a, Result<Option<Receipt>, SourceError>>;
-}
-
-/// SpendSource-output ownership comes from indexing; reservations remain application-owned.
-pub trait Utxos: Send + Sync {
-    fn utxos<'a>(&'a self, addresses: Vec<Address>) -> BoxFuture<'a, Result<UtxoSet, SourceError>>;
 }
 
 impl<C> Fees for Client<C>
@@ -150,13 +140,6 @@ where
     ) -> BoxFuture<'a, Result<TransactionId, SourceError>> {
         Box::pin(async move { self.broadcast(transaction, max_fee_rate).await })
     }
-
-    fn receipt<'a>(
-        &'a self,
-        id: &'a TransactionId,
-    ) -> BoxFuture<'a, Result<Option<Receipt>, SourceError>> {
-        Box::pin(async move { self.receipt(id).await })
-    }
 }
 
 impl<C> Transactions for TransactionClient<C>
@@ -177,12 +160,5 @@ where
         max_fee_rate: FeeRate,
     ) -> BoxFuture<'a, Result<TransactionId, SourceError>> {
         Box::pin(async move { self.client.broadcast(transaction, max_fee_rate).await })
-    }
-
-    fn receipt<'a>(
-        &'a self,
-        id: &'a TransactionId,
-    ) -> BoxFuture<'a, Result<Option<Receipt>, SourceError>> {
-        Box::pin(async move { self.client.receipt(id).await })
     }
 }

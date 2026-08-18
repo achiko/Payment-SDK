@@ -38,8 +38,4 @@ pub trait BlockInterpreter: Send + Sync {
         block: &Self::Block,
         watches: &[WatchTarget<Self::Target>],
     ) -> Result<InterpretedBlock<Self::Effect, Self::Undo>, IndexError>;
-
-    fn backfill_effect(&self, effect: Self::Effect) -> Result<Self::Effect, IndexError> {
-        Ok(effect)
-    }
 }

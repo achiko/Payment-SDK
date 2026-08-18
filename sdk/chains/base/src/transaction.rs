@@ -4,18 +4,6 @@ use serde::{Deserialize, Serialize};
 
 pub type TransactionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum InputPolicy {
-    Automatic,
-    SpendAll,
-}
-
-pub trait UtxoBuilder: Send {
-    fn inputs(&mut self, policy: InputPolicy) -> Result<(), Error>;
-
-    fn change(&mut self, address: crate::Address) -> Result<(), Error>;
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
     InvalidAddress,
@@ -144,13 +132,8 @@ impl Snapshot {
     }
 }
 
-/// Optional model-specific controls exposed by a transaction builder.
-pub trait BuilderCast {
-    fn utxo(&mut self) -> Option<&mut dyn UtxoBuilder>;
-}
-
 /// Chain-independent transaction construction used by wallet consumers.
-pub trait TransactionBuilder: BuilderCast + Send {
+pub trait TransactionBuilder: Send {
     fn transfer(
         &mut self,
         destination: crate::Address,
@@ -160,15 +143,6 @@ pub trait TransactionBuilder: BuilderCast + Send {
     fn snapshot(&self) -> Result<Snapshot, Error>;
 
     fn prepare<'a>(&'a mut self) -> TransactionFuture<'a, Result<SignedTransaction, Error>>;
-}
-
-/// Restores a live builder from its durable, JSON-serializable state.
-///
-/// Implementations bind the snapshot to the wallet that owns the signer and
-/// chain services. A snapshot from another wallet, network, or asset must be
-/// rejected rather than silently reinterpreted.
-pub trait TransactionRestore: Send + Sync {
-    fn restore(&self, snapshot: &Snapshot) -> Result<Box<dyn TransactionBuilder>, Error>;
 }
 
 /// Exact signed transaction ready for submission.

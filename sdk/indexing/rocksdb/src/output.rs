@@ -1,28 +1,25 @@
 use indexing::{
-    BackfillReader, BoxFuture, IndexError, IndexErrorKind, IndexScope, IndexedOutput, OutputCursor,
-    OutputPage, OutputQuery, OutputRequest, OutputSnapshot, WatchSelector,
+    BoxFuture, IndexError, IndexErrorKind, IndexScope, IndexedOutput, OutputCursor, OutputPage,
+    OutputQuery, OutputRequest, OutputSnapshot,
 };
 
 use crate::{
-    IndexRecords, ProjectionCursor, ProjectionEntry, ProjectionGet, ProjectionQuery,
-    ProjectionScan, ProjectionSnapshot,
+    ProjectionCursor, ProjectionEntry, ProjectionGet, ProjectionScan, ProjectionSnapshot,
+    Repository, index_record,
 };
 
-pub struct OutputReader<R> {
-    repository: R,
+pub struct OutputReader {
+    repository: Repository,
 }
 
-impl<R> OutputReader<R> {
+impl OutputReader {
     #[must_use]
-    pub const fn new(repository: R) -> Self {
+    pub const fn new(repository: Repository) -> Self {
         Self { repository }
     }
 }
 
-impl<R> OutputReader<R>
-where
-    R: ProjectionQuery,
-{
+impl OutputReader {
     async fn unspent_outputs(
         &self,
         scope: &IndexScope,
@@ -31,7 +28,7 @@ where
     ) -> Result<Vec<IndexedOutput>, IndexError> {
         let mut outputs = Vec::with_capacity(entries.len());
         for entry in entries {
-            let output = IndexRecords::decode_output(&entry.key, &entry.value)?;
+            let output = index_record::decode_output(&entry.key, &entry.value)?;
             if self.is_unspent(scope, snapshot, &output).await? {
                 outputs.push(output);
             }
@@ -45,7 +42,7 @@ where
         snapshot: &ProjectionSnapshot,
         output: &IndexedOutput,
     ) -> Result<bool, IndexError> {
-        let marker_key = IndexRecords::spent_key(&output.key())?;
+        let marker_key = index_record::spent_key(&output.key())?;
         let marker = self
             .repository
             .projection_get(ProjectionGet {
@@ -64,37 +61,22 @@ where
         let Some(value) = marker.value else {
             return Ok(true);
         };
-        IndexRecords::decode_spent(&marker_key, &value)?;
+        index_record::decode_spent(&marker_key, &value)?;
         Ok(false)
     }
 }
 
-impl<R> OutputQuery for OutputReader<R>
-where
-    R: ProjectionQuery + BackfillReader<Target = WatchSelector>,
-{
+impl OutputQuery for OutputReader {
     fn outputs<'a>(
         &'a self,
         request: OutputRequest,
     ) -> BoxFuture<'a, Result<OutputPage, IndexError>> {
         Box::pin(async move {
-            if !self
-                .repository
-                .pending_watch_backfills(&request.scope, 1)
-                .await?
-                .is_empty()
-            {
-                return Err(IndexError::new(
-                    IndexErrorKind::Conflict,
-                    "outputs are unavailable while historical watch backfill is pending",
-                    true,
-                ));
-            }
             let page = self
                 .repository
                 .projection_scan(ProjectionScan {
                     scope: request.scope.clone(),
-                    prefix: IndexRecords::output_prefix(&request.address)?,
+                    prefix: index_record::output_prefix(&request.address)?,
                     after: request.after.map(projection_cursor),
                     limit: request.limit,
                 })
@@ -113,7 +95,6 @@ where
 
 fn output_snapshot(snapshot: ProjectionSnapshot) -> OutputSnapshot {
     OutputSnapshot {
-        generation: snapshot.generation,
         revision: snapshot.revision,
         checkpoint: snapshot.checkpoint,
     }
@@ -121,7 +102,6 @@ fn output_snapshot(snapshot: ProjectionSnapshot) -> OutputSnapshot {
 
 fn projection_snapshot(snapshot: OutputSnapshot) -> ProjectionSnapshot {
     ProjectionSnapshot {
-        generation: snapshot.generation,
         revision: snapshot.revision,
         checkpoint: snapshot.checkpoint,
     }

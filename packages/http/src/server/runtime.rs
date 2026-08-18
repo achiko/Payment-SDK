@@ -105,6 +105,20 @@ pub fn service_router(
     config: &Config,
     health: HealthState,
 ) -> Result<Router, ConfigError> {
+    let protected = protected_router(protected, config)?;
+
+    let health_routes = Router::new()
+        .route(LIVENESS_PATH, get(liveness))
+        .route(READINESS_PATH, get(readiness))
+        .with_state(ReadinessState { health });
+
+    Ok(protected.merge(health_routes))
+}
+
+/// Applies configured authentication and request limits without adding routes.
+/// Applications that own their health resources use this to keep middleware
+/// outside handlers while generating one complete transport contract.
+pub fn protected_router(protected: Router, config: &Config) -> Result<Router, ConfigError> {
     config.validate()?;
 
     let mut protected = protected
@@ -119,12 +133,7 @@ pub fn service_router(
         }
     }
 
-    let health_routes = Router::new()
-        .route(LIVENESS_PATH, get(liveness))
-        .route(READINESS_PATH, get(readiness))
-        .with_state(ReadinessState { health });
-
-    Ok(protected.merge(health_routes))
+    Ok(protected)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1,20 +1,14 @@
 //! Slim extensions around established HTTP libraries.
 //!
-//! Client execution is backed by reqwest. Server middleware and serving use axum.
-//! This crate contains transport mechanics only; response schemas and business
+//! Server middleware and serving use axum. Response schemas and business
 //! resources belong to applications.
 
-pub mod client;
 pub mod server;
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::server::Config as ServerConfig;
-    use super::{client::Config as ClientConfig, client::ErrorKind as ClientErrorKind};
-    use super::{client::*, server::*};
-    use crate::client::ResponseBody;
+    use super::server::*;
     use axum::{
         Router,
         body::{Body, to_bytes},
@@ -321,131 +315,5 @@ mod tests {
     fn debug_output_never_contains_credentials() {
         let token = BearerToken::new("top-secret").expect("test token must be valid");
         assert!(!format!("{token:?}").contains("top-secret"));
-
-        let config = ClientConfig {
-            endpoint: "https://user:password@example.invalid".to_owned(),
-            request_timeout: Duration::from_secs(1),
-            max_response_bytes: 1024,
-            default_headers: vec![("authorization".to_owned(), "Bearer hidden".to_owned())],
-            retry_policy: Retry::default(),
-        };
-        let debug = format!("{config:?}");
-        assert!(!debug.contains("password"));
-        assert!(!debug.contains("Bearer hidden"));
-        assert!(debug.contains("authorization"));
-
-        let transport = Reqwest::new(config).expect("test transport must build");
-        let debug = format!("{transport:?}");
-        assert!(!debug.contains("password"));
-        assert!(!debug.contains("Bearer hidden"));
-        assert!(debug.contains("authorization"));
-    }
-
-    #[tokio::test]
-    async fn rejected_request_metadata_does_not_leak_credentials_or_body() {
-        let transport = Reqwest::new(ClientConfig::new(
-            "https://user:password@example.invalid",
-            Duration::from_secs(1),
-        ))
-        .expect("test transport must build");
-        let error = transport
-            .execute(Request {
-                method: "POST".to_owned(),
-                endpoint: String::new(),
-                headers: vec![(
-                    "authorization".to_owned(),
-                    "Bearer hidden\ninvalid".to_owned(),
-                )],
-                body: b"sensitive-request-body".to_vec(),
-            })
-            .await
-            .expect_err("an invalid header value must be rejected before sending");
-
-        assert_eq!(error.kind, ClientErrorKind::Rejected);
-        for secret in ["password", "Bearer hidden", "sensitive-request-body"] {
-            assert!(!error.message.contains(secret));
-        }
-    }
-
-    #[tokio::test]
-    async fn http_transport_does_not_follow_redirects() {
-        use std::io::{Read, Write};
-
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("test redirect listener must bind");
-        let address = listener
-            .local_addr()
-            .expect("test redirect listener address must be available");
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("test request must connect");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .expect("test request read timeout must configure");
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request);
-            stream
-                .write_all(
-                    b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/must-not-follow\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .expect("test redirect response must write");
-        });
-        let transport = Reqwest::new(ClientConfig::new(
-            format!("http://{address}/rpc"),
-            Duration::from_secs(1),
-        ))
-        .expect("test HTTP transport must build");
-
-        let response = transport
-            .execute(Request {
-                method: "POST".to_owned(),
-                endpoint: String::new(),
-                headers: Vec::new(),
-                body: b"{}".to_vec(),
-            })
-            .await
-            .expect("the original redirect response must be returned");
-
-        assert_eq!(response.status, 302);
-        server.join().expect("test redirect server must stop");
-    }
-
-    #[test]
-    fn bounded_response_rejects_declared_and_streamed_overflow_without_leaking_body() {
-        let declared_error = match ResponseBody::new(4, Some(5)) {
-            Ok(_) => panic!("an oversized declared response must fail"),
-            Err(error) => error,
-        };
-        assert_eq!(declared_error.kind, ClientErrorKind::InvalidResponse);
-        assert_eq!(
-            declared_error.message,
-            "HTTP response exceeds the configured size limit"
-        );
-
-        let mut streamed =
-            ResponseBody::new(6, None).expect("an unknown response length is allowed");
-        streamed
-            .push_chunk(b"secret")
-            .expect("a chunk at the limit must be accepted");
-        let streamed_error = streamed
-            .push_chunk(b"-response-body")
-            .expect_err("a chunk crossing the response limit must fail");
-
-        assert_eq!(streamed_error.kind, ClientErrorKind::InvalidResponse);
-        assert!(!streamed_error.message.contains("secret"));
-        assert!(!streamed_error.message.contains("response-body"));
-    }
-
-    #[test]
-    fn bounded_response_accepts_multiple_chunks_at_the_exact_limit() {
-        let mut response =
-            ResponseBody::new(5, Some(5)).expect("the declared length is within limit");
-        response
-            .push_chunk(b"12")
-            .expect("the first response chunk must fit");
-        response
-            .push_chunk(b"345")
-            .expect("the final response chunk must reach the exact limit");
-
-        assert_eq!(response.into_bytes(), b"12345");
     }
 }

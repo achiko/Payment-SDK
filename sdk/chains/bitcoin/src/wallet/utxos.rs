@@ -8,7 +8,7 @@ use indexing::{
     OutputRequest, OutputSnapshot, SourceError,
 };
 
-use crate::{Address, Network, Satoshi, TransactionId, UnspentOutput, UtxoSet, Utxos};
+use crate::{Address, Network, Satoshi, TransactionId, UnspentOutput, UtxoSet};
 
 const PAGE_SIZE: usize = 256;
 const COINBASE_MATURITY: u64 = 100;
@@ -139,31 +139,26 @@ impl IndexUtxos {
     }
 }
 
-impl Utxos for IndexUtxos {
-    fn utxos<'a>(
-        &'a self,
-        addresses: Vec<Address>,
-    ) -> crate::BoxFuture<'a, Result<UtxoSet, SourceError>> {
-        Box::pin(async move {
-            if addresses.is_empty() {
-                return Err(source_error(
-                    "Bitcoin indexed output lookup requires an address",
-                    false,
-                ));
-            }
-            let mut snapshot = None;
-            let mut seen = BTreeSet::new();
-            let mut outputs = Vec::new();
-            for address in addresses {
-                outputs.extend(self.load(address, &mut snapshot, &mut seen).await?);
-            }
-            let checkpoint = snapshot.and_then(|value| value.checkpoint).ok_or_else(|| {
-                source_error("indexed outputs have no canonical checkpoint", true)
-            })?;
-            Ok(UtxoSet {
-                checkpoint,
-                outputs,
-            })
+impl IndexUtxos {
+    pub async fn utxos(&self, addresses: Vec<Address>) -> Result<UtxoSet, SourceError> {
+        if addresses.is_empty() {
+            return Err(source_error(
+                "Bitcoin indexed output lookup requires an address",
+                false,
+            ));
+        }
+        let mut snapshot = None;
+        let mut seen = BTreeSet::new();
+        let mut outputs = Vec::new();
+        for address in addresses {
+            outputs.extend(self.load(address, &mut snapshot, &mut seen).await?);
+        }
+        let checkpoint = snapshot
+            .and_then(|value| value.checkpoint)
+            .ok_or_else(|| source_error("indexed outputs have no canonical checkpoint", true))?;
+        Ok(UtxoSet {
+            checkpoint,
+            outputs,
         })
     }
 }

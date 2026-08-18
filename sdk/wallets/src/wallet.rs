@@ -1,13 +1,13 @@
 use std::{future::Future, pin::Pin};
 
-use base::{Addresser, Broadcaster, Decimal, Signer, TransactionBuilder, TransactionRestore};
+use base::{Addresser, Broadcaster, Decimal, Signer, TransactionBuilder};
 use indexing::{
     AssetId, BlockRef, CanonicalAddress, ConfirmationProof, IndexScope, MovementId, MovementKind,
     ObservationRevision, ObservedTransaction, TransactionPage, TransactionRef, TransactionStatus,
     ValueMovement,
 };
 
-use crate::{AddressFormat, AmountFormat, Collector, Error, Sweeper};
+use crate::{AddressFormat, Error};
 
 pub type FutureResult<'a, T> = Pin<Box<dyn Future<Output = Result<T, Error>> + Send + 'a>>;
 
@@ -331,13 +331,13 @@ pub trait BalanceReader: Send + Sync {
 pub trait TransactionFactory: Send + Sync {
     fn transaction(&self) -> Box<dyn TransactionBuilder>;
 
-    fn broadcaster(&self) -> &dyn Broadcaster;
-}
+    /// Restores durable intent while reinjecting this wallet's signer and RPC.
+    fn restore(
+        &self,
+        snapshot: &base::TransactionSnapshot,
+    ) -> Result<Box<dyn TransactionBuilder>, base::TransactionError>;
 
-pub trait CollectionFactory: Send + Sync {
-    fn collector(&self) -> Option<Box<dyn Collector>> {
-        None
-    }
+    fn broadcaster(&self) -> &dyn Broadcaster;
 }
 
 pub trait HistoryReader: Send + Sync {
@@ -348,12 +348,8 @@ pub trait HistoryReader: Send + Sync {
 pub trait Wallet:
     Addresser
     + AddressFormat
-    + AmountFormat
     + BalanceReader
     + TransactionFactory
-    + CollectionFactory
-    + Sweeper
-    + TransactionRestore
     + HistoryReader
     + Signer
     + Send
@@ -364,12 +360,8 @@ pub trait Wallet:
 impl<T> Wallet for T where
     T: Addresser
         + AddressFormat
-        + AmountFormat
         + BalanceReader
         + TransactionFactory
-        + CollectionFactory
-        + Sweeper
-        + TransactionRestore
         + HistoryReader
         + Signer
         + Send
