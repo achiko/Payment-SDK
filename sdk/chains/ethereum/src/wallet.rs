@@ -1,756 +1,931 @@
+use std::sync::Arc;
+
+use alloy_primitives::keccak256;
+use base::{
+    Address as BaseAddress, Addresser, Broadcaster, BuilderCast, Decimal, KeyPair,
+    Submission as BroadcastReceipt, TransactionBuilder as BaseBuilder, TransactionEnvelope,
+    TransactionError, TransactionErrorKind, TransactionFuture, TransactionId, TransactionSnapshot,
+};
+use crypto::{PublicKeyFormat, SecretKey};
+use indexing::{History as IndexHistory, IndexScope};
+use wallets::{
+    AddressEncoding, AddressFormat, AddressText, AmountFormat, Balance, BalanceReader,
+    Error as WalletError, ErrorKind as WalletErrorKind, FutureResult, Provider, SecretBytes,
+    TransactionFactory, Wallet as WalletContract,
+};
+
 use crate::{
-    Ethereum, EthereumAddress, EthereumAsset, EthereumCollectionAttribution,
-    EthereumCollectionRequest, EthereumCollectionRequirement, EthereumPreparedCollection,
-    EthereumRpc, EthereumSignedTransaction, EthereumTransactionCodec, EthereumTransactionId,
-    EthereumTransferRequest, UnsignedEthereumTransaction, Wei,
-};
-use alloy_primitives::Address;
-use chain_contract::{
-    Balance, BalanceReader, BoxFuture, Broadcaster, ChainError, ChainErrorKind,
-    CollectionSubmission, Collector, DepositAddressGenerator, GeneratedAddress, TransactionReader,
-    TransactionSigner, TransferBuilder, WalletAdapter, WalletFactory,
-};
-use indexing::SourceError;
-use signer::{
-    Curve, KeyProvisionRequest, KeyProvisioner, OperationId, PublicKey, PublicKeyFormat, Signer,
-    SignerError,
+    Accounts, Address, AssetKind, SignedTransaction, TransactionBuilder, Transactions,
+    TransferRequest, Wei,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EthereumGenerateAddress {
-    /// Caller-selected network context. EOA key and address derivation itself is
-    /// identical across Ethereum chain IDs.
-    pub chain_id: u64,
-    pub key: KeyProvisionRequest,
+const SNAPSHOT_KIND: &str = "ethereum.transfer.v1";
+const PREPARED_KIND: &str = "ethereum.signed.v1";
+
+mod history;
+mod restore;
+mod sweep;
+
+#[derive(Clone, Debug)]
+pub struct WalletConfig {
+    pub scope: IndexScope,
+    pub asset: AssetKind,
+    pub decimals: u32,
 }
 
-impl EthereumGenerateAddress {
-    #[must_use]
-    pub fn new(chain_id: u64, operation_id: OperationId, purpose: impl Into<String>) -> Self {
-        Self {
-            chain_id,
-            key: KeyProvisionRequest {
-                operation_id,
-                curve: Curve::Secp256k1,
-                public_key_format: PublicKeyFormat::Raw,
-                purpose: purpose.into(),
-            },
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct EthereumAddressGenerator;
-
-impl DepositAddressGenerator<Ethereum> for EthereumAddressGenerator {
-    fn generate_address<'a>(
-        &'a self,
-        request: EthereumGenerateAddress,
-        keys: &'a dyn KeyProvisioner,
-    ) -> BoxFuture<'a, Result<GeneratedAddress<EthereumAddress>, ChainError>> {
-        Box::pin(async move {
-            let provisioned = keys
-                .provision(request.key)
-                .await
-                .map_err(key_provision_error)?;
-            let raw_public_key = raw_ethereum_public_key(&provisioned.public_key)?;
-            let address = Address::from_raw_public_key(raw_public_key);
-
-            Ok(GeneratedAddress {
-                address: EthereumAddress(address.into_array()),
-                key: provisioned.locator,
-                public_key: provisioned.public_key,
-            })
-        })
-    }
-}
-
-/// Complete stateless Ethereum wallet adapter. RPC state and custody are
-/// injected; this value stores only immutable chain configuration.
-#[derive(Debug)]
-pub struct EthereumWallet<R> {
-    chain_id: u64,
-    rpc: R,
-    codec: EthereumTransactionCodec,
-}
-
-impl<R> EthereumWallet<R> {
-    #[must_use]
-    pub const fn new(chain_id: u64, rpc: R) -> Self {
-        Self {
-            chain_id,
-            rpc,
-            codec: EthereumTransactionCodec,
-        }
-    }
-
-    #[must_use]
-    pub const fn chain_id(&self) -> u64 {
-        self.chain_id
-    }
-
-    #[must_use]
-    pub const fn rpc(&self) -> &R {
-        &self.rpc
-    }
-
-    fn validate_context(&self, context: &crate::EthereumBuildContext) -> Result<(), ChainError> {
-        if context.chain_id != self.chain_id {
-            return Err(invalid_transaction(format!(
-                "Ethereum RPC returned chain ID {}, expected {}",
-                context.chain_id, self.chain_id
-            )));
+impl WalletConfig {
+    fn validate(&self) -> Result<(), WalletError> {
+        if self.scope.chain.0 != "ethereum"
+            || configured_chain_id(&self.scope).is_err()
+            || matches!(self.asset, AssetKind::Native) && self.decimals != crate::ETH.decimals
+            || self.decimals > u8::MAX.into()
+        {
+            return Err(WalletError::new(
+                WalletErrorKind::Unsupported,
+                "Ethereum wallet network, asset, and decimals must agree",
+            ));
         }
         Ok(())
     }
 }
 
-impl<R: EthereumRpc> EthereumWallet<R> {
-    /// Builds and signs one collection transaction without broadcasting it.
-    ///
-    /// This separation lets the Payment Service durably persist the exact
-    /// opaque envelope and transaction ID before the external broadcast side
-    /// effect. The wallet retains no state between this and a later call to
-    /// [`Broadcaster::broadcast`].
-    pub async fn prepare_collection(
-        &self,
-        request: EthereumCollectionRequest,
-        signer: &dyn Signer,
-    ) -> Result<EthereumPreparedCollection, ChainError> {
-        let (transfer, context, attribution) = self.collection_transfer(request).await?;
-        let unsigned = crate::EthereumTransactionBuilder::build(&self.codec, transfer, context)?;
-        let transaction =
-            crate::EthereumTransactionSigning::sign(&self.codec, unsigned, signer).await?;
-        Ok(EthereumPreparedCollection {
-            transaction,
-            attribution: vec![attribution],
-        })
-    }
+pub struct WalletProvider {
+    config: WalletConfig,
+    accounts: Arc<dyn Accounts>,
+    transactions: Arc<dyn Transactions>,
+    history: Arc<dyn IndexHistory>,
+}
 
-    async fn collection_transfer(
-        &self,
-        request: EthereumCollectionRequest,
-    ) -> Result<
-        (
-            EthereumTransferRequest,
-            crate::EthereumBuildContext,
-            EthereumCollectionAttribution,
-        ),
-        ChainError,
-    > {
-        match request {
-            EthereumCollectionRequest::Native {
-                signing_operation_id,
-                from,
-                key,
-                destination,
-            } => {
-                let current = self
-                    .rpc
-                    .balance(from.clone(), &EthereumAsset::Native, None)
-                    .await
-                    .map_err(rpc_error)?;
-                let mut transfer = EthereumTransferRequest::native(
-                    signing_operation_id,
-                    key,
-                    from.clone(),
-                    destination,
-                    Wei::ZERO,
-                );
-                let context = self.rpc.build_context(&transfer).await.map_err(rpc_error)?;
-                self.validate_context(&context)?;
-                let maximum_fee = context
-                    .max_fee_per_gas
-                    .checked_mul_u64(context.gas_limit)
-                    .ok_or_else(|| {
-                        invalid_transaction("Ethereum maximum gas fee overflowed U256")
-                    })?;
-                let value = current
-                    .checked_sub(&maximum_fee)
-                    .ok_or_else(|| ChainError {
-                        kind: ChainErrorKind::InsufficientFunds,
-                        message: "Ethereum native balance cannot cover the maximum gas fee"
-                            .to_owned(),
-                    })?;
-                if value.is_zero() {
-                    return Err(ChainError {
-                        kind: ChainErrorKind::InsufficientFunds,
-                        message: "Ethereum native collection would transfer zero wei".to_owned(),
-                    });
-                }
-                transfer.value = value.clone();
-                Ok((
-                    transfer,
-                    context,
-                    EthereumCollectionAttribution {
-                        address: from,
-                        asset: EthereumAsset::Native,
-                        gross_debit: value,
-                    },
-                ))
-            }
-            EthereumCollectionRequest::Token {
-                signing_operation_id,
-                token,
-                from,
-                key,
-                destination,
-                amount,
-            } => {
-                let asset = EthereumAsset::Erc20(token.clone());
-                let token_balance = self
-                    .rpc
-                    .balance(from.clone(), &asset, None)
-                    .await
-                    .map_err(rpc_error)?;
-                let amount = requested_token_amount(amount.as_ref(), token_balance)?;
-                if amount.is_zero() {
-                    return Err(ChainError {
-                        kind: ChainErrorKind::InsufficientFunds,
-                        message: "Ethereum token collection would transfer zero units".to_owned(),
-                    });
-                }
-                let transfer = EthereumTransferRequest::erc20(
-                    signing_operation_id,
-                    key,
-                    from.clone(),
-                    token,
-                    destination,
-                    amount.clone(),
-                );
-                let context = self.rpc.build_context(&transfer).await.map_err(rpc_error)?;
-                self.validate_context(&context)?;
-                let required = context
-                    .max_fee_per_gas
-                    .checked_mul_u64(context.gas_limit)
-                    .ok_or_else(|| {
-                        invalid_transaction("Ethereum maximum gas fee overflowed U256")
-                    })?;
-                let current = self
-                    .rpc
-                    .balance(from.clone(), &EthereumAsset::Native, None)
-                    .await
-                    .map_err(rpc_error)?;
-                if current < required {
-                    return Err(ChainError {
-                        kind: ChainErrorKind::InsufficientFunds,
-                        message: "Ethereum token address lacks native gas funds".to_owned(),
-                    });
-                }
-                Ok((
-                    transfer,
-                    context,
-                    EthereumCollectionAttribution {
-                        address: from,
-                        asset,
-                        gross_debit: amount,
-                    },
-                ))
-            }
+impl WalletProvider {
+    #[must_use]
+    pub fn new(
+        config: WalletConfig,
+        accounts: Arc<dyn Accounts>,
+        transactions: Arc<dyn Transactions>,
+        history: Arc<dyn IndexHistory>,
+    ) -> Self {
+        Self {
+            config,
+            accounts,
+            transactions,
+            history,
         }
     }
 }
 
-impl<R: EthereumRpc> DepositAddressGenerator<Ethereum> for EthereumWallet<R> {
-    fn generate_address<'a>(
-        &'a self,
-        request: EthereumGenerateAddress,
-        keys: &'a dyn KeyProvisioner,
-    ) -> BoxFuture<'a, Result<GeneratedAddress<EthereumAddress>, ChainError>> {
+impl Provider for WalletProvider {
+    fn create<'a>(&'a self, secret: SecretBytes) -> FutureResult<'a, Arc<dyn WalletContract>> {
         Box::pin(async move {
-            if request.chain_id != self.chain_id {
-                return Err(invalid_public_key(format!(
-                    "Ethereum address request uses chain ID {}, expected {}",
-                    request.chain_id, self.chain_id
-                )));
-            }
-            EthereumAddressGenerator
-                .generate_address(request, keys)
-                .await
+            self.config.validate()?;
+            let key = SecretKey::new(secret.as_bytes().to_vec())
+                .map_err(|error| wallet_error(WalletErrorKind::InvalidSecret, error))?;
+            let public = key
+                .public_key(PublicKeyFormat::Raw)
+                .map_err(|error| wallet_error(WalletErrorKind::InvalidSecret, error))?;
+            let hash = keccak256(&public.bytes);
+            let mut bytes = [0_u8; 20];
+            bytes.copy_from_slice(&hash[12..]);
+            let address = Address(bytes);
+            let signer = KeyPair::new(address.clone(), secret.as_bytes().to_vec())
+                .map_err(|error| wallet_error(WalletErrorKind::InvalidSecret, error))?;
+            Ok(Arc::new(Wallet {
+                config: self.config.clone(),
+                address,
+                signer: Arc::new(signer),
+                accounts: self.accounts.clone(),
+                transactions: self.transactions.clone(),
+                history: self.history.clone(),
+            }) as Arc<dyn WalletContract>)
         })
     }
 }
 
-impl<R: EthereumRpc> BalanceReader<Ethereum> for EthereumWallet<R> {
-    fn balance<'a>(
-        &'a self,
-        address: &'a EthereumAddress,
-        asset: &'a EthereumAsset,
-    ) -> BoxFuture<'a, Result<Balance<Wei>, ChainError>> {
+struct Wallet {
+    config: WalletConfig,
+    address: Address,
+    signer: Arc<KeyPair<Address>>,
+    accounts: Arc<dyn Accounts>,
+    transactions: Arc<dyn Transactions>,
+    history: Arc<dyn IndexHistory>,
+}
+
+impl Addresser for Wallet {
+    fn address(&self) -> BaseAddress {
+        self.address.address()
+    }
+}
+
+impl base::Signer for Wallet {
+    fn sign<'a>(&'a self, request: base::SignRequest) -> base::SignFuture<'a> {
+        self.signer.sign(request)
+    }
+}
+
+impl AddressFormat for Wallet {
+    fn address_text(&self, address: &BaseAddress) -> Result<AddressText, WalletError> {
+        let bytes: [u8; 20] = address.as_bytes().try_into().map_err(|_| {
+            WalletError::new(
+                WalletErrorKind::InvalidAddress,
+                "Ethereum address must contain exactly 20 bytes",
+            )
+        })?;
+        Ok(AddressText::new(
+            AddressEncoding::Hex,
+            Address(bytes).to_string(),
+        ))
+    }
+
+    fn parse_address(&self, address: &AddressText) -> Result<BaseAddress, WalletError> {
+        if address.encoding != AddressEncoding::Hex {
+            return Err(WalletError::new(
+                WalletErrorKind::InvalidAddress,
+                "Ethereum addresses use hexadecimal encoding",
+            ));
+        }
+        address
+            .text
+            .parse::<Address>()
+            .map(|parsed| parsed.address())
+            .map_err(|error| wallet_error(WalletErrorKind::InvalidAddress, error))
+    }
+}
+
+impl BalanceReader for Wallet {
+    fn balance<'a>(&'a self) -> FutureResult<'a, Balance> {
         Box::pin(async move {
-            let confirmed = self
-                .rpc
-                .balance(address.clone(), asset, None)
+            let amount = self
+                .accounts
+                .balance(self.address.clone(), &self.config.asset, None)
                 .await
-                .map_err(rpc_error)?;
+                .map_err(|error| wallet_error(WalletErrorKind::Balance, error))?;
             Ok(Balance {
-                spendable: confirmed.clone(),
-                confirmed,
-                pending: Wei::ZERO,
+                amount: Decimal::from_atomic(
+                    num_bigint::BigUint::from_bytes_be(&amount.0),
+                    self.config.decimals,
+                ),
+                observed_at: None,
             })
         })
     }
 }
 
-impl<R: EthereumRpc> TransferBuilder<Ethereum> for EthereumWallet<R> {
-    fn build_transfer<'a>(
-        &'a self,
-        request: EthereumTransferRequest,
-    ) -> BoxFuture<'a, Result<UnsignedEthereumTransaction, ChainError>> {
-        Box::pin(async move {
-            let context = self.rpc.build_context(&request).await.map_err(rpc_error)?;
-            self.validate_context(&context)?;
-            crate::EthereumTransactionBuilder::build(&self.codec, request, context)
-        })
+impl AmountFormat for Wallet {
+    fn display_amount(&self, atomic: &Decimal) -> Result<Decimal, WalletError> {
+        let units = atomic
+            .to_atomic(0)
+            .map_err(|error| wallet_error(WalletErrorKind::InvalidAmount, error))?;
+        Ok(Decimal::from_atomic(units, self.config.decimals))
     }
 }
 
-impl<R: EthereumRpc> TransactionSigner<Ethereum> for EthereumWallet<R> {
-    fn sign_transaction<'a>(
-        &'a self,
-        transaction: UnsignedEthereumTransaction,
-        signer: &'a dyn Signer,
-    ) -> BoxFuture<'a, Result<EthereumSignedTransaction, ChainError>> {
-        crate::EthereumTransactionSigning::sign(&self.codec, transaction, signer)
+impl TransactionFactory for Wallet {
+    fn transaction(&self) -> Box<dyn BaseBuilder> {
+        Box::new(Builder::new(
+            self.config.scope.clone(),
+            self.address.clone(),
+            self.config.asset.clone(),
+            self.config.decimals,
+            self.signer.clone(),
+            self.transactions.clone(),
+        ))
+    }
+
+    fn broadcaster(&self) -> &dyn Broadcaster {
+        self
     }
 }
 
-impl<R: EthereumRpc> Broadcaster<Ethereum> for EthereumWallet<R> {
-    fn broadcast<'a>(
-        &'a self,
-        transaction: EthereumSignedTransaction,
-    ) -> BoxFuture<'a, Result<EthereumTransactionId, ChainError>> {
-        Box::pin(async move { self.rpc.broadcast(transaction).await.map_err(rpc_error) })
-    }
+struct Builder {
+    scope: IndexScope,
+    from: Address,
+    asset: AssetKind,
+    decimals: u32,
+    signer: Arc<KeyPair<Address>>,
+    transactions: Arc<dyn Transactions>,
+    transfer: Option<(Address, Decimal)>,
 }
 
-impl<R: EthereumRpc> TransactionReader<Ethereum> for EthereumWallet<R> {
-    fn transaction<'a>(
-        &'a self,
-        id: &'a EthereumTransactionId,
-    ) -> BoxFuture<'a, Result<Option<crate::EthereumReceipt>, ChainError>> {
-        Box::pin(async move { self.rpc.receipt(id).await.map_err(rpc_error) })
-    }
-}
-
-impl<R: EthereumRpc> Collector<Ethereum> for EthereumWallet<R> {
-    fn requirements<'a>(
-        &'a self,
-        request: &'a EthereumCollectionRequest,
-    ) -> BoxFuture<'a, Result<Vec<EthereumCollectionRequirement>, ChainError>> {
-        Box::pin(async move {
-            let EthereumCollectionRequest::Token {
-                signing_operation_id,
-                token,
-                from,
-                key,
-                destination,
-                amount,
-            } = request
-            else {
-                return Ok(Vec::new());
-            };
-            let token_balance = self
-                .rpc
-                .balance(from.clone(), &EthereumAsset::Erc20(token.clone()), None)
-                .await
-                .map_err(rpc_error)?;
-            let amount = requested_token_amount(amount.as_ref(), token_balance)?;
-            if amount.is_zero() {
-                return Ok(Vec::new());
-            }
-            let transfer = EthereumTransferRequest::erc20(
-                signing_operation_id.clone(),
-                key.clone(),
-                from.clone(),
-                token.clone(),
-                destination.clone(),
-                amount,
-            );
-            let context = self.rpc.build_context(&transfer).await.map_err(rpc_error)?;
-            self.validate_context(&context)?;
-            let required = context
-                .max_fee_per_gas
-                .checked_mul_u64(context.gas_limit)
-                .ok_or_else(|| invalid_transaction("Ethereum maximum gas fee overflowed U256"))?;
-            let current = self
-                .rpc
-                .balance(from.clone(), &EthereumAsset::Native, None)
-                .await
-                .map_err(rpc_error)?;
-            let Some(deficit) = required.checked_sub(&current) else {
-                return Ok(Vec::new());
-            };
-            if deficit.is_zero() {
-                return Ok(Vec::new());
-            }
-            Ok(vec![EthereumCollectionRequirement::NativeGasBalance {
-                address: from.clone(),
-                current,
-                required,
-                deficit,
-            }])
-        })
-    }
-
-    fn collect<'a>(
-        &'a self,
-        request: EthereumCollectionRequest,
-        signer: &'a dyn Signer,
-    ) -> BoxFuture<
-        'a,
-        Result<
-            CollectionSubmission<EthereumTransactionId, EthereumCollectionAttribution>,
-            ChainError,
-        >,
-    > {
-        Box::pin(async move {
-            let prepared = self.prepare_collection(request, signer).await?;
-            let transaction_id = self
-                .rpc
-                .broadcast(prepared.transaction)
-                .await
-                .map_err(rpc_error)?;
-            Ok(CollectionSubmission {
-                transaction_id,
-                attribution: prepared.attribution,
-            })
-        })
-    }
-}
-
-impl<R: EthereumRpc> WalletFactory<Ethereum> for EthereumWallet<R> {
-    fn wallet_for<'a>(
-        &'a self,
-        _asset: &'a EthereumAsset,
-    ) -> Result<&'a dyn WalletAdapter<Ethereum>, ChainError> {
-        Ok(self)
-    }
-}
-
-fn requested_token_amount(requested: Option<&Wei>, available: Wei) -> Result<Wei, ChainError> {
-    match requested {
-        Some(requested) if requested > &available => Err(ChainError {
-            kind: ChainErrorKind::InsufficientFunds,
-            message: "Ethereum token balance is lower than the requested collection amount"
-                .to_owned(),
-        }),
-        Some(requested) => Ok(requested.clone()),
-        None => Ok(available),
-    }
-}
-
-fn rpc_error(error: SourceError) -> ChainError {
-    ChainError {
-        kind: if error.retryable {
-            ChainErrorKind::RpcUnavailable
-        } else {
-            ChainErrorKind::Other
-        },
-        message: format!("Ethereum RPC operation failed: {error}"),
-    }
-}
-
-fn invalid_transaction(message: impl Into<String>) -> ChainError {
-    ChainError {
-        kind: ChainErrorKind::InvalidTransaction,
-        message: message.into(),
-    }
-}
-
-fn raw_ethereum_public_key(public_key: &PublicKey) -> Result<&[u8], ChainError> {
-    if public_key.curve != Curve::Secp256k1 {
-        return Err(invalid_public_key(
-            "Ethereum requires a secp256k1 public key",
-        ));
-    }
-
-    match public_key.format {
-        PublicKeyFormat::Raw if public_key.bytes.len() == 64 => Ok(&public_key.bytes),
-        PublicKeyFormat::Uncompressed
-            if public_key.bytes.len() == 65 && public_key.bytes[0] == 0x04 =>
-        {
-            Ok(&public_key.bytes[1..])
+impl Builder {
+    fn new(
+        scope: IndexScope,
+        from: Address,
+        asset: AssetKind,
+        decimals: u32,
+        signer: Arc<KeyPair<Address>>,
+        transactions: Arc<dyn Transactions>,
+    ) -> Self {
+        Self {
+            scope,
+            from,
+            asset,
+            decimals,
+            signer,
+            transactions,
+            transfer: None,
         }
-        _ => Err(invalid_public_key(
-            "Ethereum requires a 64-byte raw or 65-byte SEC1 public key",
+    }
+
+    fn request(&self) -> Result<TransferRequest, TransactionError> {
+        self.validate()?;
+        let (destination, amount) = self.transfer.clone().ok_or_else(|| {
+            transaction_error(
+                TransactionErrorKind::InvalidTransaction,
+                "transfer is not configured",
+            )
+        })?;
+        let value = amount
+            .to_atomic_be_bytes(self.decimals)
+            .map(Wei)
+            .map_err(|error| transaction_error(TransactionErrorKind::InvalidAmount, error))?;
+        Ok(match &self.asset {
+            AssetKind::Native => {
+                TransferRequest::native_atomic(self.from.clone(), destination, value)
+            }
+            AssetKind::Erc20(token) => {
+                TransferRequest::erc20(self.from.clone(), token.clone(), destination, value)
+            }
+        })
+    }
+
+    fn validate(&self) -> Result<(), TransactionError> {
+        if self.scope.chain.0 != "ethereum"
+            || configured_chain_id(&self.scope).is_err()
+            || matches!(self.asset, AssetKind::Native) && self.decimals != crate::ETH.decimals
+            || self.decimals > u8::MAX.into()
+        {
+            return Err(transaction_error(
+                TransactionErrorKind::InvalidSnapshot,
+                "Ethereum transaction identity, network, asset, and decimals do not agree",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl BuilderCast for Builder {
+    fn utxo(&mut self) -> Option<&mut dyn base::UtxoBuilder> {
+        None
+    }
+}
+
+impl BaseBuilder for Builder {
+    fn transfer(
+        &mut self,
+        destination: BaseAddress,
+        amount: Decimal,
+    ) -> Result<(), TransactionError> {
+        if self.transfer.is_some() {
+            return Err(transaction_error(
+                TransactionErrorKind::Unsupported,
+                "Ethereum transaction builder supports exactly one transfer",
+            ));
+        }
+        let bytes: [u8; 20] = destination.as_bytes().try_into().map_err(|_| {
+            transaction_error(
+                TransactionErrorKind::InvalidAddress,
+                "Ethereum destination must contain exactly 20 bytes",
+            )
+        })?;
+        amount
+            .to_atomic_be_bytes::<32>(self.decimals)
+            .map_err(|error| transaction_error(TransactionErrorKind::InvalidAmount, error))?;
+        self.transfer = Some((Address(bytes), amount));
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Result<TransactionSnapshot, TransactionError> {
+        self.validate()?;
+        let (destination, amount) = self.transfer.as_ref().ok_or_else(|| {
+            transaction_error(
+                TransactionErrorKind::InvalidTransaction,
+                "transfer is not configured",
+            )
+        })?;
+        Ok(TransactionSnapshot::new(
+            SNAPSHOT_KIND,
+            serde_json::json!({
+                "scope": {
+                    "chain": self.scope.chain.0.as_str(),
+                    "network": self.scope.network.as_str(),
+                },
+                "source": self.from.to_string(),
+                "destination": destination.to_string(),
+                "amount": amount.to_string(),
+                "asset": asset_snapshot(&self.asset, self.decimals),
+            }),
+        ))
+    }
+
+    fn prepare<'a>(
+        &'a mut self,
+    ) -> TransactionFuture<'a, Result<base::SignedTransaction, TransactionError>> {
+        Box::pin(async move {
+            let request = self.request()?;
+            let context = self
+                .transactions
+                .build_context(&request)
+                .await
+                .map_err(|error| transaction_error(TransactionErrorKind::Unavailable, error))?;
+            if context.chain_id != configured_chain_id(&self.scope)? {
+                return Err(transaction_error(
+                    TransactionErrorKind::Divergent,
+                    "Ethereum RPC chain ID does not match the wallet network",
+                ));
+            }
+            let signed = TransactionBuilder::new(request, context)
+                .sign(self.signer.as_ref())
+                .await
+                .map_err(|error| transaction_error(TransactionErrorKind::Signing, error))?;
+            Ok(base::SignedTransaction::new(
+                PREPARED_KIND,
+                TransactionId::new(signed.id.to_string()),
+                TransactionEnvelope::new(signed.envelope),
+            ))
+        })
+    }
+}
+
+fn configured_chain_id(scope: &IndexScope) -> Result<u64, TransactionError> {
+    match scope.network.as_str() {
+        "mainnet" => Ok(1),
+        "sepolia" => Ok(11_155_111),
+        _ => Err(transaction_error(
+            TransactionErrorKind::InvalidSnapshot,
+            "Ethereum wallet uses an unsupported network",
         )),
     }
 }
 
-fn key_provision_error(error: SignerError) -> ChainError {
-    ChainError {
-        kind: ChainErrorKind::Signer,
-        message: format!("key provisioning failed: {error}"),
+fn asset_snapshot(asset: &AssetKind, decimals: u32) -> serde_json::Value {
+    match asset {
+        AssetKind::Native => serde_json::json!({
+            "kind": "native",
+            "ticker": crate::ETH.ticker,
+            "decimals": decimals,
+        }),
+        AssetKind::Erc20(token) => serde_json::json!({
+            "kind": "erc20",
+            "token": token.to_string(),
+            "decimals": decimals,
+        }),
     }
 }
 
-fn invalid_public_key(message: impl Into<String>) -> ChainError {
-    ChainError {
-        kind: ChainErrorKind::InvalidAddress,
-        message: message.into(),
+impl Broadcaster for Wallet {
+    fn broadcast<'a>(
+        &'a self,
+        prepared: &'a base::SignedTransaction,
+    ) -> TransactionFuture<'a, Result<BroadcastReceipt, TransactionError>> {
+        Box::pin(async move {
+            if prepared.version() != base::SignedTransaction::VERSION
+                || prepared.kind() != PREPARED_KIND
+            {
+                return Err(transaction_error(
+                    TransactionErrorKind::InvalidTransaction,
+                    "prepared transaction is not an Ethereum signed envelope",
+                ));
+            }
+            let id = prepared.id().as_str().parse().map_err(|error| {
+                transaction_error(TransactionErrorKind::InvalidTransaction, error)
+            })?;
+            let signed =
+                SignedTransaction::from_envelope(id, prepared.envelope().as_bytes().to_vec())
+                    .map_err(|error| {
+                        transaction_error(TransactionErrorKind::InvalidTransaction, error)
+                    })?;
+            let id = self
+                .transactions
+                .broadcast(signed)
+                .await
+                .map_err(|error| transaction_error(TransactionErrorKind::Unavailable, error))?;
+            Ok(BroadcastReceipt {
+                id: TransactionId::new(id.to_string()),
+            })
+        })
     }
+}
+
+fn transaction_error(
+    kind: TransactionErrorKind,
+    error: impl std::fmt::Display,
+) -> TransactionError {
+    TransactionError::new(kind, error.to_string())
+}
+
+fn wallet_error(kind: WalletErrorKind, error: impl std::fmt::Display) -> WalletError {
+    WalletError::new(kind, error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
+    use indexing::{
+        BoxFuture, ChainId, HistoryQuery, IndexError, ObservedTransaction, TransactionPage,
+        TransactionQuery,
+    };
+    use wallets::{HistoryRequest, Wallets};
+
     use super::*;
-    use alloy_primitives::keccak256;
-    use futures_executor::block_on;
-    use indexing::BlockRef;
-    use signer_local::LocalSigner;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::{Receipt, TransactionId};
 
-    #[test]
-    fn rpc_error_does_not_turn_permanent_source_failures_into_retries() {
-        let retryable = rpc_error(SourceError {
-            message: "temporary".to_owned(),
-            retryable: true,
-        });
-        let permanent = rpc_error(SourceError {
-            message: "permanent".to_owned(),
-            retryable: false,
-        });
-
-        assert_eq!(retryable.kind, ChainErrorKind::RpcUnavailable);
-        assert_eq!(permanent.kind, ChainErrorKind::Other);
+    enum Rpc {
+        Test,
     }
 
-    #[derive(Debug)]
-    struct MockEthereumRpc {
-        chain_id: u64,
-        native_balance: Wei,
-        token_balance: Wei,
-        context: crate::EthereumBuildContext,
-        broadcasts: AtomicUsize,
+    enum LowBalance {
+        Test,
     }
 
-    impl EthereumRpc for MockEthereumRpc {
+    impl Accounts for Rpc {
         fn balance<'a>(
             &'a self,
-            _address: EthereumAddress,
-            asset: &'a EthereumAsset,
-            _at: Option<BlockRef>,
-        ) -> crate::BoxFuture<'a, Result<Wei, SourceError>> {
-            let balance = match asset {
-                EthereumAsset::Native => self.native_balance.clone(),
-                EthereumAsset::Erc20(_) => self.token_balance.clone(),
-            };
-            Box::pin(async move { Ok(balance) })
+            _address: Address,
+            _asset: &'a AssetKind,
+            _at: Option<indexing::BlockRef>,
+        ) -> crate::BoxFuture<'a, Result<Wei, indexing::SourceError>> {
+            Box::pin(async { Ok(Wei::from_u128(1_500_000_000_000_000_000)) })
         }
 
         fn nonce<'a>(
             &'a self,
-            _address: EthereumAddress,
-        ) -> crate::BoxFuture<'a, Result<u64, SourceError>> {
-            Box::pin(async move { Ok(self.context.nonce) })
+            _address: Address,
+        ) -> crate::BoxFuture<'a, Result<u64, indexing::SourceError>> {
+            Box::pin(async { Ok(7) })
         }
+    }
 
+    impl Transactions for Rpc {
         fn build_context<'a>(
             &'a self,
-            _request: &'a EthereumTransferRequest,
-        ) -> crate::BoxFuture<'a, Result<crate::EthereumBuildContext, SourceError>> {
-            let context = self.context.clone();
-            Box::pin(async move { Ok(context) })
+            _request: &'a TransferRequest,
+        ) -> crate::BoxFuture<'a, Result<crate::BuildContext, indexing::SourceError>> {
+            Box::pin(async {
+                Ok(crate::BuildContext {
+                    chain_id: 1,
+                    nonce: 7,
+                    gas_limit: 21_000,
+                    max_fee_per_gas: Wei::from_u128(2_000_000_000),
+                    max_priority_fee_per_gas: Wei::from_u128(1_000_000_000),
+                })
+            })
         }
 
         fn receipt<'a>(
             &'a self,
-            _id: &'a EthereumTransactionId,
-        ) -> crate::BoxFuture<'a, Result<Option<crate::EthereumReceipt>, SourceError>> {
+            id: &'a TransactionId,
+        ) -> crate::BoxFuture<'a, Result<Option<Receipt>, indexing::SourceError>> {
+            let id = id.clone();
+            Box::pin(async move {
+                Ok(Some(Receipt {
+                    id,
+                    included_in: None,
+                    succeeded: Some(true),
+                    confirmations: 2,
+                }))
+            })
+        }
+
+        fn broadcast<'a>(
+            &'a self,
+            transaction: SignedTransaction,
+        ) -> crate::BoxFuture<'a, Result<TransactionId, indexing::SourceError>> {
+            Box::pin(async move { Ok(transaction.id) })
+        }
+    }
+
+    impl Accounts for LowBalance {
+        fn balance<'a>(
+            &'a self,
+            _address: Address,
+            _asset: &'a AssetKind,
+            _at: Option<indexing::BlockRef>,
+        ) -> crate::BoxFuture<'a, Result<Wei, indexing::SourceError>> {
+            Box::pin(async { Ok(Wei::from_u128(41_999_999_999_999)) })
+        }
+
+        fn nonce<'a>(
+            &'a self,
+            _address: Address,
+        ) -> crate::BoxFuture<'a, Result<u64, indexing::SourceError>> {
+            Box::pin(async { Ok(7) })
+        }
+    }
+
+    impl Transactions for LowBalance {
+        fn build_context<'a>(
+            &'a self,
+            _request: &'a TransferRequest,
+        ) -> crate::BoxFuture<'a, Result<crate::BuildContext, indexing::SourceError>> {
+            Box::pin(async {
+                Ok(crate::BuildContext {
+                    chain_id: 1,
+                    nonce: 7,
+                    gas_limit: 21_000,
+                    max_fee_per_gas: Wei::from_u128(2_000_000_000),
+                    max_priority_fee_per_gas: Wei::from_u128(1_000_000_000),
+                })
+            })
+        }
+
+        fn receipt<'a>(
+            &'a self,
+            _id: &'a TransactionId,
+        ) -> crate::BoxFuture<'a, Result<Option<Receipt>, indexing::SourceError>> {
             Box::pin(async { Ok(None) })
         }
 
         fn broadcast<'a>(
             &'a self,
-            transaction: EthereumSignedTransaction,
-        ) -> crate::BoxFuture<'a, Result<EthereumTransactionId, SourceError>> {
-            self.broadcasts.fetch_add(1, Ordering::Relaxed);
+            transaction: SignedTransaction,
+        ) -> crate::BoxFuture<'a, Result<TransactionId, indexing::SourceError>> {
             Box::pin(async move { Ok(transaction.id) })
         }
     }
 
-    fn mock_rpc(native_balance: u128, token_balance: u128) -> MockEthereumRpc {
-        MockEthereumRpc {
-            chain_id: 31_337,
-            native_balance: Wei::from_u128(native_balance),
-            token_balance: Wei::from_u128(token_balance),
-            context: crate::EthereumBuildContext {
-                chain_id: 31_337,
-                nonce: 2,
-                gas_limit: 10,
-                max_fee_per_gas: Wei::from_u128(2),
-                max_priority_fee_per_gas: Wei::from_u128(1),
-            },
-            broadcasts: AtomicUsize::new(0),
+    enum EmptyHistory {
+        Fixture,
+    }
+
+    impl IndexHistory for EmptyHistory {
+        fn transaction<'a>(
+            &'a self,
+            _request: TransactionQuery,
+        ) -> BoxFuture<'a, Result<Option<ObservedTransaction>, IndexError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn history<'a>(
+            &'a self,
+            _request: HistoryQuery,
+        ) -> BoxFuture<'a, Result<TransactionPage, IndexError>> {
+            Box::pin(async {
+                Ok(TransactionPage {
+                    transactions: Vec::new(),
+                    next: None,
+                })
+            })
         }
     }
 
-    fn operation(value: &str) -> OperationId {
-        OperationId::new(value).expect("test operation ID must be valid")
+    fn kind() -> &'static str {
+        "mainnet-native"
     }
 
-    #[test]
-    fn generates_address_from_an_ephemeral_key() {
-        let keys = LocalSigner::ephemeral_for_testing();
-        let generator = EthereumAddressGenerator;
-        let request = EthereumGenerateAddress::new(
-            31_337,
-            operation("provision-ethereum-test-deposit"),
-            "ethereum-test-deposit",
+    fn scope() -> IndexScope {
+        IndexScope {
+            chain: ChainId(crate::CHAIN.to_owned()),
+            network: "mainnet".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prepares_and_broadcasts_through_only_wallet_abstractions() {
+        let rpc = Arc::new(Rpc::Test);
+        let mut wallets = Wallets::new();
+        wallets
+            .register(
+                kind(),
+                WalletProvider::new(
+                    WalletConfig {
+                        scope: scope(),
+                        asset: AssetKind::Native,
+                        decimals: 18,
+                    },
+                    rpc.clone(),
+                    rpc,
+                    Arc::new(EmptyHistory::Fixture),
+                ),
+            )
+            .expect("wallet key must be unique");
+        let wallet = wallets
+            .new_wallet(&kind(), SecretBytes::new([1_u8; 32]))
+            .await
+            .expect("valid local key must create the wallet");
+
+        let address = wallet
+            .address_text(&wallet.address())
+            .expect("wallet address must have canonical text");
+        assert_eq!(address.encoding, wallets::AddressEncoding::Hex);
+        assert!(address.text.starts_with("0x"));
+        assert_eq!(address.text.len(), 42);
+        assert_eq!(
+            wallet
+                .parse_address(&address)
+                .expect("canonical address text must round-trip"),
+            wallet.address()
         );
-
-        let generated = block_on(generator.generate_address(request, &keys))
-            .expect("Ethereum address should be generated");
-        let expected = Address::from_raw_public_key(&generated.public_key.bytes).into_array();
-
-        assert_eq!(generated.address, EthereumAddress(expected));
-        assert_eq!(generated.public_key.curve, Curve::Secp256k1);
-        assert_eq!(generated.public_key.format, PublicKeyFormat::Raw);
-        assert_eq!(generated.public_key.bytes.len(), 64);
-    }
-
-    #[test]
-    fn generates_a_fresh_address_for_each_request() {
-        let keys = LocalSigner::ephemeral_for_testing();
-        let generator = EthereumAddressGenerator;
-
-        let first = block_on(generator.generate_address(
-            EthereumGenerateAddress::new(31_337, operation("provision-first"), "first"),
-            &keys,
-        ))
-        .expect("first address should be generated");
-        let second = block_on(generator.generate_address(
-            EthereumGenerateAddress::new(31_337, operation("provision-second"), "second"),
-            &keys,
-        ))
-        .expect("second address should be generated");
-
-        assert_ne!(first.address, second.address);
-        assert_ne!(first.key, second.key);
-    }
-
-    #[test]
-    fn reports_token_gas_deficit() {
-        let wallet = EthereumWallet::new(31_337, mock_rpc(12, 500));
-        let request = EthereumCollectionRequest::Token {
-            signing_operation_id: operation("requirements-token"),
-            token: EthereumAddress([1; 20]),
-            from: EthereumAddress([2; 20]),
-            key: signer::KeyLocator::Identifier("token-source".to_owned()),
-            destination: EthereumAddress([3; 20]),
-            amount: None,
-        };
-
-        let requirements = block_on(wallet.requirements(&request))
-            .expect("token collection requirements should be calculated");
+        let atomic = num_bigint::BigUint::from(10_u8).pow(18);
+        let display = wallet
+            .display_amount(&Decimal::from_atomic(atomic.clone(), 0))
+            .expect("atomic wei must convert exactly");
+        assert_eq!(display.to_string(), "1");
+        assert_eq!(display.to_atomic(18).expect("ETH must round-trip"), atomic);
 
         assert_eq!(
-            requirements,
-            vec![EthereumCollectionRequirement::NativeGasBalance {
-                address: EthereumAddress([2; 20]),
-                current: Wei::from_u128(12),
-                required: Wei::from_u128(20),
-                deficit: Wei::from_u128(8),
-            }]
+            wallet
+                .balance()
+                .await
+                .expect("balance must load")
+                .amount
+                .to_string(),
+            "1.5"
+        );
+        assert!(
+            wallet
+                .history(HistoryRequest::first(10))
+                .await
+                .expect("history must load")
+                .transactions
+                .is_empty()
+        );
+
+        let mut builder = wallet.transaction();
+        builder
+            .transfer(
+                BaseAddress::from([2_u8; 20]),
+                "0.25".parse::<Decimal>().expect("amount"),
+            )
+            .expect("transfer must configure");
+        let snapshot = builder
+            .snapshot()
+            .expect("configured transfer must snapshot");
+        assert!(snapshot.value().get("wallet").is_none());
+        assert_eq!(snapshot.value()["scope"]["chain"], "ethereum");
+        assert_eq!(snapshot.value()["scope"]["network"], "mainnet");
+        assert_eq!(
+            snapshot.value()["source"],
+            Address(
+                wallet
+                    .address()
+                    .as_bytes()
+                    .try_into()
+                    .expect("Ethereum wallet address has 20 bytes")
+            )
+            .to_string()
+        );
+        assert_eq!(snapshot.value()["asset"]["kind"], "native");
+        assert_eq!(snapshot.value()["asset"]["decimals"], 18);
+        let json = serde_json::to_vec(&snapshot).expect("snapshot must serialize");
+        let decoded: TransactionSnapshot =
+            serde_json::from_slice(&json).expect("snapshot must deserialize");
+        let restored = wallet
+            .restore(&decoded)
+            .expect("this wallet must restore its snapshot");
+        assert_eq!(restored.snapshot().expect("restored state"), snapshot);
+        let prepared = builder.prepare().await.expect("transaction must sign");
+        assert_eq!(prepared.id().as_str().len(), 66);
+        let submission = wallet
+            .broadcaster()
+            .broadcast(&prepared)
+            .await
+            .expect("transaction must submit");
+        assert_eq!(submission.id, prepared.id().clone());
+    }
+
+    #[tokio::test]
+    async fn sweeps_native_balance_minus_the_maximum_fee() {
+        let rpc = Arc::new(Rpc::Test);
+        let mut wallets = Wallets::new();
+        wallets
+            .register(
+                kind(),
+                WalletProvider::new(
+                    WalletConfig {
+                        scope: scope(),
+                        asset: AssetKind::Native,
+                        decimals: 18,
+                    },
+                    rpc.clone(),
+                    rpc,
+                    Arc::new(EmptyHistory::Fixture),
+                ),
+            )
+            .expect("wallet key must be unique");
+        let wallet = wallets
+            .new_wallet(&kind(), SecretBytes::new([1_u8; 32]))
+            .await
+            .expect("valid local key must create the wallet");
+
+        let prepared = wallet
+            .sweep(BaseAddress::from([2_u8; 20]))
+            .await
+            .expect("balance above the fee ceiling must sweep");
+
+        assert_eq!(
+            prepared.fee,
+            wallets::PreparedFee::Limit(Decimal::from(42_000_000_000_000_u64))
+        );
+        assert_eq!(prepared.transaction.kind(), PREPARED_KIND);
+        assert_eq!(prepared.transaction.id().as_str().len(), 66);
+    }
+
+    #[tokio::test]
+    async fn rejects_native_sweep_when_the_fee_consumes_the_balance() {
+        let rpc = Arc::new(LowBalance::Test);
+        let mut wallets = Wallets::new();
+        wallets
+            .register(
+                kind(),
+                WalletProvider::new(
+                    WalletConfig {
+                        scope: scope(),
+                        asset: AssetKind::Native,
+                        decimals: 18,
+                    },
+                    rpc.clone(),
+                    rpc,
+                    Arc::new(EmptyHistory::Fixture),
+                ),
+            )
+            .expect("wallet key must be unique");
+        let wallet = wallets
+            .new_wallet(&kind(), SecretBytes::new([1_u8; 32]))
+            .await
+            .expect("valid local key must create the wallet");
+
+        let error = wallet
+            .sweep(BaseAddress::from([2_u8; 20]))
+            .await
+            .expect_err("balance below the fee ceiling must fail closed");
+
+        assert_eq!(error.kind, WalletErrorKind::InvalidAmount);
+        assert!(error.message.contains("maximum sweep fee"));
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_another_wallet_network_or_asset() {
+        let rpc = Arc::new(Rpc::Test);
+        let mut wallets = Wallets::new();
+        wallets
+            .register(
+                kind(),
+                WalletProvider::new(
+                    WalletConfig {
+                        scope: scope(),
+                        asset: AssetKind::Native,
+                        decimals: 18,
+                    },
+                    rpc.clone(),
+                    rpc,
+                    Arc::new(EmptyHistory::Fixture),
+                ),
+            )
+            .expect("wallet key must be unique");
+        let wallet = wallets
+            .new_wallet(&kind(), SecretBytes::new([1_u8; 32]))
+            .await
+            .expect("valid local key must create the wallet");
+        let mut builder = wallet.transaction();
+        builder
+            .transfer(
+                BaseAddress::from([2_u8; 20]),
+                "0.25".parse::<Decimal>().expect("amount"),
+            )
+            .expect("transfer must configure");
+        let snapshot = builder.snapshot().expect("transaction must snapshot");
+
+        for (field, value) in [
+            ("network", serde_json::json!("sepolia")),
+            ("asset", serde_json::json!("USDC")),
+        ] {
+            let mut changed = snapshot.value().clone();
+            match field {
+                "network" => changed["scope"]["network"] = value,
+                "asset" => changed["asset"]["ticker"] = value,
+                _ => unreachable!("fixture enumerates known fields"),
+            }
+            let error = wallet
+                .restore(&TransactionSnapshot::new(SNAPSHOT_KIND, changed))
+                .err()
+                .expect("foreign snapshot must fail");
+            assert_eq!(error.kind, TransactionErrorKind::InvalidSnapshot);
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_transfer_is_rejected_without_replacing_the_first_transfer() {
+        let rpc = Arc::new(Rpc::Test);
+        let mut wallets = Wallets::new();
+        wallets
+            .register(
+                kind(),
+                WalletProvider::new(
+                    WalletConfig {
+                        scope: scope(),
+                        asset: AssetKind::Native,
+                        decimals: 18,
+                    },
+                    rpc.clone(),
+                    rpc,
+                    Arc::new(EmptyHistory::Fixture),
+                ),
+            )
+            .expect("wallet key must be unique");
+        let wallet = wallets
+            .new_wallet(&kind(), SecretBytes::new([1_u8; 32]))
+            .await
+            .expect("valid local key must create the wallet");
+        let mut builder = wallet.transaction();
+        builder
+            .transfer(
+                BaseAddress::from([2_u8; 20]),
+                "0.25".parse::<Decimal>().expect("amount"),
+            )
+            .expect("first transfer must configure");
+
+        let error = builder
+            .transfer(
+                BaseAddress::from([3_u8; 20]),
+                "0.5".parse::<Decimal>().expect("amount"),
+            )
+            .expect_err("second transfer must not silently replace the first");
+
+        assert_eq!(error.kind, TransactionErrorKind::Unsupported);
+        assert_eq!(
+            builder.snapshot().expect("first transfer remains").value()["destination"],
+            Address([2_u8; 20]).to_string()
         );
     }
 
-    #[test]
-    fn rejects_token_collection_above_the_available_balance() {
-        let wallet = EthereumWallet::new(31_337, mock_rpc(100, 500));
-        let request = EthereumCollectionRequest::Token {
-            signing_operation_id: operation("requirements-overdrawn-token"),
-            token: EthereumAddress([1; 20]),
-            from: EthereumAddress([2; 20]),
-            key: signer::KeyLocator::Identifier("token-source".to_owned()),
-            destination: EthereumAddress([3; 20]),
-            amount: Some(Wei::from_u128(501)),
-        };
+    #[tokio::test]
+    async fn token_snapshot_binds_contract_and_decimal_configuration() {
+        let rpc = Arc::new(Rpc::Test);
+        let token = Address([9_u8; 20]);
+        let id = "mainnet-usdc";
+        let mut wallets = Wallets::new();
+        wallets
+            .register(
+                id,
+                WalletProvider::new(
+                    WalletConfig {
+                        scope: scope(),
+                        asset: AssetKind::Erc20(token.clone()),
+                        decimals: 6,
+                    },
+                    rpc.clone(),
+                    rpc,
+                    Arc::new(EmptyHistory::Fixture),
+                ),
+            )
+            .expect("wallet key must be unique");
+        let wallet = wallets
+            .new_wallet(&id, SecretBytes::new([1_u8; 32]))
+            .await
+            .expect("valid token configuration must create the wallet");
+        let mut builder = wallet.transaction();
+        builder
+            .transfer(
+                BaseAddress::from([2_u8; 20]),
+                "12.5".parse::<Decimal>().expect("amount"),
+            )
+            .expect("token transfer must configure");
 
-        let error = block_on(wallet.requirements(&request))
-            .expect_err("an overdrawn token collection should be rejected");
+        let snapshot = builder.snapshot().expect("token transfer must snapshot");
 
-        assert_eq!(error.kind, ChainErrorKind::InsufficientFunds);
+        assert_eq!(snapshot.value()["asset"]["kind"], "erc20");
+        assert_eq!(snapshot.value()["asset"]["token"], token.to_string());
+        assert_eq!(snapshot.value()["asset"]["decimals"], 6);
     }
 
-    #[test]
-    fn collects_one_token_transfer_and_returns_attribution() {
-        let signer = LocalSigner::ephemeral_for_testing();
-        let generated = block_on(EthereumAddressGenerator.generate_address(
-            EthereumGenerateAddress::new(
-                31_337,
-                operation("provision-token-source"),
-                "token-source",
-            ),
-            &signer,
-        ))
-        .expect("token source should be generated");
-        let wallet = EthereumWallet::new(31_337, mock_rpc(100, 500));
-        let source = generated.address.clone();
-        let token = EthereumAddress([4; 20]);
-        let submission = block_on(wallet.collect(
-            EthereumCollectionRequest::Token {
-                signing_operation_id: operation("sign-token-collection"),
-                token: token.clone(),
-                from: generated.address,
-                key: generated.key,
-                destination: EthereumAddress([5; 20]),
-                amount: None,
-            },
-            &signer,
-        ))
-        .expect("token collection should succeed");
+    #[tokio::test]
+    async fn prepare_rejects_an_rpc_chain_that_disagrees_with_the_wallet_network() {
+        let rpc = Arc::new(Rpc::Test);
+        let mut wallets = Wallets::new();
+        wallets
+            .register(
+                "sepolia-native",
+                WalletProvider::new(
+                    WalletConfig {
+                        scope: IndexScope {
+                            chain: ChainId(crate::CHAIN.to_owned()),
+                            network: "sepolia".to_owned(),
+                        },
+                        asset: AssetKind::Native,
+                        decimals: 18,
+                    },
+                    rpc.clone(),
+                    rpc,
+                    Arc::new(EmptyHistory::Fixture),
+                ),
+            )
+            .expect("wallet key must be unique");
+        let id = "sepolia-native";
+        let wallet = wallets
+            .new_wallet(&id, SecretBytes::new([1_u8; 32]))
+            .await
+            .expect("valid sepolia configuration must create the wallet");
+        let mut builder = wallet.transaction();
+        builder
+            .transfer(
+                BaseAddress::from([2_u8; 20]),
+                "0.25".parse::<Decimal>().expect("amount"),
+            )
+            .expect("transfer must configure");
 
-        assert_eq!(wallet.rpc().chain_id, 31_337);
-        assert_eq!(wallet.rpc().broadcasts.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            submission.attribution,
-            vec![EthereumCollectionAttribution {
-                address: source,
-                asset: EthereumAsset::Erc20(token),
-                gross_debit: Wei::from_u128(500),
-            }]
-        );
-    }
+        let error = builder
+            .prepare()
+            .await
+            .expect_err("mainnet RPC context must not prepare a sepolia transaction");
 
-    #[test]
-    fn prepares_collection_without_broadcasting_the_signed_envelope() {
-        let signer = LocalSigner::ephemeral_for_testing();
-        let generated = block_on(EthereumAddressGenerator.generate_address(
-            EthereumGenerateAddress::new(
-                31_337,
-                operation("provision-native-source"),
-                "native-source",
-            ),
-            &signer,
-        ))
-        .expect("native source should be generated");
-        let wallet = EthereumWallet::new(31_337, mock_rpc(100, 0));
-        let source = generated.address.clone();
-        let prepared = block_on(wallet.prepare_collection(
-            EthereumCollectionRequest::Native {
-                signing_operation_id: operation("sign-native-collection"),
-                from: generated.address,
-                key: generated.key,
-                destination: EthereumAddress([6; 20]),
-            },
-            &signer,
-        ))
-        .expect("native collection should be prepared");
-
-        assert_eq!(wallet.rpc().broadcasts.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            prepared.transaction.id.0,
-            keccak256(&prepared.transaction.envelope).0
-        );
-        assert_eq!(
-            prepared.attribution,
-            vec![EthereumCollectionAttribution {
-                address: source,
-                asset: EthereumAsset::Native,
-                gross_debit: Wei::from_u128(80),
-            }]
-        );
+        assert_eq!(error.kind, TransactionErrorKind::Divergent);
     }
 }

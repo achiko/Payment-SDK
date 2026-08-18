@@ -2,39 +2,37 @@ use std::{error::Error, future::Future, net::SocketAddr, path::PathBuf};
 
 use crate::{
     config::{
-        BitcoinRepositoryOptions, BitcoinServeOptions, BitcoinSourceOptions, ConfigError,
-        DatabaseOptions, RepositoryOptions, ServeOptions, SourceOptions,
+        BitcoinRepository, BitcoinServe, BitcoinSource, ConfigError as OptionsError, Database,
+        EthereumRepository, EthereumServe, EthereumSource,
     },
     runtime,
 };
-use chain_bitcoin::BitcoinNetwork;
-use http::AuthenticationMode;
-use telemetry::PrometheusTelemetry;
+use chain_bitcoin::Network;
+use http::server::AuthenticationMode;
 
 const DEFAULT_CONFIRMATION_DEPTH: u64 = 12;
 const DEFAULT_REORG_RETENTION: u64 = 50;
 const DEFAULT_RPC_TIMEOUT_SECONDS: u64 = 15;
 const DEFAULT_BITCOIN_RPC_MAX_RESPONSE_BYTES: usize = 268_435_456;
 const DEFAULT_HTTP_PORT: u16 = 8080;
-const DEFAULT_METRICS_PORT: u16 = 9090;
 const DEFAULT_POLL_SECONDS: u64 = 5;
 const DEFAULT_READY_MAX_LAG: u64 = 2;
 const DEFAULT_READY_MAX_AGE_SECONDS: u64 = 30;
 
-/// Error returned when an [`IndexerServiceConfig`] is invalid.
-pub type IndexerServiceConfigError = ConfigError;
+/// Error returned when an [`EthereumConfig`] is invalid.
+pub type ConfigError = OptionsError;
 
-/// Error returned while starting, running, or stopping an [`IndexerService`].
-pub type IndexerServiceError = Box<dyn Error + Send + Sync>;
+/// Error returned while starting, running, or stopping an [`EthereumService`].
+pub type ServiceError = Box<dyn Error + Send + Sync>;
 
 /// Programmatic configuration for one embedded Ethereum Indexer Service.
 ///
-/// [`Self::new`] selects the documented Ethereum v1 defaults. Fields remain
+/// [`Self::new`] selects the documented Ethereum defaults. Fields remain
 /// public so a composition root can intentionally override policy, network,
 /// listener, and readiness settings before constructing the service. This type
 /// deliberately does not implement `Debug`, preventing RPC credentials or a
 /// bearer token from being printed accidentally.
-pub struct IndexerServiceConfig {
+pub struct EthereumConfig {
     pub database_path: PathBuf,
     pub network: String,
     pub bootstrap_height: u64,
@@ -46,7 +44,6 @@ pub struct IndexerServiceConfig {
     pub rpc_ws_url: Option<String>,
     pub rpc_timeout_seconds: u64,
     pub http_bind: SocketAddr,
-    pub metrics_bind: SocketAddr,
     pub authentication_mode: AuthenticationMode,
     pub bearer_token: Option<String>,
     pub upstream_tls_terminated: bool,
@@ -55,8 +52,8 @@ pub struct IndexerServiceConfig {
     pub ready_max_age_seconds: u64,
 }
 
-impl IndexerServiceConfig {
-    /// Creates an Ethereum v1 configuration with loopback listeners and the
+impl EthereumConfig {
+    /// Creates an Ethereum configuration with loopback listeners and the
     /// documented confirmation, retention, polling, and readiness defaults.
     #[must_use]
     pub fn new(
@@ -80,7 +77,6 @@ impl IndexerServiceConfig {
             rpc_ws_url: None,
             rpc_timeout_seconds: DEFAULT_RPC_TIMEOUT_SECONDS,
             http_bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_HTTP_PORT)),
-            metrics_bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_METRICS_PORT)),
             authentication_mode,
             bearer_token: None,
             upstream_tls_terminated: false,
@@ -90,10 +86,10 @@ impl IndexerServiceConfig {
         }
     }
 
-    fn into_serve_options(self) -> ServeOptions {
-        ServeOptions {
-            repository: RepositoryOptions {
-                database: DatabaseOptions {
+    fn into_serve_options(self) -> EthereumServe {
+        EthereumServe {
+            repository: EthereumRepository {
+                database: Database {
                     database_path: self.database_path,
                 },
                 network: self.network,
@@ -101,7 +97,7 @@ impl IndexerServiceConfig {
                 confirmation_depth: self.confirmation_depth,
                 reorg_retention: self.reorg_retention,
             },
-            source: SourceOptions {
+            source: EthereumSource {
                 expected_chain_id: self.expected_chain_id,
                 expected_genesis_hash: self.expected_genesis_hash,
                 rpc_http_url: self.rpc_http_url,
@@ -109,7 +105,6 @@ impl IndexerServiceConfig {
                 rpc_timeout_seconds: self.rpc_timeout_seconds,
             },
             http_bind: self.http_bind,
-            metrics_bind: self.metrics_bind,
             authentication_mode: self.authentication_mode,
             bearer_token: self.bearer_token,
             upstream_tls_terminated: self.upstream_tls_terminated,
@@ -125,8 +120,8 @@ impl IndexerServiceConfig {
 /// Construction validates configuration without opening RocksDB, connecting to
 /// RPC, or binding listeners. Runtime effects begin only when [`Self::run`] or
 /// [`Self::run_until`] is awaited.
-pub struct IndexerService {
-    options: ServeOptions,
+pub struct EthereumService {
+    options: EthereumServe,
 }
 
 /// Programmatic configuration for one embedded Bitcoin Indexer Service.
@@ -136,9 +131,9 @@ pub struct IndexerService {
 /// explicit at every composition root. This type deliberately does not
 /// implement `Debug`, preventing Bitcoin Core credentials or a bearer token
 /// from being printed accidentally.
-pub struct BitcoinIndexerServiceConfig {
+pub struct BitcoinConfig {
     pub database_path: PathBuf,
-    pub network: BitcoinNetwork,
+    pub network: Network,
     pub bootstrap_height: u64,
     pub confirmation_depth: u64,
     pub reorg_retention: u64,
@@ -148,7 +143,6 @@ pub struct BitcoinIndexerServiceConfig {
     pub rpc_timeout_seconds: u64,
     pub rpc_max_response_bytes: usize,
     pub http_bind: SocketAddr,
-    pub metrics_bind: SocketAddr,
     pub authentication_mode: AuthenticationMode,
     pub bearer_token: Option<String>,
     pub upstream_tls_terminated: bool,
@@ -157,14 +151,14 @@ pub struct BitcoinIndexerServiceConfig {
     pub ready_max_age_seconds: u64,
 }
 
-impl BitcoinIndexerServiceConfig {
+impl BitcoinConfig {
     /// Creates a Bitcoin configuration with explicit chain policy and
     /// loopback operational defaults.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         database_path: impl Into<PathBuf>,
-        network: BitcoinNetwork,
+        network: Network,
         bootstrap_height: u64,
         confirmation_depth: u64,
         reorg_retention: u64,
@@ -184,7 +178,6 @@ impl BitcoinIndexerServiceConfig {
             rpc_timeout_seconds: DEFAULT_RPC_TIMEOUT_SECONDS,
             rpc_max_response_bytes: DEFAULT_BITCOIN_RPC_MAX_RESPONSE_BYTES,
             http_bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_HTTP_PORT)),
-            metrics_bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_METRICS_PORT)),
             authentication_mode,
             bearer_token: None,
             upstream_tls_terminated: false,
@@ -194,10 +187,10 @@ impl BitcoinIndexerServiceConfig {
         }
     }
 
-    fn into_serve_options(self) -> BitcoinServeOptions {
-        BitcoinServeOptions {
-            repository: BitcoinRepositoryOptions {
-                database: DatabaseOptions {
+    fn into_serve_options(self) -> BitcoinServe {
+        BitcoinServe {
+            repository: BitcoinRepository {
+                database: Database {
                     database_path: self.database_path,
                 },
                 network: self.network.canonical_name().to_owned(),
@@ -205,7 +198,7 @@ impl BitcoinIndexerServiceConfig {
                 confirmation_depth: self.confirmation_depth,
                 reorg_retention: self.reorg_retention,
             },
-            source: BitcoinSourceOptions {
+            source: BitcoinSource {
                 expected_genesis_hash: self.expected_genesis_hash,
                 rpc_http_url: self.rpc_http_url,
                 rpc_headers: self.rpc_headers,
@@ -213,7 +206,6 @@ impl BitcoinIndexerServiceConfig {
                 rpc_max_response_bytes: self.rpc_max_response_bytes,
             },
             http_bind: self.http_bind,
-            metrics_bind: self.metrics_bind,
             authentication_mode: self.authentication_mode,
             bearer_token: self.bearer_token,
             upstream_tls_terminated: self.upstream_tls_terminated,
@@ -229,39 +221,33 @@ impl BitcoinIndexerServiceConfig {
 /// Construction validates configuration without opening RocksDB, connecting
 /// to Bitcoin Core, or binding listeners. Runtime effects begin only when
 /// [`Self::run`] or [`Self::run_until`] is awaited.
-pub struct BitcoinIndexerService {
-    options: BitcoinServeOptions,
+pub struct BitcoinService {
+    options: BitcoinServe,
 }
 
-impl BitcoinIndexerService {
+impl BitcoinService {
     /// Validates a programmatic Bitcoin configuration and prepares one service.
-    pub fn new(config: BitcoinIndexerServiceConfig) -> Result<Self, IndexerServiceConfigError> {
+    pub fn new(config: BitcoinConfig) -> Result<Self, ConfigError> {
         Self::from_serve_options(config.into_serve_options())
     }
 
-    pub(crate) fn from_serve_options(
-        options: BitcoinServeOptions,
-    ) -> Result<Self, IndexerServiceConfigError> {
+    pub(crate) fn from_serve_options(options: BitcoinServe) -> Result<Self, ConfigError> {
         options.validate()?;
         Ok(Self { options })
     }
 
     /// Runs until Ctrl+C or a supervised task failure.
-    pub async fn run(self, telemetry: PrometheusTelemetry) -> Result<(), IndexerServiceError> {
-        runtime::serve_bitcoin(self.options, telemetry).await
+    pub async fn run(self) -> Result<(), ServiceError> {
+        runtime::serve_bitcoin(self.options).await
     }
 
     /// Runs until the caller-provided shutdown future completes or a
     /// supervised task fails.
-    pub async fn run_until<F>(
-        self,
-        telemetry: PrometheusTelemetry,
-        shutdown: F,
-    ) -> Result<(), IndexerServiceError>
+    pub async fn run_until<F>(self, shutdown: F) -> Result<(), ServiceError>
     where
         F: Future<Output = ()> + Send,
     {
-        runtime::serve_bitcoin_until(self.options, telemetry, async move {
+        runtime::serve_bitcoin_until(self.options, async move {
             shutdown.await;
             Ok(())
         })
@@ -269,25 +255,21 @@ impl BitcoinIndexerService {
     }
 }
 
-impl IndexerService {
+impl EthereumService {
     /// Validates a programmatic configuration and prepares one service.
-    pub fn new(config: IndexerServiceConfig) -> Result<Self, IndexerServiceConfigError> {
+    pub fn new(config: EthereumConfig) -> Result<Self, ConfigError> {
         Self::from_serve_options(config.into_serve_options())
     }
 
-    pub(crate) fn from_serve_options(
-        options: ServeOptions,
-    ) -> Result<Self, IndexerServiceConfigError> {
+    pub(crate) fn from_serve_options(options: EthereumServe) -> Result<Self, ConfigError> {
         options.validate()?;
         Ok(Self { options })
     }
 
     /// Runs until Ctrl+C or a supervised task failure.
     ///
-    /// The caller supplies the process Prometheus adapter explicitly because
-    /// installing a metrics recorder is a process-global side effect.
-    pub async fn run(self, telemetry: PrometheusTelemetry) -> Result<(), IndexerServiceError> {
-        runtime::serve(self.options, telemetry).await
+    pub async fn run(self) -> Result<(), ServiceError> {
+        runtime::serve(self.options).await
     }
 
     /// Runs until the caller-provided shutdown future completes or a
@@ -298,15 +280,11 @@ impl IndexerService {
     /// Configuration validation and the synchronous RocksDB open complete
     /// before `shutdown` is polled. The subsequent asynchronous RPC preflight
     /// and the supervised runtime are cancellation-aware.
-    pub async fn run_until<F>(
-        self,
-        telemetry: PrometheusTelemetry,
-        shutdown: F,
-    ) -> Result<(), IndexerServiceError>
+    pub async fn run_until<F>(self, shutdown: F) -> Result<(), ServiceError>
     where
         F: Future<Output = ()> + Send,
     {
-        runtime::serve_until(self.options, telemetry, async move {
+        runtime::serve_until(self.options, async move {
             shutdown.await;
             Ok(())
         })
@@ -318,8 +296,8 @@ impl IndexerService {
 mod tests {
     use super::*;
 
-    fn config() -> IndexerServiceConfig {
-        IndexerServiceConfig::new(
+    fn config() -> EthereumConfig {
+        EthereumConfig::new(
             "indexer.db",
             "anvil",
             0,
@@ -338,10 +316,6 @@ mod tests {
         assert_eq!(config.reorg_retention, 50);
         assert_eq!(config.rpc_timeout_seconds, 15);
         assert_eq!(config.http_bind, SocketAddr::from(([127, 0, 0, 1], 8080)));
-        assert_eq!(
-            config.metrics_bind,
-            SocketAddr::from(([127, 0, 0, 1], 9090))
-        );
         assert_eq!(config.poll_seconds, 5);
         assert_eq!(config.ready_max_lag, 2);
         assert_eq!(config.ready_max_age_seconds, 30);
@@ -352,7 +326,7 @@ mod tests {
         let mut config = config();
         config.confirmation_depth = 0;
 
-        let error = match IndexerService::new(config) {
+        let error = match EthereumService::new(config) {
             Ok(_) => panic!("zero confirmation depth must be rejected"),
             Err(error) => error,
         };
@@ -363,10 +337,10 @@ mod tests {
         );
     }
 
-    fn bitcoin_config() -> BitcoinIndexerServiceConfig {
-        let mut config = BitcoinIndexerServiceConfig::new(
+    fn bitcoin_config() -> BitcoinConfig {
+        let mut config = BitcoinConfig::new(
             "bitcoin-indexer.db",
-            BitcoinNetwork::Regtest,
+            Network::Regtest,
             0,
             2,
             100,
@@ -385,7 +359,7 @@ mod tests {
 
         assert_eq!(config.confirmation_depth, 2);
         assert_eq!(config.reorg_retention, 100);
-        assert_eq!(config.network, BitcoinNetwork::Regtest);
+        assert_eq!(config.network, Network::Regtest);
         assert_eq!(config.rpc_timeout_seconds, 15);
         assert_eq!(config.rpc_max_response_bytes, 268_435_456);
         assert_eq!(config.http_bind, SocketAddr::from(([127, 0, 0, 1], 8080)));
@@ -396,7 +370,7 @@ mod tests {
         let mut config = bitcoin_config();
         config.reorg_retention = 0;
 
-        let error = match BitcoinIndexerService::new(config) {
+        let error = match BitcoinService::new(config) {
             Ok(_) => panic!("zero Bitcoin reorg retention must be rejected"),
             Err(error) => error,
         };
@@ -411,7 +385,7 @@ mod tests {
     fn strict_services_require_api_authentication_while_core_auth_is_always_required() {
         let mut strict_ethereum = config();
         strict_ethereum.authentication_mode = AuthenticationMode::Strict;
-        let error = match IndexerService::new(strict_ethereum) {
+        let error = match EthereumService::new(strict_ethereum) {
             Ok(_) => panic!("strict Ethereum IX without API authentication must be rejected"),
             Err(error) => error,
         };
@@ -422,7 +396,7 @@ mod tests {
 
         let mut missing_api_auth = bitcoin_config();
         missing_api_auth.bearer_token = None;
-        let error = match BitcoinIndexerService::new(missing_api_auth) {
+        let error = match BitcoinService::new(missing_api_auth) {
             Ok(_) => panic!("Bitcoin IX without API authentication must be rejected"),
             Err(error) => error,
         };
@@ -435,7 +409,7 @@ mod tests {
         missing_core_auth.authentication_mode = AuthenticationMode::GlobalTrusted;
         missing_core_auth.bearer_token = None;
         missing_core_auth.rpc_headers.clear();
-        let error = match BitcoinIndexerService::new(missing_core_auth) {
+        let error = match BitcoinService::new(missing_core_auth) {
             Ok(_) => panic!("Bitcoin IX without Core authentication must be rejected"),
             Err(error) => error,
         };
@@ -449,13 +423,13 @@ mod tests {
     fn global_trusted_services_accept_missing_api_bearers() {
         let mut ethereum = config();
         ethereum.bearer_token = Some("ignored bearer with whitespace".to_owned());
-        IndexerService::new(ethereum)
+        EthereumService::new(ethereum)
             .expect("global-trusted Ethereum IX must not require an API bearer");
 
         let mut bitcoin = bitcoin_config();
         bitcoin.authentication_mode = AuthenticationMode::GlobalTrusted;
         bitcoin.bearer_token = None;
-        BitcoinIndexerService::new(bitcoin)
+        BitcoinService::new(bitcoin)
             .expect("global-trusted Bitcoin IX must not require an API bearer");
     }
 
@@ -464,7 +438,7 @@ mod tests {
         let mut config = config();
         config.http_bind = SocketAddr::from(([0, 0, 0, 0], 8080));
 
-        let error = match IndexerService::new(config) {
+        let error = match EthereumService::new(config) {
             Ok(_) => panic!("non-loopback global-trusted IX must require upstream TLS"),
             Err(error) => error,
         };
@@ -481,7 +455,7 @@ mod tests {
         strict.authentication_mode = AuthenticationMode::Strict;
         strict.bearer_token = Some(secret.to_owned());
 
-        let error = match IndexerService::new(strict) {
+        let error = match EthereumService::new(strict) {
             Ok(_) => panic!("strict IX must reject a malformed bearer"),
             Err(error) => error,
         };

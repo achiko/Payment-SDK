@@ -13,8 +13,8 @@ code.
 Bitcoin PS block-only v1 resolves its address subset: the mandatory policy
 selects P2WPKH or P2TR key-path for newly generated deposits; imported/watch-
 only addresses, additional scripts, and automated orphan-key retirement are
-excluded. See
-[`BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md`](../TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md).
+excluded. These are design constraints, not evidence of a standalone payment
+runtime.
 The following questions remain general or post-v1 decisions.
 
 - Is a wallet one root key, one chain account, one customer, or an accounting
@@ -100,31 +100,35 @@ requires complete transaction interaction. Choose one explicitly:
    structured external data without importing chain types;
 4. treat hardware transaction signing as a separate application workflow.
 
-Do not resolve this by making Bitcoin depend on `signer-trezor` or by teaching
-the base signer contract about Bitcoin transactions.
+Do not resolve this by making Bitcoin depend on a hardware-wallet
+implementation or by teaching the base signer contract about Bitcoin
+transactions.
 
 ## Signing and custody
 
 - Can one transaction require multiple signers or partial signatures?
-- Does a `Signer` instance own one key or a collection addressed by `KeyLocator`?
+- Should a future production signer own one key or a collection addressed by
+  an opaque application-defined locator?
 - Which curves, signature encodings, and recoverability formats are required?
 - Must a signer attest/display the address or transaction intent?
 - What timeout, retry, cancellation, and user-rejection behavior is required?
 - How are signer capabilities and availability cached safely?
 
-## Storage
+## Store
 
 Ethereum IX/PS v1 selects separate RocksDB databases, a serialized conditional
-writer, synchronous atomic batches, explicit record versions/migrations, and a
-staged IX rebuild. Semantic repositories remain the public persistence
-boundary.
+writer, synchronous atomic batches, versioned records, and a staged IX rebuild.
+Semantic repositories remain the public persistence boundary. The RocksDB
+adapter initializes new databases at its current physical schema and rejects
+existing databases with missing or incompatible schema metadata; it exposes no
+in-place schema conversion API.
 
 Bitcoin PS v1 selects one exclusive RocksDB database per network and policy,
 chain-neutral opaque spend-resource IDs in `sdk/deposits`, atomic uniqueness for
 the complete exact-outpoint set, retained non-debug exact selection/envelope
 evidence, and one physical projection batch for the leg/reservations plus all
-affected ledgers and the cursor. The implementation and migration logic are
-present in source with deterministic real-store coverage. This does not prove
+affected ledgers and the cursor. The implementation is present in source with
+deterministic real-store coverage. This does not prove
 the pending composed Core 31 regtest scenario or production operation. V1 does
 not archive signed aggregates or release their per-deposit ownership for a
 second collection.
@@ -134,7 +138,7 @@ second collection.
 - What consistency and isolation guarantees are required?
 - Must block commit, balance materialization, transaction history, watch state,
   and outbox notifications share one atomic commit?
-- How are schema versions and migrations represented without naming a backend?
+- How are incompatible persisted schemas rebuilt or replaced operationally?
 - What idempotency keys prevent duplicate address creation, withdrawals, and
   notifications?
 
@@ -165,12 +169,10 @@ Ethereum v1 keeps reconciliation/delivery loops inside the existing apps and
 uses authenticated versioned HTTP for IX commands/queries plus cursor replay.
 Transport remains at-least-once; repository idempotency makes effects stable.
 
-Bitcoin PS v1 makes the same application-topology selection for a separate
-Bitcoin mode. An explicit multi-deposit batch is one durable job; it may cross
-user IDs only when every durable user belongs to the authenticated exchange
-principal. The database, IX feed, WS, network, asset, policy, and master
-destination remain single-scope. The implemented mode is selected with
-`payment-api bitcoin`; its live Core 31 operational acceptance remains pending.
+Bitcoin payment composition must preserve exact signed bytes, exact-outpoint
+uniqueness, chain/network scope, and index-driven confirmation. The current
+workspace exposes payment orchestration as a library; a complete live Bitcoin
+payment executable and Core acceptance remain future composition work.
 
 - Are reconciliation and event-delivery workers separate executables or loops
   inside `apps/api` and `apps/indexer`?

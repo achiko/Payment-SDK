@@ -16,7 +16,7 @@ pub struct IndexError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IndexErrorKind {
     Source,
-    Storage,
+    Store,
     Conflict,
     ScopeMismatch,
     PolicyMismatch,

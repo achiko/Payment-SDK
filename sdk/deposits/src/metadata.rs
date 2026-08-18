@@ -4,8 +4,7 @@ use crate::{BoxFuture, DepositError};
 
 pub const PAYMENT_SERVICE_OWNER: &str = "payment-service";
 /// Version 4 binds the durable principal-scope model used for ownership and
-/// idempotency. Older bound stores require explicit semantic migration before
-/// the normal runtime may open them.
+/// idempotency.
 pub const PAYMENT_DOMAIN_SCHEMA_VERSION: u16 = 4;
 
 /// Durable authorization-independent model for principal ownership and
@@ -25,7 +24,7 @@ pub struct PolicyIdentity {
 /// Path-global PS identity. One database is permanently bound to one service,
 /// domain schema, chain scope, and active policy identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PaymentDatabaseMetadata {
+pub struct DatabaseIdentity {
     pub service_owner: String,
     pub domain_schema_version: u16,
     pub scope: IndexScope,
@@ -35,49 +34,20 @@ pub struct PaymentDatabaseMetadata {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InitializePaymentDatabase {
+pub struct InitializeDatabase {
     pub scope: IndexScope,
     pub active_policy: PolicyIdentity,
     pub initialized_at: u64,
 }
 
-/// Explicit semantic migration performed only after the application has made
-/// and verified the required physical RocksDB backup.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MigratePaymentDatabase {
-    /// Operator-supplied scope used to bind legacy records that did not retain
-    /// network identity. The concrete Ethereum-only runtime validates this
-    /// assertion before invoking the repository.
-    pub scope: IndexScope,
-    pub active_policy: PolicyIdentity,
-    pub migrated_at: u64,
-    /// Bounds each validation and index-rebuild scan.
-    pub page_size: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PaymentDatabaseMigrationReport {
-    pub metadata: PaymentDatabaseMetadata,
-    pub previous_domain_schema_version: Option<u16>,
-    pub deposits: usize,
-    pub ledger_entries: usize,
-    pub mirrored_observations: usize,
-    pub deposit_observations: usize,
-    pub reconciliation_cases: usize,
-    pub users: usize,
-    pub jobs: usize,
-    pub collections: usize,
-    pub deposit_indexes_rebuilt: usize,
-}
-
-pub trait PaymentDatabaseMetadataStore: Send + Sync {
+pub trait DatabaseInitializer: Send + Sync {
     /// Initializes an empty database or validates the immutable identity
-    /// already present. Existing unbound PS data requires explicit migration;
+    /// already present. Existing unbound PS data is rejected;
     /// an IX-owned database is always rejected.
     fn initialize_or_validate<'a>(
         &'a self,
-        command: InitializePaymentDatabase,
-    ) -> BoxFuture<'a, Result<PaymentDatabaseMetadata, DepositError>> {
+        command: InitializeDatabase,
+    ) -> BoxFuture<'a, Result<DatabaseIdentity, DepositError>> {
         self.initialize_or_validate_principal_scope(command, PrincipalScopeMode::RoleScoped)
     }
 
@@ -85,32 +55,15 @@ pub trait PaymentDatabaseMetadataStore: Send + Sync {
     /// durable principal-scope model.
     fn initialize_or_validate_principal_scope<'a>(
         &'a self,
-        command: InitializePaymentDatabase,
+        command: InitializeDatabase,
         principal_scope_mode: PrincipalScopeMode,
-    ) -> BoxFuture<'a, Result<PaymentDatabaseMetadata, DepositError>>;
-
-    fn database_metadata(
-        &self,
-    ) -> BoxFuture<'_, Result<Option<PaymentDatabaseMetadata>, DepositError>>;
-
-    /// Validates and upgrades existing PS semantic records before binding the
-    /// database to the current owner/schema/scope/policy. Implementations must
-    /// reject IX-owned or mixed stores and must not write metadata until every
-    /// validation and required supplementary-index rebuild succeeds.
-    fn migrate_and_bind<'a>(
-        &'a self,
-        command: MigratePaymentDatabase,
-    ) -> BoxFuture<'a, Result<PaymentDatabaseMigrationReport, DepositError>> {
-        self.migrate_and_bind_principal_scope(command, PrincipalScopeMode::RoleScoped)
-    }
-
-    /// Performs explicit semantic migration while binding the selected
-    /// principal-scope model. Implementations must reject populated mode
-    /// switches because persisted ownership and idempotency identities depend
-    /// on this value.
-    fn migrate_and_bind_principal_scope<'a>(
-        &'a self,
-        command: MigratePaymentDatabase,
-        principal_scope_mode: PrincipalScopeMode,
-    ) -> BoxFuture<'a, Result<PaymentDatabaseMigrationReport, DepositError>>;
+    ) -> BoxFuture<'a, Result<DatabaseIdentity, DepositError>>;
 }
+
+pub trait MetadataReader: Send + Sync {
+    fn database_metadata(&self) -> BoxFuture<'_, Result<Option<DatabaseIdentity>, DepositError>>;
+}
+
+pub trait DatabaseMetadata: DatabaseInitializer + MetadataReader {}
+
+impl<T> DatabaseMetadata for T where T: DatabaseInitializer + MetadataReader {}

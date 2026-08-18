@@ -1,5 +1,5 @@
+use crate::ChainId;
 use crate::{BlockHeight, BlockRef, WatchSelector};
-use chain_identity::ChainId;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IndexScope {

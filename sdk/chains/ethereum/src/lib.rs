@@ -1,52 +1,58 @@
 //! Ethereum-owned contracts and chain-native types.
 
 mod address;
-mod collection;
+mod error;
 mod indexer;
 mod rpc;
 mod transaction;
 mod wallet;
 
-pub use address::{EthereumAddress, EthereumAddressParseError};
-pub use collection::{
-    EthereumCollectionAttribution, EthereumCollectionRequest, EthereumCollectionRequirement,
-    EthereumPreparedCollection,
-};
+pub use address::Address as EthereumAddress;
+pub use address::{Address, AddressParseError};
+pub use error::{ChainError, ChainErrorKind};
 pub use indexer::{
-    EthereumBlock, EthereumBlockInterpreter, EthereumHeadWake, EthereumHttpBlockSource,
-    EthereumIndexRecordCodec, EthereumIndexRpc, EthereumIndexSourceConfig,
-    EthereumIndexingCapabilities, EthereumNewHeadsClient, EthereumNewHeadsConfig,
-    EthereumNewHeadsConnection, EthereumNewHeadsConnectionEvent, EthereumNewHeadsConnector,
-    EthereumUndo, EthereumWatchTarget, TokioTungsteniteNewHeadsConnector, parse_new_heads_wake,
+    Block, BlockClient, BlockInterpreter, Head, HeadConnection, HeadConnector, HeadEvent,
+    HeadsClient, HeadsConfig, Source, SourceConfig, TokioConnector, parse_new_heads_wake,
 };
 pub use rpc::{
-    EthereumHttpRpc, EthereumHttpRpcBuildError, EthereumHttpRpcBuildErrorKind,
-    EthereumHttpRpcConfig, EthereumRpc, EthereumRpcLimits,
+    AccountClient, Accounts, BuildError, BuildErrorKind, Client as RpcClient, HttpAccounts,
+    HttpConfig, HttpTransactions, Limits, TransactionClient, Transactions,
 };
 pub use transaction::{
-    EthereumBuildContext, EthereumEip1559FeeInspection, EthereumEip1559InspectionError,
-    EthereumReceipt, EthereumSignedTransaction, EthereumSignedTransactionError,
-    EthereumTransactionBuilder, EthereumTransactionCodec, EthereumTransactionId,
-    EthereumTransactionIdParseError, EthereumTransactionSigning, EthereumTransferRequest,
-    UnsignedEthereumTransaction,
+    BuildContext, FeeInspection, IdError, InspectionError, Receipt, SignedError, SignedTransaction,
+    TransactionBuilder, TransactionId, TransferRequest, UnsignedTransaction,
 };
-pub use wallet::{EthereumAddressGenerator, EthereumGenerateAddress, EthereumWallet};
+pub use wallet::{WalletConfig, WalletProvider};
 
-use chain_contract::Chain;
+use base::{Asset, Decimal, DecimalError};
+use base::{Chain, ChainCollection, NetworkId, NetworkKind};
 use std::{future::Future, pin::Pin};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-#[derive(Clone, Copy, Debug)]
-pub struct Ethereum;
+/// Canonical chain key shared by metadata, indexing scopes, and persistence.
+pub const CHAIN: &str = "ethereum";
+
+const MAINNET: Chain = Chain::new(NetworkId::new("1", NetworkKind::Mainnet), CHAIN, "ETH");
+const TESTNET: &[(&str, Chain)] = &[(
+    "sepolia",
+    Chain::new(
+        NetworkId::new("11155111", NetworkKind::Testnet),
+        CHAIN,
+        "ETH",
+    ),
+)];
+
+pub const CHAINS: ChainCollection = ChainCollection::new(MAINNET, TESTNET);
+pub const ETH: Asset = Asset::new(MAINNET, "Ethereum", "ETH", 18);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum EthereumAsset {
+pub enum AssetKind {
     Native,
-    Erc20(EthereumAddress),
+    Erc20(Address),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct Wei(pub [u8; 32]);
 
 impl Wei {
@@ -55,6 +61,15 @@ impl Wei {
     #[must_use]
     pub fn from_u128(value: u128) -> Self {
         Self(alloy_primitives::U256::from(value).to_be_bytes())
+    }
+
+    pub fn from_decimal(value: &Decimal) -> Result<Self, DecimalError> {
+        value.to_atomic_be_bytes(ETH.decimals).map(Self)
+    }
+
+    #[must_use]
+    pub fn decimal(&self) -> Decimal {
+        Decimal::from_atomic(num_bigint::BigUint::from_bytes_be(&self.0), ETH.decimals)
     }
 
     #[must_use]
@@ -85,19 +100,19 @@ impl Wei {
     }
 }
 
-impl Chain for Ethereum {
-    const NAME: &'static str = "ethereum";
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
 
-    type Asset = EthereumAsset;
-    type Address = EthereumAddress;
-    type Amount = Wei;
-    type TransactionId = EthereumTransactionId;
-    type GenerateAddressRequest = EthereumGenerateAddress;
-    type TransferRequest = EthereumTransferRequest;
-    type CollectionRequest = EthereumCollectionRequest;
-    type CollectionRequirement = EthereumCollectionRequirement;
-    type CollectionAttribution = EthereumCollectionAttribution;
-    type UnsignedTransaction = UnsignedEthereumTransaction;
-    type SignedTransaction = EthereumSignedTransaction;
-    type Receipt = EthereumReceipt;
+    #[test]
+    fn metadata_uses_the_canonical_chain_key() {
+        assert_eq!(CHAINS.mainnet.name, CHAIN);
+        assert!(
+            CHAINS
+                .testnet
+                .as_slice()
+                .iter()
+                .all(|(_, chain)| chain.name == CHAIN)
+        );
+    }
 }

@@ -8,26 +8,74 @@ own blocks and transactions.
 
 - [`BlockSource`](../sdk/indexing/src/source.rs) exposes the observed tip,
   canonical block at a height, and canonical hash lookup.
-- [`IndexedBlock`](../sdk/indexing/src/block.rs) exposes height, hash, parent
+- [`IndexedBlock`](../sdk/indexing/src/source.rs) exposes height, hash, parent
   hash, and optional timestamp through `BlockRef`.
 - [`BlockInterpreter`](../sdk/indexing/src/source.rs) converts a chain-native
   block and active watch targets into events plus chain-owned undo data.
-- [`IndexRepository`](../sdk/indexing/src/store.rs) persists watches and joins
-  block/undo, observation, confirmation, checkpoint, and feed mutations in one
-  atomic semantic command.
-- [`IndexingWorker`](../sdk/indexing/src/service.rs) exposes sync and checkpoint
+- The focused repository traits in [`store.rs`](../sdk/indexing/src/store.rs)
+  join block/undo, observation, confirmation, checkpoint, and feed mutations in
+  one atomic semantic command without a god repository marker.
+- [`Worker`](../sdk/indexing/src/service.rs) exposes sync and checkpoint
   status to the IX worker.
-- [`ObservationRegistry`](../sdk/indexing/src/service.rs) registers address and
+- [`Watcher`](../sdk/indexing/src/indexer.rs) registers and removes address and
   transaction-ID watches.
-- [`ObservationQuery`](../sdk/indexing/src/service.rs) returns normalized
-  transaction facts by transaction ID or address.
-- [`ObservationEventSource`](../sdk/indexing/src/service.rs) provides durable,
-  cursor-based replay independent of its push/poll transport.
-- [`ProjectionQuery`](../sdk/indexing/src/projection.rs) exposes a chain-owned,
-  generation/revision/checkpoint-fenced opaque projection without leaking
-  physical storage keys.
+- [`Checkpoint`](../sdk/indexing/src/indexer.rs) reads the current canonical
+  boundary used as the birthday for a watch created before an external action.
+- [`History`](../sdk/indexing/src/indexer.rs) returns normalized transaction
+  facts by transaction ID or address.
+- [`Observer`](../sdk/indexing/src/indexer.rs) returns durable cursor-based event
+  pages. It does not create a follow stream.
+- [`OutputQuery`](../sdk/indexing/src/output.rs) is the backend-neutral typed
+  output read contract. Its cursor carries a consistency snapshot and an opaque
+  position; consumers never receive a storage key.
+- `indexing-rocksdb::OutputReader` implements that contract over private
+  generation/revision/checkpoint-fenced records. Generic indexing and concrete
+  chains do not expose byte-key projection contracts.
 - [`ObservationDraft`](../sdk/indexing/src/observation.rs) carries interpreted
   facts before the repository assigns revisions, IDs, and feed cursors.
+
+The concise consumer `Watcher` contract keeps `watch` and `unwatch` together.
+The repository `WatchStore` keeps durable registration and removal together.
+The operations are lifecycle complements; splitting them into independent
+traits would make every real consumer reconstruct the same pair.
+
+Amounts in movements, fees, outputs, and payment projections use
+`base::Decimal`. The value is exact and never floating point. Concrete chain
+interpreters convert native atomic integers at their boundary; indexing does
+not define or persist a competing `AtomicAmount` type.
+
+`indexing_rocksdb::Handle` implements `Checkpoint`, `Watcher`, `History`, and
+`Observer`; `Indexer` is their blanket marker. Its corresponding
+`indexing_rocksdb::Runtime` owns one RocksDB database, the generic ordered sync
+worker, and historical-watch backfills. An embedded composition supplies a
+chain-owned `Source` and `BlockInterpreter`, retains the runtime to call
+`sync(max_blocks)`, and gives only the cloneable handle to business code. This
+keeps record codecs, database keys, and repository mechanics out of concrete
+chain crates and external applications. Bitcoin additionally obtains an
+`OutputReader` through `handle.outputs()` for typed spendable-output queries.
+
+```rust,ignore
+let source = chain_bitcoin::Source::connect(rpc, source_config).await?;
+let interpreter = chain_bitcoin::BlockInterpreter::new(scope.clone(), network)?;
+let runtime = indexing_rocksdb::Runtime::open(
+    "index.db",
+    index_config,
+    source,
+    interpreter,
+)?;
+let indexer: std::sync::Arc<dyn indexing::Indexer> =
+    std::sync::Arc::new(runtime.handle());
+
+// A process-owned loop calls this; business code receives only `indexer`.
+runtime.sync(256).await?;
+```
+
+`Composer::new().with(scope, child)?` performs exact-scope delegation only; duplicate registration returns
+`IndexErrorKind::Conflict` and never replaces the existing child. It does not
+synchronize chains or merge child streams. `EthereumService` and `BitcoinService` in `apps/indexer`
+are the current chain-specific runtime facades. `indexing-http::Remote`
+implements the same consumer traits over the generic router, and payment
+reconciliation connects persisted broadcasts to index events.
 
 The approved Ethereum v1 configuration is detailed in
 [`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md). It processes no mempool state.
@@ -35,6 +83,12 @@ Bitcoin v1 is also block-only. It consumes an unpruned Bitcoin Core 31 source,
 requires a synchronized transaction index, resolves every input previous
 output, and materializes watched canonical UTXOs in the same atomic commit as
 the block, undo, observations, feed rows, and checkpoint.
+
+Bitcoin wallets consume indexed spendable outputs through
+`chain-bitcoin::IndexUtxos`. This chain-owned adapter validates generic facts
+and converts them into native outpoints, satoshis, scripts, confirmation depth,
+and coinbase maturity. The indexing contract therefore remains independent of
+Bitcoin while wallet transaction construction does not depend on RocksDB.
 
 ## Address registration
 
@@ -123,6 +177,10 @@ snapshot without deleting history.
 Undo retention and the maximum supported reorg depth must be explicit. A reorg
 beyond retained undo data is not a normal retry; it requires a controlled
 rebuild from an earlier checkpoint.
+
+Changing confirmation policy or an incompatible physical record schema also
+requires an explicit offline rebuild. It is not an ordinary indexing mutation,
+and there is no public policy-migration command in the indexing contract.
 
 Ethereum v1 retains 50 complete reversible bundles plus one predecessor anchor.
 The parent check is only a sequential fast path: startup, polling, reconnect,

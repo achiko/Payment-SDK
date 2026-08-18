@@ -1,245 +1,237 @@
 # Architecture rules
 
-## Layers
+## Dependency direction
 
 ```text
-apps
-├──> sdk/deposits ──> sdk/indexing ──> sdk/storage
-├──> sdk/chains/<concrete> ──> sdk/{chains/contract, transactions, signing, indexing}
-└──> packages
+apps/*
+  -> sdk/*
+  -> packages/*
 
-sdk/chains/contract ──> sdk/{chains/identity, signing}
-sdk/indexing ──> sdk/{chains/identity, storage}
-sdk/* ──> packages/* where generic transport is required
-packages/* ──> packages/* only
+sdk/chains/{bitcoin,ethereum}
+  -> sdk/chains/base
+  -> sdk/indexing where block interpretation needs neutral facts
+  -> packages/* for generic mechanisms
+
+sdk/indexing/{http,rocksdb}
+  -> sdk/indexing
+
+packages/*
+  -> packages/* only
 ```
 
-`A -> B` in a Cargo graph means “A depends on B.” Therefore the abstraction
-order `storage -> indexing -> bitcoin` appears in Cargo as
-`bitcoin -> indexing -> storage`.
+Cargo arrows mean “depends on.” Dependencies flow from composition toward
+reusable abstractions. `packages/*` never imports `sdk/*` or `apps/*`.
+Concrete chain crates may consume protocol-neutral SDK contracts; generic SDK
+crates may not import a concrete chain.
 
-`apps/`, `sdk/`, and `packages/` are architectural namespaces. Every leaf with
-a `Cargo.toml` is a Cargo package; packages do not sit directly at the
-repository root.
+Applications may depend on any SDK/package needed for composition but may not
+depend on another application. Every Cargo package remains under `apps/`,
+`sdk/`, or `packages/`; do not introduce flat root crates or catch-all
+`core`, `common`, or `utils` packages.
 
 ## Ownership
 
-- `apps/` selects concrete chains, signers, storage, transports, and workers.
-- `apps/api/` is the PS composition root. Its implemented Ethereum and Bitcoin
-  runtime modes each own one scope's user/deposit orchestration, PS RocksDB,
-  policy, jobs, and business workers. A database never mixes Ethereum with
-  Bitcoin or two networks.
-- `apps/custody/` is a loopback-only, ephemeral local-development adapter over
-  `signer-local`; it is not durable or production custody.
-- `apps/indexer/` is the IX composition root and owns its
-  checkpoint/watch/observation DB. Its library facade and thin CLI host the
-  same runtime; embedding does not weaken exclusive database ownership.
-- `apps/wallet/` is the stateless WS composition root and must not select or own
-  a storage backend.
-- `sdk/chains/identity/` owns only opaque cross-process chain, asset, address,
-  transaction, and 256-bit atomic-value identifiers.
-- `sdk/chains/contract/` owns small stateless wallet/transaction capabilities.
-- `sdk/chains/bitcoin/` owns every Bitcoin-specific type and rule.
-- `sdk/chains/ethereum/` owns every Ethereum-specific type and rule.
-- `sdk/transactions/utxo/` owns reusable selection, fee, output, and change
-  algorithms, but no Bitcoin serialization or signing.
-- `sdk/transactions/account/` owns only behavior genuinely shared by
-  account-model transactions.
-- `sdk/signing/` owns chain-independent keys and cryptographic operations.
-- `sdk/indexing/` owns synchronization, checkpoints, watches, changes, and
-  reorg/finality orchestration without knowing a concrete chain.
-- `sdk/deposits/` owns PS-only deposits, observation classification, event-log,
-  accounting-ledger, and durable collection-workflow contracts.
-- `sdk/storage/` owns atomic persistence mechanics without knowing chains or
-  indexer semantics.
-- `packages/` contains code transferable to a non-blockchain project.
+- `apps/indexer` is the runnable Bitcoin/Ethereum Indexer Service composition
+  root. It selects one chain source/interpreter, one RocksDB repository, the
+  generic HTTP router, and worker supervision.
+- `apps/wallet` is the stateless Wallet Service composition root. Its binary
+  can build configured Bitcoin and/or Ethereum wallets, RPC capabilities, and
+  remote Indexer readers from explicit `WS_*` environment variables. With no
+  chain configuration it remains live but truthfully not ready. It owns no
+  storage or production custody policy.
+- `apps/api` owns durable protocol-neutral payment orchestration and HTTP. Its
+  binary composes RocksDB, remote indexing, Bitcoin/Ethereum native wallets,
+  Ethereum ERC-20 wallets, reconciliation, mandatory bearer authentication,
+  and one optional finite local deposit scope. TLS and production custody
+  remain external.
+- `sdk/chains/base` owns only approved protocol-neutral values and small
+  capabilities: address, asset, chain/network, block reference, exact decimal,
+  derivation, key pair, signing, transaction builder, signed transaction, and
+  broadcaster.
+- `sdk/chains/bitcoin` owns every Bitcoin address/network, RPC, UTXO, script,
+  fee, transaction, sighash, witness, signing, and block-interpretation rule.
+- `sdk/chains/ethereum` owns every Ethereum address/network, RPC, nonce, gas,
+  EIP-1559/ERC-20, transaction, signing, receipt/log, and block-interpretation
+  rule.
+- `sdk/wallets` owns the protocol-neutral wallet capabilities, provider
+  boundary, and `Wallets` composition collection.
+- `sdk/indexing` owns chain-neutral watches, transaction facts, output facts,
+  checkpoints, finality, replay, reorg, synchronization, and semantic
+  repository contracts.
+- `sdk/indexing/http` is the chain-neutral remote consumer implementation.
+- `sdk/indexing/rocksdb` implements indexing repository contracts and keeps
+  physical keys, records, and codecs private from chains and applications.
+- `sdk/deposits` owns payment-only deposit, classification, accounting, job,
+  reconciliation, and collection records. Indexing never imports these
+  business meanings.
+- `packages/crypto` owns transferable cryptographic mechanisms without chain,
+  wallet, RPC, custody, or asset policy.
+- `packages/http` and `packages/json-rpc` own generic client/server extensions
+  and JSON-RPC framing, not chain methods or business response DTOs.
+- `packages/storage` owns generic atomic storage mechanics; its RocksDB child
+  supplies the engine without indexing semantics.
 
-The chain deletion test is mandatory: deleting `sdk/chains/bitcoin/` must
-remove every Bitcoin-specific type while leaving signing, UTXO construction,
-indexing, storage, HTTP, and JSON-RPC usable.
+## Shared values and chain deletion
 
-## Explicitly rejected designs
+`base::Address` is opaque bytes. Concrete chains own parsing, display encoding,
+checksum, and network validation. `Decimal` is the only generic monetary
+representation; concrete chains alone convert to and from native integer units
+such as satoshis or wei.
 
-- Do not return to a single flat `crates/` directory.
-- Do not distribute one chain across global `ports`, `domain`, `primitives`, or
-  adapter buckets.
-- Do not create catch-all packages named `core`, `common`, or `utils`.
-- Do not introduce `signing-core`, `signer-bitcoin`, or `signer-ethereum`.
-- Do not place `local.rs` or `trezor.rs` in a chain or wallet directory.
-- Do not let a chain choose or construct a concrete signer.
-- Do not make generic signing depend on transaction, wallet, RPC, or indexer
-  types.
-- Do not introduce a `signing_plan` layer. Use builder, unsigned transaction,
-  and signed transaction states.
-- Do not put concrete Bitcoin or Ethereum RPC methods in generic JSON-RPC.
-- Do not make a storage backend part of generic chain/signing contracts.
-  Applications may select a backend after its semantics are approved; Ethereum
-  IX v1 selects RocksDB through `storage-rocksdb`.
-- Do not assume all account-oriented chains use Ethereum's nonce/value/gas
-  transaction model.
-- Do not name an application `payment-service`; name executables after their
-  actual role, such as `api`, `worker`, or `cli`.
-- Do not add a dependency from a more generic layer to a less generic layer.
+Persisted indexing identities are network-safe: `CanonicalAddress` and
+`TransactionRef` each contain one complete `IndexScope` plus their canonical
+text. Repositories, HTTP adapters, interpreters, wallets, and application
+composition reject an identity whose chain or network differs from its request
+scope. Concrete crates expose one canonical `CHAIN` key and use that same key in
+`Chain` metadata and indexing scopes; ticker abbreviations are display metadata,
+not persistence keys.
 
-## Current dependency graph
+The chain deletion invariant is mandatory: deleting Bitcoin must remove every
+Bitcoin-specific type while leaving base, Ethereum, wallets, indexing,
+deposits, storage, HTTP, JSON-RPC, and crypto usable. The same rule applies to
+every future chain. Generic crates must not contain chain names, tickers,
+address encodings, RPC methods, or transaction DTOs.
+
+## Signing and transactions
+
+The required flow is:
 
 ```text
-apps/api
-├── deposits
-├── indexing + chain-identity
-├── chain-ethereum / chain-bitcoin (signed-transaction inspection)
-├── storage-rocksdb
-└── packages/http + telemetry
-
-apps/custody                        (local development only)
-├── signer + signer-local + signer-remote wire DTOs
-└── packages/http (loopback-only; no storage backend)
-
-apps/indexer                         (chain-specific IX composition)
-├── chain-bitcoin / chain-ethereum
-├── indexing
-├── storage-rocksdb
-└── packages/http + telemetry
-
-apps/wallet
-├── chain-bitcoin / chain-ethereum
-├── authenticated IX client for Bitcoin canonical UTXOs
-├── signer + signer-remote
-└── packages/http + telemetry (no direct storage or DB backend)
-
-chain-bitcoin
-├── chain-contract
-├── transaction-utxo
-├── signer
-├── indexing
-└── json-rpc
-
-chain-ethereum
-├── chain-contract
-├── transaction-account
-├── signer
-├── indexing
-└── json-rpc + packages/http
-
-deposits      -> indexing + chain-identity + signer
-indexing      -> storage + chain-identity
-chain-contract -> chain-identity + signer
-signer-local  -> signer
-signer-remote -> signer (external reqwest transport; no chain dependency)
-signer-trezor -> signer + transport
-json-rpc      -> transport
-http          -> transport
-packages/*    -> packages/* only
+chain-native request
+  -> chain-native builder
+  -> chain computes payload/digest
+  -> injected Signer signs cryptographic data
+  -> chain verifies and assembles exact signed envelope
+  -> persist SignedTransaction
+  -> register transaction watch
+  -> Broadcaster submits exact bytes
+  -> Indexer observes confirmation and reorg state
 ```
 
-## Ethereum Indexer v1 selection
+`Signer` has one signing function and never receives a transaction, RPC client,
+wallet policy, hardware capability, or user-interaction request. `KeyPair` is
+currently the only implementation.
 
-[`docs/INDEXER_SERVICE.md`](./docs/INDEXER_SERVICE.md) is the approved concrete
-selection for the first IX vertical slice. It does not weaken the ownership
-rules above:
+`TransactionBuilder` exposes transfer, versioned JSON snapshot, and prepare.
+`BuilderCast::utxo` provides optional input/change controls without forcing a
+UTXO model onto account chains. `SignedTransaction` is durable data—not an RPC
+handle—and contains a version, chain-owned kind, canonical text ID, and exact
+redacted-debug envelope. `Broadcaster` has one external-effect method.
 
-- `sdk/indexing` owns backend-independent ordered sync and semantic repository
-  commands; the application injects `storage-rocksdb`.
-- `sdk/chains/ethereum` owns Ethereum RPC methods, decoding, and fact drafts.
-- `apps/indexer` selects one Ethereum scope, source, repository, HTTP adapter,
-  telemetry, and worker supervisor. `IndexerService` exposes that composition
-  to an in-process application, while `indexer-worker` delegates to the same
-  library runtime.
-- `sdk/deposits` and `apps/api` own the separate PS database, retry window,
-  event mirror, projection cursor, and reconciliation cases.
-- HTTP reconciliation is authoritative; WebSocket `newHeads` messages are
-  wake-up hints only.
-- One RocksDB owner replaces distributed leasing only for v1. It does not
-  authorize multiple independent writers or claim high availability.
+Bitcoin owns native SegWit v0 P2WPKH and Taproot key-path input validation and
+signing. Ethereum owns chain-ID/build-context validation, EIP-1559 envelopes,
+and signer recovery. Never invent one universal native transaction model.
 
-## Bitcoin block-only v1 selection
+## Wallets
 
-- `sdk/chains/bitcoin` owns Core 31 RPC behavior, input previous-output
-  resolution, per-input/per-output facts, the UTXO record format, and exact
-  transaction signing/broadcast validation.
-- `sdk/indexing` persists only opaque Bitcoin projection mutations and their
-  chain-owned inverse inside the generic atomic block command.
-- `apps/indexer` selects one Bitcoin network, explicit confirmation/reorg
-  policy, one RocksDB owner, authenticated Core transport, HTTP API, telemetry,
-  and worker supervisor.
-- IX materializes canonical UTXOs, PS owns exact-outpoint reservations, and WS
-  verifies the supplied selection against IX before signing. Neither IX nor WS
-  owns reservation or payment workflow state.
-- Bitcoin v1 is block-only and does not claim mempool, conflict, replacement,
-  drop, RBF, or CPFP lifecycle coverage.
+The wallet abstraction combines small capabilities:
 
-## Bitcoin Payment Service block-only v1 selection
+- `Addresser`
+- `AddressFormat`
+- `AmountFormat`
+- `BalanceReader`
+- `TransactionFactory`
+- `CollectionFactory`
+- `Sweeper`
+- `TransactionRestore`
+- `HistoryReader`
+- the one-method `Signer`
 
-[`TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md`](./TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md)
-records the implemented Bitcoin PS decisions and remaining operational
-acceptance boundary. Source and deterministic tests are not Core 31 regtest or
-production-deployment evidence.
+`Provider` creates one concrete wallet from secret bytes. `Wallets<K>` maps an
+application-owned typed key to exactly one provider, rejects duplicate keys at
+startup, and returns `Arc<dyn Wallet>`. Key generation, mnemonic policy, custody, RPC endpoints, and
+authentication belong to application composition, not the wallet trait.
 
-- `apps/api` selects one native-BTC network, one Bitcoin IX feed, one Bitcoin
-  WS, one active policy, and one exclusive PS RocksDB path. It MUST NOT mix
-  Ethereum or multiple Bitcoin networks in that database.
-- `sdk/deposits` owns chain-neutral multi-source collection jobs, durable source
-  reservations, opaque spend-resource uniqueness, allocations, exact-envelope
-  retention, and atomic collection/ledger projection. It MUST NOT import
-  Bitcoin outpoint or transaction types.
-- `sdk/chains/bitcoin` owns canonical outpoints, scripts, transaction decoding,
-  txid/fee/vsize checks, and the chain-native validation used by the Bitcoin PS
-  adapter. IX remains the source of canonical UTXO facts; WS remains the
-  stateless exact-selection signer and broadcaster.
-- An explicit batch may cross user IDs only when every user belongs to the same
-  authenticated exchange principal. It atomically reserves the complete
-  eligible UTXO set for every selected deposit, orders inputs by `(txid, vout)`,
-  and drains to one master output without change.
-- Shared fees use checked proportional largest-remainder allocation by gross
-  input with canonical deposit-ID tie-breaking. The policy has mandatory
-  minimum, confirmation, fee-rate, absolute-fee, and batch-size limits with no
-  permissive financial defaults.
-- UTXO-batch v1 has no generic failure or reservation-release path. An unsigned
-  required reservation remains active and retryable; cancellation/release needs
-  a future explicit safe design.
-- Once durably signed, exact bytes, txid, reservations, allocations, and watch
-  state are retained indefinitely in v1. Recovery may rebroadcast only the same
-  bytes and accept same-txid re-inclusion; it does not sign a replacement or
-  release an outpoint because of time, confirmation, RPC outage, an absent
-  receipt, or IX's separate rollback-retention boundary. This retained per-
-  deposit ownership permits only one Bitcoin collection aggregate per deposit;
-  later receipts remain watched/accounted but are not collectable until a future
-  multi-reservation/archival design exists.
-- Bitcoin PS v1 inherits the block-only IX boundary and excludes mempool/drop/
-  replacement detection, PS-generated RBF replacement, CPFP, fee bumping,
-  PSBT, multisig, and hardware transaction protocols.
+Wallets never wait for receipts. Balance/history use indexing facts, and
+durable callers observe submitted transactions through `Indexer`.
 
-## Ethereum Payment Service v1 selection
+`CollectionFactory::collector` optionally exposes selected-output collection.
+The generic `Collector` accepts source wallets with exact selected outputs,
+one destination, and returns `PreparedCollection` with `PreparedFee::Exact`.
+`SelectedOutput` contains only an indexing `OutputId` plus its scale-zero
+chain-native atomic `Decimal` reservation fence. Scripts and other spend
+evidence remain in the concrete chain.
 
-[`docs/PAYMENT_SERVICE.md`](./docs/PAYMENT_SERVICE.md) records the first
-concrete PS selection without weakening the ownership rules above:
+Bitcoin implements an exact multi-owner drain. It reloads every selected UTXO
+from IX at one checkpoint, rejects duplicates, wrong ownership, and amount
+drift, canonically orders inputs, and signs each input through its owning
+wallet. Account-model draining instead uses the one-method `Sweeper`: Ethereum
+native transfers `balance - maximum fee`, Ethereum tokens transfer their full
+token balance after checking separate native fee capacity, and Bitcoin leaves
+that capability unsupported. Account sweeps return `PreparedFee::Limit`; PS
+persists that ceiling with the signed leg, while IX receipt facts determine
+the factual fee and any residual balance.
 
-- `apps/api` exclusively owns one PS RocksDB path, one Ethereum `IndexScope`,
-  one numeric EVM chain ID, one active policy identity, and one IX feed;
-- `sdk/deposits` owns durable users, jobs, command idempotency, deposits,
-  deposit-to-observation indexes, absolute ledgers, typed reconciliation, and
-  collection aggregates/legs/reservations;
-- PS reaches IX and stateless WS only through semantic HTTP clients and never
-  opens IX storage or custody secret material. Application adapters select the
-  required global authentication mode once: strict mode requires bearer
-  authentication on every repo-owned boundary, while global-trusted mode omits
-  repo-owned bearer authorization and maps every reachable caller to one typed
-  principal;
-- the collection executor persists the exact signed envelope before broadcast,
-  checks its chain ID and configured fee ceilings, and advances durable legs
-  from IX facts; and
-- normal startup validates immutable owner/schema/scope/policy metadata, while
-  explicit migration first creates a verified physical backup, validates
-  semantic records, and rebuilds supplementary indexes before rebinding; and
-- one exclusive writer is an Ethereum v1 constraint, not a claim of HA.
-  Another network requires another process/database until a scope-keyed PS
-  design is approved.
+Concrete chain RPC modules use one shared chain-local client for request
+correlation and focused adapters for method families. Bitcoin separates node,
+fee, and transaction operations; Ethereum separates account and transaction
+operations. Generic HTTP and JSON-RPC transports own endpoint failover,
+timeouts, authentication, and response limits. Applications inject those
+adapters into wallets and workers instead of using a service-locator
+connection.
 
-Authentication remains a transport/application concern. Chain, signing,
-indexing, deposit, transaction, and storage contracts do not accept endpoint,
-header, bearer, TLS, or environment-variable data. Disabling repo-owned bearer
-authorization never disables Core/RPC or vendor custody authentication,
-operation identities, chain-native validation, policy, or durable idempotency.
-Matching HTTP clients validate the sanitized remote mode and fail closed on a
-missing or mismatched value; they never infer or downgrade a mode from an
-absent credential or failed request.
+## Indexing
+
+The consumer surface is intentionally small:
+
+- `Watcher`: watch and unwatch one selector lifecycle;
+- `History`: transaction and address history reads;
+- `Observer`: durable cursor-based revision events;
+- `Indexer`: the marker combining those three traits;
+- `OutputQuery`: a separate optional snapshot-consistent output read.
+
+`Composer` routes consumer calls by exact `IndexScope`; duplicate scopes are a
+conflict. The generic HTTP router uses
+`/v1/scopes/{chain}/{network}/...`. Watch idempotency keys are always supplied
+by callers. `indexing-http::Remote` supports bounded responses, timeouts,
+retry, and multiple endpoints.
+
+Concrete block interpreters produce semantic observation/output changes and
+undo. They do not create RocksDB keys or encoded values. A canonical commit
+atomically covers block effects, undo, checkpoint movement, observation
+revisions, events, and outputs. UTXO transactions remain multiple independent
+movements rather than a fake single sender/recipient amount.
+
+Ordinary indexing APIs expose no physical schema or policy migration command.
+The adapter rejects incompatible data; rebuild/restore is an explicit operator
+operation outside the consumer traits.
+
+## Payment orchestration
+
+`apps/api::Payments` binds each concrete wallet to an exact indexing scope. Its
+durable lifecycle is:
+
+```text
+Requested -> Prepared -> Watched -> Submitted -> Confirmed
+```
+
+Exact signed bytes are persisted before watch registration and broadcast.
+Retries reuse those bytes and the same caller-owned watch identity.
+`Payments::reconcile` consumes revision events and atomically commits payment
+evidence with the per-scope cursor. Confirmation/finality advances state; a
+reorg revision can return it to submitted.
+
+`apps/api::Sweeps` owns account, token-with-gas, and UTXO collection execution
+over a durable collection already created and reserved by `sdk/deposits`.
+`DepositWallets` resolves each
+durable deposit to an already composed abstract wallet without exposing secret
+bytes or key locators; `GasWallet` resolves an application-owned native funding
+wallet. Each ordered leg prepares once, records the exact signed
+transaction and factual fee, registers the idempotent IX transaction watch,
+and only then broadcasts. A lost response retries the stored exact bytes and
+the same watch identity; it never signs again. A token sweep cannot be prepared
+until IX confirms its gas leg. The application allocates the
+scale-zero network fee proportionally by gross participant value using largest
+remainder and deposit-ID tie-breaking, and durably records gross debit, master
+credit, and allocated fee per deposit.
+
+The wallet executable and Payment Service executable are implemented. The
+Payment binary can compose address issuance, watches, observation,
+balance/history, collection planning, and execution from an explicit finite
+map of environment-referenced local keys. The planner accepts stable IDs only;
+it derives policy, destination, amount, and spend resources from configured and
+durable PS/IX state. One process supports one
+optional Bitcoin-native, Ethereum-native, or ERC-20 deposit scope; ERC-20 may
+select a same-scope native gas wallet. This is an application-owned in-process
+resolver, not production custody. Multiple deposit scopes, TLS, HA, and
+live-network readiness remain outside this composition.

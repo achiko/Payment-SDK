@@ -1,8 +1,9 @@
 # Ethereum Indexer Service v1
 
-Status: Ethereum IX implementation baseline and the current single-scope
-Ethereum PS source composition are complete. Opt-in real-node execution and
-production deployment evidence remain pending.
+Status: the Bitcoin and Ethereum IX runtime, generic HTTP surface, remote HTTP
+client, and RocksDB repository are implemented and covered by deterministic
+loopback end-to-end tests. Opt-in real-node execution and production deployment
+evidence remain pending.
 
 This document remains the Ethereum-specific runtime contract. Bitcoin uses the
 same generic repository/reorg/rebuild machinery through the chain-specific
@@ -22,7 +23,7 @@ process downloads every canonical block from a mandatory bootstrap height and
 filters facts against durable address and transaction watches.
 
 The process may be the `indexer-worker` binary or an application embedding the
-`IndexerService` library facade. Both placements run the same runtime and obey
+`EthereumService` library facade. Both placements run the same runtime and obey
 the same single-scope, exclusive-database ownership rules.
 
 V1 indexes:
@@ -60,7 +61,8 @@ never itself canonical evidence.
 
 The persisted chain identity, bootstrap height, confirmation policy, and
 retention policy must match configured values on restart. A mismatch fails
-closed until an explicit migration is run.
+closed and requires an offline rebuild under the new configuration. Ordinary
+indexing does not mutate the meaning of already published facts in place.
 
 One process owns one database. RocksDB's path lock and the storage adapter's
 serialized writer provide the v1 single-owner guarantee. This is not a
@@ -69,50 +71,49 @@ databases for the same scope as independent writers.
 
 ### In-process composition
 
-`IndexerServiceConfig::new` requires the database path, logical network slug,
+`EthereumConfig::new` requires the database path, logical network slug,
 bootstrap height, expected chain ID, expected genesis hash, and authoritative
 HTTP RPC URL. It selects the documented v1 defaults for confirmation,
 retention, polling, loopback listeners, and readiness. Callers may override
 those public configuration fields before validation:
 
 ```rust
-use indexer_worker::{IndexerService, IndexerServiceConfig, PrometheusTelemetry};
+use http::server::AuthenticationMode;
+use indexer_worker::{EthereumConfig, EthereumService};
 
 // Replace this with the actual block-zero hash reported by the target node.
 let genesis_hash =
     "0x0000000000000000000000000000000000000000000000000000000000000000";
-let mut config = IndexerServiceConfig::new(
+let mut config = EthereumConfig::new(
     "./indexer.db",
     "anvil",
     0,
     31_337,
     genesis_hash,
     "http://127.0.0.1:8545",
+    AuthenticationMode::GlobalTrusted,
 );
 // One confirmation is suitable only for this disposable local test.
 config.confirmation_depth = 1;
 
-let service = IndexerService::new(config)?;
-let telemetry = PrometheusTelemetry::install()?;
-service.run(telemetry).await?;
+let service = EthereumService::new(config)?;
+service.run().await?;
 ```
 
 `run()` owns Ctrl+C handling. A larger application should normally call
-`run_until(telemetry, shutdown)` with its existing shutdown future. Startup
-still opens the exclusive RocksDB path, verifies RPC chain identity, uses the
-provided Prometheus adapter, and binds the configured HTTP and metrics
-listeners. The facade does not turn IX into a stateless object like WS.
+`run_until(shutdown)` with its existing shutdown future. Startup opens the
+exclusive RocksDB path, verifies RPC chain identity, and binds the configured
+HTTP listener. The facade does not turn IX into a stateless object like WS.
 Configuration validation and synchronous RocksDB opening finish before the
 shutdown future is polled; asynchronous RPC preflight and the supervised
 runtime are cancellation-aware.
 
-Only one process-global metrics recorder can be installed. Library execution
-therefore requires the host to pass a compatible `PrometheusTelemetry`
-explicitly. A standalone host may call `PrometheusTelemetry::install()`; a host
-that already owns the recorder must construct the adapter from its existing
-handle. Offline backup, migration, rebuild, and cleanup remain explicit
-`indexer-worker` maintenance commands and must not run concurrently with the
-embedded service.
+The current runtime does not install a metrics recorder or expose a metrics
+listener. Operational status and readiness are available through the HTTP API;
+telemetry can be added later by an application-owned adapter without adding
+chain or storage semantics to the indexing contracts. Offline backup, rebuild,
+and cleanup remain explicit `indexer-worker` maintenance commands and must not
+run concurrently with the embedded service.
 
 ## Confirmation policy
 
@@ -182,27 +183,17 @@ IX records are grouped into stable logical namespaces for:
 - append-only event rows and event-ID indexes; and
 - reorg and staged-rebuild progress.
 
-Schema upgrades are ordered and resumable. A binary rejects a newer schema and
-corrupt frames. `migrate schema` handles this physical format registry.
-Maintenance commands create and verify a backup before a mutation. Published
-revision/event journals are never deleted by migration, rebuild, cleanup, or
+Physical record versions belong to the RocksDB adapter. A binary rejects
+missing, older, newer, or corrupt schema metadata. The adapter provides no
+in-place schema conversion; operators create a new database and rebuild it.
+Published revision/event journals are never deleted by rebuild, cleanup, or
 unwatch.
 
-Confirmation depth and rollback retention use the separate `migrate policy`
-path. The operator supplies the exact old values, target values, an idempotency
-key, and an audit reason. One compare-and-swap batch updates repository policy,
-appends an immutable versioned audit row, and moves a checkpointed index to
-`RebuildRequired`. Scope and bootstrap height remain immutable; chain-finality
-cannot be enabled in Ethereum v1. A retry with the same key and payload returns
-the recorded version, while changed payload or stale old values fail closed.
-
-Run policy migration only while the service is stopped, with no staged rebuild
-manifest. A checkpointed repository must be `Ready`; an active revert, replay,
-halt, or rebuild is rejected rather than relabeled. After migration, a
-checkpointed repository requires staged rebuild activation under the target
-configuration before semantic watch/query/feed operations resume. An empty,
-uncheckpointed repository remains `Starting` and can initialize directly under
-the new policy.
+Confirmation depth and rollback retention have no semantic migration command.
+Changing either value requires a new offline rebuild under the target policy.
+The rebuilt generation is validated before activation, so already published
+facts are never relabeled in place. Scope and bootstrap height remain immutable;
+chain-finality cannot be enabled in Ethereum v1.
 
 ## Watch semantics
 
@@ -255,20 +246,21 @@ generations are removed only by explicit cleanup after operational verification.
 The versioned semantic surface is:
 
 ```text
-GET    /v1/scopes/ethereum/{network}/status
-POST   /v1/scopes/ethereum/{network}/watches
-DELETE /v1/scopes/ethereum/{network}/watches/{watch_id}
-GET    /v1/scopes/ethereum/{network}/transactions/{tx_hash}
-GET    /v1/scopes/ethereum/{network}/addresses/{address}/transactions
-GET    /v1/events?after_cursor=...&limit=...
+GET    /v1/scopes/{chain}/{network}/status
+POST   /v1/scopes/{chain}/{network}/watches
+DELETE /v1/scopes/{chain}/{network}/watches/{watch_id}
+GET    /v1/scopes/{chain}/{network}/transactions/{transaction}
+GET    /v1/scopes/{chain}/{network}/addresses/{address}/transactions
+GET    /v1/scopes/{chain}/{network}/events?after_cursor=...&limit=...
+GET    /v1/scopes/{chain}/{network}/addresses/{address}/outputs
 GET    /health/live
 GET    /health/ready
-GET    /metrics                    loopback listener only
 ```
 
 Pagination is exclusive-after, defaults to 100, and is capped at 1,000. JSON
-cursors and other large integers are decimal strings. Atomic amounts are
-32-byte hexadecimal strings. Errors use:
+cursors and other large integers are decimal strings. Monetary values are
+exact `Decimal` strings; each concrete chain validates its native-unit scale.
+Errors use:
 
 ```json
 {
@@ -292,60 +284,37 @@ Readiness requires phase `Ready`, lag no greater than two blocks, and a
 successful canonical reconciliation in the preceding 30 seconds. Liveness only
 reports that the process and supervisor are running.
 
-Direct watch registration keeps repository idempotency mandatory. In strict
-mode the HTTP request must provide its key. In global-trusted mode IX generates
-a UUIDv7 when omitted, persists it before returning, and reports the effective
-identity in the response header and body. Retry-safe callers should still
-provide and reuse their own value because a wholly lost generated response
-cannot identify a later retry.
-
-The loopback Prometheus listener reports checkpoint, remote tip, lag, worker
-phase, published event-feed head, reconciliation/backfill outcomes, source-call
-outcomes and durations, block-commit outcomes and latency, exact or
-beyond-retention reorg depth, and WebSocket enabled/connected/reconnect/failure
-state. It also reports
-`payment_sdk_strict_authentication_mode{service="indexer"}`. Metric labels
-contain sanitized service/network values only; RPC URLs, authorization,
-request bodies, raw block data, and bearer values are never labels.
+Direct watch registration keeps repository idempotency mandatory. Every HTTP
+request must provide a non-empty caller-owned idempotency key in both strict and
+global-trusted modes. IX never invents one: callers must persist and reuse the
+same key so a lost response can be retried safely.
 
 ## Payment Service integration
 
-PS uses a separate database and owns the cross-service retry window:
+PS owns the cross-service retry window. A deposit address is exposed only after
+the durable deposit record exists and IX has acknowledged its caller-owned,
+idempotent address watch. For outgoing payments and sweeps, PS persists the
+exact signed transaction, registers the transaction watch, and only then
+broadcasts. It consumes IX revision events with a durable per-scope cursor;
+confirmation may advance a payment while a later reorg revision may move it
+back to submitted.
 
-1. require IX `Ready` and capture its checkpoint as the birthday;
-2. request a new address through the stateless Wallet Service boundary;
-3. atomically persist the deposit as `AwaitingWatch` plus a zero ledger row;
-4. register the IX watch with a stable idempotency key;
-5. persist `Active { watch_id }`; and
-6. only then return the address.
-
-A worker retries every durable `AwaitingWatch` record. PS mirrors IX events and
-advances an ingestion cursor atomically. A separate projection cursor advances
-only after classification and all affected absolute ledger rows are committed.
-
-If a reorg lowers canonical confirmation below an already credited `accounted`
-amount, PS preserves `accounted`, appends corrected canonical ledger snapshots,
-creates a durable open `PostCreditReorg` reconciliation case, and blocks further
-automatic credit and collection for that deposit. Only an explicit operator
-resolution may close the case.
-
-The backend-independent coordinator and persistent PS repository implement and
-test these atomic transitions. `apps/api` now exposes the authenticated public
-deposit, collection, job, balance, ledger, and observation APIs and runs the
-durable watch-reconciliation, IX-ingestion, business-projection, expiration,
-readiness, and collection/job workers for its one configured Ethereum scope.
-The concrete PS contract and remaining deployment exclusions are documented in
-[`PAYMENT_SERVICE.md`](./PAYMENT_SERVICE.md). IX remains independent of
-`sdk/deposits`.
+`apps/api` provides protocol-neutral orchestration plus a configured payment
+binary. It composes concrete Bitcoin/Ethereum wallets, the remote Indexer
+adapter, payment RocksDB, bearer-authenticated HTTP, and reconciliation. One
+optional finite deposit scope can additionally compose address/watch,
+observation, balance/history, and server-derived collection planning/execution
+for Bitcoin native, Ethereum native, or ERC-20. UTXO planning consumes IX
+outputs only through a stable canonical snapshot. The concrete contract and
+exclusions are documented in [`PAYMENT_SERVICE.md`](./PAYMENT_SERVICE.md). IX
+remains independent of `sdk/deposits`.
 
 ## Operations and validation
 
-The Indexer binary provides `serve`, `backup`, `migrate schema`, `migrate
-policy`, `rebuild`, `rebuild-abort`, and old-generation cleanup commands for
-Ethereum, plus the corresponding nested `bitcoin` command family. Both
-migration modes create and verify the requested backup before mutation. Logs
-and metrics must not contain bearer tokens, RPC authorization, custody values,
-raw signed transactions, or private keys.
+The Indexer binary provides `serve`, `backup`, `rebuild`, `rebuild-abort`, and
+old-generation cleanup commands for Ethereum, plus the corresponding nested
+`bitcoin` command family. Logs must not contain bearer tokens, RPC
+authorization, raw signed transactions, or private keys.
 
 Deterministic tests own exact reorg depths 1, 12, 49, 50, and 51, response-loss
 retry, confirmation on empty blocks, and crash boundaries. A pinned opt-in
@@ -353,3 +322,15 @@ Kurtosis/Disruptoor profile and runbook are checked in for a real pre-finality
 fork, but that resource-intensive scenario is not part of `cargo test` and has
 not yet been executed. It does not assert an exact depth because proposer
 timing makes the fork nondeterministic.
+
+The offline runtime acceptance tests start real loopback Indexer HTTP services,
+deterministic Bitcoin Core and Ethereum JSON-RPC doubles, and a real temporary
+RocksDB repository. They exercise the chain-neutral HTTP adapter through watch
+registration, block ingestion, confirmation, transaction/history/event reads,
+and Bitcoin output reads. Each test then shuts down and reopens the service on
+the same RocksDB path to prove that caller idempotency, history, the event
+cursor, and outputs survive a process restart:
+
+```bash
+mac cargo test --locked -p indexer-worker --test runtime_e2e
+```

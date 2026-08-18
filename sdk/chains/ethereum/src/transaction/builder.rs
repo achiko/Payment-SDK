@@ -1,30 +1,24 @@
 use alloy_primitives::keccak256;
+use base::{Decimal, DecimalError, TransactionFuture};
 
-use crate::{EthereumAddress, Wei};
-use signer::{KeyLocator, OperationId};
+use crate::{Address, Wei};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EthereumTransferRequest {
-    pub signing_operation_id: OperationId,
-    pub key: KeyLocator,
-    pub from: EthereumAddress,
-    pub to: Option<EthereumAddress>,
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TransferRequest {
+    pub from: Address,
+    pub to: Option<Address>,
     pub value: Wei,
     pub data: Vec<u8>,
 }
 
-impl EthereumTransferRequest {
+impl TransferRequest {
+    pub fn native(from: Address, to: Address, value: Decimal) -> Result<Self, DecimalError> {
+        Ok(Self::native_atomic(from, to, Wei::from_decimal(&value)?))
+    }
+
     #[must_use]
-    pub fn native(
-        signing_operation_id: OperationId,
-        key: KeyLocator,
-        from: EthereumAddress,
-        to: EthereumAddress,
-        value: Wei,
-    ) -> Self {
+    pub fn native_atomic(from: Address, to: Address, value: Wei) -> Self {
         Self {
-            signing_operation_id,
-            key,
             from,
             to: Some(to),
             value,
@@ -35,22 +29,13 @@ impl EthereumTransferRequest {
     /// Builds canonical ERC-20 `transfer(address,uint256)` calldata in the
     /// Ethereum crate so transport adapters never own protocol encoding.
     #[must_use]
-    pub fn erc20(
-        signing_operation_id: OperationId,
-        key: KeyLocator,
-        from: EthereumAddress,
-        token: EthereumAddress,
-        recipient: EthereumAddress,
-        amount: Wei,
-    ) -> Self {
+    pub fn erc20(from: Address, token: Address, recipient: Address, amount: Wei) -> Self {
         let mut data = Vec::with_capacity(68);
         data.extend_from_slice(&keccak256("transfer(address,uint256)").0[..4]);
         data.extend_from_slice(&[0; 12]);
         data.extend_from_slice(&recipient.0);
         data.extend_from_slice(&amount.0);
         Self {
-            signing_operation_id,
-            key,
             from,
             to: Some(token),
             value: Wei::ZERO,
@@ -59,8 +44,8 @@ impl EthereumTransferRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EthereumBuildContext {
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BuildContext {
     pub chain_id: u64,
     pub nonce: u64,
     pub gas_limit: u64,
@@ -68,10 +53,33 @@ pub struct EthereumBuildContext {
     pub max_priority_fee_per_gas: Wei,
 }
 
-pub trait EthereumTransactionBuilder: Send + Sync {
-    fn build(
-        &self,
-        request: EthereumTransferRequest,
-        context: EthereumBuildContext,
-    ) -> Result<super::UnsignedEthereumTransaction, chain_contract::ChainError>;
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Builder {
+    request: TransferRequest,
+    context: BuildContext,
+}
+
+impl Builder {
+    #[must_use]
+    pub const fn new(request: TransferRequest, context: BuildContext) -> Self {
+        Self { request, context }
+    }
+
+    pub fn build<'a>(
+        &'a self,
+    ) -> TransactionFuture<'a, Result<super::UnsignedTransaction, crate::ChainError>> {
+        Box::pin(
+            async move { super::operations::build(self.request.clone(), self.context.clone()) },
+        )
+    }
+
+    pub fn sign<'a>(
+        &'a self,
+        signer: &'a dyn base::Signer,
+    ) -> TransactionFuture<'a, Result<super::SignedTransaction, crate::ChainError>> {
+        Box::pin(async move {
+            let unsigned = super::operations::build(self.request.clone(), self.context.clone())?;
+            super::operations::sign(unsigned, signer).await
+        })
+    }
 }

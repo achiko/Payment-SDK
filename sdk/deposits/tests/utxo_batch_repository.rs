@@ -1,39 +1,37 @@
-use chain_identity::{AssetId, AtomicAmount, CanonicalAddress, CanonicalTransactionId, ChainId};
+use base::Decimal;
+use deposits::KeyId;
 use deposits::{
-    AcceptCollectionBroadcast, ApplyResult, AttachCollectionWatch, CloseDeposit,
-    CollectionAllocation, CollectionId, CollectionLegId, CollectionLegKind, CollectionLegState,
-    CollectionPageRequest, CollectionReservationState, CollectionSpendResource,
-    CollectionSpendResourceEvidence, CollectionSpendResourceId, CollectionState, CollectionStore,
-    CollectionTransitionGuard, CommandIdentity, CommandOperation, CommandPrincipal,
-    CreateCollectionLeg, CreateDeposit, CreateDepositWithLedger, CreateJob,
-    CreateUtxoBatchCollection, CreateUtxoBatchCollectionJob, CreateUtxoBatchParticipant, DepositId,
-    DepositLedger, DepositState, DepositStore, EnsureUser, FailCollectionLeg, IdempotencyKey,
-    InitializePaymentDatabase, JobId, JobPageRequest, JobPayload, JobStore, LedgerEffect,
-    LedgerEntryId, MirrorObservation, ObservationConsumerCheckpoints, PaymentDatabaseMetadataStore,
-    PersistentPaymentRepository, PolicyIdentity, ProjectObservation, ProjectUtxoBatchCollection,
-    ProjectionFeeTreatment, RecordObservation, RecordSignedCollectionLeg,
-    ReleaseCollectionReservation, RequestHash, RetryCollectionLeg, SafeCollectionError,
-    SignedEnvelopeBytes, UserId, UserStore, UtxoBatchProjectionTransition,
+    AcceptBroadcast, ApplyResult, AttachWatch, BatchJob, BatchParticipant, CloseDeposit,
+    CollectionAllocation, CollectionCreator, CollectionError, CollectionHistory, CollectionId,
+    CollectionLegKind, CollectionLegState, CollectionQuery, CollectionReader,
+    CollectionReservationState, CollectionRetry, CollectionState, CommandIdentity,
+    CommandOperation, CommandPrincipal, CreateBatch, CreateLeg, DatabaseInitializer,
+    DepositCreator, DepositId, DepositLifecycle, DepositPlan, DepositReader, DepositState, EntryId,
+    EventProjector, FailLeg, IdempotencyKey, InitializeDatabase, JobAssociations, JobCommands,
+    JobId, JobPayload, JobPlan, JobQuery, LedgerEffect, LedgerReader, LegId, LegOutcome,
+    MirrorObservation, OpenDeposit, PaymentStore, PolicyIdentity, ProgressReader, ProjectBatch,
+    ProjectObservation, ProjectionFeeTreatment, RecordObservation, RecordSignature,
+    ReleaseReservation, RequestHash, ResourceId, ResourceProof, RetryLeg, SignedBytes,
+    SpendResource, SubmissionWriter, TransitionGuard, User, UserId, UserStore,
+    UtxoBatchProjectionTransition, WatchQueue,
 };
+use indexing::{AssetId, CanonicalAddress, ChainId, TransactionRef};
 use indexing::{
-    BlockHash, BlockHeight, BlockRef, ConfirmationProof, EventCursor, IndexScope, MovementId,
-    MovementKind, NetworkFee, ObservationEvent, ObservationEventId, ObservationRevision,
-    ObservedTransaction, TransactionStatus, ValueMovement, WatchId,
+    BlockHash, BlockHeight, BlockRef, ConfirmationProof, EventCursor, EventId, IndexScope,
+    MovementId, NetworkFee, ObservationEvent, ObservationRevision, ObservedTransaction,
+    TransactionStatus, ValueMovement, WatchId,
 };
-use signer::KeyLocator;
-use storage_rocksdb::RocksDbStorage;
+use storage_rocksdb::RocksDb;
 use tempfile::TempDir;
 
-type Repository = PersistentPaymentRepository<RocksDbStorage>;
+type Repository = PaymentStore<RocksDb>;
 
-fn amount(value: u64) -> AtomicAmount {
-    let mut bytes = [0_u8; 32];
-    bytes[24..].copy_from_slice(&value.to_be_bytes());
-    AtomicAmount(bytes)
+fn amount(value: u64) -> Decimal {
+    Decimal::from(value)
 }
 
 fn chain() -> ChainId {
-    ChainId("bitcoin".to_owned())
+    ChainId("chain-a".to_owned())
 }
 
 fn asset() -> AssetId {
@@ -45,14 +43,20 @@ fn asset() -> AssetId {
 
 fn address(value: &str) -> CanonicalAddress {
     CanonicalAddress {
-        chain: chain(),
+        scope: IndexScope {
+            chain: chain(),
+            network: "regtest".to_owned(),
+        },
         value: value.to_owned(),
     }
 }
 
-fn transaction(value: &str) -> CanonicalTransactionId {
-    CanonicalTransactionId {
-        chain: chain(),
+fn transaction(value: &str) -> TransactionRef {
+    TransactionRef {
+        scope: IndexScope {
+            chain: chain(),
+            network: "regtest".to_owned(),
+        },
         value: value.to_owned(),
     }
 }
@@ -68,26 +72,26 @@ fn block(height: u64, hash: u8) -> BlockRef {
 
 fn policy() -> PolicyIdentity {
     PolicyIdentity {
-        version: "bitcoin-policy-v1".to_owned(),
+        version: "utxo-policy-v1".to_owned(),
         digest: [11; 32],
     }
 }
 
-fn guard(collection: &deposits::Collection) -> CollectionTransitionGuard {
-    CollectionTransitionGuard {
+fn guard(collection: &deposits::Collection) -> TransitionGuard {
+    TransitionGuard {
         collection_state: collection.state,
         leg_state: collection.legs[0].state.clone(),
     }
 }
 
-fn resource(txid: &str, output_index: u32, value: u64) -> CollectionSpendResource {
-    CollectionSpendResource {
-        id: CollectionSpendResourceId {
+fn resource(txid: &str, output_index: u32, value: u64) -> SpendResource {
+    SpendResource {
+        id: ResourceId {
             transaction_id: transaction(txid),
             output_index,
         },
         amount: amount(value),
-        evidence: CollectionSpendResourceEvidence::new(
+        evidence: ResourceProof::new(
             format!("utxo-evidence-v1:{txid}:{output_index}:{value}").into_bytes(),
         )
         .expect("test evidence is bounded"),
@@ -108,9 +112,9 @@ fn allocation(deposit_id: &str, gross: u64, fee: u64) -> CollectionAllocation {
 fn batch_command(
     collection_id: &str,
     job_id: &str,
-    participants: Vec<(&str, &str, LedgerEntryId, Vec<CollectionSpendResource>)>,
-) -> CreateUtxoBatchCollection {
-    CreateUtxoBatchCollection {
+    participants: Vec<(&str, &str, EntryId, Vec<SpendResource>)>,
+) -> CreateBatch {
+    CreateBatch {
         id: CollectionId(collection_id.to_owned()),
         job_id: JobId(job_id.to_owned()),
         asset: asset(),
@@ -119,26 +123,24 @@ fn batch_command(
         participants: participants
             .into_iter()
             .map(
-                |(user_id, deposit_id, expected_ledger_head, spend_resources)| {
-                    CreateUtxoBatchParticipant {
-                        user_id: UserId(user_id.to_owned()),
-                        deposit_id: DepositId(deposit_id.to_owned()),
-                        expected_ledger_head,
-                        reservation_amount: spend_resources.iter().fold(
-                            AtomicAmount::ZERO,
-                            |total, resource| {
-                                total
-                                    .checked_add(&resource.amount)
-                                    .expect("test resource sum fits")
-                            },
-                        ),
-                        spend_resources,
-                    }
+                |(user_id, deposit_id, expected_ledger_head, spend_resources)| BatchParticipant {
+                    user_id: UserId(user_id.to_owned()),
+                    deposit_id: DepositId(deposit_id.to_owned()),
+                    expected_ledger_head,
+                    reservation_amount: spend_resources.iter().fold(
+                        Decimal::zero(),
+                        |total, resource| {
+                            total
+                                .checked_add(&resource.amount)
+                                .expect("test resource sum fits")
+                        },
+                    ),
+                    spend_resources,
                 },
             )
             .collect(),
-        leg: CreateCollectionLeg {
-            id: CollectionLegId("sweep".to_owned()),
+        leg: CreateLeg {
+            id: LegId("sweep".to_owned()),
             kind: CollectionLegKind::Sweep,
             planned_amount: None,
         },
@@ -146,29 +148,24 @@ fn batch_command(
     }
 }
 
-fn safe_reorg() -> SafeCollectionError {
-    SafeCollectionError {
+fn safe_reorg() -> CollectionError {
+    CollectionError {
         code: "chain_reorg".to_owned(),
-        message: "canonical Bitcoin transaction was reorged".to_owned(),
+        message: "canonical UTXO transaction was reorged".to_owned(),
         retryable: true,
     }
 }
 
-fn deposit_command(
-    id: &str,
-    user: &str,
-    deposit_address: &str,
-    expected: u64,
-) -> CreateDepositWithLedger {
-    CreateDepositWithLedger {
-        deposit: CreateDeposit {
+fn deposit_command(id: &str, user: &str, deposit_address: &str, expected: u64) -> OpenDeposit {
+    OpenDeposit {
+        deposit: DepositPlan {
             id: DepositId(id.to_owned()),
             idempotency_key: IdempotencyKey(format!("create-{id}")),
             user_id: UserId(user.to_owned()),
             asset: asset(),
             address: address(deposit_address),
-            key: KeyLocator::Identifier(format!("key-{id}")),
-            key_purpose: "bitcoin-payment-deposit-v1".to_owned(),
+            key: KeyId::Identifier(format!("key-{id}")),
+            key_purpose: "utxo-payment-deposit-v1".to_owned(),
             expected: amount(expected),
             birthday: BlockHeight(1),
             expires_at: 10_000,
@@ -191,7 +188,7 @@ fn observation(
 ) -> deposits::MirroredObservation {
     deposits::MirroredObservation {
         event: ObservationEvent {
-            id: ObservationEventId(id.to_owned()),
+            id: EventId(id.to_owned()),
             cursor: EventCursor(cursor),
             watch_ids: vec![WatchId("collection-watch".to_owned())],
             previous_status,
@@ -215,21 +212,17 @@ fn observation(
 
 fn input_movements() -> Vec<ValueMovement> {
     vec![
-        ValueMovement {
+        ValueMovement::Input {
             id: MovementId("input-a".to_owned()),
             asset: asset(),
             amount: amount(1_000),
-            from: Some(address("bcrt1qdeposit-a")),
-            to: None,
-            kind: MovementKind::Input,
+            owner: Some(address("bcrt1qdeposit-a")),
         },
-        ValueMovement {
+        ValueMovement::Input {
             id: MovementId("input-b".to_owned()),
             asset: asset(),
             amount: amount(2_000),
-            from: Some(address("bcrt1qdeposit-b")),
-            to: None,
-            kind: MovementKind::Input,
+            owner: Some(address("bcrt1qdeposit-b")),
         },
     ]
 }
@@ -245,11 +238,11 @@ fn collection_network_fee() -> Option<NetworkFee> {
 fn collection_projection(
     event: &deposits::MirroredObservation,
     expected_cursor: Option<EventCursor>,
-    heads: &[deposits::LedgerEntryId],
+    heads: &[deposits::EntryId],
     transition: UtxoBatchProjectionTransition,
-    expected: CollectionTransitionGuard,
-) -> ProjectUtxoBatchCollection {
-    ProjectUtxoBatchCollection {
+    expected: TransitionGuard,
+) -> ProjectBatch {
+    ProjectBatch {
         projection: ProjectObservation {
             expected_cursor,
             through: event.event.cursor,
@@ -282,14 +275,14 @@ fn collection_projection(
             utxo_batch_transition: None,
         },
         collection_id: CollectionId("batch-1".to_owned()),
-        leg_id: CollectionLegId("sweep".to_owned()),
+        leg_id: LegId("sweep".to_owned()),
         expected,
         transaction_id: transaction("collection-tx"),
         transition,
     }
 }
 
-fn appended_heads(outcome: &deposits::UtxoBatchProjectionOutcome) -> Vec<deposits::LedgerEntryId> {
+fn appended_heads(outcome: &deposits::BatchOutcome) -> Vec<deposits::EntryId> {
     outcome
         .projection
         .ledger_results
@@ -306,7 +299,7 @@ fn appended_heads(outcome: &deposits::UtxoBatchProjectionOutcome) -> Vec<deposit
 async fn batch_creation_is_atomic_canonical_and_indexed_for_every_participant()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = Repository::new(RocksDbStorage::open(directory.path())?);
+    let repository = Repository::new(RocksDb::open(directory.path())?);
     let owner = CommandPrincipal("exchange-principal".to_owned());
     let mut initial_heads = std::collections::BTreeMap::new();
     for (user_id, deposit_id, deposit_address, expected) in [
@@ -316,7 +309,7 @@ async fn batch_creation_is_atomic_canonical_and_indexed_for_every_participant()
         ("user-d", "deposit-d", "bcrt1qdeposit-d", 70),
     ] {
         repository
-            .ensure_user(EnsureUser {
+            .ensure_user(User {
                 id: UserId(user_id.to_owned()),
                 owner: owner.clone(),
                 first_seen_at: 1,
@@ -351,15 +344,15 @@ async fn batch_creation_is_atomic_canonical_and_indexed_for_every_participant()
         ),
     ] {
         repository
-            .create_or_replay(CreateJob {
+            .create_or_replay(JobPlan {
                 id: JobId(job_id.to_owned()),
                 command: CommandIdentity {
                     principal: owner.clone(),
-                    operation: CommandOperation::CreateCollection,
+                    operation: CommandOperation::CollectionPlan,
                     client_key: IdempotencyKey(format!("command-{job_id}")),
                     request_hash: RequestHash([job_id.as_bytes()[4]; 32]),
                 },
-                payload: JobPayload::CreateUtxoBatchCollection(CreateUtxoBatchCollectionJob {
+                payload: JobPayload::CreateBatch(BatchJob {
                     collection_id: CollectionId(collection_id.to_owned()),
                     deposit_ids,
                 }),
@@ -425,7 +418,7 @@ async fn batch_creation_is_atomic_canonical_and_indexed_for_every_participant()
         let indexed = repository
             .collections_for_deposit(
                 &participant.reservation.deposit_id,
-                CollectionPageRequest {
+                CollectionQuery {
                     after: None,
                     limit: 10,
                 },
@@ -439,7 +432,7 @@ async fn batch_creation_is_atomic_canonical_and_indexed_for_every_participant()
             repository
                 .collections_for_deposit(
                     &participant.deposit_id,
-                    CollectionPageRequest {
+                    CollectionQuery {
                         after: None,
                         limit: 10,
                     },
@@ -450,7 +443,7 @@ async fn batch_creation_is_atomic_canonical_and_indexed_for_every_participant()
         );
     }
     drop(repository);
-    let reopened = Repository::new(RocksDbStorage::open(directory.path())?);
+    let reopened = Repository::new(RocksDb::open(directory.path())?);
     assert_eq!(
         reopened.collection(&winner.id).await?,
         Some(winner_collection)
@@ -462,10 +455,10 @@ async fn batch_creation_is_atomic_canonical_and_indexed_for_every_participant()
 async fn intervening_ledger_projection_rejects_stale_utxo_reservation_without_partial_state()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = Repository::new(RocksDbStorage::open(directory.path())?);
+    let repository = Repository::new(RocksDb::open(directory.path())?);
     let owner = CommandPrincipal("exchange-principal".to_owned());
     repository
-        .ensure_user(EnsureUser {
+        .ensure_user(User {
             id: UserId("user-a".to_owned()),
             owner: owner.clone(),
             first_seen_at: 1,
@@ -480,15 +473,15 @@ async fn intervening_ledger_projection_rejects_stale_utxo_reservation_without_pa
         ))
         .await?;
     repository
-        .create_or_replay(CreateJob {
+        .create_or_replay(JobPlan {
             id: JobId("job-stale".to_owned()),
             command: CommandIdentity {
                 principal: owner.clone(),
-                operation: CommandOperation::CreateCollection,
+                operation: CommandOperation::CollectionPlan,
                 client_key: IdempotencyKey("command-stale".to_owned()),
                 request_hash: RequestHash([9; 32]),
             },
-            payload: JobPayload::CreateUtxoBatchCollection(CreateUtxoBatchCollectionJob {
+            payload: JobPayload::CreateBatch(BatchJob {
                 collection_id: CollectionId("batch-stale".to_owned()),
                 deposit_ids: vec![created.deposit.id.clone()],
             }),
@@ -508,13 +501,11 @@ async fn intervening_ledger_projection_rejects_stale_utxo_reservation_without_pa
             confirmations: 1,
         },
         None,
-        vec![ValueMovement {
+        vec![ValueMovement::Output {
             id: MovementId("funding-after-selection-output".to_owned()),
             asset: asset(),
             amount: amount(50),
-            from: None,
-            to: Some(created.deposit.address.clone()),
-            kind: MovementKind::Output,
+            owner: Some(created.deposit.address.clone()),
         }],
         None,
     );
@@ -569,7 +560,7 @@ async fn intervening_ledger_projection_rejects_stale_utxo_reservation_without_pa
         repository
             .collections_for_deposit(
                 &created.deposit.id,
-                CollectionPageRequest {
+                CollectionQuery {
                     after: None,
                     limit: 10,
                 },
@@ -591,7 +582,7 @@ async fn intervening_ledger_projection_rejects_stale_utxo_reservation_without_pa
 async fn signed_utxo_batch_rejects_terminal_failure_and_exact_resource_release()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = Repository::new(RocksDbStorage::open(directory.path())?);
+    let repository = Repository::new(RocksDb::open(directory.path())?);
     let owner = CommandPrincipal("exchange-principal".to_owned());
     let mut deposits = Vec::new();
     for (user_id, deposit_id, deposit_address) in [
@@ -599,7 +590,7 @@ async fn signed_utxo_batch_rejects_terminal_failure_and_exact_resource_release()
         ("user-b", "deposit-b", "bcrt1qdeposit-b"),
     ] {
         repository
-            .ensure_user(EnsureUser {
+            .ensure_user(User {
                 id: UserId(user_id.to_owned()),
                 owner: owner.clone(),
                 first_seen_at: 1,
@@ -623,15 +614,15 @@ async fn signed_utxo_batch_rejects_terminal_failure_and_exact_resource_release()
         ("job-b", "batch-b", "deposit-b"),
     ] {
         repository
-            .create_or_replay(CreateJob {
+            .create_or_replay(JobPlan {
                 id: JobId(job_id.to_owned()),
                 command: CommandIdentity {
                     principal: owner.clone(),
-                    operation: CommandOperation::CreateCollection,
+                    operation: CommandOperation::CollectionPlan,
                     client_key: IdempotencyKey(format!("command-{job_id}")),
                     request_hash: RequestHash([job_id.as_bytes()[4]; 32]),
                 },
-                payload: JobPayload::CreateUtxoBatchCollection(CreateUtxoBatchCollectionJob {
+                payload: JobPayload::CreateBatch(BatchJob {
                     collection_id: CollectionId(collection_id.to_owned()),
                     deposit_ids: vec![DepositId(deposit_id.to_owned())],
                 }),
@@ -658,19 +649,20 @@ async fn signed_utxo_batch_rejects_terminal_failure_and_exact_resource_release()
         .collection()
         .clone();
     let signed = repository
-        .record_signed(RecordSignedCollectionLeg {
+        .record_signed(RecordSignature {
             collection_id: created.id.clone(),
             leg_id: created.legs[0].id.clone(),
             expected: guard(&created),
             expected_transaction_id: transaction("collection-tx"),
-            envelope: SignedEnvelopeBytes::new(vec![1, 2, 3, 4])?,
+            envelope: SignedBytes::new(vec![1, 2, 3, 4])?,
             allocations: vec![allocation("deposit-a", 1_000, 10)],
+            fee_limit: None,
             signed_at: 40,
             expires_at: u64::MAX,
         })
         .await?;
     let broadcast = repository
-        .accept_broadcast(AcceptCollectionBroadcast {
+        .accept_broadcast(AcceptBroadcast {
             collection_id: signed.id.clone(),
             leg_id: signed.legs[0].id.clone(),
             expected: guard(&signed),
@@ -690,12 +682,12 @@ async fn signed_utxo_batch_rejects_terminal_failure_and_exact_resource_release()
     assert_eq!(active_close.kind, deposits::DepositErrorKind::InvalidState);
 
     let terminal_failure = repository
-        .fail_leg(FailCollectionLeg {
+        .fail_leg(FailLeg {
             collection_id: broadcast.id.clone(),
             leg_id: broadcast.legs[0].id.clone(),
             expected: guard(&broadcast),
             transaction_id: transaction("collection-tx"),
-            error: SafeCollectionError {
+            error: CollectionError {
                 code: "terminal_failure".to_owned(),
                 message: "test terminal failure".to_owned(),
                 retryable: false,
@@ -709,7 +701,7 @@ async fn signed_utxo_batch_rejects_terminal_failure_and_exact_resource_release()
         deposits::DepositErrorKind::InvalidState
     );
     let release = repository
-        .release_reservation(ReleaseCollectionReservation {
+        .release_reservation(ReleaseReservation {
             collection_id: broadcast.id.clone(),
             expected_collection_state: broadcast.state,
             expected_reservation_state: CollectionReservationState::Active,
@@ -757,10 +749,10 @@ async fn signed_utxo_batch_rejects_terminal_failure_and_exact_resource_release()
 async fn retained_transaction_survives_confirm_reorg_retry_reinclude_and_replay()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = Repository::new(RocksDbStorage::open(directory.path())?);
+    let repository = Repository::new(RocksDb::open(directory.path())?);
     let owner = CommandPrincipal("exchange-principal".to_owned());
     repository
-        .initialize_or_validate(InitializePaymentDatabase {
+        .initialize_or_validate(InitializeDatabase {
             scope: IndexScope {
                 chain: chain(),
                 network: "regtest".to_owned(),
@@ -771,7 +763,7 @@ async fn retained_transaction_survives_confirm_reorg_retry_reinclude_and_replay(
         .await?;
     for user in ["user-a", "user-b"] {
         repository
-            .ensure_user(EnsureUser {
+            .ensure_user(User {
                 id: UserId(user.to_owned()),
                 owner: owner.clone(),
                 first_seen_at: 2,
@@ -809,15 +801,15 @@ async fn retained_transaction_survives_confirm_reorg_retry_reinclude_and_replay(
         )
         .await?;
     let job = repository
-        .create_or_replay(CreateJob {
+        .create_or_replay(JobPlan {
             id: JobId("batch-job".to_owned()),
             command: CommandIdentity {
                 principal: owner.clone(),
-                operation: CommandOperation::CreateCollection,
+                operation: CommandOperation::CollectionPlan,
                 client_key: IdempotencyKey("batch-command".to_owned()),
                 request_hash: RequestHash([3; 32]),
             },
-            payload: JobPayload::CreateUtxoBatchCollection(CreateUtxoBatchCollectionJob {
+            payload: JobPayload::CreateBatch(BatchJob {
                 collection_id: CollectionId("batch-1".to_owned()),
                 deposit_ids: vec![deposit_a.deposit.id.clone(), deposit_b.deposit.id.clone()],
             }),
@@ -833,7 +825,7 @@ async fn retained_transaction_survives_confirm_reorg_retry_reinclude_and_replay(
             repository
                 .jobs_for_user(
                     &UserId(user_id.to_owned()),
-                    JobPageRequest {
+                    JobQuery {
                         after: None,
                         limit: 10,
                     },
@@ -858,21 +850,17 @@ async fn retained_transaction_survives_confirm_reorg_retry_reinclude_and_replay(
         },
         None,
         vec![
-            ValueMovement {
+            ValueMovement::Output {
                 id: MovementId("fund-a".to_owned()),
                 asset: asset(),
                 amount: amount(1_000),
-                from: None,
-                to: Some(deposit_a.deposit.address.clone()),
-                kind: MovementKind::Output,
+                owner: Some(deposit_a.deposit.address.clone()),
             },
-            ValueMovement {
+            ValueMovement::Output {
                 id: MovementId("fund-b".to_owned()),
                 asset: asset(),
                 amount: amount(2_000),
-                from: None,
-                to: Some(deposit_b.deposit.address.clone()),
-                kind: MovementKind::Output,
+                owner: Some(deposit_b.deposit.address.clone()),
             },
         ],
         None,
@@ -946,7 +934,7 @@ async fn retained_transaction_survives_confirm_reorg_retry_reinclude_and_replay(
         .clone();
     assert_eq!(
         repository
-            .active_collection_for(&created.deposit_id, &created.asset)
+            .active_collection_for(created.deposit_id(), &created.asset)
             .await?,
         Some(created.clone())
     );
@@ -962,19 +950,20 @@ async fn retained_transaction_survives_confirm_reorg_retry_reinclude_and_replay(
         allocation("deposit-b", 2_000, 20),
     ];
     let signed = repository
-        .record_signed(RecordSignedCollectionLeg {
+        .record_signed(RecordSignature {
             collection_id: created.id.clone(),
             leg_id: created.legs[0].id.clone(),
             expected: guard(&created),
             expected_transaction_id: transaction("collection-tx"),
-            envelope: SignedEnvelopeBytes::new(vec![1, 2, 3, 4])?,
+            envelope: SignedBytes::new(vec![1, 2, 3, 4])?,
             allocations: allocations.clone(),
+            fee_limit: None,
             signed_at: 40,
             expires_at: 10_000,
         })
         .await?;
     let broadcast = repository
-        .accept_broadcast(AcceptCollectionBroadcast {
+        .accept_broadcast(AcceptBroadcast {
             collection_id: signed.id.clone(),
             leg_id: signed.legs[0].id.clone(),
             expected: guard(&signed),
@@ -989,7 +978,7 @@ async fn retained_transaction_survives_confirm_reorg_retry_reinclude_and_replay(
             .is_some()
     );
     let mut collection = repository
-        .attach_watch(AttachCollectionWatch {
+        .attach_watch(AttachWatch {
             collection_id: broadcast.id.clone(),
             leg_id: broadcast.legs[0].id.clone(),
             expected: guard(&broadcast),
@@ -1026,7 +1015,7 @@ async fn retained_transaction_survives_confirm_reorg_retry_reinclude_and_replay(
         })
         .await?;
     let mut stale_heads = heads.clone();
-    stale_heads[1] = deposits::LedgerEntryId("stale-head".to_owned());
+    stale_heads[1] = deposits::EntryId("stale-head".to_owned());
     let atomic_error = repository
         .project_utxo_batch_and_advance(collection_projection(
             &confirmed,
@@ -1084,13 +1073,13 @@ async fn retained_transaction_survives_confirm_reorg_retry_reinclude_and_replay(
     )));
     assert!(
         repository
-            .active_collection_for(&collection.deposit_id, &collection.asset)
+            .active_collection_for(collection.deposit_id(), &collection.asset)
             .await?
             .is_none()
     );
     assert_eq!(
         repository
-            .retained_collection_for(&collection.deposit_id, &collection.asset)
+            .retained_collection_for(collection.deposit_id(), &collection.asset)
             .await?,
         Some(collection.clone())
     );
@@ -1102,11 +1091,11 @@ async fn retained_transaction_survives_confirm_reorg_retry_reinclude_and_replay(
             .current(&deposit_id)
             .await?
             .expect("participant ledger exists");
-        assert_eq!(ledger.balances.balance, AtomicAmount::ZERO);
-        assert_ne!(ledger.balances.collected, AtomicAmount::ZERO);
+        assert_eq!(ledger.balances.balance, Decimal::zero());
+        assert_ne!(ledger.balances.collected, Decimal::zero());
         assert_eq!(
             match &ledger.cause {
-                deposits::LedgerEntryCause::Observation { network_fee, .. } => *network_fee,
+                deposits::LedgerEntryCause::Observation { network_fee, .. } => network_fee.clone(),
                 _ => None,
             },
             None,
@@ -1194,12 +1183,12 @@ async fn retained_transaction_survives_confirm_reorg_retry_reinclude_and_replay(
     );
     assert_eq!(
         repository
-            .active_collection_for(&collection.deposit_id, &collection.asset)
+            .active_collection_for(collection.deposit_id(), &collection.asset)
             .await?,
         Some(collection.clone())
     );
     let release_error = repository
-        .release_reservation(ReleaseCollectionReservation {
+        .release_reservation(ReleaseReservation {
             collection_id: collection.id.clone(),
             expected_collection_state: CollectionState::Reorged,
             expected_reservation_state: CollectionReservationState::Active,
@@ -1214,7 +1203,7 @@ async fn retained_transaction_survives_confirm_reorg_retry_reinclude_and_replay(
         .signed_envelope(&collection.id, &collection.legs[0].id)
         .await?
         .expect("reorg retains the exact signed envelope");
-    let retry_command = RetryCollectionLeg {
+    let retry_command = RetryLeg {
         collection_id: collection.id.clone(),
         leg_id: collection.legs[0].id.clone(),
         expected: guard(&collection),
@@ -1237,7 +1226,7 @@ async fn retained_transaction_survives_confirm_reorg_retry_reinclude_and_replay(
             == retained_before_retry.bytes
     );
     collection = repository
-        .accept_broadcast(AcceptCollectionBroadcast {
+        .accept_broadcast(AcceptBroadcast {
             collection_id: collection.id.clone(),
             leg_id: collection.legs[0].id.clone(),
             expected: guard(&collection),
@@ -1397,13 +1386,13 @@ async fn retained_transaction_survives_confirm_reorg_retry_reinclude_and_replay(
         repository
             .signed_envelope(
                 &CollectionId("batch-1".to_owned()),
-                &CollectionLegId("sweep".to_owned())
+                &LegId("sweep".to_owned())
             )
             .await?
             .is_some()
     );
     drop(repository);
-    let reopened = Repository::new(RocksDbStorage::open(directory.path())?);
+    let reopened = Repository::new(RocksDb::open(directory.path())?);
     assert_eq!(
         reopened
             .collection(&CollectionId("batch-1".to_owned()))
@@ -1414,7 +1403,7 @@ async fn retained_transaction_survives_confirm_reorg_retry_reinclude_and_replay(
         reopened
             .signed_envelope(
                 &CollectionId("batch-1".to_owned()),
-                &CollectionLegId("sweep".to_owned())
+                &LegId("sweep".to_owned())
             )
             .await?
             .is_some()
@@ -1424,7 +1413,7 @@ async fn retained_transaction_survives_confirm_reorg_retry_reinclude_and_replay(
             reopened
                 .jobs_for_user(
                     &UserId(user_id.to_owned()),
-                    JobPageRequest {
+                    JobQuery {
                         after: None,
                         limit: 10,
                     },

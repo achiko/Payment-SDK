@@ -1,6 +1,7 @@
-use crate::{BoxFuture, DepositError, DepositId, JobId, LedgerEntryId, PolicyIdentity, UserId};
-use chain_identity::{AssetId, AtomicAmount, CanonicalAddress, CanonicalTransactionId};
+use crate::{BoxFuture, DepositError, DepositId, EntryId, JobId, PolicyIdentity, UserId};
+use base::Decimal;
 use indexing::WatchId;
+use indexing::{AssetId, CanonicalAddress, TransactionRef};
 use std::fmt;
 
 /// Maximum opaque signed transaction size accepted by PS persistence.
@@ -19,7 +20,7 @@ pub const MAX_TOTAL_SPEND_RESOURCE_EVIDENCE_BYTES: usize = 8 * 1024 * 1024;
 pub struct CollectionId(pub String);
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CollectionLegId(pub String);
+pub struct LegId(pub String);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CollectionMode {
@@ -51,26 +52,16 @@ pub enum CollectionLegKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CollectionLegState {
     Required,
-    Signed {
-        transaction_id: CanonicalTransactionId,
-    },
-    Broadcast {
-        transaction_id: CanonicalTransactionId,
-    },
-    Confirmed {
-        transaction_id: CanonicalTransactionId,
-    },
-    Failed {
-        transaction_id: CanonicalTransactionId,
-    },
-    Reorged {
-        transaction_id: CanonicalTransactionId,
-    },
+    Signed { transaction_id: TransactionRef },
+    Broadcast { transaction_id: TransactionRef },
+    Confirmed { transaction_id: TransactionRef },
+    Failed { transaction_id: TransactionRef },
+    Reorged { transaction_id: TransactionRef },
 }
 
 impl CollectionLegState {
     #[must_use]
-    pub const fn transaction_id(&self) -> Option<&CanonicalTransactionId> {
+    pub const fn transaction_id(&self) -> Option<&TransactionRef> {
         match self {
             Self::Required => None,
             Self::Signed { transaction_id }
@@ -86,7 +77,7 @@ impl CollectionLegState {
 /// Credentials, signed envelopes, RPC URLs, and custody details must never be
 /// placed in this record.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SafeCollectionError {
+pub struct CollectionError {
     pub code: String,
     pub message: String,
     pub retryable: bool,
@@ -102,7 +93,7 @@ pub enum ReservationReleaseReason {
 pub enum CollectionReservationState {
     Active,
     Consumed {
-        transaction_id: CanonicalTransactionId,
+        transaction_id: TransactionRef,
         consumed_at: u64,
     },
     Released {
@@ -115,16 +106,16 @@ pub enum CollectionReservationState {
 pub struct CollectionReservation {
     pub deposit_id: DepositId,
     pub asset: AssetId,
-    pub amount: AtomicAmount,
+    pub amount: Decimal,
     pub state: CollectionReservationState,
 }
 
 /// Exact UTXO spend-resource identity. Output indexes are interpreted in the
 /// transaction identified by `transaction_id`; string-only or address-level
-/// reservations are deliberately insufficient for Bitcoin collection.
+/// reservations are deliberately insufficient for UTXO collection.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CollectionSpendResourceId {
-    pub transaction_id: CanonicalTransactionId,
+pub struct ResourceId {
+    pub transaction_id: TransactionRef,
     pub output_index: u32,
 }
 
@@ -132,18 +123,18 @@ pub struct CollectionSpendResourceId {
 /// Its redacting `Debug` implementation reports only byte length so chain
 /// evidence cannot enter ordinary diagnostic output.
 #[derive(Clone, PartialEq, Eq)]
-pub struct CollectionSpendResourceEvidence(Vec<u8>);
+pub struct ResourceProof(Vec<u8>);
 
-impl fmt::Debug for CollectionSpendResourceEvidence {
+impl fmt::Debug for ResourceProof {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("CollectionSpendResourceEvidence")
+            .debug_struct("ResourceProof")
             .field("byte_len", &self.0.len())
             .finish_non_exhaustive()
     }
 }
 
-impl CollectionSpendResourceEvidence {
+impl ResourceProof {
     /// Creates non-empty bounded replay evidence.
     ///
     /// # Errors
@@ -173,22 +164,22 @@ impl CollectionSpendResourceEvidence {
 /// integer PS policy input. Persistence validates that the participant's
 /// reservation is exactly the checked sum of its resources.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CollectionSpendResource {
-    pub id: CollectionSpendResourceId,
-    pub amount: AtomicAmount,
-    pub evidence: CollectionSpendResourceEvidence,
+pub struct SpendResource {
+    pub id: ResourceId,
+    pub amount: Decimal,
+    pub evidence: ResourceProof,
 }
 
 /// One deposit participating in a collection aggregate.
 ///
 /// Account-model collections contain exactly one participant with no exact
-/// spend resources. A Bitcoin UTXO batch contains one or more participants,
+/// spend resources. A UTXO batch contains one or more participants,
 /// each with one or more canonically ordered outpoint reservations.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectionParticipant {
     pub user_id: UserId,
     pub reservation: CollectionReservation,
-    pub spend_resources: Vec<CollectionSpendResource>,
+    pub spend_resources: Vec<SpendResource>,
 }
 
 /// Confirmed factual attribution for the sweep transaction.
@@ -199,24 +190,24 @@ pub struct CollectionParticipant {
 pub struct CollectionAllocation {
     pub deposit_id: DepositId,
     pub asset: AssetId,
-    pub gross_debit: AtomicAmount,
-    pub master_credit: AtomicAmount,
+    pub gross_debit: Decimal,
+    pub master_credit: Decimal,
     pub allocated_fee_asset: AssetId,
-    pub allocated_fee: AtomicAmount,
+    pub allocated_fee: Decimal,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectionLeg {
-    pub id: CollectionLegId,
+    pub id: LegId,
     /// Stable zero-based execution order within the aggregate.
     pub position: u16,
     pub kind: CollectionLegKind,
-    /// PS-owned amount fixed before execution when this leg transfers value
-    /// outside the reserved collection asset. Ethereum gas funding uses this
-    /// field so a restart cannot silently change the prefund amount after the
-    /// durable workflow has been created. Sweep value is represented by the
-    /// aggregate reservation and therefore leaves this field empty.
-    pub planned_amount: Option<AtomicAmount>,
+    /// PS-owned amount fixed before execution. For gas funding this is the
+    /// transferred amount. For an account-model sweep this is the signed
+    /// transaction's maximum native fee, not the factual receipt fee. UTXO
+    /// sweep value is represented by the aggregate reservation and leaves this
+    /// field empty.
+    pub planned_amount: Option<Decimal>,
     pub state: CollectionLegState,
     /// Durable IX watch registration, retained after terminal state changes.
     pub watch_id: Option<WatchId>,
@@ -224,10 +215,10 @@ pub struct CollectionLeg {
     /// Compatibility projection for one-source account-model callers. It is
     /// `Some` exactly when `allocations` contains one item.
     pub allocation: Option<CollectionAllocation>,
-    /// Factual per-deposit attribution. Bitcoin batches require one allocation
+    /// Factual per-deposit attribution. UTXO batches require one allocation
     /// for every participant in canonical participant order.
     pub allocations: Vec<CollectionAllocation>,
-    pub last_error: Option<SafeCollectionError>,
+    pub last_error: Option<CollectionError>,
     pub updated_at: u64,
 }
 
@@ -236,26 +227,43 @@ pub struct Collection {
     pub id: CollectionId,
     /// Stable association with the durable command job that created it.
     pub job_id: JobId,
-    pub user_id: UserId,
-    pub deposit_id: DepositId,
     pub mode: CollectionMode,
     pub asset: AssetId,
     pub destination: CanonicalAddress,
     pub policy: PolicyIdentity,
     pub state: CollectionState,
-    pub reservation: CollectionReservation,
-    /// Canonically ordered participant reservations. The legacy
-    /// `user_id`/`deposit_id`/`reservation` fields mirror the first participant
-    /// so existing one-source Ethereum callers remain source compatible.
+    /// Canonically ordered participant reservations.
     pub participants: Vec<CollectionParticipant>,
     pub legs: Vec<CollectionLeg>,
     pub attempt_count: u32,
-    pub last_error: Option<SafeCollectionError>,
+    pub last_error: Option<CollectionError>,
     pub created_at: u64,
     pub updated_at: u64,
 }
 
 impl Collection {
+    #[must_use]
+    pub fn primary(&self) -> &CollectionParticipant {
+        self.participants
+            .first()
+            .expect("a validated collection always has a primary participant")
+    }
+
+    #[must_use]
+    pub fn user_id(&self) -> &UserId {
+        &self.primary().user_id
+    }
+
+    #[must_use]
+    pub fn deposit_id(&self) -> &DepositId {
+        &self.primary().reservation.deposit_id
+    }
+
+    #[must_use]
+    pub fn reservation(&self) -> &CollectionReservation {
+        &self.primary().reservation
+    }
+
     #[must_use]
     pub fn participant(&self, deposit_id: &DepositId) -> Option<&CollectionParticipant> {
         self.participants
@@ -265,15 +273,15 @@ impl Collection {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CreateCollectionLeg {
-    pub id: CollectionLegId,
+pub struct CreateLeg {
+    pub id: LegId,
     pub kind: CollectionLegKind,
     /// Required and positive for `GasFunding`; forbidden for `Sweep`.
-    pub planned_amount: Option<AtomicAmount>,
+    pub planned_amount: Option<Decimal>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CreateCollection {
+pub struct CollectionPlan {
     pub id: CollectionId,
     pub job_id: JobId,
     pub user_id: UserId,
@@ -282,35 +290,35 @@ pub struct CreateCollection {
     pub asset: AssetId,
     pub destination: CanonicalAddress,
     pub policy: PolicyIdentity,
-    pub reservation_amount: AtomicAmount,
-    pub legs: Vec<CreateCollectionLeg>,
+    pub reservation_amount: Decimal,
+    pub legs: Vec<CreateLeg>,
     pub created_at: u64,
 }
 
-/// One participant supplied when atomically creating a Bitcoin UTXO batch.
+/// One participant supplied when atomically creating a UTXO batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CreateUtxoBatchParticipant {
+pub struct BatchParticipant {
     pub user_id: UserId,
     pub deposit_id: DepositId,
     /// Ledger head against which the caller selected and approved these exact
     /// spend resources. Creation atomically fences every participant head so
     /// an intervening IX projection cannot leave a stale UTXO reservation.
-    pub expected_ledger_head: LedgerEntryId,
-    pub reservation_amount: AtomicAmount,
-    pub spend_resources: Vec<CollectionSpendResource>,
+    pub expected_ledger_head: EntryId,
+    pub reservation_amount: Decimal,
+    pub spend_resources: Vec<SpendResource>,
 }
 
-/// Creates one Bitcoin collection aggregate over an exact, canonically
+/// Creates one UTXO collection aggregate over an exact, canonically
 /// ordered set of participant outpoints.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CreateUtxoBatchCollection {
+pub struct CreateBatch {
     pub id: CollectionId,
     pub job_id: JobId,
     pub asset: AssetId,
     pub destination: CanonicalAddress,
     pub policy: PolicyIdentity,
-    pub participants: Vec<CreateUtxoBatchParticipant>,
-    pub leg: CreateCollectionLeg,
+    pub participants: Vec<BatchParticipant>,
+    pub leg: CreateLeg,
     pub created_at: u64,
 }
 
@@ -330,7 +338,7 @@ impl CreateCollectionOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CollectionTransitionGuard {
+pub struct TransitionGuard {
     pub collection_state: CollectionState,
     pub leg_state: CollectionLegState,
 }
@@ -338,9 +346,9 @@ pub struct CollectionTransitionGuard {
 /// Opaque signed chain-native bytes. This type intentionally has no `Debug`
 /// implementation so envelopes cannot enter ordinary diagnostic output.
 #[derive(Clone, PartialEq, Eq)]
-pub struct SignedEnvelopeBytes(Vec<u8>);
+pub struct SignedBytes(Vec<u8>);
 
-impl SignedEnvelopeBytes {
+impl SignedBytes {
     /// Creates a bounded non-empty opaque envelope.
     ///
     /// # Errors
@@ -370,11 +378,11 @@ impl SignedEnvelopeBytes {
 /// retention/alerting hint. This type intentionally has no `Debug`
 /// implementation.
 #[derive(Clone, PartialEq, Eq)]
-pub struct SignedCollectionEnvelope {
+pub struct SignedEnvelope {
     pub collection_id: CollectionId,
-    pub leg_id: CollectionLegId,
-    pub expected_transaction_id: CanonicalTransactionId,
-    pub bytes: SignedEnvelopeBytes,
+    pub leg_id: LegId,
+    pub expected_transaction_id: TransactionRef,
+    pub bytes: SignedBytes,
     pub signed_at: u64,
     pub expires_at: u64,
 }
@@ -382,50 +390,53 @@ pub struct SignedCollectionEnvelope {
 /// Persists the signed envelope, transaction attribution index, and `Signed`
 /// leg state in one atomic write.
 /// This command intentionally has no `Debug` implementation.
-pub struct RecordSignedCollectionLeg {
+pub struct RecordSignature {
     pub collection_id: CollectionId,
-    pub leg_id: CollectionLegId,
-    pub expected: CollectionTransitionGuard,
-    pub expected_transaction_id: CanonicalTransactionId,
-    pub envelope: SignedEnvelopeBytes,
+    pub leg_id: LegId,
+    pub expected: TransitionGuard,
+    pub expected_transaction_id: TransactionRef,
+    pub envelope: SignedBytes,
     /// Required, canonical, and one-per-participant for UTXO batches. Other
     /// modes leave this empty and attach factual attribution at confirmation.
     pub allocations: Vec<CollectionAllocation>,
+    /// Maximum fee authorized by an account-model sweep. UTXO batches and gas
+    /// funding leave this empty. Confirmation still uses the factual IX fee.
+    pub fee_limit: Option<Decimal>,
     pub signed_at: u64,
     pub expires_at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AcceptCollectionBroadcast {
+pub struct AcceptBroadcast {
     pub collection_id: CollectionId,
-    pub leg_id: CollectionLegId,
-    pub expected: CollectionTransitionGuard,
-    pub transaction_id: CanonicalTransactionId,
+    pub leg_id: LegId,
+    pub expected: TransitionGuard,
+    pub transaction_id: TransactionRef,
     pub accepted_at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AttachCollectionWatch {
+pub struct AttachWatch {
     pub collection_id: CollectionId,
-    pub leg_id: CollectionLegId,
-    pub expected: CollectionTransitionGuard,
+    pub leg_id: LegId,
+    pub expected: TransitionGuard,
     pub watch_id: WatchId,
     pub updated_at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConfirmCollectionLeg {
+pub struct ConfirmLeg {
     pub collection_id: CollectionId,
-    pub leg_id: CollectionLegId,
-    pub expected: CollectionTransitionGuard,
-    pub transaction_id: CanonicalTransactionId,
+    pub leg_id: LegId,
+    pub expected: TransitionGuard,
+    pub transaction_id: TransactionRef,
     /// Required for a sweep and forbidden for a gas-funding leg.
     pub allocation: Option<CollectionAllocation>,
     pub confirmed_at: u64,
 }
 
 /// Atomic lifecycle transition coupled to one mirrored IX projection for a
-/// Bitcoin UTXO batch.
+/// UTXO batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UtxoBatchProjectionTransition {
     /// Canonical re-inclusion of the exact retained transaction after a reorg.
@@ -437,41 +448,41 @@ pub enum UtxoBatchProjectionTransition {
         confirmed_at: u64,
     },
     Reorged {
-        error: SafeCollectionError,
+        error: CollectionError,
         reorged_at: u64,
     },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FailCollectionLeg {
+pub struct FailLeg {
     pub collection_id: CollectionId,
-    pub leg_id: CollectionLegId,
-    pub expected: CollectionTransitionGuard,
-    pub transaction_id: CanonicalTransactionId,
-    pub error: SafeCollectionError,
+    pub leg_id: LegId,
+    pub expected: TransitionGuard,
+    pub transaction_id: TransactionRef,
+    pub error: CollectionError,
     pub failed_at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReorgCollectionLeg {
+pub struct ReorgLeg {
     pub collection_id: CollectionId,
-    pub leg_id: CollectionLegId,
-    pub expected: CollectionTransitionGuard,
-    pub transaction_id: CanonicalTransactionId,
-    pub error: SafeCollectionError,
+    pub leg_id: LegId,
+    pub expected: TransitionGuard,
+    pub transaction_id: TransactionRef,
+    pub error: CollectionError,
     pub reorged_at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RetryCollectionLeg {
+pub struct RetryLeg {
     pub collection_id: CollectionId,
-    pub leg_id: CollectionLegId,
-    pub expected: CollectionTransitionGuard,
+    pub leg_id: LegId,
+    pub expected: TransitionGuard,
     pub updated_at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReleaseCollectionReservation {
+pub struct ReleaseReservation {
     pub collection_id: CollectionId,
     pub expected_collection_state: CollectionState,
     pub expected_reservation_state: CollectionReservationState,
@@ -480,13 +491,13 @@ pub struct ReleaseCollectionReservation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CollectionLegReference {
+pub struct LegRef {
     pub collection_id: CollectionId,
-    pub leg_id: CollectionLegId,
+    pub leg_id: LegId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CollectionPageRequest {
+pub struct CollectionQuery {
     pub after: Option<CollectionId>,
     pub limit: usize,
 }
@@ -499,17 +510,19 @@ pub struct CollectionPage {
 
 /// Durable PS collection repository. Every mutating operation is optimistic
 /// and exact retries return the already-persisted result.
-pub trait CollectionStore: Send + Sync {
+pub trait CollectionCreator: Send + Sync {
     fn create_or_replay_collection<'a>(
         &'a self,
-        command: CreateCollection,
+        command: CollectionPlan,
     ) -> BoxFuture<'a, Result<CreateCollectionOutcome, DepositError>>;
 
     fn create_or_replay_utxo_batch<'a>(
         &'a self,
-        command: CreateUtxoBatchCollection,
+        command: CreateBatch,
     ) -> BoxFuture<'a, Result<CreateCollectionOutcome, DepositError>>;
+}
 
+pub trait CollectionReader: Send + Sync {
     fn collection<'a>(
         &'a self,
         id: &'a CollectionId,
@@ -531,63 +544,88 @@ pub trait CollectionStore: Send + Sync {
         deposit_id: &'a DepositId,
         asset: &'a AssetId,
     ) -> BoxFuture<'a, Result<Option<Collection>, DepositError>>;
+}
 
+pub trait CollectionHistory: Send + Sync {
     fn collections_for_deposit<'a>(
         &'a self,
         deposit_id: &'a DepositId,
-        request: CollectionPageRequest,
+        request: CollectionQuery,
     ) -> BoxFuture<'a, Result<CollectionPage, DepositError>>;
 
     fn leg_for_transaction<'a>(
         &'a self,
-        transaction_id: &'a CanonicalTransactionId,
-    ) -> BoxFuture<'a, Result<Option<CollectionLegReference>, DepositError>>;
+        transaction_id: &'a TransactionRef,
+    ) -> BoxFuture<'a, Result<Option<LegRef>, DepositError>>;
 
     fn signed_envelope<'a>(
         &'a self,
         collection_id: &'a CollectionId,
-        leg_id: &'a CollectionLegId,
-    ) -> BoxFuture<'a, Result<Option<SignedCollectionEnvelope>, DepositError>>;
+        leg_id: &'a LegId,
+    ) -> BoxFuture<'a, Result<Option<SignedEnvelope>, DepositError>>;
+}
 
+pub trait SubmissionWriter: Send + Sync {
     fn record_signed<'a>(
         &'a self,
-        command: RecordSignedCollectionLeg,
+        command: RecordSignature,
     ) -> BoxFuture<'a, Result<Collection, DepositError>>;
 
     fn accept_broadcast<'a>(
         &'a self,
-        command: AcceptCollectionBroadcast,
+        command: AcceptBroadcast,
     ) -> BoxFuture<'a, Result<Collection, DepositError>>;
 
     fn attach_watch<'a>(
         &'a self,
-        command: AttachCollectionWatch,
+        command: AttachWatch,
     ) -> BoxFuture<'a, Result<Collection, DepositError>>;
+}
 
+pub trait LegOutcome: Send + Sync {
     fn confirm_leg<'a>(
         &'a self,
-        command: ConfirmCollectionLeg,
+        command: ConfirmLeg,
     ) -> BoxFuture<'a, Result<Collection, DepositError>>;
 
-    fn fail_leg<'a>(
-        &'a self,
-        command: FailCollectionLeg,
-    ) -> BoxFuture<'a, Result<Collection, DepositError>>;
+    fn fail_leg<'a>(&'a self, command: FailLeg) -> BoxFuture<'a, Result<Collection, DepositError>>;
 
     fn reorg_leg<'a>(
         &'a self,
-        command: ReorgCollectionLeg,
+        command: ReorgLeg,
     ) -> BoxFuture<'a, Result<Collection, DepositError>>;
+}
 
+pub trait CollectionRetry: Send + Sync {
     fn retry_leg<'a>(
         &'a self,
-        command: RetryCollectionLeg,
+        command: RetryLeg,
     ) -> BoxFuture<'a, Result<Collection, DepositError>>;
 
     fn release_reservation<'a>(
         &'a self,
-        command: ReleaseCollectionReservation,
+        command: ReleaseReservation,
     ) -> BoxFuture<'a, Result<Collection, DepositError>>;
+}
+
+pub trait Collections:
+    CollectionCreator
+    + CollectionReader
+    + CollectionHistory
+    + SubmissionWriter
+    + LegOutcome
+    + CollectionRetry
+{
+}
+
+impl<T> Collections for T where
+    T: CollectionCreator
+        + CollectionReader
+        + CollectionHistory
+        + SubmissionWriter
+        + LegOutcome
+        + CollectionRetry
+{
 }
 
 fn invalid(message: impl Into<String>) -> DepositError {

@@ -5,25 +5,25 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base = { path = "../base" }
+crypto = { path = "../../../packages/crypto" }
+wallets = { path = "../../wallets" }
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-eth = { version = "=1.0.22", default-features = false, features = ["serde", "std"] }
-chain-contract = { path = "../contract" }
-chain-identity = { path = "../identity" }
 futures-util = { version = "=0.3.33", default-features = false, features = ["sink", "std"] }
 http = { path = "../../../packages/http" }
 indexing = { path = "../../indexing" }
+num-bigint.workspace = true
 json-rpc = { path = "../../../packages/json-rpc" }
 serde_json = { workspace = true, features = ["raw_value"] }
-signer = { path = "../../signing/contract" }
+serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["time"] }
 tokio-tungstenite = { version = "=0.28.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
-transaction-account = { path = "../../transactions/account" }
 
 [dev-dependencies]
 futures-executor.workspace = true
-signer-local = { path = "../../signing/local" }
 
 [lints]
 workspace = true

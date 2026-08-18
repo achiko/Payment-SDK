@@ -1,25 +1,37 @@
 use std::{error::Error, fmt};
 
-use crate::{
-    BoxFuture, CommandIdentity, DepositError, DepositId, IdempotencyKey, ReconciliationCaseId,
-};
-use chain_identity::{AtomicAmount, AtomicAmountArithmeticError};
-use indexing::{MovementId, ObservationEventId, ObservationRevision, TransactionStatus};
+use crate::{BoxFuture, CaseId, CommandIdentity, DepositError, DepositId, IdempotencyKey};
+use base::{Decimal, DecimalError};
+use indexing::{EventId, MovementId, ObservationRevision, TransactionStatus};
+
+use crate::amount;
 
 /// Absolute balances after one ledger transition. Every ledger row stores the
 /// complete snapshot; these are not deltas or mutable columns.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DepositBalances {
     /// Canonically included incoming value, even if not deep enough yet.
-    pub received: AtomicAmount,
+    pub received: Decimal,
     /// Subset of `received` that has satisfied IX confirmation/finality policy.
-    pub confirmed: AtomicAmount,
+    pub confirmed: Decimal,
     /// Current canonical on-chain value at the deposit address for this asset.
-    pub balance: AtomicAmount,
+    pub balance: Decimal,
     /// Confirmed gross value removed from the deposit by PS-owned collections.
-    pub collected: AtomicAmount,
+    pub collected: Decimal,
     /// Value credited to the user's business account by an explicit PS decision.
-    pub accounted: AtomicAmount,
+    pub accounted: Decimal,
+}
+
+impl Default for DepositBalances {
+    fn default() -> Self {
+        Self {
+            received: Decimal::zero(),
+            confirmed: Decimal::zero(),
+            balance: Decimal::zero(),
+            collected: Decimal::zero(),
+            accounted: Decimal::zero(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -30,7 +42,7 @@ impl ProjectionId {
     /// Length-prefixing prevents delimiter ambiguity in opaque IDs.
     #[must_use]
     pub fn for_observation(
-        event_id: &ObservationEventId,
+        event_id: &EventId,
         revision: ObservationRevision,
         deposit_id: &DepositId,
     ) -> Self {
@@ -46,7 +58,7 @@ impl ProjectionId {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LedgerEntryId(pub String);
+pub struct EntryId(pub String);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LedgerObservationKind {
@@ -54,9 +66,6 @@ pub enum LedgerObservationKind {
     Collection,
     GasFunding,
     OtherBalanceChange,
-    /// Retained only so existing RecordV1 rows remain decodable. New
-    /// transitions retain their business classification when reorged.
-    Reorg,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,13 +151,13 @@ pub type ObservationLedgerEffect = LedgerEffect<MovementId>;
 /// Fully resolved input to the pure ledger engine. Repositories construct this
 /// from a durable IX revision plus PS classification.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LedgerObservationTransition {
+pub struct LedgerTransition {
     pub status: TransactionStatus,
     pub previous_status: Option<TransactionStatus>,
-    pub effect: LedgerEffect<AtomicAmount>,
+    pub effect: LedgerEffect<Decimal>,
     /// Network fee resolved from the mirrored IX fact when the deposit address
     /// is the payer and the fee asset is the deposit asset.
-    pub network_fee: Option<AtomicAmount>,
+    pub network_fee: Option<Decimal>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,7 +201,7 @@ pub enum LedgerTransitionError {
     Arithmetic {
         field: LedgerBalanceField,
         operation: LedgerArithmeticOperation,
-        source: AtomicAmountArithmeticError,
+        source: DecimalError,
     },
 }
 
@@ -256,21 +265,21 @@ fn is_terminal(status: &TransactionStatus) -> bool {
 }
 
 fn movement_total(
-    effect: &LedgerEffect<AtomicAmount>,
-) -> Result<Option<AtomicAmount>, LedgerTransitionError> {
-    fn sum(amounts: &[AtomicAmount]) -> Result<Option<AtomicAmount>, LedgerTransitionError> {
+    effect: &LedgerEffect<Decimal>,
+) -> Result<Option<Decimal>, LedgerTransitionError> {
+    fn sum(amounts: &[Decimal]) -> Result<Option<Decimal>, LedgerTransitionError> {
         let Some((first, rest)) = amounts.split_first() else {
             return Ok(None);
         };
         rest.iter()
-            .try_fold(*first, |total, amount| {
-                total
-                    .checked_add(amount)
-                    .map_err(|source| LedgerTransitionError::Arithmetic {
+            .try_fold(first.clone(), |total, value| {
+                amount::checked_add(&total, value).map_err(|source| {
+                    LedgerTransitionError::Arithmetic {
                         field: LedgerBalanceField::Balance,
                         operation: LedgerArithmeticOperation::Add,
                         source,
-                    })
+                    }
+                })
             })
             .map(Some)
     }
@@ -285,10 +294,9 @@ fn movement_total(
     let Some(debits) = sum(debit_movements)? else {
         return Ok(None);
     };
-    let credits = sum(credit_movements)?.unwrap_or(AtomicAmount::ZERO);
-    let net = debits
-        .checked_sub(&credits)
-        .or_else(|_| credits.checked_sub(&debits))
+    let credits = sum(credit_movements)?.unwrap_or_else(Decimal::zero);
+    let net = amount::checked_sub(&debits, &credits)
+        .or_else(|_| amount::checked_sub(&credits, &debits))
         .map_err(|source| LedgerTransitionError::Arithmetic {
             field: LedgerBalanceField::Balance,
             operation: LedgerArithmeticOperation::Subtract,
@@ -298,7 +306,7 @@ fn movement_total(
 }
 
 fn net_balance_direction(
-    effect: &LedgerEffect<AtomicAmount>,
+    effect: &LedgerEffect<Decimal>,
 ) -> Result<Option<BalanceDirection>, LedgerTransitionError> {
     let LedgerEffect::NetBalanceChange {
         debit_movements,
@@ -307,24 +315,20 @@ fn net_balance_direction(
     else {
         return Ok(None);
     };
-    let sum = |amounts: &[AtomicAmount]| {
-        amounts
-            .iter()
-            .try_fold(AtomicAmount::ZERO, |total, amount| {
-                total
-                    .checked_add(amount)
-                    .map_err(|source| LedgerTransitionError::Arithmetic {
-                        field: LedgerBalanceField::Balance,
-                        operation: LedgerArithmeticOperation::Add,
-                        source,
-                    })
+    let sum = |amounts: &[Decimal]| {
+        amounts.iter().try_fold(Decimal::zero(), |total, value| {
+            amount::checked_add(&total, value).map_err(|source| LedgerTransitionError::Arithmetic {
+                field: LedgerBalanceField::Balance,
+                operation: LedgerArithmeticOperation::Add,
+                source,
             })
+        })
     };
     let debits = sum(debit_movements)?;
     let credits = sum(credit_movements)?;
     if debits == credits {
         Ok(None)
-    } else if debits.checked_sub(&credits).is_ok() {
+    } else if amount::checked_sub(&debits, &credits).is_ok() {
         Ok(Some(BalanceDirection::Debit))
     } else {
         Ok(Some(BalanceDirection::Credit))
@@ -332,14 +336,14 @@ fn net_balance_direction(
 }
 
 fn update_field(
-    value: &mut AtomicAmount,
-    amount: &AtomicAmount,
+    value: &mut Decimal,
+    amount: &Decimal,
     field: LedgerBalanceField,
     operation: LedgerArithmeticOperation,
 ) -> Result<(), LedgerTransitionError> {
     *value = match operation {
-        LedgerArithmeticOperation::Add => value.checked_add(amount),
-        LedgerArithmeticOperation::Subtract => value.checked_sub(amount),
+        LedgerArithmeticOperation::Add => amount::checked_add(value, amount),
+        LedgerArithmeticOperation::Subtract => amount::checked_sub(value, amount),
     }
     .map_err(|source| LedgerTransitionError::Arithmetic {
         field,
@@ -349,15 +353,17 @@ fn update_field(
     Ok(())
 }
 
-fn inverse(operation: LedgerArithmeticOperation) -> LedgerArithmeticOperation {
-    match operation {
-        LedgerArithmeticOperation::Add => LedgerArithmeticOperation::Subtract,
-        LedgerArithmeticOperation::Subtract => LedgerArithmeticOperation::Add,
+impl LedgerArithmeticOperation {
+    fn inverse(self) -> Self {
+        match self {
+            Self::Add => Self::Subtract,
+            Self::Subtract => Self::Add,
+        }
     }
 }
 
 fn contribution_operations(
-    effect: &LedgerEffect<AtomicAmount>,
+    effect: &LedgerEffect<Decimal>,
     phase: CanonicalPhase,
 ) -> Result<Vec<(LedgerBalanceField, LedgerArithmeticOperation)>, LedgerTransitionError> {
     use LedgerArithmeticOperation::{Add, Subtract};
@@ -434,7 +440,7 @@ fn network_fee_operations(
 
 fn apply_operations(
     balances: &mut DepositBalances,
-    amount: &AtomicAmount,
+    amount: &Decimal,
     operations: impl IntoIterator<Item = (LedgerBalanceField, LedgerArithmeticOperation)>,
 ) -> Result<(), LedgerTransitionError> {
     for (field, operation) in operations {
@@ -466,7 +472,7 @@ fn apply_operations(
 /// unsigned 256-bit overflow/underflow.
 pub fn apply_observation_transition(
     current: DepositBalances,
-    transition: &LedgerObservationTransition,
+    transition: &LedgerTransition,
 ) -> Result<DepositBalances, LedgerTransitionError> {
     if is_terminal(&transition.status) && transition.previous_status.is_none() {
         return Err(LedgerTransitionError::MissingPreviousStatus);
@@ -483,13 +489,13 @@ pub fn apply_observation_transition(
             let removal =
                 contribution_operations(&transition.effect, canonical_phase(previous_status))?
                     .into_iter()
-                    .map(|(field, operation)| (field, inverse(operation)));
+                    .map(|(field, operation)| (field, operation.inverse()));
             apply_operations(&mut next, amount, removal)?;
         }
         if let Some(network_fee) = transition.network_fee.as_ref() {
             let removal = network_fee_operations(transition.effect.kind(), previous_status)
                 .into_iter()
-                .map(|(field, operation)| (field, inverse(operation)));
+                .map(|(field, operation)| (field, operation.inverse()));
             apply_operations(&mut next, network_fee, removal)?;
         }
     }
@@ -517,16 +523,15 @@ pub enum LedgerEntryCause {
     },
     Observation {
         projection_id: ProjectionId,
-        event_id: ObservationEventId,
+        event_id: EventId,
         observation_revision: ObservationRevision,
         status: TransactionStatus,
         kind: LedgerObservationKind,
         /// Stable pointers into the mirrored IX fact that changed this deposit.
         movement_ids: Vec<MovementId>,
         /// Eligible fee amount after repository validation of the mirrored
-        /// fee asset and payer. The status determines whether it contributes;
-        /// legacy rows decode this as `None`.
-        network_fee: Option<AtomicAmount>,
+        /// fee asset and payer. The status determines whether it contributes.
+        network_fee: Option<Decimal>,
     },
     Accounting {
         idempotency_key: IdempotencyKey,
@@ -536,7 +541,7 @@ pub enum LedgerEntryCause {
     /// reconciliation case. Only `accounted` may differ from the previous
     /// absolute snapshot.
     ReconciliationResolution {
-        case_id: ReconciliationCaseId,
+        case_id: CaseId,
         idempotency_key: IdempotencyKey,
         reason: String,
     },
@@ -553,9 +558,9 @@ pub struct OpenLedger {
 /// verifiable sequence and supplies an optimistic-concurrency boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LedgerEntry {
-    pub id: LedgerEntryId,
+    pub id: EntryId,
     pub deposit_id: DepositId,
-    pub previous: Option<LedgerEntryId>,
+    pub previous: Option<EntryId>,
     pub cause: LedgerEntryCause,
     pub balances: DepositBalances,
     pub recorded_at: u64,
@@ -566,10 +571,10 @@ pub struct LedgerEntry {
 /// from the immutable mirror and computes the absolute snapshot itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordObservation {
-    pub event_id: ObservationEventId,
+    pub event_id: EventId,
     pub effect: ObservationLedgerEffect,
     pub deposit_id: DepositId,
-    pub expected_head: Option<LedgerEntryId>,
+    pub expected_head: Option<EntryId>,
     pub recorded_at: u64,
 }
 
@@ -581,8 +586,8 @@ pub struct AccountingCommand {
     /// [`crate::CommandOperation::Accounting`].
     pub command: CommandIdentity,
     pub deposit_id: DepositId,
-    pub expected_head: Option<LedgerEntryId>,
-    pub next_accounted: AtomicAmount,
+    pub expected_head: Option<EntryId>,
+    pub next_accounted: Decimal,
     /// Human-readable administrator/business justification retained in the
     /// immutable audit row. It must be non-blank and at most 1,024 bytes.
     pub reason: String,
@@ -596,31 +601,21 @@ pub enum ApplyResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LedgerPageRequest {
+pub struct LedgerQuery {
     pub deposit_id: DepositId,
-    pub after: Option<LedgerEntryId>,
+    pub after: Option<EntryId>,
     pub limit: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LedgerPage {
     pub entries: Vec<LedgerEntry>,
-    pub next: Option<LedgerEntryId>,
+    pub next: Option<EntryId>,
 }
 
-pub trait DepositLedger: Send + Sync {
+pub trait LedgerWriter: Send + Sync {
     /// Idempotently creates the zero-balance first row for a persisted deposit.
     fn open<'a>(&'a self, command: OpenLedger) -> BoxFuture<'a, Result<ApplyResult, DepositError>>;
-
-    fn current<'a>(
-        &'a self,
-        deposit_id: &'a DepositId,
-    ) -> BoxFuture<'a, Result<Option<LedgerEntry>, DepositError>>;
-
-    fn entries<'a>(
-        &'a self,
-        request: LedgerPageRequest,
-    ) -> BoxFuture<'a, Result<LedgerPage, DepositError>>;
 
     /// Resolves and appends the absolute snapshot. Implementations must
     /// preserve `accounted`, apply optimistic head matching, and derive IX
@@ -640,16 +635,30 @@ pub trait DepositLedger: Send + Sync {
     ) -> BoxFuture<'a, Result<ApplyResult, DepositError>>;
 }
 
+pub trait LedgerReader: Send + Sync {
+    fn current<'a>(
+        &'a self,
+        deposit_id: &'a DepositId,
+    ) -> BoxFuture<'a, Result<Option<LedgerEntry>, DepositError>>;
+
+    fn entries<'a>(
+        &'a self,
+        request: LedgerQuery,
+    ) -> BoxFuture<'a, Result<LedgerPage, DepositError>>;
+}
+
+pub trait DepositLedger: LedgerWriter + LedgerReader {}
+
+impl<T> DepositLedger for T where T: LedgerWriter + LedgerReader {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chain_identity::{CanonicalTransactionId, ChainId};
     use indexing::{BlockHash, BlockHeight, BlockRef, ConfirmationProof};
+    use indexing::{ChainId, TransactionRef};
 
-    fn amount(value: u64) -> AtomicAmount {
-        let mut bytes = [0; 32];
-        bytes[24..].copy_from_slice(&value.to_be_bytes());
-        AtomicAmount(bytes)
+    fn amount(value: u64) -> Decimal {
+        Decimal::from(value)
     }
 
     fn block(height: u64) -> BlockRef {
@@ -681,9 +690,9 @@ mod tests {
     fn incoming(
         status: TransactionStatus,
         previous_status: Option<TransactionStatus>,
-        amounts: Vec<AtomicAmount>,
-    ) -> LedgerObservationTransition {
-        LedgerObservationTransition {
+        amounts: Vec<Decimal>,
+    ) -> LedgerTransition {
+        LedgerTransition {
             status,
             previous_status,
             effect: LedgerEffect::Incoming { movements: amounts },
@@ -700,7 +709,7 @@ mod tests {
         )
         .expect("two included movements fit in the ledger");
         assert_eq!(
-            included_balances,
+            included_balances.clone(),
             DepositBalances {
                 received: amount(100),
                 confirmed: amount(0),
@@ -711,7 +720,7 @@ mod tests {
         );
 
         let confirmed_balances = apply_observation_transition(
-            included_balances,
+            included_balances.clone(),
             &incoming(confirmed(), Some(included()), vec![amount(40), amount(60)]),
         )
         .expect("confirmation replaces rather than duplicates inclusion");
@@ -773,7 +782,7 @@ mod tests {
             collected: amount(0),
             accounted: amount(100),
         };
-        let included_transition = LedgerObservationTransition {
+        let included_transition = LedgerTransition {
             status: included(),
             previous_status: None,
             effect: LedgerEffect::Collection {
@@ -781,13 +790,13 @@ mod tests {
             },
             network_fee: None,
         };
-        let swept = apply_observation_transition(current, &included_transition)
+        let swept = apply_observation_transition(current.clone(), &included_transition)
             .expect("included collection can debit the current balance");
         assert_eq!(swept.balance, amount(0));
         assert_eq!(swept.collected, amount(0));
         assert_eq!(swept.accounted, amount(100));
 
-        let confirmed_transition = LedgerObservationTransition {
+        let confirmed_transition = LedgerTransition {
             status: confirmed(),
             previous_status: Some(included()),
             effect: LedgerEffect::Collection {
@@ -800,7 +809,7 @@ mod tests {
         assert_eq!(confirmed_sweep.balance, amount(0));
         assert_eq!(confirmed_sweep.collected, amount(100));
 
-        let reorg_transition = LedgerObservationTransition {
+        let reorg_transition = LedgerTransition {
             status: TransactionStatus::Reorged {
                 previous_block: block(1),
             },
@@ -817,7 +826,7 @@ mod tests {
 
     #[test]
     fn overflow_and_underflow_report_the_exact_field_and_operation() {
-        let maximum = AtomicAmount([u8::MAX; 32]);
+        let maximum = amount::from_bytes([u8::MAX; 32]);
         let overflow = apply_observation_transition(
             DepositBalances {
                 received: maximum,
@@ -831,13 +840,16 @@ mod tests {
             LedgerTransitionError::Arithmetic {
                 field: LedgerBalanceField::Received,
                 operation: LedgerArithmeticOperation::Add,
-                source: AtomicAmountArithmeticError::Overflow,
+                source: DecimalError::new(
+                    base::DecimalErrorKind::Overflow,
+                    "atomic amount exceeds 32 bytes"
+                ),
             }
         );
 
         let underflow = apply_observation_transition(
             DepositBalances::default(),
-            &LedgerObservationTransition {
+            &LedgerTransition {
                 status: included(),
                 previous_status: None,
                 effect: LedgerEffect::Collection {
@@ -852,7 +864,10 @@ mod tests {
             LedgerTransitionError::Arithmetic {
                 field: LedgerBalanceField::Balance,
                 operation: LedgerArithmeticOperation::Subtract,
-                source: AtomicAmountArithmeticError::Underflow,
+                source: DecimalError::new(
+                    base::DecimalErrorKind::NegativeAmount,
+                    "currency amount must not be negative"
+                ),
             }
         );
     }
@@ -881,8 +896,11 @@ mod tests {
             },
             TransactionStatus::Dropped,
             TransactionStatus::Replaced {
-                by: CanonicalTransactionId {
-                    chain: ChainId("ethereum".to_owned()),
+                by: TransactionRef {
+                    scope: indexing::IndexScope {
+                        chain: ChainId("chain-a".to_owned()),
+                        network: "test".to_owned(),
+                    },
                     value: "0xreplacement".to_owned(),
                 },
             },
@@ -890,7 +908,7 @@ mod tests {
 
         for status in terminal_statuses {
             let corrected = apply_observation_transition(
-                included_balances,
+                included_balances.clone(),
                 &incoming(status, Some(included()), vec![amount(10)]),
             )
             .expect("terminal revision reverses the prior inclusion");
@@ -907,7 +925,7 @@ mod tests {
             collected: amount(0),
             accounted: amount(110),
         };
-        let included_transition = LedgerObservationTransition {
+        let included_transition = LedgerTransition {
             status: included(),
             previous_status: None,
             effect: LedgerEffect::Collection {
@@ -915,14 +933,14 @@ mod tests {
             },
             network_fee: Some(amount(10)),
         };
-        let included_balances = apply_observation_transition(current, &included_transition)
+        let included_balances = apply_observation_transition(current.clone(), &included_transition)
             .expect("included native collection debits its transfer and network fee");
         assert_eq!(included_balances.balance, amount(0));
         assert_eq!(included_balances.collected, amount(0));
 
         let confirmed_balances = apply_observation_transition(
             included_balances,
-            &LedgerObservationTransition {
+            &LedgerTransition {
                 status: confirmed(),
                 previous_status: Some(included()),
                 effect: LedgerEffect::Collection {
@@ -937,7 +955,7 @@ mod tests {
 
         let restored = apply_observation_transition(
             confirmed_balances,
-            &LedgerObservationTransition {
+            &LedgerTransition {
                 status: TransactionStatus::Reorged {
                     previous_block: block(1),
                 },
@@ -963,8 +981,8 @@ mod tests {
             reason: Some("execution reverted".to_owned()),
         };
         let failed_balances = apply_observation_transition(
-            current,
-            &LedgerObservationTransition {
+            current.clone(),
+            &LedgerTransition {
                 status: failed.clone(),
                 previous_status: None,
                 effect: LedgerEffect::Collection {
@@ -979,7 +997,7 @@ mod tests {
 
         let restored = apply_observation_transition(
             failed_balances,
-            &LedgerObservationTransition {
+            &LedgerTransition {
                 status: TransactionStatus::Reorged {
                     previous_block: block(1),
                 },
@@ -1001,7 +1019,7 @@ mod tests {
                 balance: amount(10),
                 ..DepositBalances::default()
             },
-            &LedgerObservationTransition {
+            &LedgerTransition {
                 status: confirmed(),
                 previous_status: None,
                 effect: LedgerEffect::OtherBalanceChange {

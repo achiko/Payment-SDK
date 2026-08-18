@@ -1,34 +1,33 @@
-use chain_identity::{AssetId, AtomicAmount, ChainId};
+use base::Decimal;
 use deposits::{
-    ClaimJob, CloseDepositJob, CommandIdentity, CommandOperation, CommandPrincipal,
-    CreateDepositJob, CreateJob, CreateJobOutcome, DepositErrorKind, DepositId, IdempotencyKey,
-    InitializePaymentDatabase, JobError, JobId, JobPageRequest, JobPayload, JobResource, JobState,
-    JobStore, PAYMENT_DOMAIN_SCHEMA_VERSION, PAYMENT_SERVICE_OWNER, PaymentDatabaseMetadataStore,
-    PersistentPaymentRepository, PolicyIdentity, PrincipalScopeMode, RequestHash, TransitionJob,
-    UserId, UserStore,
+    ClaimJob, CloseJob, CommandIdentity, CommandOperation, CommandPrincipal, CreateJobOutcome,
+    DatabaseInitializer, DepositErrorKind, DepositId, DepositJob, IdempotencyKey,
+    InitializeDatabase, JobAssociations, JobCommands, JobError, JobId, JobPayload, JobPlan,
+    JobQuery, JobReader, JobResource, JobRunner, JobState, MetadataReader,
+    PAYMENT_DOMAIN_SCHEMA_VERSION, PAYMENT_SERVICE_OWNER, PaymentStore, PolicyIdentity,
+    PrincipalScopeMode, RequestHash, TransitionJob, UserId, UserStore,
 };
 use indexing::IndexScope;
-use storage::{Key, Namespace, Operation, Storage, Value, WriteBatch};
-use storage_rocksdb::RocksDbStorage;
+use indexing::{AssetId, ChainId};
+use storage::{Key, Namespace, Operation, Store, Value, WriteBatch};
+use storage_rocksdb::RocksDb;
 use tempfile::TempDir;
 
-fn amount(value: u64) -> AtomicAmount {
-    let mut bytes = [0_u8; 32];
-    bytes[24..].copy_from_slice(&value.to_be_bytes());
-    AtomicAmount(bytes)
+fn amount(value: u64) -> Decimal {
+    Decimal::from(value)
 }
 
-fn create_deposit_job(id: &str, hash: u8, created_at: u64) -> CreateJob {
-    let chain = ChainId("ethereum".to_owned());
-    CreateJob {
+fn create_deposit_job(id: &str, hash: u8, created_at: u64) -> JobPlan {
+    let chain = ChainId("chain-a".to_owned());
+    JobPlan {
         id: JobId(id.to_owned()),
         command: CommandIdentity {
             principal: CommandPrincipal("exchange-backend".to_owned()),
-            operation: CommandOperation::CreateDeposit,
+            operation: CommandOperation::DepositPlan,
             client_key: IdempotencyKey("exchange-order-8472".to_owned()),
             request_hash: RequestHash([hash; 32]),
         },
-        payload: JobPayload::CreateDeposit(CreateDepositJob {
+        payload: JobPayload::DepositPlan(DepositJob {
             deposit_id: DepositId("deposit-456".to_owned()),
             user_id: UserId("user-15".to_owned()),
             scope: IndexScope {
@@ -53,8 +52,8 @@ fn create_deposit_job(id: &str, hash: u8, created_at: u64) -> CreateJob {
     }
 }
 
-fn close_deposit_job(id: &str, key: &str, created_at: u64) -> CreateJob {
-    CreateJob {
+fn close_deposit_job(id: &str, key: &str, created_at: u64) -> JobPlan {
+    JobPlan {
         id: JobId(id.to_owned()),
         command: CommandIdentity {
             principal: CommandPrincipal("exchange-backend".to_owned()),
@@ -62,7 +61,7 @@ fn close_deposit_job(id: &str, key: &str, created_at: u64) -> CreateJob {
             client_key: IdempotencyKey(key.to_owned()),
             request_hash: RequestHash([created_at as u8; 32]),
         },
-        payload: JobPayload::CloseDeposit(CloseDepositJob {
+        payload: JobPayload::CloseDeposit(CloseJob {
             deposit_id: DepositId("deposit-456".to_owned()),
             user_id: UserId("user-15".to_owned()),
         }),
@@ -83,10 +82,10 @@ fn retryable_error() -> JobError {
     }
 }
 
-fn metadata(scope_network: &str, policy: &str) -> InitializePaymentDatabase {
-    InitializePaymentDatabase {
+fn metadata(scope_network: &str, policy: &str) -> InitializeDatabase {
+    InitializeDatabase {
         scope: IndexScope {
-            chain: ChainId("ethereum".to_owned()),
+            chain: ChainId("chain-a".to_owned()),
             network: scope_network.to_owned(),
         },
         active_policy: PolicyIdentity {
@@ -101,7 +100,7 @@ fn metadata(scope_network: &str, policy: &str) -> InitializePaymentDatabase {
 async fn database_metadata_binds_owner_scope_schema_and_policy()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
     let initialized = repository
         .initialize_or_validate(metadata("sepolia", "policy-v1"))
         .await?;
@@ -139,7 +138,7 @@ async fn database_metadata_binds_owner_scope_schema_and_policy()
     let policy_error = repository
         .initialize_or_validate(metadata("sepolia", "policy-v2"))
         .await
-        .expect_err("active policy identity is immutable without migration");
+        .expect_err("active policy identity is immutable");
     assert_eq!(policy_error.kind, DepositErrorKind::Conflict);
     Ok(())
 }
@@ -148,7 +147,7 @@ async fn database_metadata_binds_owner_scope_schema_and_policy()
 async fn database_metadata_binds_principal_scope_mode_without_switching()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
     let initialized = repository
         .initialize_or_validate_principal_scope(
             metadata("sepolia", "policy-v1"),
@@ -185,7 +184,7 @@ async fn database_metadata_binds_principal_scope_mode_without_switching()
 async fn database_metadata_rejects_indexer_and_unbound_payment_data()
 -> Result<(), Box<dyn std::error::Error>> {
     let ix_directory = TempDir::new()?;
-    let ix_storage = RocksDbStorage::open(ix_directory.path())?;
+    let ix_storage = RocksDb::open(ix_directory.path())?;
     ix_storage
         .commit(WriteBatch {
             conditions: Vec::new(),
@@ -196,24 +195,48 @@ async fn database_metadata_rejects_indexer_and_unbound_payment_data()
             }],
         })
         .await?;
-    let ix_repository = PersistentPaymentRepository::new(ix_storage);
+    let ix_repository = PaymentStore::new(ix_storage);
     let ix_error = ix_repository
         .initialize_or_validate(metadata("sepolia", "policy-v1"))
         .await
         .expect_err("PS must not adopt an IX-owned database");
     assert_eq!(ix_error.kind, DepositErrorKind::Conflict);
 
-    let legacy_directory = TempDir::new()?;
-    let legacy_repository =
-        PersistentPaymentRepository::new(RocksDbStorage::open(legacy_directory.path())?);
-    legacy_repository
-        .create_or_replay(create_deposit_job("legacy-job", 5, 100))
+    let unbound_directory = TempDir::new()?;
+    let unbound_repository = PaymentStore::new(RocksDb::open(unbound_directory.path())?);
+    unbound_repository
+        .create_or_replay(create_deposit_job("unbound-job", 5, 100))
         .await?;
-    let legacy_error = legacy_repository
+    let unbound_error = unbound_repository
         .initialize_or_validate(metadata("sepolia", "policy-v1"))
         .await
-        .expect_err("unbound PS records require the explicit migration path");
-    assert_eq!(legacy_error.kind, DepositErrorKind::Conflict);
+        .expect_err("unbound PS records are rejected");
+    assert_eq!(unbound_error.kind, DepositErrorKind::Conflict);
+    Ok(())
+}
+
+#[tokio::test]
+async fn database_metadata_rejects_invalid_current_record() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = TempDir::new()?;
+    let storage = RocksDb::open(directory.path())?;
+    storage
+        .commit(WriteBatch {
+            conditions: Vec::new(),
+            operations: vec![Operation::Put {
+                namespace: Namespace("ps.v1.database_metadata".to_owned()),
+                key: Key(b"identity".to_vec()),
+                value: Value(vec![0xff]),
+            }],
+        })
+        .await?;
+
+    let repository = PaymentStore::new(storage);
+    let error = repository
+        .initialize_or_validate(metadata("sepolia", "policy-v1"))
+        .await
+        .expect_err("invalid current metadata must be rejected");
+    assert_eq!(error.kind, DepositErrorKind::Store);
     Ok(())
 }
 
@@ -221,8 +244,8 @@ async fn database_metadata_rejects_indexer_and_unbound_payment_data()
 async fn bound_payment_database_rejects_later_indexer_ownership()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let storage = RocksDbStorage::open(directory.path())?;
-    let repository = PersistentPaymentRepository::new(storage.clone());
+    let storage = RocksDb::open(directory.path())?;
+    let repository = PaymentStore::new(storage.clone());
     repository
         .initialize_or_validate(metadata("sepolia", "policy-v1"))
         .await?;
@@ -261,7 +284,7 @@ async fn database_metadata_rejects_each_unbound_collection_namespace()
         "ps.v1.reconciliation_generation",
     ] {
         let directory = TempDir::new()?;
-        let storage = RocksDbStorage::open(directory.path())?;
+        let storage = RocksDb::open(directory.path())?;
         storage
             .commit(WriteBatch {
                 conditions: Vec::new(),
@@ -272,11 +295,11 @@ async fn database_metadata_rejects_each_unbound_collection_namespace()
                 }],
             })
             .await?;
-        let repository = PersistentPaymentRepository::new(storage);
+        let repository = PaymentStore::new(storage);
         let error = repository
             .initialize_or_validate(metadata("sepolia", "policy-v1"))
             .await
-            .expect_err("unbound collection records require explicit metadata migration");
+            .expect_err("unbound collection records are rejected");
         assert_eq!(error.kind, DepositErrorKind::Conflict, "{namespace}");
     }
     Ok(())
@@ -286,7 +309,7 @@ async fn database_metadata_rejects_each_unbound_collection_namespace()
 async fn same_command_replays_stable_job_and_changed_request_conflicts()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
 
     let first = repository
         .create_or_replay(create_deposit_job("job-original", 7, 100))
@@ -341,7 +364,7 @@ async fn jobs_retain_payload_and_claim_state_across_restarts()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let expected_job = {
-        let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+        let repository = PaymentStore::new(RocksDb::open(directory.path())?);
         let created = repository
             .create_or_replay(create_deposit_job("job-restart", 9, 1_000))
             .await?;
@@ -349,7 +372,7 @@ async fn jobs_retain_payload_and_claim_state_across_restarts()
     };
 
     let claimed = {
-        let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+        let repository = PaymentStore::new(RocksDb::open(directory.path())?);
         assert_eq!(
             repository.job(&expected_job.id).await?,
             Some(expected_job.clone())
@@ -380,7 +403,7 @@ async fn jobs_retain_payload_and_claim_state_across_restarts()
         claimed
     };
 
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
     assert_eq!(repository.job(&claimed.id).await?, Some(claimed.clone()));
     assert_eq!(
         repository
@@ -409,7 +432,7 @@ async fn jobs_retain_payload_and_claim_state_across_restarts()
     );
     assert!(matches!(
         reclaimed.payload,
-        JobPayload::CreateDeposit(CreateDepositJob {
+        JobPayload::DepositPlan(DepositJob {
             key_purpose,
             ..
         }) if key_purpose == "deposit-address"
@@ -421,7 +444,7 @@ async fn jobs_retain_payload_and_claim_state_across_restarts()
 async fn expected_state_allows_only_one_concurrent_transition()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
     repository
         .create_or_replay(create_deposit_job("job-transition", 10, 100))
         .await?;
@@ -477,7 +500,7 @@ async fn expected_state_allows_only_one_concurrent_transition()
 async fn retry_success_failure_and_user_resource_indexes_are_durable()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
     let first = repository
         .create_or_replay(create_deposit_job("job-a", 11, 100))
         .await?
@@ -567,7 +590,7 @@ async fn retry_success_failure_and_user_resource_indexes_are_durable()
     let user_jobs = repository
         .jobs_for_user(
             &UserId("user-15".to_owned()),
-            JobPageRequest {
+            JobQuery {
                 after: None,
                 limit: 10,
             },
@@ -584,7 +607,7 @@ async fn retry_success_failure_and_user_resource_indexes_are_durable()
     let resource_jobs = repository
         .jobs_for_resource(
             &JobResource::Deposit(DepositId("deposit-456".to_owned())),
-            JobPageRequest {
+            JobQuery {
                 after: None,
                 limit: 10,
             },

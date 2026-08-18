@@ -1,11 +1,17 @@
-use chain_identity::{AssetId, AtomicAmount, CanonicalAddress};
-use indexing::{BlockHeight, WatchId};
-use signer::KeyLocator;
+use base::Decimal;
+use base::DerivationPath;
+use indexing::{AssetId, BlockHeight, CanonicalAddress, WatchId};
+
+/// Opaque application-owned reference to key material.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum KeyId {
+    Identifier(String),
+    DerivationPath(DerivationPath),
+}
 
 /// Explicit marker assigned when decoding a version-1 deposit row that
 /// predates durable key-purpose storage. It is metadata only and must never be
 /// interpreted as a custody instruction for a new operation.
-pub const LEGACY_DEPOSIT_KEY_PURPOSE: &str = "legacy-v1-key-purpose-unavailable";
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DepositId(pub String);
@@ -67,10 +73,10 @@ pub struct Deposit {
     pub user_id: UserId,
     pub asset: AssetId,
     pub address: CanonicalAddress,
-    pub key: KeyLocator,
+    pub key: KeyId,
     /// Opaque custody/provisioning purpose metadata. Never secret material.
     pub key_purpose: String,
-    pub expected: AtomicAmount,
+    pub expected: Decimal,
     pub birthday: BlockHeight,
     pub expires_at: u64,
     pub state: DepositState,
@@ -78,16 +84,16 @@ pub struct Deposit {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CreateDeposit {
+pub struct DepositPlan {
     pub id: DepositId,
     pub idempotency_key: IdempotencyKey,
     pub user_id: UserId,
     pub asset: AssetId,
     pub address: CanonicalAddress,
-    pub key: KeyLocator,
+    pub key: KeyId,
     /// Opaque custody/provisioning purpose metadata. Never secret material.
     pub key_purpose: String,
-    pub expected: AtomicAmount,
+    pub expected: Decimal,
     pub birthday: BlockHeight,
     pub expires_at: u64,
     pub created_at: u64,

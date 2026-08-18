@@ -1,29 +1,29 @@
+use crate::{ChainError, ChainErrorKind};
 use bitcoin::{Transaction, Txid, consensus, hashes::Hash};
-use chain_contract::{ChainError, ChainErrorKind};
 use indexing::BlockRef;
 use std::{fmt, str::FromStr};
 
-use crate::{BitcoinOutPoint, Satoshi};
+use crate::{Outpoint, Satoshi};
 
 /// A non-witness transaction ID stored in the digest byte order used by
 /// `rust-bitcoin`. Text formatting and parsing use Bitcoin Core's conventional
 /// reversed hexadecimal display order.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BitcoinTransactionId(pub [u8; 32]);
+pub struct Id(pub [u8; 32]);
 
-impl fmt::Display for BitcoinTransactionId {
+impl fmt::Display for Id {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Txid::from_byte_array(self.0).fmt(formatter)
     }
 }
 
-impl fmt::Debug for BitcoinTransactionId {
+impl fmt::Debug for Id {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, formatter)
     }
 }
 
-impl FromStr for BitcoinTransactionId {
+impl FromStr for Id {
     type Err = bitcoin::hex::HexToArrayError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -31,21 +31,21 @@ impl FromStr for BitcoinTransactionId {
     }
 }
 
-impl From<Txid> for BitcoinTransactionId {
+impl From<Txid> for Id {
     fn from(id: Txid) -> Self {
         Self(id.to_byte_array())
     }
 }
 
-impl From<BitcoinTransactionId> for Txid {
-    fn from(id: BitcoinTransactionId) -> Self {
+impl From<Id> for Txid {
+    fn from(id: Id) -> Self {
         Self::from_byte_array(id.0)
     }
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct BitcoinSignedTransaction {
-    id: BitcoinTransactionId,
+pub struct SignedTransaction {
+    id: Id,
     consensus_bytes: Vec<u8>,
 }
 
@@ -56,35 +56,35 @@ pub struct BitcoinSignedTransaction {
 /// output. A caller such as Payment Service must compare `inputs` with its
 /// independently reserved previous-output facts before computing a fee.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BitcoinSignedTransactionInspection {
-    pub transaction_id: BitcoinTransactionId,
+pub struct Inspection {
+    pub transaction_id: Id,
     pub version: i32,
     pub lock_time: u32,
     pub virtual_size: u64,
-    pub inputs: Vec<BitcoinSignedInputInspection>,
-    pub outputs: Vec<BitcoinSignedOutputInspection>,
+    pub inputs: Vec<InputInspection>,
+    pub outputs: Vec<OutputInspection>,
 }
 
 /// One signed transaction input in consensus order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BitcoinSignedInputInspection {
-    pub outpoint: BitcoinOutPoint,
+pub struct InputInspection {
+    pub outpoint: Outpoint,
     pub sequence: u32,
 }
 
 /// One signed transaction output in consensus order.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BitcoinSignedOutputInspection {
+pub struct OutputInspection {
     pub output_index: u32,
     pub value: Satoshi,
     pub script_pubkey: Vec<u8>,
 }
 
-impl BitcoinSignedTransaction {
+impl SignedTransaction {
     /// Decodes exact Bitcoin consensus bytes and verifies their non-witness
     /// transaction ID before accepting them at the signed-transaction boundary.
     pub fn from_consensus_bytes(
-        expected_id: BitcoinTransactionId,
+        expected_id: Id,
         consensus_bytes: Vec<u8>,
     ) -> Result<Self, ChainError> {
         let transaction: Transaction =
@@ -93,7 +93,7 @@ impl BitcoinSignedTransaction {
                     "could not decode signed Bitcoin consensus bytes: {error}"
                 ))
             })?;
-        let computed_id = BitcoinTransactionId::from(transaction.compute_txid());
+        let computed_id = Id::from(transaction.compute_txid());
         if computed_id != expected_id {
             return Err(invalid_transaction(format!(
                 "signed Bitcoin transaction ID mismatch: expected {expected_id}, computed {computed_id}"
@@ -106,7 +106,7 @@ impl BitcoinSignedTransaction {
     }
 
     #[must_use]
-    pub const fn id(&self) -> BitcoinTransactionId {
+    pub const fn id(&self) -> Id {
         self.id
     }
 
@@ -121,7 +121,7 @@ impl BitcoinSignedTransaction {
     }
 
     #[must_use]
-    pub fn into_parts(self) -> (BitcoinTransactionId, Vec<u8>) {
+    pub fn into_parts(self) -> (Id, Vec<u8>) {
         (self.id, self.consensus_bytes)
     }
 
@@ -140,9 +140,9 @@ impl BitcoinSignedTransaction {
     /// Returns an invalid-transaction error if the retained bytes no longer
     /// decode, their txid differs from the verified boundary value, or a
     /// platform-sized count cannot be represented by the public integer types.
-    pub fn inspect(&self) -> Result<BitcoinSignedTransactionInspection, ChainError> {
+    pub fn inspect(&self) -> Result<Inspection, ChainError> {
         let transaction = decode_signed_transaction(&self.consensus_bytes)?;
-        let transaction_id = BitcoinTransactionId::from(transaction.compute_txid());
+        let transaction_id = Id::from(transaction.compute_txid());
         if transaction_id != self.id {
             return Err(invalid_transaction(format!(
                 "signed Bitcoin transaction ID mismatch: expected {}, computed {transaction_id}",
@@ -154,9 +154,9 @@ impl BitcoinSignedTransaction {
         let inputs = transaction
             .input
             .iter()
-            .map(|input| BitcoinSignedInputInspection {
-                outpoint: BitcoinOutPoint {
-                    transaction_id: BitcoinTransactionId::from(input.previous_output.txid),
+            .map(|input| InputInspection {
+                outpoint: Outpoint {
+                    transaction_id: Id::from(input.previous_output.txid),
                     output_index: input.previous_output.vout,
                 },
                 sequence: input.sequence.to_consensus_u32(),
@@ -167,7 +167,7 @@ impl BitcoinSignedTransaction {
             .iter()
             .enumerate()
             .map(|(output_index, output)| {
-                Ok(BitcoinSignedOutputInspection {
+                Ok(OutputInspection {
                     output_index: u32::try_from(output_index).map_err(|_| {
                         invalid_transaction("signed Bitcoin output index exceeds u32")
                     })?,
@@ -176,7 +176,7 @@ impl BitcoinSignedTransaction {
                 })
             })
             .collect::<Result<Vec<_>, ChainError>>()?;
-        Ok(BitcoinSignedTransactionInspection {
+        Ok(Inspection {
             transaction_id,
             version: transaction.version.0,
             lock_time: transaction.lock_time.to_consensus_u32(),
@@ -187,33 +187,33 @@ impl BitcoinSignedTransaction {
     }
 }
 
-impl fmt::Debug for BitcoinSignedTransaction {
+impl fmt::Debug for SignedTransaction {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("BitcoinSignedTransaction")
+            .debug_struct("SignedTransaction")
             .field("id", &self.id)
             .field(
                 "consensus_bytes",
-                &RedactedConsensusBytes(self.consensus_bytes.len()),
+                &RedactedBytes(self.consensus_bytes.len()),
             )
             .finish()
     }
 }
 
-struct RedactedConsensusBytes(usize);
+struct RedactedBytes(usize);
 
-impl fmt::Debug for RedactedConsensusBytes {
+impl fmt::Debug for RedactedBytes {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "<redacted: {} bytes>", self.0)
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BitcoinReceipt {
-    pub id: BitcoinTransactionId,
+pub struct Receipt {
+    pub id: Id,
     pub included_in: Option<BlockRef>,
     pub confirmations: u64,
-    pub replaced_by: Option<BitcoinTransactionId>,
+    pub replaced_by: Option<Id>,
 }
 
 fn invalid_transaction(message: impl Into<String>) -> ChainError {
@@ -272,7 +272,7 @@ mod tests {
     #[test]
     fn transaction_id_uses_conventional_display_byte_order() {
         let displayed = format!("{:064x}", 1);
-        let id: BitcoinTransactionId = displayed
+        let id: Id = displayed
             .parse()
             .expect("canonical transaction ID should parse");
         let mut internal = [0_u8; 32];
@@ -285,20 +285,16 @@ mod tests {
 
     #[test]
     fn transaction_id_rejects_invalid_hex() {
-        assert!(
-            "not-a-transaction-id"
-                .parse::<BitcoinTransactionId>()
-                .is_err()
-        );
-        assert!("00".parse::<BitcoinTransactionId>().is_err());
+        assert!("not-a-transaction-id".parse::<Id>().is_err());
+        assert!("00".parse::<Id>().is_err());
     }
 
     #[test]
     fn signed_transaction_preserves_verified_exact_bytes() {
         let transaction = transaction();
         let bytes = consensus::serialize(&transaction);
-        let expected_id = BitcoinTransactionId::from(transaction.compute_txid());
-        let signed = BitcoinSignedTransaction::from_consensus_bytes(expected_id, bytes.clone())
+        let expected_id = Id::from(transaction.compute_txid());
+        let signed = SignedTransaction::from_consensus_bytes(expected_id, bytes.clone())
             .expect("matching signed transaction bytes should be accepted");
 
         assert_eq!(signed.id(), expected_id);
@@ -307,11 +303,8 @@ mod tests {
 
     #[test]
     fn signed_transaction_rejects_malformed_bytes() {
-        let error = BitcoinSignedTransaction::from_consensus_bytes(
-            BitcoinTransactionId([0; 32]),
-            vec![0xff],
-        )
-        .expect_err("malformed consensus bytes must fail");
+        let error = SignedTransaction::from_consensus_bytes(Id([0; 32]), vec![0xff])
+            .expect_err("malformed consensus bytes must fail");
 
         assert_eq!(error.kind, ChainErrorKind::InvalidTransaction);
         assert!(error.message.contains("could not decode"));
@@ -320,9 +313,8 @@ mod tests {
     #[test]
     fn signed_transaction_rejects_mismatched_transaction_id() {
         let bytes = consensus::serialize(&transaction());
-        let error =
-            BitcoinSignedTransaction::from_consensus_bytes(BitcoinTransactionId([0; 32]), bytes)
-                .expect_err("a mismatched transaction ID must fail");
+        let error = SignedTransaction::from_consensus_bytes(Id([0; 32]), bytes)
+            .expect_err("a mismatched transaction ID must fail");
 
         assert_eq!(error.kind, ChainErrorKind::InvalidTransaction);
         assert!(error.message.contains("transaction ID mismatch"));
@@ -331,8 +323,8 @@ mod tests {
     #[test]
     fn signed_transaction_debug_redacts_consensus_bytes() {
         let transaction = transaction();
-        let signed = BitcoinSignedTransaction::from_consensus_bytes(
-            BitcoinTransactionId::from(transaction.compute_txid()),
+        let signed = SignedTransaction::from_consensus_bytes(
+            Id::from(transaction.compute_txid()),
             consensus::serialize(&transaction),
         )
         .expect("matching signed transaction bytes should be accepted");
@@ -346,8 +338,8 @@ mod tests {
     #[test]
     fn signed_transaction_reports_consensus_virtual_size() {
         let transaction = transaction();
-        let signed = BitcoinSignedTransaction::from_consensus_bytes(
-            BitcoinTransactionId::from(transaction.compute_txid()),
+        let signed = SignedTransaction::from_consensus_bytes(
+            Id::from(transaction.compute_txid()),
             consensus::serialize(&transaction),
         )
         .expect("matching signed transaction bytes should be accepted");
@@ -361,8 +353,8 @@ mod tests {
     #[test]
     fn signed_transaction_inspection_preserves_ordered_consensus_fields() {
         let transaction = transaction();
-        let signed = BitcoinSignedTransaction::from_consensus_bytes(
-            BitcoinTransactionId::from(transaction.compute_txid()),
+        let signed = SignedTransaction::from_consensus_bytes(
+            Id::from(transaction.compute_txid()),
             consensus::serialize(&transaction),
         )
         .expect("matching signed transaction bytes should be accepted");
@@ -379,16 +371,16 @@ mod tests {
         assert_eq!(
             inspection.inputs,
             vec![
-                BitcoinSignedInputInspection {
-                    outpoint: BitcoinOutPoint {
-                        transaction_id: BitcoinTransactionId([7; 32]),
+                InputInspection {
+                    outpoint: Outpoint {
+                        transaction_id: Id([7; 32]),
                         output_index: 3,
                     },
                     sequence: Sequence::ENABLE_RBF_NO_LOCKTIME.to_consensus_u32(),
                 },
-                BitcoinSignedInputInspection {
-                    outpoint: BitcoinOutPoint {
-                        transaction_id: BitcoinTransactionId([8; 32]),
+                InputInspection {
+                    outpoint: Outpoint {
+                        transaction_id: Id([8; 32]),
                         output_index: 9,
                     },
                     sequence: Sequence::MAX.to_consensus_u32(),
@@ -398,12 +390,12 @@ mod tests {
         assert_eq!(
             inspection.outputs,
             vec![
-                BitcoinSignedOutputInspection {
+                OutputInspection {
                     output_index: 0,
                     value: Satoshi(42_000),
                     script_pubkey: vec![0x51],
                 },
-                BitcoinSignedOutputInspection {
+                OutputInspection {
                     output_index: 1,
                     value: Satoshi(7_000),
                     script_pubkey: vec![0x00, 0x14, 1, 2, 3],

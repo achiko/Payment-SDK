@@ -10,20 +10,13 @@ pub struct User {
     pub first_seen_at: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EnsureUser {
-    pub id: UserId,
-    pub owner: CommandPrincipal,
-    pub first_seen_at: u64,
-}
-
 /// Durable PS ownership of opaque users. Authentication and customer profiles
 /// remain outside this boundary.
 pub trait UserStore: Send + Sync {
     /// Creates the user when absent and otherwise returns the original record.
     /// The owner and first-seen timestamp are immutable once persisted. Reuse
     /// of the same opaque user ID by another principal is a conflict.
-    fn ensure_user<'a>(&'a self, command: EnsureUser) -> BoxFuture<'a, Result<User, DepositError>>;
+    fn ensure_user<'a>(&'a self, command: User) -> BoxFuture<'a, Result<User, DepositError>>;
 
     fn user<'a>(&'a self, id: &'a UserId) -> BoxFuture<'a, Result<Option<User>, DepositError>>;
 }

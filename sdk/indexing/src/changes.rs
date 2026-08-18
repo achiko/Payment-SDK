@@ -1,49 +1,31 @@
-use crate::{
-    BlockRef, ConfirmationPolicy, IndexScope, ObservationDraft, ProjectionBatch, WatchId,
-    WatchVersion,
-};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IndexedEvent<E> {
-    pub watch_id: WatchId,
-    pub transaction_id: Vec<u8>,
-    pub payload: E,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BlockChanges<E, U> {
-    pub block: BlockRef,
-    pub events: Vec<IndexedEvent<E>>,
-    /// Chain-owned information required to reverse this block atomically.
-    pub undo: U,
-}
+use crate::{BlockRef, ConfirmationPolicy, IndexScope, ObservationDraft, WatchVersion};
 
 /// Exact source payloads retained with a reversible canonical block bundle.
 /// Decoded chain-native fields remain owned by the concrete chain crate.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RawBlockData {
+pub struct RawBlock {
     pub block: Vec<u8>,
     pub receipts: Vec<Vec<u8>>,
 }
 
 /// Complete semantic input to one atomic repository commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InterpretedBlock<U> {
+pub struct InterpretedBlock<E, U> {
     pub block: BlockRef,
     pub drafts: Vec<ObservationDraft>,
-    /// Opaque chain-owned state changes committed with this canonical block.
-    pub projection: ProjectionBatch,
+    /// Typed chain semantics; only a repository adapter may encode them.
+    pub effect: E,
     /// Chain-owned information required to reverse the block.
     pub undo: U,
-    pub raw: RawBlockData,
+    pub raw: RawBlock,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CommitBlockCommand<U> {
+pub struct CommitBlock<E, U> {
     pub scope: IndexScope,
     pub expected_checkpoint: Option<BlockRef>,
     pub expected_watch_version: WatchVersion,
     pub confirmation_policy: ConfirmationPolicy,
     pub reorg_retention: u64,
-    pub block: InterpretedBlock<U>,
+    pub block: InterpretedBlock<E, U>,
 }

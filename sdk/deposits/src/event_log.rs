@@ -1,9 +1,9 @@
 use crate::{
-    ApplyResult, BoxFuture, Collection, CollectionId, CollectionLegId, CollectionTransitionGuard,
-    DepositError, DepositId, ReconciliationCase, RecordObservation, UtxoBatchProjectionTransition,
+    ApplyResult, BoxFuture, Collection, CollectionId, DepositError, DepositId, LegId,
+    ReconciliationCase, RecordObservation, TransitionGuard, UtxoBatchProjectionTransition,
 };
-use chain_identity::CanonicalTransactionId;
-use indexing::{EventCursor, ObservationEvent, ObservationEventId};
+use indexing::TransactionRef;
+use indexing::{EventCursor, EventId, ObservationEvent};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MirroredObservation {
@@ -23,26 +23,26 @@ pub enum AppendOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ObservationLogRequest {
+pub struct LogQuery {
     pub after: Option<EventCursor>,
     pub limit: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ObservationLogPage {
+pub struct LogPage {
     pub observations: Vec<MirroredObservation>,
     pub next: Option<EventCursor>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DepositObservationLogRequest {
+pub struct DepositFilter {
     pub deposit_id: DepositId,
     pub after: Option<EventCursor>,
     pub limit: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DepositObservationLogPage {
+pub struct DepositEvents {
     pub observations: Vec<MirroredObservation>,
     pub next: Option<EventCursor>,
 }
@@ -103,15 +103,15 @@ pub struct ProjectObservation {
     /// storage batch as ledger rows, deposit-event indexes, reconciliation,
     /// and cursor movement. Generic/account-model projection leaves this
     /// empty; callers should prefer `project_utxo_batch_and_advance` when set.
-    pub utxo_batch_transition: Option<UtxoBatchProjectionMutation>,
+    pub utxo_batch_transition: Option<BatchMutation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UtxoBatchProjectionMutation {
+pub struct BatchMutation {
     pub collection_id: CollectionId,
-    pub leg_id: CollectionLegId,
-    pub expected: CollectionTransitionGuard,
-    pub transaction_id: CanonicalTransactionId,
+    pub leg_id: LegId,
+    pub expected: TransitionGuard,
+    pub transaction_id: TransactionRef,
     pub transition: UtxoBatchProjectionTransition,
 }
 
@@ -122,56 +122,64 @@ pub struct ProjectionOutcome {
     pub reconciliation_cases: Vec<ReconciliationCase>,
 }
 
-/// Couples a Bitcoin collection lifecycle transition to every PS semantic
+/// Couples a UTXO collection lifecycle transition to every PS semantic
 /// effect of the same mirrored IX fact.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProjectUtxoBatchCollection {
+pub struct ProjectBatch {
     pub projection: ProjectObservation,
     pub collection_id: CollectionId,
-    pub leg_id: CollectionLegId,
-    pub expected: CollectionTransitionGuard,
-    pub transaction_id: CanonicalTransactionId,
+    pub leg_id: LegId,
+    pub expected: TransitionGuard,
+    pub transaction_id: TransactionRef,
     pub transition: UtxoBatchProjectionTransition,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UtxoBatchProjectionOutcome {
+pub struct BatchOutcome {
     pub projection: ProjectionOutcome,
     pub collection: Collection,
 }
 
 /// PS-owned append-only mirror. IX owns the source facts; this log owns what PS received.
-pub trait ObservationEventLog: Send + Sync {
+pub trait EventWriter: Send + Sync {
     fn append<'a>(
         &'a self,
         command: AppendObservation,
     ) -> BoxFuture<'a, Result<AppendOutcome, DepositError>>;
+}
 
+pub trait EventReader: Send + Sync {
     fn observation<'a>(
         &'a self,
-        event_id: &'a ObservationEventId,
+        event_id: &'a EventId,
     ) -> BoxFuture<'a, Result<Option<MirroredObservation>, DepositError>>;
 
     fn observations<'a>(
         &'a self,
-        request: ObservationLogRequest,
-    ) -> BoxFuture<'a, Result<ObservationLogPage, DepositError>>;
+        request: LogQuery,
+    ) -> BoxFuture<'a, Result<LogPage, DepositError>>;
 
     fn observations_for_deposit<'a>(
         &'a self,
-        request: DepositObservationLogRequest,
-    ) -> BoxFuture<'a, Result<DepositObservationLogPage, DepositError>>;
+        request: DepositFilter,
+    ) -> BoxFuture<'a, Result<DepositEvents, DepositError>>;
 }
+
+pub trait EventLog: EventWriter + EventReader {}
+
+impl<T> EventLog for T where T: EventWriter + EventReader {}
 
 /// Durable two-stage PS consumer progress. Mirroring and its cursor movement
 /// are one transaction. Projection advances independently only after all
 /// semantic ledger effects for the mirrored event commit.
-pub trait ObservationConsumerCheckpoints: Send + Sync {
+pub trait ProgressReader: Send + Sync {
     fn consumer_checkpoint<'a>(
         &'a self,
         name: ConsumerCheckpointName,
     ) -> BoxFuture<'a, Result<ConsumerCheckpoint, DepositError>>;
+}
 
+pub trait EventProjector: Send + Sync {
     fn mirror_and_advance<'a>(
         &'a self,
         command: MirrorObservation,
@@ -184,6 +192,10 @@ pub trait ObservationConsumerCheckpoints: Send + Sync {
 
     fn project_utxo_batch_and_advance<'a>(
         &'a self,
-        command: ProjectUtxoBatchCollection,
-    ) -> BoxFuture<'a, Result<UtxoBatchProjectionOutcome, DepositError>>;
+        command: ProjectBatch,
+    ) -> BoxFuture<'a, Result<BatchOutcome, DepositError>>;
 }
+
+pub trait ConsumerProgress: ProgressReader + EventProjector {}
+
+impl<T> ConsumerProgress for T where T: ProgressReader + EventProjector {}

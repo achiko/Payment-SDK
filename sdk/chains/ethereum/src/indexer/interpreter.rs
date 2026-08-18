@@ -1,21 +1,18 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::LazyLock};
 
-use alloy_primitives::U256;
-use chain_identity::{AssetId, AtomicAmount, CanonicalAddress, CanonicalTransactionId, ChainId};
+use alloy_primitives::{B256, U256};
+use base::Decimal;
 use indexing::{
-    BlockInterpreter, IndexError, IndexErrorKind, IndexScope, InterpretedBlock, MovementId,
-    MovementKind, NetworkFee, ObservationDraft, ObservationDraftStatus, RawBlockData,
-    ValueMovement, WatchId, WatchSelector, WatchTarget,
+    AssetId, BlockInterpreter as IndexBlockInterpreter, CanonicalAddress, ChainId, IndexChanges,
+    IndexError, IndexErrorKind, IndexScope, IndexUndo, InterpretedBlock, MovementId, NetworkFee,
+    ObservationDraft, ObservationDraftStatus, RawBlock, TransactionRef, ValueMovement, WatchId,
+    WatchSelector, WatchTarget,
 };
-
-use crate::EthereumTransactionId;
+use num_bigint::BigUint;
 
 use super::{
-    EthereumBlock, EthereumUndo, EthereumWatchTarget,
-    model::{
-        ParsedLog, ParsedReceipt, ParsedTransaction, encode_hex, parse_and_validate_receipts,
-        parse_block,
-    },
+    Block,
+    model::{ParsedBlock, ParsedLog, ParsedReceipt, ParsedTransaction, encode_hex},
 };
 
 const TRANSFER_TOPIC: [u8; 32] = [
@@ -23,15 +20,20 @@ const TRANSFER_TOPIC: [u8; 32] = [
     0x95, 0x2b, 0xa7, 0xf1, 0x63, 0xc4, 0xa1, 0x16, 0x28, 0xf5, 0x5a, 0x4d, 0xf5, 0x23, 0xb3, 0xef,
 ];
 const ZERO_ADDRESS: [u8; 20] = [0; 20];
+static CHAIN_ID: LazyLock<ChainId> = LazyLock::new(|| ChainId(crate::CHAIN.to_owned()));
+static NATIVE_ASSET: LazyLock<AssetId> = LazyLock::new(|| AssetId {
+    chain: (*CHAIN_ID).clone(),
+    asset: "native".to_owned(),
+});
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EthereumBlockInterpreter {
+pub struct BlockInterpreter {
     scope: IndexScope,
 }
 
-impl EthereumBlockInterpreter {
+impl BlockInterpreter {
     pub fn new(scope: IndexScope) -> Result<Self, IndexError> {
-        if scope.chain != ChainId("ethereum".to_owned()) {
+        if scope.chain != *CHAIN_ID {
             return Err(IndexError::new(
                 IndexErrorKind::ScopeMismatch,
                 "Ethereum interpreter scope must use the ethereum chain ID",
@@ -53,7 +55,7 @@ impl EthereumBlockInterpreter {
         &self.scope
     }
 
-    fn validate_watch(&self, watch: &WatchTarget<EthereumWatchTarget>) -> Result<(), IndexError> {
+    fn validate_watch(&self, watch: &WatchTarget<WatchSelector>) -> Result<(), IndexError> {
         if watch.scope != self.scope {
             return Err(IndexError::new(
                 IndexErrorKind::ScopeMismatch,
@@ -61,17 +63,7 @@ impl EthereumBlockInterpreter {
                 false,
             ));
         }
-        let consistent = match (&watch.target, &watch.selector) {
-            (EthereumWatchTarget::Address(address), WatchSelector::Address(selector)) => {
-                selector.chain == self.scope.chain && selector.value == encode_hex(&address.0)
-            }
-            (
-                EthereumWatchTarget::Transaction(transaction),
-                WatchSelector::Transaction(selector),
-            ) => selector.chain == self.scope.chain && selector.value == encode_hex(&transaction.0),
-            _ => false,
-        };
-        if !consistent {
+        if watch.target != watch.selector {
             return Err(IndexError::new(
                 IndexErrorKind::InvalidWatch,
                 "Ethereum watch target does not match its canonical selector",
@@ -86,7 +78,7 @@ impl EthereumBlockInterpreter {
         transaction: &ParsedTransaction,
         receipt: &ParsedReceipt,
         movements: &[ValueMovement],
-        watches: &[WatchTarget<EthereumWatchTarget>],
+        watches: &[WatchTarget<WatchSelector>],
         height: indexing::BlockHeight,
     ) -> Result<Vec<WatchId>, IndexError> {
         let mut touched_addresses = BTreeSet::from([transaction.from]);
@@ -97,10 +89,7 @@ impl EthereumBlockInterpreter {
             touched_addresses.insert(contract);
         }
         for movement in movements {
-            for endpoint in [movement.from.as_ref(), movement.to.as_ref()]
-                .into_iter()
-                .flatten()
-            {
+            for endpoint in [movement.from(), movement.to()].into_iter().flatten() {
                 let bytes = parse_canonical_address(endpoint)?;
                 touched_addresses.insert(bytes);
             }
@@ -112,10 +101,26 @@ impl EthereumBlockInterpreter {
             if !watch.is_active_at(height) {
                 continue;
             }
-            let matched = match &watch.target {
-                EthereumWatchTarget::Address(address) => touched_addresses.contains(&address.0),
-                EthereumWatchTarget::Transaction(transaction_id) => {
-                    transaction_id.0 == transaction.hash
+            let matched = match &watch.selector {
+                WatchSelector::Address(address) => {
+                    if !address.belongs_to(&self.scope) {
+                        return Err(IndexError::new(
+                            IndexErrorKind::ScopeMismatch,
+                            "Ethereum address watch belongs to a different scope",
+                            false,
+                        ));
+                    }
+                    touched_addresses.contains(&parse_canonical_address(address)?)
+                }
+                WatchSelector::Transaction(transaction_id) => {
+                    if !transaction_id.belongs_to(&self.scope) {
+                        return Err(IndexError::new(
+                            IndexErrorKind::ScopeMismatch,
+                            "Ethereum transaction watch belongs to a different scope",
+                            false,
+                        ));
+                    }
+                    parse_canonical_transaction(transaction_id)? == transaction.hash
                 }
             };
             if matched {
@@ -126,17 +131,18 @@ impl EthereumBlockInterpreter {
     }
 }
 
-impl BlockInterpreter for EthereumBlockInterpreter {
-    type Block = EthereumBlock;
-    type Target = EthereumWatchTarget;
-    type Undo = EthereumUndo;
+impl IndexBlockInterpreter for BlockInterpreter {
+    type Block = Block;
+    type Target = WatchSelector;
+    type Effect = IndexChanges;
+    type Undo = IndexUndo;
 
     fn inspect(
         &self,
         block: &Self::Block,
         watches: &[WatchTarget<Self::Target>],
-    ) -> Result<InterpretedBlock<Self::Undo>, IndexError> {
-        let parsed = parse_block(&block.raw_block, Some(block.reference.height), true)
+    ) -> Result<InterpretedBlock<Self::Effect, Self::Undo>, IndexError> {
+        let parsed = ParsedBlock::parse(&block.raw_block, Some(block.reference.height), true)
             .map_err(invalid_block)?;
         if parsed.reference != block.reference {
             return Err(IndexError::new(
@@ -146,7 +152,7 @@ impl BlockInterpreter for EthereumBlockInterpreter {
             ));
         }
         let receipts =
-            parse_and_validate_receipts(&block.raw_receipts, &parsed).map_err(invalid_block)?;
+            ParsedReceipt::parse_all(&block.raw_receipts, &parsed).map_err(invalid_block)?;
         let observed_at = block.reference.timestamp.ok_or_else(|| {
             IndexError::new(
                 IndexErrorKind::InvalidBlock,
@@ -156,7 +162,6 @@ impl BlockInterpreter for EthereumBlockInterpreter {
         })?;
 
         let mut drafts = Vec::new();
-        let mut affected_transactions = Vec::new();
         for (transaction, receipt) in parsed.transactions.iter().zip(&receipts) {
             let fee_amount = receipt
                 .effective_gas_price
@@ -169,12 +174,12 @@ impl BlockInterpreter for EthereumBlockInterpreter {
                     )
                 })?;
             let fee = NetworkFee {
-                asset: native_asset(),
-                amount: atomic(fee_amount),
-                payer: Some(canonical_address(transaction.from)),
+                asset: (*NATIVE_ASSET).clone(),
+                amount: atomic_decimal(fee_amount),
+                payer: Some(transaction.from.canonical(&self.scope)),
             };
             let movements = if receipt.succeeded {
-                successful_movements(transaction, receipt)?
+                successful_movements(transaction, receipt, &self.scope)?
             } else {
                 Vec::new()
             };
@@ -189,7 +194,7 @@ impl BlockInterpreter for EthereumBlockInterpreter {
                 continue;
             }
 
-            let transaction_id = canonical_transaction(transaction.hash);
+            let transaction_id = transaction.hash.canonical(&self.scope);
             drafts.push(ObservationDraft {
                 scope: self.scope.clone(),
                 transaction_id,
@@ -206,17 +211,14 @@ impl BlockInterpreter for EthereumBlockInterpreter {
                 first_seen_at: observed_at,
                 observed_at,
             });
-            affected_transactions.push(EthereumTransactionId(transaction.hash));
         }
 
         Ok(InterpretedBlock {
             block: block.reference.clone(),
             drafts,
-            projection: indexing::ProjectionBatch::default(),
-            undo: EthereumUndo {
-                affected_transactions,
-            },
-            raw: RawBlockData {
+            effect: IndexChanges::default(),
+            undo: IndexUndo::default(),
+            raw: RawBlock {
                 block: block.raw_block.clone(),
                 receipts: block.raw_receipts.clone(),
             },
@@ -227,6 +229,7 @@ impl BlockInterpreter for EthereumBlockInterpreter {
 fn successful_movements(
     transaction: &ParsedTransaction,
     receipt: &ParsedReceipt,
+    scope: &IndexScope,
 ) -> Result<Vec<ValueMovement>, IndexError> {
     let transaction_id = encode_hex(&transaction.hash);
     let mut movements = Vec::new();
@@ -238,58 +241,62 @@ fn successful_movements(
                 false,
             )
         })?;
-        movements.push(ValueMovement {
+        movements.push(ValueMovement::Transfer {
             id: MovementId(format!("{transaction_id}:value")),
-            asset: native_asset(),
-            amount: atomic(transaction.value),
-            from: Some(canonical_address(transaction.from)),
-            to: Some(canonical_address(to)),
-            kind: MovementKind::Transfer,
+            asset: (*NATIVE_ASSET).clone(),
+            amount: atomic_decimal(transaction.value),
+            from: transaction.from.canonical(scope),
+            to: to.canonical(scope),
         });
     }
 
     for log in &receipt.logs {
-        if let Some(movement) = transfer_movement(&transaction_id, log) {
+        if let Some(movement) = transfer_movement(&transaction_id, log, scope) {
             movements.push(movement);
         }
     }
     Ok(movements)
 }
 
-fn transfer_movement(transaction_id: &str, log: &ParsedLog) -> Option<ValueMovement> {
+fn transfer_movement(
+    transaction_id: &str,
+    log: &ParsedLog,
+    scope: &IndexScope,
+) -> Option<ValueMovement> {
     if log.topics.len() != 3 || log.topics[0] != TRANSFER_TOPIC || log.data.len() != 32 {
         return None;
     }
     let from = topic_address(log.topics[1])?;
     let to = topic_address(log.topics[2])?;
     let amount = U256::from_be_slice(&log.data);
-    let (from_endpoint, to_endpoint, kind) = if from == ZERO_ADDRESS {
-        (
-            None,
-            (to != ZERO_ADDRESS).then(|| canonical_address(to)),
-            MovementKind::Mint,
-        )
-    } else if to == ZERO_ADDRESS {
-        (Some(canonical_address(from)), None, MovementKind::Burn)
-    } else {
-        (
-            Some(canonical_address(from)),
-            Some(canonical_address(to)),
-            MovementKind::Transfer,
-        )
+    let id = MovementId(format!("{transaction_id}:{}", log.log_index));
+    let asset = AssetId {
+        chain: (*CHAIN_ID).clone(),
+        asset: encode_hex(&log.address),
     };
-
-    Some(ValueMovement {
-        id: MovementId(format!("{transaction_id}:{}", log.log_index)),
-        asset: AssetId {
-            chain: ethereum_chain(),
-            asset: encode_hex(&log.address),
-        },
-        amount: atomic(amount),
-        from: from_endpoint,
-        to: to_endpoint,
-        kind,
-    })
+    if from == ZERO_ADDRESS {
+        (to != ZERO_ADDRESS).then(|| ValueMovement::Mint {
+            id,
+            asset,
+            amount: atomic_decimal(amount),
+            to: to.canonical(scope),
+        })
+    } else if to == ZERO_ADDRESS {
+        Some(ValueMovement::Burn {
+            id,
+            asset,
+            amount: atomic_decimal(amount),
+            from: from.canonical(scope),
+        })
+    } else {
+        Some(ValueMovement::Transfer {
+            id,
+            asset,
+            amount: atomic_decimal(amount),
+            from: from.canonical(scope),
+            to: to.canonical(scope),
+        })
+    }
 }
 
 fn topic_address(topic: [u8; 32]) -> Option<[u8; 20]> {
@@ -300,7 +307,7 @@ fn topic_address(topic: [u8; 32]) -> Option<[u8; 20]> {
 }
 
 fn parse_canonical_address(address: &CanonicalAddress) -> Result<[u8; 20], IndexError> {
-    if address.chain != ethereum_chain() {
+    if address.scope.chain != *CHAIN_ID {
         return Err(IndexError::new(
             IndexErrorKind::InvalidBlock,
             "Ethereum movement contains a foreign-chain address",
@@ -320,33 +327,57 @@ fn parse_canonical_address(address: &CanonicalAddress) -> Result<[u8; 20], Index
         })
 }
 
-fn atomic(value: U256) -> AtomicAmount {
-    AtomicAmount(value.to_be_bytes::<32>())
+fn parse_canonical_transaction(transaction: &TransactionRef) -> Result<[u8; 32], IndexError> {
+    if transaction.scope.chain != *CHAIN_ID {
+        return Err(IndexError::new(
+            IndexErrorKind::InvalidWatch,
+            "Ethereum transaction watch belongs to another chain",
+            false,
+        ));
+    }
+    transaction
+        .value
+        .parse::<B256>()
+        .map(|value| value.0)
+        .map_err(|_| {
+            IndexError::new(
+                IndexErrorKind::InvalidWatch,
+                "Ethereum transaction watch is malformed",
+                false,
+            )
+        })
 }
 
-fn native_asset() -> AssetId {
-    AssetId {
-        chain: ethereum_chain(),
-        asset: "native".to_owned(),
+fn atomic_decimal(value: U256) -> Decimal {
+    Decimal::from_atomic(BigUint::from_bytes_be(&value.to_be_bytes::<32>()), 0)
+}
+
+trait Canonicalize {
+    type Output;
+
+    fn canonical(self, scope: &IndexScope) -> Self::Output;
+}
+
+impl Canonicalize for [u8; 20] {
+    type Output = CanonicalAddress;
+
+    fn canonical(self, scope: &IndexScope) -> Self::Output {
+        CanonicalAddress {
+            scope: scope.clone(),
+            value: encode_hex(&self),
+        }
     }
 }
 
-fn canonical_address(value: [u8; 20]) -> CanonicalAddress {
-    CanonicalAddress {
-        chain: ethereum_chain(),
-        value: encode_hex(&value),
-    }
-}
+impl Canonicalize for [u8; 32] {
+    type Output = TransactionRef;
 
-fn canonical_transaction(value: [u8; 32]) -> CanonicalTransactionId {
-    CanonicalTransactionId {
-        chain: ethereum_chain(),
-        value: encode_hex(&value),
+    fn canonical(self, scope: &IndexScope) -> Self::Output {
+        TransactionRef {
+            scope: scope.clone(),
+            value: encode_hex(&self),
+        }
     }
-}
-
-fn ethereum_chain() -> ChainId {
-    ChainId("ethereum".to_owned())
 }
 
 fn invalid_block(error: impl ToString) -> IndexError {
@@ -355,14 +386,13 @@ fn invalid_block(error: impl ToString) -> IndexError {
 
 #[cfg(test)]
 mod tests {
-    use chain_identity::ChainId;
+    use indexing::ChainId;
     use indexing::{
         BlockHash, BlockHeight, BlockRef, IndexedBlock, MovementKind, WatchId, WatchSelector,
     };
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::EthereumAddress;
 
     const BLOCK_HASH: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const PARENT_HASH: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -374,7 +404,7 @@ mod tests {
 
     fn scope() -> IndexScope {
         IndexScope {
-            chain: ChainId("ethereum".to_owned()),
+            chain: ChainId(crate::CHAIN.to_owned()),
             network: "test".to_owned(),
         }
     }
@@ -469,12 +499,12 @@ mod tests {
         })
     }
 
-    fn ethereum_block(transaction: Value, receipt: Value) -> EthereumBlock {
+    fn ethereum_block(transaction: Value, receipt: Value) -> Block {
         let raw_block =
             serde_json::to_vec(&block_value(transaction)).expect("test block JSON must serialize");
-        let parsed =
-            parse_block(&raw_block, Some(BlockHeight(10)), true).expect("test block must parse");
-        EthereumBlock {
+        let parsed = ParsedBlock::parse(&raw_block, Some(BlockHeight(10)), true)
+            .expect("test block must parse");
+        Block {
             reference: parsed.reference,
             raw_block,
             raw_receipts: vec![
@@ -483,12 +513,13 @@ mod tests {
         }
     }
 
-    fn transaction_watch() -> WatchTarget<EthereumWatchTarget> {
+    fn transaction_watch() -> WatchTarget<WatchSelector> {
+        let selector = WatchSelector::Transaction(hash(TX_HASH).canonical(&scope()));
         WatchTarget {
             id: WatchId("watch-tx".to_owned()),
             scope: scope(),
-            selector: WatchSelector::Transaction(canonical_transaction(hash(TX_HASH))),
-            target: EthereumWatchTarget::Transaction(EthereumTransactionId(hash(TX_HASH))),
+            selector: selector.clone(),
+            target: selector,
             idempotency_key: "tx-key".to_owned(),
             start_height: BlockHeight(1),
             registered_at: None,
@@ -496,13 +527,14 @@ mod tests {
         }
     }
 
-    fn address_watch(value: &str) -> WatchTarget<EthereumWatchTarget> {
+    fn address_watch(value: &str) -> WatchTarget<WatchSelector> {
         let value = address(value);
+        let selector = WatchSelector::Address(value.canonical(&scope()));
         WatchTarget {
             id: WatchId("watch-address".to_owned()),
             scope: scope(),
-            selector: WatchSelector::Address(canonical_address(value)),
-            target: EthereumWatchTarget::Address(EthereumAddress(value)),
+            selector: selector.clone(),
+            target: selector,
             idempotency_key: "address-key".to_owned(),
             start_height: BlockHeight(1),
             registered_at: None,
@@ -511,10 +543,10 @@ mod tests {
     }
 
     fn inspect(
-        block: &EthereumBlock,
-        watches: &[WatchTarget<EthereumWatchTarget>],
-    ) -> Result<InterpretedBlock<EthereumUndo>, IndexError> {
-        EthereumBlockInterpreter::new(scope())?.inspect(block, watches)
+        block: &Block,
+        watches: &[WatchTarget<WatchSelector>],
+    ) -> Result<InterpretedBlock<IndexChanges, IndexUndo>, IndexError> {
+        BlockInterpreter::new(scope())?.inspect(block, watches)
     }
 
     #[test]
@@ -527,14 +559,18 @@ mod tests {
         let draft = interpreted.drafts.first().expect("watched tx must emit");
         assert_eq!(draft.movements.len(), 1);
         assert_eq!(
-            draft.movements[0].id,
-            MovementId(format!("{TX_HASH}:value"))
+            draft.movements[0].id(),
+            &MovementId(format!("{TX_HASH}:value"))
         );
-        assert_eq!(draft.movements[0].amount, atomic(U256::from(42_u8)));
+        assert_eq!(
+            draft.movements[0].amount(),
+            &atomic_decimal(U256::from(42_u8))
+        );
         assert_eq!(
             draft.fee.as_ref().expect("fee must exist").amount,
-            atomic(U256::from(21_000_u64 * 3))
+            atomic_decimal(U256::from(21_000_u64 * 3))
         );
+        assert_eq!(draft.movements[0].amount().scale(), 0);
         assert_eq!(draft.status, ObservationDraftStatus::Included);
         assert_eq!(interpreted.raw.block, block.raw_block);
     }
@@ -548,8 +584,8 @@ mod tests {
         let interpreted =
             inspect(&block, &[address_watch(CONTRACT)]).expect("contract creation must interpret");
         assert_eq!(
-            interpreted.drafts[0].movements[0].to,
-            Some(canonical_address(address(CONTRACT)))
+            interpreted.drafts[0].movements[0].to(),
+            Some(&address(CONTRACT).canonical(&scope()))
         );
     }
 
@@ -602,12 +638,12 @@ mod tests {
         let interpreted = inspect(&block, &[transaction_watch()]).expect("logs must interpret");
         let movements = &interpreted.drafts[0].movements;
         assert_eq!(movements.len(), 3);
-        assert_eq!(movements[0].kind, MovementKind::Transfer);
-        assert_eq!(movements[1].kind, MovementKind::Mint);
-        assert_eq!(movements[1].from, None);
-        assert_eq!(movements[2].kind, MovementKind::Burn);
-        assert_eq!(movements[2].to, None);
-        assert_eq!(movements[2].id, MovementId(format!("{TX_HASH}:2")));
+        assert_eq!(movements[0].kind(), MovementKind::Transfer);
+        assert_eq!(movements[1].kind(), MovementKind::Mint);
+        assert_eq!(movements[1].from(), None);
+        assert_eq!(movements[2].kind(), MovementKind::Burn);
+        assert_eq!(movements[2].to(), None);
+        assert_eq!(movements[2].id(), &MovementId(format!("{TX_HASH}:2")));
     }
 
     #[test]

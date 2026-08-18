@@ -6,7 +6,7 @@ use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
-use super::{EthereumHeadWake, source::parse_new_heads_notification};
+use super::{Head, source::parse_new_heads_notification};
 
 const SUBSCRIPTION_REQUEST_ID: u64 = 1;
 
@@ -15,22 +15,22 @@ const SUBSCRIPTION_REQUEST_ID: u64 = 1;
 /// A missing URL disables the stream. This stream is only a latency hint: the
 /// authoritative worker must reconcile every wake through numbered HTTP reads.
 #[derive(Clone, PartialEq, Eq)]
-pub struct EthereumNewHeadsConfig {
+pub struct HeadsConfig {
     websocket_url: Option<String>,
     reconnect_delay: Duration,
 }
 
-impl fmt::Debug for EthereumNewHeadsConfig {
+impl fmt::Debug for HeadsConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("EthereumNewHeadsConfig")
+            .debug_struct("HeadsConfig")
             .field("websocket_configured", &self.websocket_url.is_some())
             .field("reconnect_delay", &self.reconnect_delay)
             .finish()
     }
 }
 
-impl EthereumNewHeadsConfig {
+impl HeadsConfig {
     pub fn new(
         websocket_url: Option<String>,
         reconnect_delay: Duration,
@@ -76,44 +76,86 @@ impl EthereumNewHeadsConfig {
 
 /// Minimal message boundary used to make reconnect behavior deterministic in
 /// tests without exposing Tungstenite types to the application.
-pub trait EthereumNewHeadsConnection: Send {
+pub trait HeadConnection: Send {
     fn send<'a>(&'a mut self, payload: Vec<u8>) -> BoxFuture<'a, Result<(), SourceError>>;
 
     fn receive<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<Vec<u8>>, SourceError>>;
 }
 
 /// Connector boundary for the optional `newHeads` wake stream.
-pub trait EthereumNewHeadsConnector: Send + Sync {
+pub trait HeadConnector: Send + Sync {
     fn connect<'a>(
         &'a self,
         websocket_url: &'a str,
-    ) -> BoxFuture<'a, Result<Box<dyn EthereumNewHeadsConnection>, SourceError>>;
+    ) -> BoxFuture<'a, Result<Box<dyn HeadConnection>, SourceError>>;
 }
 
 /// Tokio/Tungstenite connector used by the production wake-only client.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct TokioTungsteniteNewHeadsConnector;
+pub enum TokioConnector {
+    #[default]
+    Tokio,
+}
 
-impl EthereumNewHeadsConnector for TokioTungsteniteNewHeadsConnector {
+impl HeadConnector for TokioConnector {
     fn connect<'a>(
         &'a self,
         websocket_url: &'a str,
-    ) -> BoxFuture<'a, Result<Box<dyn EthereumNewHeadsConnection>, SourceError>> {
+    ) -> BoxFuture<'a, Result<Box<dyn HeadConnection>, SourceError>> {
         Box::pin(async move {
             let (stream, _) = connect_async(websocket_url)
                 .await
                 .map_err(|_| source_error("Ethereum newHeads WebSocket connection failed", true))?;
-            Ok(Box::new(TungsteniteNewHeadsConnection { stream })
-                as Box<dyn EthereumNewHeadsConnection>)
+            Ok(Box::new(HeadSocket { stream }) as Box<dyn HeadConnection>)
         })
     }
 }
 
-struct TungsteniteNewHeadsConnection {
+struct HeadSocket {
     stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
 }
 
-impl EthereumNewHeadsConnection for TungsteniteNewHeadsConnection {
+enum SocketFrame {
+    Payload(Vec<u8>),
+    Ignore,
+    Closed,
+}
+
+impl HeadSocket {
+    async fn next_frame(&mut self) -> Result<SocketFrame, SourceError> {
+        match self.stream.next().await {
+            Some(Ok(Message::Text(message))) => {
+                Ok(SocketFrame::Payload(message.as_bytes().to_vec()))
+            }
+            Some(Ok(Message::Binary(message))) => Ok(SocketFrame::Payload(message.to_vec())),
+            Some(Ok(Message::Ping(payload))) => {
+                self.stream
+                    .send(Message::Pong(payload))
+                    .await
+                    .map_err(|_| source_error("Ethereum newHeads pong send failed", true))?;
+                Ok(SocketFrame::Ignore)
+            }
+            Some(Ok(Message::Close(_))) | None => Ok(SocketFrame::Closed),
+            Some(Ok(Message::Pong(_) | Message::Frame(_))) => Ok(SocketFrame::Ignore),
+            Some(Err(_)) => Err(source_error(
+                "Ethereum newHeads WebSocket receive failed",
+                true,
+            )),
+        }
+    }
+
+    async fn receive_payload(&mut self) -> Result<Option<Vec<u8>>, SourceError> {
+        loop {
+            match self.next_frame().await? {
+                SocketFrame::Payload(payload) => return Ok(Some(payload)),
+                SocketFrame::Closed => return Ok(None),
+                SocketFrame::Ignore => {}
+            }
+        }
+    }
+}
+
+impl HeadConnection for HeadSocket {
     fn send<'a>(&'a mut self, payload: Vec<u8>) -> BoxFuture<'a, Result<(), SourceError>> {
         Box::pin(async move {
             let payload = String::from_utf8(payload)
@@ -126,32 +168,7 @@ impl EthereumNewHeadsConnection for TungsteniteNewHeadsConnection {
     }
 
     fn receive<'a>(&'a mut self) -> BoxFuture<'a, Result<Option<Vec<u8>>, SourceError>> {
-        Box::pin(async move {
-            loop {
-                match self.stream.next().await {
-                    Some(Ok(Message::Text(message))) => {
-                        return Ok(Some(message.as_bytes().to_vec()));
-                    }
-                    Some(Ok(Message::Binary(message))) => return Ok(Some(message.to_vec())),
-                    Some(Ok(Message::Ping(payload))) => {
-                        self.stream
-                            .send(Message::Pong(payload))
-                            .await
-                            .map_err(|_| {
-                                source_error("Ethereum newHeads pong send failed", true)
-                            })?;
-                    }
-                    Some(Ok(Message::Close(_))) | None => return Ok(None),
-                    Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
-                    Some(Err(_)) => {
-                        return Err(source_error(
-                            "Ethereum newHeads WebSocket receive failed",
-                            true,
-                        ));
-                    }
-                }
-            }
-        })
+        Box::pin(self.receive_payload())
     }
 }
 
@@ -161,34 +178,39 @@ impl EthereumNewHeadsConnection for TungsteniteNewHeadsConnection {
 /// after transport closure, RPC rejection, or malformed session data. Returning
 /// `false` from `on_wake` shuts the loop down cleanly. Head notifications never
 /// become canonical block data; callers must wake the ordered HTTP worker.
-pub struct EthereumNewHeadsClient<C = TokioTungsteniteNewHeadsConnector> {
-    config: EthereumNewHeadsConfig,
+pub struct HeadsClient<C = TokioConnector> {
+    config: HeadsConfig,
     connector: Arc<C>,
 }
 
-impl EthereumNewHeadsClient<TokioTungsteniteNewHeadsConnector> {
+impl HeadsClient<TokioConnector> {
     #[must_use]
-    pub fn new(config: EthereumNewHeadsConfig) -> Self {
-        Self::with_connector(config, TokioTungsteniteNewHeadsConnector)
+    pub fn new(config: HeadsConfig) -> Self {
+        Self::with_connector(config, TokioConnector::Tokio)
     }
 }
 
 /// Sanitized lifecycle event for the optional wake-only WebSocket stream.
 ///
 /// Events intentionally contain no endpoint, subscription identifier, or
-/// provider error text, so applications can use them for metrics without
+/// provider error text, so applications can use them for diagnostics without
 /// exposing RPC configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EthereumNewHeadsConnectionEvent {
+pub enum HeadEvent {
     Connected,
     Disconnected,
     ReconnectScheduled,
     Failure,
 }
 
-impl<C> EthereumNewHeadsClient<C> {
+enum RunOutcome {
+    Stop { connected: bool },
+    Retry { connected: bool, failed: bool },
+}
+
+impl<C> HeadsClient<C> {
     #[must_use]
-    pub fn with_connector(config: EthereumNewHeadsConfig, connector: C) -> Self {
+    pub fn with_connector(config: HeadsConfig, connector: C) -> Self {
         Self {
             config,
             connector: Arc::new(connector),
@@ -196,18 +218,18 @@ impl<C> EthereumNewHeadsClient<C> {
     }
 
     #[must_use]
-    pub fn config(&self) -> &EthereumNewHeadsConfig {
+    pub fn config(&self) -> &HeadsConfig {
         &self.config
     }
 }
 
-impl<C> EthereumNewHeadsClient<C>
+impl<C> HeadsClient<C>
 where
-    C: EthereumNewHeadsConnector,
+    C: HeadConnector,
 {
     pub async fn run<F>(&self, mut on_wake: F) -> Result<(), SourceError>
     where
-        F: FnMut(EthereumHeadWake) -> bool + Send,
+        F: FnMut(Head) -> bool + Send,
     {
         self.run_with_events(&mut on_wake, |_| {}).await
     }
@@ -221,8 +243,8 @@ where
         mut on_event: E,
     ) -> Result<(), SourceError>
     where
-        F: FnMut(EthereumHeadWake) -> bool + Send,
-        E: FnMut(EthereumNewHeadsConnectionEvent) + Send,
+        F: FnMut(Head) -> bool + Send,
+        E: FnMut(HeadEvent) + Send,
     {
         let Some(websocket_url) = self.config.websocket_url() else {
             return Ok(());
@@ -230,61 +252,121 @@ where
         let request = subscription_request()?;
 
         loop {
-            let mut connection = match self.connector.connect(websocket_url).await {
-                Ok(connection) => connection,
-                Err(_) => {
-                    on_event(EthereumNewHeadsConnectionEvent::Failure);
-                    on_event(EthereumNewHeadsConnectionEvent::ReconnectScheduled);
+            match self
+                .run_once(websocket_url, &request, &mut on_wake, &mut on_event)
+                .await
+            {
+                RunOutcome::Stop { connected } => {
+                    emit_disconnect(connected, &mut on_event);
+                    return Ok(());
+                }
+                RunOutcome::Retry { connected, failed } => {
+                    emit_disconnect(connected, &mut on_event);
+                    emit_failure(failed, &mut on_event);
+                    on_event(HeadEvent::ReconnectScheduled);
                     tokio::time::sleep(self.config.reconnect_delay()).await;
-                    continue;
-                }
-            };
-            if connection.send(request.clone()).await.is_err() {
-                on_event(EthereumNewHeadsConnectionEvent::Failure);
-                on_event(EthereumNewHeadsConnectionEvent::ReconnectScheduled);
-                tokio::time::sleep(self.config.reconnect_delay()).await;
-                continue;
-            }
-
-            let mut session = NewHeadsSession::awaiting_confirmation();
-            let mut connected = false;
-            loop {
-                let message = match connection.receive().await {
-                    Ok(Some(message)) => message,
-                    Ok(None) => break,
-                    Err(_) => {
-                        on_event(EthereumNewHeadsConnectionEvent::Failure);
-                        break;
-                    }
-                };
-                let was_active = session.is_active();
-                match session.consume(&message) {
-                    Ok(Some(wake)) if !on_wake(wake) => {
-                        if connected {
-                            on_event(EthereumNewHeadsConnectionEvent::Disconnected);
-                        }
-                        return Ok(());
-                    }
-                    Ok(_) => {
-                        if !was_active && session.is_active() {
-                            connected = true;
-                            on_event(EthereumNewHeadsConnectionEvent::Connected);
-                        }
-                    }
-                    Err(_) => {
-                        on_event(EthereumNewHeadsConnectionEvent::Failure);
-                        break;
-                    }
                 }
             }
-
-            if connected {
-                on_event(EthereumNewHeadsConnectionEvent::Disconnected);
-            }
-            on_event(EthereumNewHeadsConnectionEvent::ReconnectScheduled);
-
-            tokio::time::sleep(self.config.reconnect_delay()).await;
         }
+    }
+
+    async fn run_once<F, E>(
+        &self,
+        websocket_url: &str,
+        request: &[u8],
+        on_wake: &mut F,
+        on_event: &mut E,
+    ) -> RunOutcome
+    where
+        F: FnMut(Head) -> bool + Send,
+        E: FnMut(HeadEvent) + Send,
+    {
+        let Ok(mut connection) = self.connector.connect(websocket_url).await else {
+            return RunOutcome::Retry {
+                connected: false,
+                failed: true,
+            };
+        };
+        if connection.send(request.to_vec()).await.is_err() {
+            return RunOutcome::Retry {
+                connected: false,
+                failed: true,
+            };
+        }
+        run_session(connection.as_mut(), on_wake, on_event).await
+    }
+}
+
+async fn run_session<F, E>(
+    connection: &mut dyn HeadConnection,
+    on_wake: &mut F,
+    on_event: &mut E,
+) -> RunOutcome
+where
+    F: FnMut(Head) -> bool + Send,
+    E: FnMut(HeadEvent) + Send,
+{
+    let mut session = NewHeadsSession::awaiting_confirmation();
+    let mut connected = false;
+    loop {
+        let message = match connection.receive().await {
+            Ok(Some(message)) => message,
+            Ok(None) => {
+                return RunOutcome::Retry {
+                    connected,
+                    failed: false,
+                };
+            }
+            Err(_) => {
+                return RunOutcome::Retry {
+                    connected,
+                    failed: true,
+                };
+            }
+        };
+        let was_active = session.is_active();
+        match session.consume(&message) {
+            Ok(Some(wake)) if !on_wake(wake) => return RunOutcome::Stop { connected },
+            Ok(_) => activate_session(was_active, &session, &mut connected, on_event),
+            Err(_) => {
+                return RunOutcome::Retry {
+                    connected,
+                    failed: true,
+                };
+            }
+        }
+    }
+}
+
+fn activate_session<E>(
+    was_active: bool,
+    session: &NewHeadsSession,
+    connected: &mut bool,
+    on_event: &mut E,
+) where
+    E: FnMut(HeadEvent),
+{
+    if !was_active && session.is_active() {
+        *connected = true;
+        on_event(HeadEvent::Connected);
+    }
+}
+
+fn emit_disconnect<E>(connected: bool, on_event: &mut E)
+where
+    E: FnMut(HeadEvent),
+{
+    if connected {
+        on_event(HeadEvent::Disconnected);
+    }
+}
+
+fn emit_failure<E>(failed: bool, on_event: &mut E)
+where
+    E: FnMut(HeadEvent),
+{
+    if failed {
+        on_event(HeadEvent::Failure);
     }
 }
 
@@ -302,7 +384,7 @@ impl NewHeadsSession {
         matches!(self, Self::Active { .. })
     }
 
-    fn consume(&mut self, message: &[u8]) -> Result<Option<EthereumHeadWake>, SourceError> {
+    fn consume(&mut self, message: &[u8]) -> Result<Option<Head>, SourceError> {
         match self {
             Self::AwaitingConfirmation => {
                 let value: Value = serde_json::from_slice(message).map_err(|_| {
@@ -373,16 +455,16 @@ mod tests {
 
     #[derive(Clone)]
     struct ScriptedConnector {
-        connections: Arc<Mutex<VecDeque<Box<dyn EthereumNewHeadsConnection>>>>,
+        connections: Arc<Mutex<VecDeque<Box<dyn HeadConnection>>>>,
         connect_count: Arc<Mutex<usize>>,
         failures_before_connect: Arc<Mutex<usize>>,
     }
 
-    impl EthereumNewHeadsConnector for ScriptedConnector {
+    impl HeadConnector for ScriptedConnector {
         fn connect<'a>(
             &'a self,
             _websocket_url: &'a str,
-        ) -> BoxFuture<'a, Result<Box<dyn EthereumNewHeadsConnection>, SourceError>> {
+        ) -> BoxFuture<'a, Result<Box<dyn HeadConnection>, SourceError>> {
             Box::pin(async move {
                 *self.connect_count.lock().expect("connect count lock") += 1;
                 let mut failures = self
@@ -408,7 +490,7 @@ mod tests {
         sent: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
-    impl EthereumNewHeadsConnection for ScriptedConnection {
+    impl HeadConnection for ScriptedConnection {
         fn send<'a>(&'a mut self, payload: Vec<u8>) -> BoxFuture<'a, Result<(), SourceError>> {
             Box::pin(async move {
                 self.sent.lock().expect("sent requests lock").push(payload);
@@ -429,8 +511,7 @@ mod tests {
             connect_count: Arc::clone(&connect_count),
             failures_before_connect: Arc::new(Mutex::new(0)),
         };
-        let client =
-            EthereumNewHeadsClient::with_connector(EthereumNewHeadsConfig::disabled(), connector);
+        let client = HeadsClient::with_connector(HeadsConfig::disabled(), connector);
 
         futures_executor::block_on(client.run(|_| true))
             .expect("a disabled wake client must exit successfully");
@@ -440,7 +521,7 @@ mod tests {
 
     #[test]
     fn config_debug_output_redacts_the_websocket_url() {
-        let config = EthereumNewHeadsConfig::new(
+        let config = HeadsConfig::new(
             Some("wss://provider-user:provider-secret@example.invalid/ws".to_owned()),
             Duration::from_secs(3),
         )
@@ -473,16 +554,15 @@ mod tests {
         let connect_count = Arc::new(Mutex::new(0));
         let connector = ScriptedConnector {
             connections: Arc::new(Mutex::new(VecDeque::from([
-                Box::new(first) as Box<dyn EthereumNewHeadsConnection>,
-                Box::new(second) as Box<dyn EthereumNewHeadsConnection>,
+                Box::new(first) as Box<dyn HeadConnection>,
+                Box::new(second) as Box<dyn HeadConnection>,
             ]))),
             connect_count: Arc::clone(&connect_count),
             failures_before_connect: Arc::new(Mutex::new(1)),
         };
-        let config =
-            EthereumNewHeadsConfig::new(Some("ws://example.invalid".to_owned()), Duration::ZERO)
-                .expect("the scripted WebSocket URL must be valid");
-        let client = EthereumNewHeadsClient::with_connector(config, connector);
+        let config = HeadsConfig::new(Some("ws://example.invalid".to_owned()), Duration::ZERO)
+            .expect("the scripted WebSocket URL must be valid");
+        let client = HeadsClient::with_connector(config, connector);
         let mut wakes = Vec::new();
         let mut events = Vec::new();
 
@@ -500,20 +580,20 @@ mod tests {
         assert_eq!(*connect_count.lock().expect("connect count lock"), 3);
         assert_eq!(
             wakes,
-            vec![EthereumHeadWake {
+            vec![Head {
                 announced_height: BlockHeight(10)
             }]
         );
         assert_eq!(
             events,
             vec![
-                EthereumNewHeadsConnectionEvent::Failure,
-                EthereumNewHeadsConnectionEvent::ReconnectScheduled,
-                EthereumNewHeadsConnectionEvent::Connected,
-                EthereumNewHeadsConnectionEvent::Disconnected,
-                EthereumNewHeadsConnectionEvent::ReconnectScheduled,
-                EthereumNewHeadsConnectionEvent::Connected,
-                EthereumNewHeadsConnectionEvent::Disconnected,
+                HeadEvent::Failure,
+                HeadEvent::ReconnectScheduled,
+                HeadEvent::Connected,
+                HeadEvent::Disconnected,
+                HeadEvent::ReconnectScheduled,
+                HeadEvent::Connected,
+                HeadEvent::Disconnected,
             ]
         );
         let sent = sent.lock().expect("sent requests lock");
@@ -542,15 +622,14 @@ mod tests {
         };
         let connector = ScriptedConnector {
             connections: Arc::new(Mutex::new(VecDeque::from([
-                Box::new(connection) as Box<dyn EthereumNewHeadsConnection>
+                Box::new(connection) as Box<dyn HeadConnection>
             ]))),
             connect_count: Arc::new(Mutex::new(0)),
             failures_before_connect: Arc::new(Mutex::new(0)),
         };
-        let config =
-            EthereumNewHeadsConfig::new(Some("ws://example.invalid".to_owned()), Duration::ZERO)
-                .expect("the scripted WebSocket URL must be valid");
-        let client = EthereumNewHeadsClient::with_connector(config, connector);
+        let config = HeadsConfig::new(Some("ws://example.invalid".to_owned()), Duration::ZERO)
+            .expect("the scripted WebSocket URL must be valid");
+        let client = HeadsClient::with_connector(config, connector);
         let mut wakes = Vec::new();
 
         client
@@ -598,7 +677,7 @@ mod tests {
             session
                 .consume(&notification("0xabc", "0x5"))
                 .expect("the matching notification must be accepted"),
-            Some(EthereumHeadWake {
+            Some(Head {
                 announced_height: BlockHeight(5),
             })
         );

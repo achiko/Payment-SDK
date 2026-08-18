@@ -7,105 +7,48 @@ use std::{
 };
 
 use crate::{
-    BlockCommitObservation, BlockCommitObservationOutcome, BlockHeight, BlockInterpreter, BlockRef,
-    BlockSource, CommitBlockCommand, ConfirmationPolicy, IndexError, IndexErrorKind,
-    IndexRepository, IndexedBlock, IndexingWorker, NoopSyncObserver, RebuildReason, ReorgDepth,
-    ReorgObservation, RevertTipCommand, RevertTipOutcome, SyncObserver, SyncPhase, SyncRequest,
-    SyncStatus,
+    BlockHeight, BlockInterpreter, BlockRef, BlockSource, CanonicalReader, ChainWriter,
+    CommitBlock, CommitObservation, CommitStatus, IndexError, IndexErrorKind, IndexedBlock,
+    NoopWorkerObserver, RebuildReason, ReorgDepth, ReorgObservation, RevertOutcome, RevertTip,
+    StatusStore, SyncPhase, SyncRequest, SyncStatus, WatchReader, WorkerObserver,
 };
 
-pub const V1_CONFIRMATION_DEPTH: u64 = 12;
-pub const V1_REORG_RETENTION: u64 = 50;
+mod config;
+mod contract;
+mod validation;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OrderedSyncConfig {
-    pub scope: crate::IndexScope,
-    pub bootstrap_height: BlockHeight,
-    pub confirmation_policy: ConfirmationPolicy,
-    pub reorg_retention: u64,
-}
-
-impl OrderedSyncConfig {
-    pub fn new(
-        scope: crate::IndexScope,
-        bootstrap_height: BlockHeight,
-        confirmation_policy: ConfirmationPolicy,
-        reorg_retention: u64,
-    ) -> Result<Self, IndexError> {
-        if confirmation_policy.minimum_confirmations == 0 {
-            return Err(IndexError::new(
-                IndexErrorKind::PolicyMismatch,
-                "confirmation depth must be greater than zero",
-                false,
-            ));
-        }
-        if confirmation_policy.require_chain_finality {
-            return Err(IndexError::new(
-                IndexErrorKind::PolicyMismatch,
-                "ordered depth worker does not consume a chain-finality source",
-                false,
-            ));
-        }
-        if reorg_retention == 0 {
-            return Err(IndexError::new(
-                IndexErrorKind::InvalidRequest,
-                "reorg retention must be greater than zero",
-                false,
-            ));
-        }
-
-        Ok(Self {
-            scope,
-            bootstrap_height,
-            confirmation_policy,
-            reorg_retention,
-        })
-    }
-
-    #[must_use]
-    pub fn ethereum_v1(scope: crate::IndexScope, bootstrap_height: BlockHeight) -> Self {
-        Self {
-            scope,
-            bootstrap_height,
-            confirmation_policy: ConfirmationPolicy {
-                minimum_confirmations: V1_CONFIRMATION_DEPTH,
-                require_chain_finality: false,
-            },
-            reorg_retention: V1_REORG_RETENTION,
-        }
-    }
-}
-
+pub use config::{SyncConfig, V1_CONFIRMATION_DEPTH, V1_REORG_RETENTION};
+use contract::RunningGuard;
 /// HTTP-authoritative, one-scope ordered synchronization worker.
 ///
 /// WebSocket notifications intentionally do not enter this type. They may only
 /// wake a caller that invokes `sync`; every decision is made from `BlockSource`
 /// tip, canonical-hash, and full-block reads.
-pub struct OrderedSyncWorker<S, I, R> {
+pub struct SyncWorker<S, I, R> {
     source: S,
     interpreter: I,
     repository: R,
-    config: OrderedSyncConfig,
-    observer: Arc<dyn SyncObserver>,
+    config: SyncConfig,
+    observer: Arc<dyn WorkerObserver>,
     running: AtomicBool,
 }
 
-impl<S, I, R> OrderedSyncWorker<S, I, R> {
+impl<S, I, R> SyncWorker<S, I, R> {
     #[must_use]
-    pub fn new(source: S, interpreter: I, repository: R, config: OrderedSyncConfig) -> Self {
+    pub fn new(source: S, interpreter: I, repository: R, config: SyncConfig) -> Self {
         Self {
             source,
             interpreter,
             repository,
             config,
-            observer: Arc::new(NoopSyncObserver),
+            observer: Arc::new(NoopWorkerObserver::Ignore),
             running: AtomicBool::new(false),
         }
     }
 
     /// Installs the process-owned adapter for ordered-sync observations.
     #[must_use]
-    pub fn with_observer(mut self, observer: Arc<dyn SyncObserver>) -> Self {
+    pub fn with_observer(mut self, observer: Arc<dyn WorkerObserver>) -> Self {
         self.observer = observer;
         self
     }
@@ -116,19 +59,14 @@ impl<S, I, R> OrderedSyncWorker<S, I, R> {
     }
 }
 
-struct RunningGuard<'a>(&'a AtomicBool);
-
-impl Drop for RunningGuard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
-impl<S, I, R> OrderedSyncWorker<S, I, R>
+impl<S, I, R> SyncWorker<S, I, R>
 where
     S: BlockSource<Block = I::Block>,
     I: BlockInterpreter,
-    R: IndexRepository<Target = I::Target, Undo = I::Undo>,
+    R: CanonicalReader<Target = I::Target, Effect = I::Effect, Undo = I::Undo>
+        + WatchReader
+        + ChainWriter
+        + StatusStore,
 {
     fn enter(&self) -> Result<RunningGuard<'_>, IndexError> {
         self.running
@@ -158,7 +96,7 @@ where
 
         // Recovery-required phases are durable, externally observable service
         // states. Normal polling must not try to overwrite them with
-        // `Reconciling`; only an explicit rebuild or migration may clear them.
+        // `Reconciling`; only an explicit rebuild may clear them.
         let durable_status = self.repository.status(&self.config.scope).await?;
         if matches!(
             durable_status.phase,
@@ -291,7 +229,7 @@ where
                 ));
             }
 
-            let command = CommitBlockCommand {
+            let command = CommitBlock {
                 scope: self.config.scope.clone(),
                 expected_checkpoint: checkpoint.clone(),
                 expected_watch_version: watches.version,
@@ -303,13 +241,13 @@ where
             let result = self.repository.commit_block(command).await;
             let elapsed = started_at.elapsed();
             let outcome = match &result {
-                Ok(outcome) => BlockCommitObservationOutcome::Success(*outcome),
-                Err(error) => BlockCommitObservationOutcome::Failure {
+                Ok(outcome) => CommitStatus::Success(*outcome),
+                Err(error) => CommitStatus::Failure {
                     kind: error.kind,
                     retryable: error.retryable,
                 },
             };
-            self.observer.block_commit(BlockCommitObservation {
+            self.observer.block_commit(CommitObservation {
                 scope: self.config.scope.clone(),
                 block: source_ref.clone(),
                 elapsed,
@@ -429,7 +367,7 @@ where
             .checked_sub(ancestor.height.0)
             .ok_or_else(|| {
                 IndexError::new(
-                    IndexErrorKind::Storage,
+                    IndexErrorKind::Store,
                     "common ancestor is above the persisted checkpoint",
                     false,
                 )
@@ -458,21 +396,21 @@ where
             .await?;
             let expected_tip = current.clone().ok_or_else(|| {
                 IndexError::new(
-                    IndexErrorKind::Storage,
+                    IndexErrorKind::Store,
                     "repository lost its checkpoint during reorg recovery",
                     false,
                 )
             })?;
             current = match self
                 .repository
-                .revert_tip(RevertTipCommand {
+                .revert_tip(RevertTip {
                     scope: self.config.scope.clone(),
                     expected_tip,
                 })
                 .await?
             {
-                RevertTipOutcome::Reverted { checkpoint }
-                | RevertTipOutcome::AlreadyReverted { checkpoint } => checkpoint,
+                RevertOutcome::Reverted { checkpoint }
+                | RevertOutcome::AlreadyReverted { checkpoint } => checkpoint,
             };
         }
         self.publish_status(
@@ -487,52 +425,6 @@ where
             checkpoint: current,
             rebuild_required: None,
         })
-    }
-
-    fn validate_scope(&self, scope: &crate::IndexScope) -> Result<(), IndexError> {
-        if scope != &self.config.scope {
-            return Err(IndexError::new(
-                IndexErrorKind::ScopeMismatch,
-                "request scope does not match the worker scope",
-                false,
-            ));
-        }
-        Ok(())
-    }
-
-    fn validate_interpreted(
-        &self,
-        source_ref: &BlockRef,
-        interpreted: &crate::InterpretedBlock<I::Undo>,
-    ) -> Result<(), IndexError> {
-        if &interpreted.block != source_ref {
-            return Err(IndexError::new(
-                IndexErrorKind::InvalidBlock,
-                "interpreter changed the source block reference",
-                false,
-            ));
-        }
-        for draft in &interpreted.drafts {
-            if draft.scope != self.config.scope
-                || draft.transaction_id.chain != self.config.scope.chain
-            {
-                return Err(IndexError::new(
-                    IndexErrorKind::ScopeMismatch,
-                    "interpreted observation belongs to a different scope",
-                    false,
-                ));
-            }
-            if matches!(draft.status, crate::ObservationDraftStatus::Failed { .. })
-                && !draft.movements.is_empty()
-            {
-                return Err(IndexError::new(
-                    IndexErrorKind::InvalidBlock,
-                    "failed receipt draft contains value movements",
-                    false,
-                ));
-            }
-        }
-        Ok(())
     }
 
     async fn publish_status(
@@ -584,33 +476,6 @@ where
             Some(error.message.clone()),
         )
         .await
-    }
-}
-
-impl<S, I, R> IndexingWorker for OrderedSyncWorker<S, I, R>
-where
-    S: BlockSource<Block = I::Block>,
-    I: BlockInterpreter,
-    R: IndexRepository<Target = I::Target, Undo = I::Undo>,
-{
-    fn sync<'a>(
-        &'a self,
-        request: SyncRequest,
-    ) -> crate::BoxFuture<'a, Result<SyncStatus, IndexError>> {
-        Box::pin(async move {
-            let _guard = self.enter()?;
-            self.sync_inner(request).await
-        })
-    }
-
-    fn status<'a>(
-        &'a self,
-        scope: &'a crate::IndexScope,
-    ) -> crate::BoxFuture<'a, Result<SyncStatus, IndexError>> {
-        Box::pin(async move {
-            self.validate_scope(scope)?;
-            self.repository.status(scope).await
-        })
     }
 }
 

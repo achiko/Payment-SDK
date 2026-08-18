@@ -1,5 +1,0 @@
-/target
-/tmp
-.env
-.env.*
-!.env.example

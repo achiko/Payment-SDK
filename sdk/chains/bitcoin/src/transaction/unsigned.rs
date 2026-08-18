@@ -1,24 +1,10 @@
-use crate::BoxFuture;
-use chain_contract::ChainError;
-use signer::{OperationId, Signer};
-
-use super::{BitcoinInput, BitcoinOutput, BitcoinSignedTransaction, SighashType};
+use super::{Input, Output, SighashType};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnsignedBitcoinTransaction {
-    pub signing_operation_id: OperationId,
+pub struct UnsignedTransaction {
     pub version: i32,
     pub lock_time: u32,
-    pub inputs: Vec<BitcoinInput>,
-    pub outputs: Vec<BitcoinOutput>,
+    pub inputs: Vec<Input>,
+    pub outputs: Vec<Output>,
     pub sighash_type: SighashType,
-}
-
-/// Bitcoin owns sighash computation, signer invocation, and witness/script assembly.
-pub trait BitcoinTransactionSigning: Send + Sync {
-    fn sign<'a>(
-        &'a self,
-        transaction: UnsignedBitcoinTransaction,
-        signer: &'a dyn Signer,
-    ) -> BoxFuture<'a, Result<BitcoinSignedTransaction, ChainError>>;
 }

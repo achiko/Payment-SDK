@@ -1,5 +1,12 @@
 # Multi-chain wallet: primitives, interfaces, and architecture patterns
 
+> **Historical design input—not a current API or source of truth.** Names such
+> as `LocalSigner`, `TxBroadcaster`, and `Transactioner` below describe the
+> original handwritten proposal and intentionally do not match the implemented
+> contracts. Use [`../ARCHITECTURE.md`](../ARCHITECTURE.md),
+> [`CONTRACTS.md`](./CONTRACTS.md), and [`refactoring.md`](./refactoring.md) for
+> the current design.
+
 > Transcribed from two pages of handwritten notes and combined with an architectural pattern analysis. Ambiguities in the original design are retained and identified rather than silently resolved.
 
 ## Document metadata
@@ -78,11 +85,12 @@ Example from the notes:
 ```rust
 Chain {
     network_id: NetworkId(0),
-    name: "btc".to_owned(),
+    name: "bitcoin".to_owned(),
 }
 ```
 
-The source describes Bitcoin mainnet conceptually as `Chain { network_id: 0, name: "btc" }`.
+The source describes Bitcoin mainnet conceptually as
+`Chain { network_id: 0, name: "bitcoin" }`; `BTC` remains display/ticker metadata.
 
 ### `Transaction`
 
@@ -553,4 +561,3 @@ The design is best summarized as:
 > A layered, ports-and-adapters multi-chain wallet design that uses Rust traits as ports, chain-specific implementations as adapters and strategies, newtypes for domain safety, dependency injection at construction boundaries, and a partially type-enforced transaction pipeline.
 
 Its strongest ideas are the separation of signing from keys, injection of transport dependencies, normalization of chain read models, and isolation of BTC/ETH behavior. Its largest unresolved issues are chain-safe addressing, private-key exposure through `Wallet`, duplicated broadcasting responsibility, incomplete transaction states, amount representation, and the absence of a fully defined application/use-case layer.
-

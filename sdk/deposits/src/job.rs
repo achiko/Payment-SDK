@@ -1,4 +1,5 @@
-use chain_identity::{AssetId, AtomicAmount};
+use base::Decimal;
+use indexing::AssetId;
 use indexing::IndexScope;
 
 use crate::{
@@ -13,9 +14,9 @@ pub struct CommandPrincipal(pub String);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CommandOperation {
-    CreateDeposit,
+    DepositPlan,
     CloseDeposit,
-    CreateCollection,
+    CollectionPlan,
     RetryCollection,
     Accounting,
     ResolveReconciliation,
@@ -39,19 +40,19 @@ pub struct CommandIdentity {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobKind {
-    CreateDeposit,
+    DepositPlan,
     CloseDeposit,
-    CreateCollection,
+    CollectionPlan,
     RetryCollection,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CreateDepositJob {
+pub struct DepositJob {
     pub deposit_id: DepositId,
     pub user_id: UserId,
     pub scope: IndexScope,
     pub asset: AssetId,
-    pub expected: AtomicAmount,
+    pub expected: Decimal,
     pub expires_at: u64,
     pub created_at: u64,
     /// Opaque custody/provisioning purpose metadata. Never secret material.
@@ -59,20 +60,20 @@ pub struct CreateDepositJob {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CloseDepositJob {
+pub struct CloseJob {
     pub deposit_id: DepositId,
     pub user_id: UserId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CreateCollectionJob {
+pub struct CollectionJob {
     pub collection_id: CollectionId,
     pub deposit_id: DepositId,
     pub user_id: UserId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RetryCollectionJob {
+pub struct RetryJob {
     pub collection_id: CollectionId,
     pub deposit_id: DepositId,
     pub user_id: UserId,
@@ -82,13 +83,13 @@ pub struct RetryCollectionJob {
 /// IDs are strictly canonical and unique; their actual users are resolved from
 /// durable deposit records under the job's common authenticated owner.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CreateUtxoBatchCollectionJob {
+pub struct BatchJob {
     pub collection_id: CollectionId,
     pub deposit_ids: Vec<DepositId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RetryUtxoBatchCollectionJob {
+pub struct RetryBatch {
     pub collection_id: CollectionId,
     pub deposit_ids: Vec<DepositId>,
 }
@@ -96,23 +97,23 @@ pub struct RetryUtxoBatchCollectionJob {
 /// Typed durable payload retained so a worker can resume after a PS restart.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JobPayload {
-    CreateDeposit(CreateDepositJob),
-    CloseDeposit(CloseDepositJob),
-    CreateCollection(CreateCollectionJob),
-    RetryCollection(RetryCollectionJob),
-    CreateUtxoBatchCollection(CreateUtxoBatchCollectionJob),
-    RetryUtxoBatchCollection(RetryUtxoBatchCollectionJob),
+    DepositPlan(DepositJob),
+    CloseDeposit(CloseJob),
+    CollectionPlan(CollectionJob),
+    RetryCollection(RetryJob),
+    CreateBatch(BatchJob),
+    RetryUtxoBatchCollection(RetryBatch),
 }
 
 impl JobPayload {
     #[must_use]
     pub const fn kind(&self) -> JobKind {
         match self {
-            Self::CreateDeposit(_) => JobKind::CreateDeposit,
+            Self::DepositPlan(_) => JobKind::DepositPlan,
             Self::CloseDeposit(_) => JobKind::CloseDeposit,
-            Self::CreateCollection(_) => JobKind::CreateCollection,
+            Self::CollectionPlan(_) => JobKind::CollectionPlan,
             Self::RetryCollection(_) => JobKind::RetryCollection,
-            Self::CreateUtxoBatchCollection(_) => JobKind::CreateCollection,
+            Self::CreateBatch(_) => JobKind::CollectionPlan,
             Self::RetryUtxoBatchCollection(_) => JobKind::RetryCollection,
         }
     }
@@ -120,11 +121,11 @@ impl JobPayload {
     #[must_use]
     pub const fn operation(&self) -> CommandOperation {
         match self {
-            Self::CreateDeposit(_) => CommandOperation::CreateDeposit,
+            Self::DepositPlan(_) => CommandOperation::DepositPlan,
             Self::CloseDeposit(_) => CommandOperation::CloseDeposit,
-            Self::CreateCollection(_) => CommandOperation::CreateCollection,
+            Self::CollectionPlan(_) => CommandOperation::CollectionPlan,
             Self::RetryCollection(_) => CommandOperation::RetryCollection,
-            Self::CreateUtxoBatchCollection(_) => CommandOperation::CreateCollection,
+            Self::CreateBatch(_) => CommandOperation::CollectionPlan,
             Self::RetryUtxoBatchCollection(_) => CommandOperation::RetryCollection,
         }
     }
@@ -132,22 +133,22 @@ impl JobPayload {
     #[must_use]
     pub fn user_id(&self) -> Option<&UserId> {
         match self {
-            Self::CreateDeposit(payload) => Some(&payload.user_id),
+            Self::DepositPlan(payload) => Some(&payload.user_id),
             Self::CloseDeposit(payload) => Some(&payload.user_id),
-            Self::CreateCollection(payload) => Some(&payload.user_id),
+            Self::CollectionPlan(payload) => Some(&payload.user_id),
             Self::RetryCollection(payload) => Some(&payload.user_id),
-            Self::CreateUtxoBatchCollection(_) | Self::RetryUtxoBatchCollection(_) => None,
+            Self::CreateBatch(_) | Self::RetryUtxoBatchCollection(_) => None,
         }
     }
 
     #[must_use]
     pub fn deposit_ids(&self) -> Option<&[DepositId]> {
         match self {
-            Self::CreateUtxoBatchCollection(payload) => Some(&payload.deposit_ids),
+            Self::CreateBatch(payload) => Some(&payload.deposit_ids),
             Self::RetryUtxoBatchCollection(payload) => Some(&payload.deposit_ids),
-            Self::CreateDeposit(_)
+            Self::DepositPlan(_)
             | Self::CloseDeposit(_)
-            | Self::CreateCollection(_)
+            | Self::CollectionPlan(_)
             | Self::RetryCollection(_) => None,
         }
     }
@@ -155,17 +156,13 @@ impl JobPayload {
     #[must_use]
     pub fn resource(&self) -> JobResource {
         match self {
-            Self::CreateDeposit(payload) => JobResource::Deposit(payload.deposit_id.clone()),
+            Self::DepositPlan(payload) => JobResource::Deposit(payload.deposit_id.clone()),
             Self::CloseDeposit(payload) => JobResource::Deposit(payload.deposit_id.clone()),
-            Self::CreateCollection(payload) => {
-                JobResource::Collection(payload.collection_id.clone())
-            }
+            Self::CollectionPlan(payload) => JobResource::Collection(payload.collection_id.clone()),
             Self::RetryCollection(payload) => {
                 JobResource::Collection(payload.collection_id.clone())
             }
-            Self::CreateUtxoBatchCollection(payload) => {
-                JobResource::Collection(payload.collection_id.clone())
-            }
+            Self::CreateBatch(payload) => JobResource::Collection(payload.collection_id.clone()),
             Self::RetryUtxoBatchCollection(payload) => {
                 JobResource::Collection(payload.collection_id.clone())
             }
@@ -246,7 +243,7 @@ pub struct Job {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CreateJob {
+pub struct JobPlan {
     /// Server-generated after an explicit replay lookup misses and before the
     /// first persistence attempt. The create path still resolves a concurrent
     /// replay race to the already-persisted ID.
@@ -294,7 +291,7 @@ pub struct ClaimJob {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct JobPageRequest {
+pub struct JobQuery {
     pub after: Option<JobId>,
     pub limit: usize,
 }
@@ -307,7 +304,7 @@ pub struct JobPage {
 
 /// Durable job repository. IDs are generated outside this contract, while
 /// create-or-replay guarantees that one business command keeps one stable ID.
-pub trait JobStore: Send + Sync {
+pub trait JobCommands: Send + Sync {
     /// Looks up an already-accepted command before a caller generates fresh
     /// server IDs or performs any external provisioning side effect. Reuse of
     /// the scoped client key with another request hash is a conflict.
@@ -318,25 +315,31 @@ pub trait JobStore: Send + Sync {
 
     fn create_or_replay<'a>(
         &'a self,
-        command: CreateJob,
+        command: JobPlan,
     ) -> BoxFuture<'a, Result<CreateJobOutcome, DepositError>>;
+}
 
+pub trait JobReader: Send + Sync {
     fn job<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Option<Job>, DepositError>>;
 
-    fn jobs<'a>(&'a self, request: JobPageRequest) -> BoxFuture<'a, Result<JobPage, DepositError>>;
+    fn jobs<'a>(&'a self, request: JobQuery) -> BoxFuture<'a, Result<JobPage, DepositError>>;
+}
 
+pub trait JobAssociations: Send + Sync {
     fn jobs_for_user<'a>(
         &'a self,
         user_id: &'a UserId,
-        request: JobPageRequest,
+        request: JobQuery,
     ) -> BoxFuture<'a, Result<JobPage, DepositError>>;
 
     fn jobs_for_resource<'a>(
         &'a self,
         resource: &'a JobResource,
-        request: JobPageRequest,
+        request: JobQuery,
     ) -> BoxFuture<'a, Result<JobPage, DepositError>>;
+}
 
+pub trait JobRunner: Send + Sync {
     /// Claims the oldest due queued/retry job, or reclaims an expired running
     /// lease. Every successful claim increments `attempt_count` atomically.
     fn claim_next<'a>(
@@ -349,3 +352,7 @@ pub trait JobStore: Send + Sync {
     fn transition<'a>(&'a self, command: TransitionJob)
     -> BoxFuture<'a, Result<Job, DepositError>>;
 }
+
+pub trait Jobs: JobCommands + JobReader + JobAssociations + JobRunner {}
+
+impl<T> Jobs for T where T: JobCommands + JobReader + JobAssociations + JobRunner {}

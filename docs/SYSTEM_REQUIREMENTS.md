@@ -8,21 +8,19 @@ It gathers the product flows, service boundaries, folder rules, persistence
 semantics, accounting corrections, acceptance criteria, and unresolved
 decisions in one place.
 
-The stateless Bitcoin/Ethereum Wallet Service execution paths and authenticated
-chain-specific HTTP runtimes, both durable Indexer Service modes, and the
-single-network Ethereum and Bitcoin Payment Service v1 runtimes are implemented
-in source. Code and acceptance tests, not trait presence or documentation,
-determine which parts are complete. A loopback-only ephemeral custody adapter
-supports disposable local development. This is not production
-deployment evidence: durable production custody, automated Anvil acceptance,
-HA, and multi-network PS ownership remain external, unvalidated, or excluded.
-The repository-owned Bitcoin Core 31.1 regtest system-acceptance suite passed
-all eight isolated strict/global-trusted executions on 2026-08-11. The service
-runbooks are
-[`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md),
-[`WALLET_SERVICE.md`](./WALLET_SERVICE.md),
-[`BITCOIN_SERVICES.md`](./BITCOIN_SERVICES.md), and
-[`PAYMENT_SERVICE.md`](./PAYMENT_SERVICE.md).
+The durable Bitcoin and Ethereum indexer runtime, stateless wallet runtime,
+concrete wallets, and configured payment runtime are implemented. A
+cross-service Ethereum acceptance test composes wallet/signing, RPC broadcast,
+Indexer HTTP, Payment HTTP, reconciliation, restart, and reorg correction over
+real temporary RocksDB databases. Code and tests, not trait presence or
+documentation, determine completeness. The Payment binary optionally composes
+one finite Bitcoin-native, Ethereum-native, or ERC-20 deposit scope and requires
+bearer authentication; TLS termination remains external. That singular scope
+supports authenticated collection planning from durable ledger and canonical
+Indexer evidence; multiple deposit scopes are not composed. The workspace has no
+production custody process and therefore does not claim a production exchange/
+payment-gateway deployment, production custody, HA, or multi-network payment
+ownership.
 
 The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** express requirement
 strength.
@@ -55,33 +53,26 @@ remain open.
 ```text
 apps/
 ├── api/                           Payment Service composition root
-├── custody/                       ephemeral loopback custody for local development
 ├── indexer/                       Indexer Service composition root
 └── wallet/                        stateless Wallet Service composition root
 
 sdk/
 ├── chains/
-│   ├── identity/                  opaque cross-process chain identifiers
-│   ├── contract/                  stateless wallet/transaction capabilities
+│   ├── base/                      approved neutral values, signing and transaction contracts
 │   ├── bitcoin/                   all Bitcoin-specific logic and types
 │   └── ethereum/                  all Ethereum-specific logic and types
 ├── deposits/                      PS deposit, ledger, event, collection contracts
 ├── indexing/                      generic sync, watch, fact, finality contracts
-├── signing/
-│   ├── contract/                  generic key/signing contracts
-│   ├── local/                     ephemeral in-memory test provisioner/signer
-│   ├── remote/                    authenticated remote custody client
-│   └── trezor/                    Trezor signer implementation placeholder
-├── storage/                       backend-independent atomic storage mechanics
-└── transactions/
-    ├── account/                   narrow reusable account-model construction
-    └── utxo/                      reusable UTXO selection/funding
+│   ├── http/                      chain-neutral remote consumer adapter
+│   └── rocksdb/                   semantic RocksDB repository implementation
+└── wallets/                       protocol-neutral wallet/provider composition
 
 packages/
+├── crypto/                        reusable cryptographic mechanisms and values
 ├── http/                          transferable HTTP wrapper
 ├── json-rpc/                      transferable JSON-RPC framing
-├── telemetry/                     transferable observability contracts
-└── transport/                     transferable request transport
+├── storage/                       backend-independent atomic storage mechanics
+└── design-lint/                   repository design validation
 
 reference/                         ignored upstream research checkouts
 old/                               recoverable previous workspace
@@ -98,18 +89,16 @@ flowchart TB
     DEPOSITS[sdk/deposits]
     BTC[sdk/chains/bitcoin]
     ETH[sdk/chains/ethereum]
-    CHAIN_CONTRACT[sdk/chains/contract]
-    CHAIN_ID[sdk/chains/identity]
+    BASE[sdk/chains/base]
+    WALLETS[sdk/wallets]
     INDEXING[sdk/indexing]
-    SIGNING[sdk/signing/contract]
-    TX_UTXO[sdk/transactions/utxo]
-    TX_ACCOUNT[sdk/transactions/account]
-    STORAGE[sdk/storage]
+    IXROCKS[sdk/indexing/rocksdb]
+    STORAGE[packages/storage]
     PACKAGES[packages/*]
 
     API --> DEPOSITS
     API --> INDEXING
-    API --> SIGNING
+    API --> WALLETS
     API --> STORAGE
 
     IXAPP --> BTC
@@ -119,27 +108,23 @@ flowchart TB
 
     WSAPP --> BTC
     WSAPP --> ETH
-    WSAPP --> SIGNING
+    WSAPP --> WALLETS
 
-    BTC --> CHAIN_CONTRACT
+    BTC --> BASE
     BTC --> INDEXING
-    BTC --> SIGNING
-    BTC --> TX_UTXO
     BTC --> PACKAGES
 
-    ETH --> CHAIN_CONTRACT
+    ETH --> BASE
     ETH --> INDEXING
-    ETH --> SIGNING
-    ETH --> TX_ACCOUNT
     ETH --> PACKAGES
 
     DEPOSITS --> INDEXING
-    DEPOSITS --> CHAIN_ID
-    DEPOSITS --> SIGNING
-    INDEXING --> CHAIN_ID
-    INDEXING --> STORAGE
-    CHAIN_CONTRACT --> CHAIN_ID
-    CHAIN_CONTRACT --> SIGNING
+    DEPOSITS --> BASE
+    INDEXING --> BASE
+    IXROCKS --> INDEXING
+    IXROCKS --> STORAGE
+    WALLETS --> BASE
+    WALLETS --> INDEXING
 ```
 
 Cargo arrows mean “depends on.” The abstraction order
@@ -159,6 +144,11 @@ Cargo arrows mean “depends on.” The abstraction order
 - Concrete HTTP/JSON-RPC methods MUST remain in the concrete chain crate.
 - `packages/*` MUST remain usable by non-blockchain projects and MUST NOT
   import `sdk/*`.
+- `packages/crypto` MUST NOT contain chain names, address formats, transaction
+  rules, RPC methods, wallet behavior, asset units, or custody policy.
+- Each concrete chain MUST own its RPC wrapper below that chain's `src/rpc/`
+  directory. The wrappers MAY use different upstream clients and DTOs; no
+  cross-chain RPC trait is required.
 - WS MUST be stateless and MUST NOT select or own a database backend.
 - IX MUST NOT import deposits, users, accounting, or collection semantics.
 - No crate named `core`, `common`, `utils`, `payment-domain`, `payment-ports`,
@@ -216,18 +206,48 @@ PS MUST NOT write IX storage.
 WS MUST:
 
 - remain stateless across calls;
-- expose a per-chain/per-asset `WalletFactory`/`WalletAdapter` surface;
-- generate chain-native addresses using an injected `KeyProvisioner`;
-- read balances;
-- build unsigned transactions;
-- invoke an injected signer and assemble signed chain transactions;
-- broadcast transactions;
-- read receipts;
-- report factual collection prerequisites; and
+- expose the small `Addresser`, `AddressFormat`, `AmountFormat`,
+  `BalanceReader`, `TransactionFactory`, `CollectionFactory`, `Sweeper`,
+  `TransactionRestore`, and `HistoryReader` capabilities through
+  `wallets::Wallet`;
+- construct concrete wallets through application-registered `Provider` values;
+- keep chain-native address derivation and validation in the concrete chain;
+- build and serialize chain-native transaction snapshots;
+- return a durable exact `SignedTransaction` before broadcast;
+- expose broadcast as a separate one-method capability; and
+- obtain transaction history and confirmation from indexing rather than
+  polling a receipt waiter;
 - perform one collection transaction per call.
+- require authentication on every non-health runtime route;
+- separate preparation from broadcast so the exact signed transaction can be
+  persisted before the external effect; and
+- accept transaction-addressed retries only with the caller's same serialized
+  signed transaction, without rebuilding or re-signing it.
+
+For selected-output collection, a wallet MAY expose `Collector`. Its generic
+inputs MUST contain only source wallets, stable output identities, exact
+scale-zero native atomic reservation amounts, and a destination. Chain scripts
+and spend evidence MUST remain in the concrete chain. Preparation MUST return
+the exact signed transaction and factual scale-zero fee without applying
+business allocation policy.
+
+For account-model collection, a wallet MAY implement the one-method
+`Sweeper::sweep(destination)` capability. Native-asset sweeping MUST reserve a
+checked fee ceiling before choosing the transferred value. Token sweeping MAY
+transfer the full token balance only when the wallet independently verifies
+that its native balance covers the fee ceiling. The capability MUST return the
+exact signed transaction and its scale-zero fee ceiling; application policy
+and factual post-confirmation allocation remain outside the wallet. PS MUST
+persist that ceiling with the signed leg before broadcast and MUST reject an
+observed fee above it. When actual gas or effective price is lower, the
+remaining native balance is factual and eligible for a later collection; the
+ceiling MUST NOT be accounted as if it were the receipt fee.
 
 WS MUST NOT persist deposits, watches, observation state, ledger balances, or
 multi-step collection workflow state.
+It also MUST NOT claim durable idempotency-key deduplication: that state belongs
+to PS. Its broadcast retry semantics derive from resubmitting the same signed
+envelope under its canonical transaction ID.
 
 ### 3.3 Indexer Service — IX
 
@@ -258,8 +278,11 @@ mempool-capable Bitcoin release.
   identifiers.
 - Concrete chain crates MUST retain their native strongly typed forms.
 - Monetary values MUST use integer atomic units, never floating point.
-- The cross-chain atomic amount supports an unsigned 256-bit magnitude.
-- Asset display precision and symbols are metadata, not part of the amount.
+- `base::Decimal` is the sole cross-chain monetary representation and MUST retain
+  arbitrary-precision exact base-10 values without floating point.
+- Concrete chain boundaries MUST validate non-negativity, supported precision,
+  and native integer range when converting `Decimal` to atomic units.
+- Asset display precision and symbols are metadata, not a second amount type.
 - Transaction observations MUST support multiple movements.
 - A UTXO transaction MUST NOT be reduced to a fictitious single
   `from → to → amount` transfer.
@@ -276,8 +299,9 @@ A deposit MUST include at least:
 - user ID;
 - asset ID;
 - canonical address;
+- the canonical address's complete chain/network scope;
 - opaque key locator;
-- expected atomic amount;
+- expected exact amount;
 - birthday block height;
 - expiration time;
 - creation time; and
@@ -311,7 +335,7 @@ sequenceDiagram
     User->>PS: [request] create deposit(asset, expected, idempotency_key)
     PS->>IX: [request] scope readiness / canonical checkpoint
     IX-->>PS: [response] Ready(checkpoint = birthday)
-    PS->>WS: [request] generate address(asset, key purpose)
+    PS->>WS: [request] generate address(asset, operation ID, candidate)
     WS->>KP: [request] provision key
     KP-->>WS: [response] key locator + public key
     Note over WS: derive chain-native address
@@ -328,6 +352,14 @@ sequenceDiagram
 Requirements:
 
 - PS MUST NOT return an address before IX acknowledges the watch.
+- Deposit-address selection is server-owned. A caller MUST NOT select key
+  purpose or key material. Independent deposits MUST receive different
+  canonical addresses; an idempotent retry of one deposit MUST retain its
+  exact address, key identity, birthday, and watch request.
+- A finite configured address source MUST resolve candidates deterministically
+  and report exhaustion explicitly. PS MAY skip a candidate already owned by
+  another durable deposit, but MUST rely on the repository's atomic address
+  uniqueness check to resolve concurrent allocation safely.
 - PS and IX cannot share a local transaction because their databases are
   separate.
 - `AwaitingWatch` MUST be recoverable by an idempotent reconciler.
@@ -691,14 +723,23 @@ Every collection MUST:
 - persist the expected transaction ID and exact opaque signed envelope before
   the first broadcast side effect;
 - record broadcast transaction IDs;
-- call IX `watch(txid)` after broadcast;
-- retain the failure window where a transaction ID exists but watch
-  registration has not completed;
+- call idempotent IX `watch(txid)` before broadcast and durably attach its
+  receipt after the accepted broadcast transition; repeating after an
+  ambiguous response MUST use the same idempotency key;
+- retain the exact signed envelope after submission so an explicit retry can
+  rebroadcast identical bytes without rebuilding or signing again;
 - update `collected` only after IX confirmation proof;
 - release or retry reservations only after a chain-specific proven-safe
   transition; Bitcoin UTXO-batch v1 exposes retry but no generic failure or
   release transition; and
 - reverse canonical collection balances after reorg.
+
+`POST /v1/collections` accepts only durable collection/job IDs, deposit IDs,
+and a timestamp. Scope, asset, transaction model, master destination, policy,
+amount, and UTXO evidence are application-bound or loaded from PS/IX state.
+For UTXO batches the planner reads each active deposit and ledger head,
+requires one stable canonical output snapshot, derives exact outpoint
+reservations, and atomically fences every participant and resource.
 
 Collection modes are:
 
@@ -757,13 +798,13 @@ sequenceDiagram
     WS-->>PS: [response] txid + opaque envelope + attribution
     Note over PS: validate chain ID and fee ceilings
     PS->>PSDB: [write] atomically leg = Signed(txid)<br/>exact envelope + tx index
+    PS->>IX: [request] idempotent watch(txid)
+    IX-->>PS: [response] watch_id
     PS->>WS: [request] broadcast exact envelope(expected txid)
     WS->>Chain: [request] broadcast exact bytes
     Chain-->>WS: [response] txid
     WS-->>PS: [response] matching txid
-    PS->>PSDB: [write] atomically leg = Broadcast<br/>delete envelope
-    PS->>IX: [request] watch(txid)
-    IX-->>PS: [response] watch_id
+    PS->>PSDB: [write] leg = Broadcast<br/>retain exact envelope
     PS->>PSDB: [write] attach watch_id
 
     Note over PS,IX: Outcome returns through the normal IX event pipeline
@@ -772,6 +813,24 @@ sequenceDiagram
 ```
 
 ### 8.4 Batched UTXO collection
+
+The implemented abstract execution boundary is `apps/api::Sweeps`. An injected
+`DepositWallets` resolves durable deposit ownership to already composed
+wallets; neither secrets nor key locators cross the executor API. The Bitcoin
+collector MUST reload every reserved output from IX at one common checkpoint,
+verify source ownership and exact amount, reject duplicates, order inputs
+canonically, and sign every input through its owning wallet.
+
+Execution MUST persist the exact signed transaction before any node effect,
+register the idempotent transaction watch before broadcast, and reuse both the
+stored envelope and watch identity after an ambiguous/lost response. It MUST
+NOT rebuild, resign, or substitute another transaction during that retry.
+
+The factual scale-zero fee MUST be allocated proportionally to participant
+gross reservation values using integer largest remainder. Equal remainders use
+canonical deposit ID ordering. Durable allocations MUST separately record
+gross debit, net master credit, fee asset, and allocated fee with checked
+arithmetic; a fee greater than or equal to total reserved value MUST fail.
 
 ```mermaid
 sequenceDiagram
@@ -785,20 +844,20 @@ sequenceDiagram
     PS->>PSDB: [request] deposits eligible for batch
     PSDB-->>PS: [response] N deposits + key locators
     PS->>IX: [request] canonical unspent-output facts for N addresses
-    IX-->>PS: [response] exact outpoints + values + scripts + confirmations
+    IX-->>PS: [response] exact output IDs + atomic values
     PS->>PSDB: [write] atomically reserve exact source outpoints
-    PS->>WS: [request] sign exact selection(N inputs, master)
+    PS->>WS: [request] collect(source wallets + selected outputs, master)
 
-    Note over WS: validate every selected outpoint/value/script/key<br/>build one raw transaction and sign without broadcast
-    WS-->>PS: [response] txid + exact signed bytes + gross attribution
-    PS->>PSDB: [write] persist exact bytes + one Prepared leg + N allocations
-    PS->>WS: [request] broadcast expected txid + exact signed bytes
+    Note over WS: reload one IX snapshot; validate ownership/value/evidence<br/>canonically order and sign each input with its source wallet
+    WS-->>PS: [response] PreparedCollection(exact signed transaction, factual fee)
+    PS->>PSDB: [write] persist exact bytes + Signed leg + largest-remainder allocations
+    PS->>IX: [request] idempotently watch(txid)
+    IX-->>PS: [response] durable watch receipt
+    PS->>WS: [request] broadcast exact stored transaction
     WS->>Chain: [request] preflight then send unchanged bytes
     Chain-->>WS: [response] same txid
     WS-->>PS: [response] verified txid
-    PS->>PSDB: [write] advance leg to Broadcast
-    PS->>IX: [request] watch(txid)
-    IX-->>PS: [response] watch_id
+    PS->>PSDB: [write] advance leg to Broadcast + attach watch_id
 
     IX-->>PS: [event] transaction state revision
     PS->>PSDB: [write] append one event mirror
@@ -832,8 +891,8 @@ Bitcoin PS block-only v1 makes these additional selections:
   one generation/revision/checkpoint-fenced IX snapshot, sorts it canonically by
   `(txid, vout)`, and drains it to exactly one policy master output with no
   change output.
-- Collection creation atomically reserves every exact outpoint and its bounded
-  previous-output evidence. Overlap on any outpoint MUST make the whole
+- Collection creation atomically reserves every exact outpoint and amount.
+  Overlap on any outpoint MUST make the whole
   reservation attempt fail and retry; partial reservation is forbidden.
 - The actual transaction fee is allocated in proportion to gross input using
   integer largest-remainder allocation. Equal remainders are ordered by
@@ -843,9 +902,11 @@ Bitcoin PS block-only v1 makes these additional selections:
   minimum collection amount, minimum spend confirmations, requested and maximum
   fee rates in satoshis per kvB, maximum absolute fee, and batch deposit/input
   limits. None has a permissive financial default.
-- Before broadcast, PS independently validates the exact inputs, one master
-  output, txid, fee, vsize, fee ceilings, attribution, and dust/value bounds of
-  the returned Bitcoin transaction.
+- Before returning `PreparedCollection`, the Bitcoin collector validates exact
+  inputs, ownership, one destination output, fee, and dust/value bounds. The
+  Bitcoin broadcaster revalidates the signed envelope and transaction ID before
+  node submission. PS consumes only the generic prepared transaction and
+  factual fee.
 - Once signed bytes are durably recorded, neither reservations nor the exact
   envelope expire automatically. Bitcoin PS v1 retains the same txid, bytes,
   allocations, reservations, and watch indefinitely through broadcast
@@ -863,13 +924,14 @@ Bitcoin PS block-only v1 makes these additional selections:
   conflicting replacement signing. Timeout, RPC outage, or one missing receipt
   is not evidence that a reserved outpoint is reusable.
 
-These decisions are recorded in
-[`../TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md`](../TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md).
-Their source implementation and deterministic evidence are not composed Core 31
-or production-runtime acceptance evidence by themselves. The separate opt-in
-[`Bitcoin regtest system-acceptance suite`](../tests/bitcoin-regtest-acceptance/README.md)
-provides the bounded composed Core 31.1 evidence; it is still not production
-deployment evidence.
+These requirements remain useful domain constraints. A narrow opt-in harness
+starts a disposable, network-disabled Bitcoin Core 31.x regtest process and
+checks concrete wallet construction, indexed funding, build/sign/broadcast,
+mined inclusion, confirmed history, balance, and the production RPC wrapper;
+it is feature-gated and ignored by default. It does not compose the HTTP
+payment/deposit application, and deterministic tests or a compiled harness are
+not live-node or production-runtime evidence. See
+[`manual-bitcoin-regtest/README.md`](./manual-bitcoin-regtest/README.md).
 
 ### 8.5 ERC-20/token collection with gas
 
@@ -893,13 +955,14 @@ sequenceDiagram
         WS-->>PS: [response] prefund txid + opaque envelope
         Note over PS: validate chain ID and fee ceilings
         PS->>PSDB: [write] atomically GasFunding leg = Signed<br/>exact envelope + tx index
+        PS->>IX: [request] idempotent watch(prefund txid)
+        IX-->>PS: [response] watch_id
         PS->>WS: [request] broadcast exact envelope(expected txid)
         WS->>Chain: [request] broadcast exact prefund bytes
         Chain-->>WS: [response] prefund txid
         WS-->>PS: [response] prefund txid
-        PS->>PSDB: [write] atomically leg = Broadcast<br/>delete envelope
-        PS->>IX: [request] watch(prefund txid)
-        IX-->>PS: [response] watch_id
+        PS->>PSDB: [write] leg = Broadcast<br/>retain exact envelope
+        PS->>PSDB: [write] attach watch_id
         IX-->>PS: [event] prefund Confirmed / Failed / Dropped / Reorged
         PS->>PSDB: [write] mirror event + update leg
         Note over PS: Continue only after confirmation proof
@@ -909,13 +972,14 @@ sequenceDiagram
     WS-->>PS: [response] sweep txid + opaque envelope + attribution
     Note over PS: validate chain ID and fee ceilings
     PS->>PSDB: [write] atomically Sweep leg = Signed<br/>exact envelope + tx index
+    PS->>IX: [request] idempotent watch(sweep txid)
+    IX-->>PS: [response] watch_id
     PS->>WS: [request] broadcast exact envelope(expected txid)
     WS->>Chain: [request] broadcast exact token-transfer bytes
     Chain-->>WS: [response] sweep txid
     WS-->>PS: [response] matching sweep txid
-    PS->>PSDB: [write] atomically leg = Broadcast<br/>delete envelope
-    PS->>IX: [request] watch(sweep txid)
-    IX-->>PS: [response] watch_id
+    PS->>PSDB: [write] leg = Broadcast<br/>retain exact envelope
+    PS->>PSDB: [write] attach watch_id
     IX-->>PS: [event] sweep transaction state revision
     PS->>PSDB: [write] mirror + absolute ledger row + leg state
 ```
@@ -958,14 +1022,14 @@ flowchart LR
 
 ### 9.2 Key custody
 
-- PS persists deposit-to-key ownership using an opaque `KeyLocator`.
-- Actual secret material belongs to the selected local/Trezor/HSM/KMS/remote
-  key provider.
-- WS receives a public key and/or locator, not authority to choose custody.
-- Process-separated PS and WS require an authenticated signer adapter; they
-  MUST NOT serialize a Rust trait object or casually pass plaintext keys.
-- Hardware signer availability, rejection, timeout, and required user
-  interaction MUST be explicit outcomes.
+The current workspace implements only the in-process `base::KeyPair` signer;
+it does not define a key locator, custody service, remote signer, or hardware
+wallet adapter. A production composition MUST keep actual secret material in
+its selected custody backend. If PS and WS are process-separated, their signer
+boundary MUST be authenticated and MUST NOT serialize a Rust trait object or
+pass plaintext keys. Any future hardware signer must represent availability,
+rejection, timeout, and required user interaction explicitly without teaching
+the base signer chain transaction types.
 
 ### 9.3 Trezor limitation
 
@@ -980,10 +1044,10 @@ The implementation MUST choose one of:
 3. define a protocol-neutral interactive signing session; or
 4. treat hardware transaction signing as an application workflow.
 
-Bitcoin MUST NOT depend directly on `signer-trezor`, and the base signer MUST
+Bitcoin MUST NOT depend on a hardware-wallet package, and the base signer MUST
 NOT learn Bitcoin transaction types.
 
-## 10. Storage and consistency requirements
+## 10. Store and consistency requirements
 
 ### 10.1 Generic storage
 
@@ -1037,88 +1101,31 @@ For one reverted block, inverse effects and checkpoint movement MUST be atomic.
   replacement. IX rollback retention is a separate policy and MUST NOT release
   PS ownership.
 - A crash between event mirroring and projection MUST be recoverable by replay.
-- A crash between broadcast and IX watch registration MUST be recoverable from
-  the persisted collection leg and idempotent reconciliation.
+- A crash after watch registration and before a successful broadcast response
+  MUST be recoverable from the persisted collection leg by rebroadcasting the
+  same signed bytes; watch registration is idempotent.
 
 ## 11. API requirements
 
-Ethereum PS v1 exposes internal exchange-backend JSON/HTTP operations for:
+The Indexer Service exposes one chain-neutral `/v1/scopes/{chain}/{network}`
+surface for status, watches, transaction history, revision events, and output
+queries. Watch registration always requires a caller-owned idempotency key;
+authentication mode never authorizes the server to invent one.
 
-- create deposit;
-- retrieve deposit address and expiration;
-- retrieve latest absolute deposit balances;
-- retrieve deposit ledger history;
-- retrieve relevant observation history;
-- retrieve collection state and legs;
-- initiate/enable collection according to policy;
-- apply a user accounting credit/reversal; and
-- inspect reconciliation or failure state; and
-- resolve reconciliation explicitly as reverse credit, accepted liability, or
-  externally recorded debt.
+The wallet and payment crates currently export routers and `serve` helpers for
+already composed values. Their embedding application MUST select
+authentication, TLS, secret/custody integration, rate limits, and process
+supervision. Documentation MUST NOT claim a checked-in deployment merely
+because these routers compile.
 
-Commands that can outlive one request SHOULD return durable job IDs.
+Monetary API values use exact `Decimal` strings. Large cursors/heights use
+lossless decimal encoding. Chain-specific address and transaction text is
+validated by the concrete chain at its boundary.
 
-Ethereum PS v1 uses `/v1`, strict JSON, unsigned decimal strings for atomic
-amounts, and bounded cursor pagination. `STRICT_AUTHENTICATION_MODE` is a
-required global deployment value for every repo-owned HTTP service and matching
-client. It accepts exactly lowercase `true` or `false`; a missing, empty,
-whitespace-padded, or otherwise different value MUST fail startup.
-
-When the value is `true`, PS requires separate ordinary and administrator
-bearer credentials. The administrator credential MAY use ordinary routes; the
-ordinary credential MUST receive `403` on administrator routes. WS, IX, and the
-repo-owned development custody adapter likewise require their configured
-service bearer. Every external PS mutation MUST carry `Idempotency-Key`.
-
-When the value is `false`, every caller that can reach a repo-owned service is
-one stable global-trusted principal. Authorization headers are ignored for
-authorization, ordinary and administrator PS routes are both available, and
-repo-owned bearer variables are not required. This is a deployment-wide trust
-decision, not anonymous multi-tenancy or identity isolation. External
-HSM/KMS/custody, node RPC, chain validation, policy, and durable repository
-idempotency remain independently enforced. Non-loopback listeners require
-trusted upstream TLS termination in both modes. Webhooks are excluded.
-PS database metadata MUST bind the corresponding principal-scope mode. Legacy
-unbound data that contains principal-scoped records may migrate only to
-role-scoped strict ownership. An explicitly verified-empty legacy store may be
-bound to global-trusted ownership. A populated database MUST NOT switch between
-role-scoped and global-trusted ownership without a future principal-aware
-migration.
-
-In global-trusted mode an omitted external mutation identity is replaced by a
-UUIDv7 before any external effect and returned to the caller. Losing that whole
-response makes a later request indistinguishable from an intentionally new
-command, so retry-safe callers SHOULD still supply and reuse an identity.
-In both modes PS scopes the effective identity by principal and semantic
-operation and stores a hash of the canonical request meaning. Exact replay
-returns the original resource/job IDs; reuse for different content returns
-`409`. Server-owned IDs are lowercase-prefixed UUIDv7 values. Long-running
-create-deposit, close-deposit, create-collection, and retry-collection commands
-return `202` and a durable job in `queued`, `running`, `waiting_retry`,
-`succeeded`, or `failed` state.
-
-The Ethereum v1 deployment unit is one PS process with exclusive ownership of
-one PS RocksDB path, one Ethereum `IndexScope`, one active policy identity, and
-one IX feed. Multiple networks require separate instances/databases until a
-future scope-keyed PS persistence design is approved.
-
-The required Ethereum v1 policy supplies both a human-readable network label
-and numeric EVM chain ID, asset allowlist, TTL, master destinations, collection
-thresholds, gas-funder limit, and ceilings for gas limit, maximum fee per gas,
-priority fee per gas, and maximum total fee. These values have no permissive
-financial defaults.
-
-Bitcoin PS block-only v1 implements `/v1`, strict JSON, bounded cursor
-pagination, the same global authentication-mode contract, mutation
-idempotency, and durable jobs. Its batch collection command explicitly
-identifies multiple deposits and
-may cross user IDs only within one authenticated exchange-principal ownership
-boundary. Its mandatory versioned policy selects one Bitcoin network, native
-BTC, P2WPKH or P2TR deposit addresses, TTL, master destination, collection and
-spend-confirmation minimums, fee-rate and absolute-fee ceilings, and batch
-limits. The runnable mode is selected through `payment-api bitcoin`; its source
-and deterministic coverage are supplemented by the passing automated Core 31.1
-regtest system-acceptance suite.
+External mutations MUST be retry-safe. Transaction submission persists the
+exact signed envelope and caller-owned watch identity before broadcast;
+confirmation is consumed asynchronously from indexing rather than awaited in
+the request.
 
 ## 12. Operational and security requirements
 
@@ -1127,8 +1134,9 @@ regtest system-acceptance suite.
   the explicit IX cursor.
 - Logs MUST NOT contain private keys, seed phrases, raw signer secrets, or
   unredacted custody credentials.
-- Every repo-owned service MUST expose its sanitized authentication mode in
-  structured startup output, public readiness/status, and a persistent metric.
+- Every repo-owned network service MUST expose its sanitized authentication
+  mode in structured startup output and public readiness/status. If a metrics
+  adapter is composed, it MUST expose the same sanitized mode there.
   Global-trusted mode MUST emit one high-severity startup warning and MUST NOT
   log one warning per request.
 - A repo-owned client MUST reject a missing or mismatched remote authentication
@@ -1153,11 +1161,9 @@ The questions below remain open for the general multi-chain system unless a
 more focused decision record closes them. For Ethereum IX v1,
 [`INDEXER_SERVICE.md`](./INDEXER_SERVICE.md) closes the database, transport,
 scope, confirmation, reorg, and completeness choices described there.
-For Bitcoin WS/IX block-only v1, the implemented choices are recorded below and
-tracked in [`../TODO/BITCOIN_WALLET_INDEXER_IMPLEMENTATION_PLAN.md`](../TODO/BITCOIN_WALLET_INDEXER_IMPLEMENTATION_PLAN.md).
-For Bitcoin PS block-only v1, the implemented application and financial-policy
-choices are tracked separately in
-[`../TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md`](../TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md).
+The implemented Bitcoin WS/IX choices and the remaining Bitcoin payment
+constraints are recorded below. Removed implementation-plan files are not
+current sources of truth.
 
 ### 13.1 Wallet and address lifecycle
 
@@ -1243,33 +1249,32 @@ replacement signing are excluded.
 ### 13.5 Signing and custody
 
 - Can one transaction require multiple signers or partial signatures?
-- Does one signer instance own many keys addressed by `KeyLocator`?
+- Should a future production signer own one key or many keys addressed by an
+  opaque application-defined locator?
 - Which curves, schemes, and signature encodings are required?
 - Must signers display or attest transaction intent?
 - What timeout, cancellation, retry, and user-rejection behavior is required?
 - Which Trezor integration option from section 9.3 is selected?
 
-### 13.6 Storage
+### 13.6 Store
 
-Ethereum v1 decision: semantic IX commands compose over the generic `Storage`
-contract and commit through a serialized RocksDB 0.24 writer. One synchronous
-WAL-backed batch contains block effects, observations, events, checkpoint, and
-retention changes. Records have explicit versions; migrations, backup, and
-generation-based rebuild fail closed.
+Ethereum v1 decision: semantic IX commands compose over backend-neutral
+repository contracts. The selected `sdk/indexing/rocksdb` adapter commits them
+through a serialized RocksDB 0.24 writer. One synchronous WAL-backed batch
+contains block effects, observations, events, checkpoint, and retention
+changes. Record versions are adapter-private. An incompatible schema or policy
+requires an explicit offline rebuild; ordinary indexing exposes no policy
+migration API.
 
-Ethereum PS v1 separately binds its RocksDB database to the PS owner, schema
-v2, one Ethereum scope, numeric chain ID through policy, and active policy
-identity. `migrate` requires and verifies a physical backup, validates semantic
-records and references, rebuilds supplementary indexes, and binds metadata
-only after validation succeeds. These are v1 selections, not mandatory
-backends for every future deployment.
+The current payment composition does not expose a schema-migration command.
+Any future persisted-schema conversion requires a separately approved,
+recoverable operator design; it must not leak into ordinary indexing traits.
 
-- Is the atomic key/value contract sufficient, or should implementations expose
-  only semantic repositories?
-- What isolation and durability guarantees are mandatory?
-- Must IX block commit, observation update, and event feed share one physical
-  transaction?
-- How are schema versions and migrations represented?
+- What isolation and durability guarantees are mandatory for future storage
+  adapters and highly available deployments?
+- How should each future adapter version its records and support offline
+  rebuilds without exposing physical migration concepts through indexing
+  contracts?
 - Which backup, restore, and rebuild procedures are required?
 
 ### 13.7 Deposit accounting
@@ -1323,25 +1328,23 @@ principal. Transport remains at-least-once with repository idempotency.
 
 | Requirement area | Rust location |
 |---|---|
-| Chain identity and atomic value | `sdk/chains/identity` |
-| Stateless wallet capabilities/factory | `sdk/chains/contract` |
-| Generic signer/key provisioning | `sdk/signing/contract` |
+| Chain identity, exact decimal value, transaction and signing boundaries | `sdk/chains/base` |
+| Stateless wallet capabilities and provider composition | `sdk/wallets` |
+| Generic cryptographic mechanisms | `packages/crypto` |
 | Bitcoin transactions/indexing/collection | `sdk/chains/bitcoin` |
 | Ethereum transactions/indexing/collection | `sdk/chains/ethereum` |
 | Generic block sync/reorg/finality | `sdk/indexing` |
-| IX public watch/query/event surface | `sdk/indexing::service` |
+| IX public watch/query/event surface | `sdk/indexing::{Indexer,Watcher,History,Observer}` |
 | IX fact and transaction state model | `sdk/indexing::observation` |
 | PS deposits/event mirror/ledger | `sdk/deposits` |
 | PS durable collection workflow | `sdk/deposits::collection` |
-| Ethereum PS API and workers | `apps/api` |
-| Bitcoin PS API and workers | `apps/api` (`payment-api bitcoin`) |
-| Ephemeral local custody adapter | `apps/custody`, `sdk/signing/local` |
-| PS users/jobs/reconciliation/migration | `sdk/deposits::{user,job,reconciliation,metadata,migration}` |
-| Stateless authenticated Ethereum WS | `apps/wallet`, `sdk/signing/remote` |
-| Backend-independent storage mechanics | `sdk/storage` |
-| Generic UTXO construction | `sdk/transactions/utxo` |
-| Narrow account construction | `sdk/transactions/account` |
-| Generic HTTP/JSON-RPC/transport | `packages/*` |
+| Durable payment orchestration and supervised runtime | `apps/api` |
+| PS deposit/accounting/job contracts | `sdk/deposits` |
+| Stateless wallet HTTP runtime and binary | `apps/wallet` |
+| Backend-independent storage mechanics | `packages/storage` |
+| Bitcoin UTXO construction | `sdk/chains/bitcoin` |
+| Ethereum account construction | `sdk/chains/ethereum` |
+| Generic HTTP/JSON-RPC infrastructure | `packages/*` |
 
 ## 15. Structural acceptance criteria
 
@@ -1387,6 +1390,4 @@ run.
 - [`RESEARCH.md`](./RESEARCH.md) — Alloy, BDK, Blockbook, NBXplorer,
   BTCPay, SHKeeper, Trezor, and Solana findings.
 - [`REQUIREMENTS.md`](./REQUIREMENTS.md) — compact open-decision checklist.
-- [`../TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md`](../TODO/BITCOIN_PAYMENT_SERVICE_IMPLEMENTATION_PLAN.md) — implemented Bitcoin PS v1 decisions.
-- [`../tests/bitcoin-regtest-acceptance/README.md`](../tests/bitcoin-regtest-acceptance/README.md) — automated Bitcoin Core 31.1 operational acceptance and its evidence boundary.
-- [`manual-bitcoin-regtest/README.md`](./manual-bitcoin-regtest/README.md) — preserved manual diagnostic fallback.
+- [`manual-bitcoin-regtest/README.md`](./manual-bitcoin-regtest/README.md) — current Bitcoin acceptance boundary.

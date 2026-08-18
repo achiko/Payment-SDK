@@ -1,15 +1,14 @@
-use std::{
-    collections::HashMap,
-    sync::atomic::{AtomicU8, AtomicU64, Ordering},
-};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use indexing::{BlockHash, BlockHeight, BlockRef, BlockSource, BoxFuture, IndexScope, SourceError};
-use json_rpc::{JsonRpcClient, JsonRpcError, JsonRpcFailure, JsonRpcRequest, RawJson, RequestId};
+use json_rpc::{Client as JsonClient, Error, Failure, RawJson};
 use serde_json::{Value, value::RawValue};
 
+use crate::rpc::client::{CallError, Client};
+
 use super::{
-    EthereumBlock, EthereumIndexRpc, EthereumIndexingCapabilities,
-    model::{encode_hex, parse_and_validate_receipts, parse_block, parse_quantity},
+    Block,
+    model::{ParsedBlock, ParsedReceipt, encode_hex, parse_quantity},
 };
 
 const RECEIPTS_UNKNOWN: u8 = 0;
@@ -17,13 +16,13 @@ const RECEIPTS_BY_BLOCK: u8 = 1;
 const RECEIPTS_BY_TRANSACTION: u8 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EthereumIndexSourceConfig {
+pub struct SourceConfig {
     pub scope: IndexScope,
     pub expected_chain_id: u64,
     pub expected_genesis_hash: BlockHash,
 }
 
-impl EthereumIndexSourceConfig {
+impl SourceConfig {
     pub fn validate(&self) -> Result<(), SourceError> {
         if self.scope.chain.0 != "ethereum" {
             return Err(source_error(
@@ -52,38 +51,37 @@ impl EthereumIndexSourceConfig {
 /// Construction verifies `eth_chainId` and block zero before the value can be
 /// used as a `BlockSource`. Receipt capability is discovered once and an
 /// official method-not-found response permanently selects the batched fallback.
-pub struct EthereumHttpBlockSource<C> {
-    client: C,
-    config: EthereumIndexSourceConfig,
-    next_request_id: AtomicU64,
+pub struct BlockClient<C> {
+    client: Client<C>,
+    config: SourceConfig,
     receipt_mode: AtomicU8,
 }
 
-impl<C> EthereumHttpBlockSource<C>
+impl<C> BlockClient<C>
 where
-    C: JsonRpcClient,
+    C: JsonClient,
 {
-    pub async fn connect(
-        client: C,
-        config: EthereumIndexSourceConfig,
-    ) -> Result<Self, SourceError> {
+    pub async fn connect(client: C, config: SourceConfig) -> Result<Self, SourceError> {
+        Self::from_rpc(Client::new(client), config).await
+    }
+
+    pub async fn from_rpc(client: Client<C>, config: SourceConfig) -> Result<Self, SourceError> {
         config.validate()?;
         let source = Self {
             client,
             config,
-            next_request_id: AtomicU64::new(1),
             receipt_mode: AtomicU8::new(RECEIPTS_UNKNOWN),
         };
-        source.verify_chain_identity().await?;
+        source.verify_chains().await?;
         Ok(source)
     }
 
     #[must_use]
-    pub fn config(&self) -> &EthereumIndexSourceConfig {
+    pub fn config(&self) -> &SourceConfig {
         &self.config
     }
 
-    async fn verify_chain_identity(&self) -> Result<(), SourceError> {
+    async fn verify_chains(&self) -> Result<(), SourceError> {
         let chain_id = self
             .request_result("eth_chainId", serde_json::json!([]))
             .await?;
@@ -108,7 +106,7 @@ where
                 false,
             ));
         }
-        let genesis = parse_block(raw_genesis.as_bytes(), Some(BlockHeight(0)), false)
+        let genesis = ParsedBlock::parse(raw_genesis.as_bytes(), Some(BlockHeight(0)), false)
             .map_err(|error| source_error(error.to_string(), false))?;
         if genesis.reference.hash != self.config.expected_genesis_hash {
             return Err(source_error(
@@ -137,39 +135,9 @@ where
                 true,
             ));
         }
-        let parsed = parse_block(raw.as_bytes(), expected_height, full_transactions)
+        let parsed = ParsedBlock::parse(raw.as_bytes(), expected_height, full_transactions)
             .map_err(|error| source_error(error.to_string(), true))?;
         Ok((raw, parsed))
-    }
-
-    async fn fetch_block_by_hash(
-        &self,
-        hash: &BlockHash,
-    ) -> Result<Option<(RawJson, super::model::ParsedBlock)>, SourceError> {
-        if hash.0.len() != 32 {
-            return Err(source_error(
-                "requested Ethereum block hash must be 32 bytes",
-                false,
-            ));
-        }
-        let raw = self
-            .request_result(
-                "eth_getBlockByHash",
-                serde_json::json!([encode_hex(&hash.0), true]),
-            )
-            .await?;
-        if is_json_null(&raw)? {
-            return Ok(None);
-        }
-        let parsed = parse_block(raw.as_bytes(), None, true)
-            .map_err(|error| source_error(error.to_string(), true))?;
-        if parsed.reference.hash != *hash {
-            return Err(source_error(
-                "Ethereum hash lookup returned a different block",
-                true,
-            ));
-        }
-        Ok(Some((raw, parsed)))
     }
 
     async fn fetch_receipts(
@@ -224,55 +192,17 @@ where
         &self,
         block: &super::model::ParsedBlock,
     ) -> Result<Vec<Vec<u8>>, SourceError> {
-        let mut expected_ids = Vec::with_capacity(block.transactions.len());
         let mut requests = Vec::with_capacity(block.transactions.len());
         for transaction in &block.transactions {
-            let id = self.request_id()?;
-            expected_ids.push(id.clone());
             let hash = encode_hex(&transaction.hash);
-            requests.push(
-                JsonRpcRequest::new(id, "eth_getTransactionReceipt", &[hash])
-                    .map_err(map_json_rpc_error)?,
-            );
+            requests.push(("eth_getTransactionReceipt", serde_json::json!([hash])));
         }
-        let responses = self
-            .client
+        self.client
             .batch(requests)
-            .await
-            .map_err(map_json_rpc_error)?;
-        if responses.len() != expected_ids.len() {
-            return Err(source_error(
-                "Ethereum receipt batch response count is inconsistent",
-                true,
-            ));
-        }
-
-        // JSON-RPC batch response order is explicitly unspecified. Restore the
-        // transaction order by request ID before validating and retaining each
-        // receipt.
-        let mut responses_by_id = HashMap::with_capacity(responses.len());
-        for response in responses {
-            if responses_by_id
-                .insert(response.id.clone(), response)
-                .is_some()
-            {
-                return Err(source_error(
-                    "Ethereum receipt batch contains a duplicate response ID",
-                    true,
-                ));
-            }
-        }
-
-        expected_ids
+            .await?
             .into_iter()
-            .map(|expected_id| {
-                let response = responses_by_id.remove(&expected_id).ok_or_else(|| {
-                    source_error(
-                        "Ethereum receipt batch has no response for a request ID",
-                        true,
-                    )
-                })?;
-                let raw = match response.result {
+            .map(|result| {
+                let raw = match result {
                     Ok(raw) => raw,
                     Err(failure) => return Err(map_remote_failure(failure)),
                 };
@@ -302,47 +232,22 @@ where
         method: &'static str,
         params: Value,
     ) -> Result<RawJson, CallFailure> {
-        let id = self.request_id().map_err(CallFailure::local)?;
-        let request = JsonRpcRequest::new(id.clone(), method, &params)
-            .map_err(|error| CallFailure::local(map_json_rpc_error(error)))?;
-        let response = self
-            .client
-            .request(request)
-            .await
-            .map_err(|error| CallFailure::local(map_json_rpc_error(error)))?;
-        if response.id != id {
-            return Err(CallFailure::local(source_error(
-                "Ethereum JSON-RPC response ID does not match its request",
-                true,
-            )));
-        }
-        match response.result {
+        match self.client.call(method, params).await {
             Ok(result) => Ok(result),
-            Err(failure) => {
-                let remote_code = Some(failure.code);
-                Err(CallFailure {
-                    remote_code,
-                    error: map_remote_failure(failure),
-                })
-            }
+            Err(CallError::Local(error)) => Err(CallFailure::local(error)),
+            Err(CallError::Remote(failure)) => Err(CallFailure {
+                remote_code: Some(failure.code),
+                error: map_remote_failure(failure),
+            }),
         }
-    }
-
-    fn request_id(&self) -> Result<RequestId, SourceError> {
-        self.next_request_id
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(1)
-            })
-            .map(RequestId::Number)
-            .map_err(|_| source_error("Ethereum JSON-RPC request ID space is exhausted", false))
     }
 }
 
-impl<C> BlockSource for EthereumHttpBlockSource<C>
+impl<C> BlockSource for BlockClient<C>
 where
-    C: JsonRpcClient,
+    C: JsonClient,
 {
-    type Block = EthereumBlock;
+    type Block = Block;
 
     fn tip<'a>(&'a self) -> BoxFuture<'a, Result<BlockRef, SourceError>> {
         Box::pin(async move {
@@ -359,9 +264,9 @@ where
             let tag = format!("0x{:x}", height.0);
             let (raw_block, parsed) = self.fetch_block(tag, Some(height), true).await?;
             let raw_receipts = self.fetch_receipts(&parsed).await?;
-            parse_and_validate_receipts(&raw_receipts, &parsed)
+            ParsedReceipt::parse_all(&raw_receipts, &parsed)
                 .map_err(|error| source_error(error.to_string(), true))?;
-            Ok(EthereumBlock {
+            Ok(Block {
                 reference: parsed.reference,
                 raw_block: raw_block.0,
                 raw_receipts,
@@ -381,43 +286,15 @@ where
             if is_json_null(&raw)? {
                 return Ok(None);
             }
-            let block = parse_block(raw.as_bytes(), Some(height), false)
+            let block = ParsedBlock::parse(raw.as_bytes(), Some(height), false)
                 .map_err(|error| source_error(error.to_string(), true))?;
             Ok(Some(block.reference.hash))
         })
     }
 }
 
-impl<C> EthereumIndexRpc for EthereumHttpBlockSource<C>
-where
-    C: JsonRpcClient,
-{
-    fn indexing_capabilities(&self) -> EthereumIndexingCapabilities {
-        EthereumIndexingCapabilities::V1
-    }
-
-    fn block_by_hash<'a>(
-        &'a self,
-        hash: BlockHash,
-    ) -> BoxFuture<'a, Result<Option<EthereumBlock>, SourceError>> {
-        Box::pin(async move {
-            let Some((raw_block, parsed)) = self.fetch_block_by_hash(&hash).await? else {
-                return Ok(None);
-            };
-            let raw_receipts = self.fetch_receipts(&parsed).await?;
-            parse_and_validate_receipts(&raw_receipts, &parsed)
-                .map_err(|error| source_error(error.to_string(), true))?;
-            Ok(Some(EthereumBlock {
-                reference: parsed.reference,
-                raw_block: raw_block.0,
-                raw_receipts,
-            }))
-        })
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EthereumHeadWake {
+pub struct Head {
     pub announced_height: BlockHeight,
 }
 
@@ -427,13 +304,11 @@ pub struct EthereumHeadWake {
 /// lossy subscription as canonical evidence. Every hint must trigger numbered
 /// HTTP reconciliation; duplicates, gaps, and same-height replacements are all
 /// equivalent wake-ups.
-pub fn parse_new_heads_wake(message: &[u8]) -> Result<EthereumHeadWake, SourceError> {
+pub fn parse_new_heads_wake(message: &[u8]) -> Result<Head, SourceError> {
     parse_new_heads_notification(message).map(|(_, wake)| wake)
 }
 
-pub(super) fn parse_new_heads_notification(
-    message: &[u8],
-) -> Result<(String, EthereumHeadWake), SourceError> {
+pub(super) fn parse_new_heads_notification(message: &[u8]) -> Result<(String, Head), SourceError> {
     let value: Value = serde_json::from_slice(message)
         .map_err(|_| source_error("Ethereum newHeads notification is not valid JSON", true))?;
     let method = value.get("method").and_then(Value::as_str);
@@ -466,10 +341,7 @@ pub(super) fn parse_new_heads_notification(
     let announced_height = u64::try_from(number)
         .map(BlockHeight)
         .map_err(|_| source_error("Ethereum newHeads number exceeds u64", true))?;
-    Ok((
-        subscription_id.to_owned(),
-        EthereumHeadWake { announced_height },
-    ))
+    Ok((subscription_id.to_owned(), Head { announced_height }))
 }
 
 #[derive(Debug)]
@@ -487,11 +359,11 @@ impl CallFailure {
     }
 }
 
-fn map_json_rpc_error(error: JsonRpcError) -> SourceError {
+fn map_json_rpc_error(error: Error) -> SourceError {
     source_error(error.to_string(), error.is_retryable())
 }
 
-fn map_remote_failure(failure: JsonRpcFailure) -> SourceError {
+fn map_remote_failure(failure: Failure) -> SourceError {
     source_error(
         format!(
             "Ethereum JSON-RPC request failed with code {}",
@@ -521,9 +393,9 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use chain_identity::ChainId;
     use futures_executor::block_on;
-    use json_rpc::JsonRpcResponse;
+    use indexing::ChainId;
+    use json_rpc::{Request, Response};
     use serde_json::json;
 
     use super::*;
@@ -569,7 +441,7 @@ mod tests {
                 .clone()
         }
 
-        fn response(&self, request: JsonRpcRequest) -> JsonRpcResponse {
+        fn response(&self, request: Request) -> Response {
             let mut state = self.state.lock().expect("script lock must be healthy");
             let expected = state
                 .replies
@@ -577,9 +449,9 @@ mod tests {
                 .expect("source made more requests than scripted");
             assert_eq!(request.method, expected.method);
             state.methods.push(request.method);
-            JsonRpcResponse {
+            Response {
                 id: request.id,
-                result: expected.result.map_err(|code| JsonRpcFailure {
+                result: expected.result.map_err(|code| Failure {
                     code,
                     message: "scripted failure".to_owned(),
                     data: None,
@@ -588,19 +460,16 @@ mod tests {
         }
     }
 
-    impl JsonRpcClient for ScriptedClient {
-        fn request<'a>(
-            &'a self,
-            request: JsonRpcRequest,
-        ) -> BoxFuture<'a, Result<JsonRpcResponse, JsonRpcError>> {
+    impl JsonClient for ScriptedClient {
+        fn request<'a>(&'a self, request: Request) -> BoxFuture<'a, Result<Response, Error>> {
             let response = self.response(request);
             Box::pin(async move { Ok(response) })
         }
 
         fn batch<'a>(
             &'a self,
-            requests: Vec<JsonRpcRequest>,
-        ) -> BoxFuture<'a, Result<Vec<JsonRpcResponse>, JsonRpcError>> {
+            requests: Vec<Request>,
+        ) -> BoxFuture<'a, Result<Vec<Response>, Error>> {
             let mut responses: Vec<_> = requests
                 .into_iter()
                 .map(|request| self.response(request))
@@ -712,10 +581,10 @@ mod tests {
         .into_bytes()
     }
 
-    fn config() -> EthereumIndexSourceConfig {
-        EthereumIndexSourceConfig {
+    fn config() -> SourceConfig {
+        SourceConfig {
             scope: IndexScope {
-                chain: ChainId("ethereum".to_owned()),
+                chain: ChainId(crate::CHAIN.to_owned()),
                 network: "dev".to_owned(),
             },
             expected_chain_id: 31_337,
@@ -737,22 +606,8 @@ mod tests {
         .expect("well-formed notification must become a wake hint");
         assert_eq!(
             wake,
-            EthereumHeadWake {
+            Head {
                 announced_height: BlockHeight(12)
-            }
-        );
-    }
-
-    #[test]
-    fn capabilities_do_not_claim_unavailable_data() {
-        assert_eq!(
-            EthereumIndexingCapabilities::V1,
-            EthereumIndexingCapabilities {
-                block_transactions: true,
-                receipts: true,
-                logs: true,
-                traces: false,
-                internal_transfers: false,
             }
         );
     }
@@ -783,11 +638,9 @@ mod tests {
             failure("eth_getBlockReceipts", -32_601),
             success("eth_getTransactionReceipt", receipt()),
             success("eth_getBlockByNumber", header),
-            raw_success("eth_getBlockByHash", raw_full_block.clone()),
-            success("eth_getTransactionReceipt", receipt()),
         ]);
 
-        let source = block_on(EthereumHttpBlockSource::connect(client.clone(), config()))
+        let source = block_on(BlockClient::connect(client.clone(), config()))
             .expect("matching chain identity must connect");
         let canonical = block_on(source.block_at(BlockHeight(10)))
             .expect("numbered full block must load through receipt fallback");
@@ -799,11 +652,6 @@ mod tests {
                 .expect("canonical hash lookup must succeed"),
             Some(BlockHash(vec![0xaa; 32]))
         );
-        let by_hash = block_on(source.block_by_hash(BlockHash(vec![0xaa; 32])))
-            .expect("hash lookup must succeed")
-            .expect("scripted hash must exist");
-        assert_eq!(by_hash.reference, canonical.reference);
-
         let methods = client.methods();
         assert_eq!(
             methods,
@@ -814,8 +662,6 @@ mod tests {
                 "eth_getBlockReceipts",
                 "eth_getTransactionReceipt",
                 "eth_getBlockByNumber",
-                "eth_getBlockByHash",
-                "eth_getTransactionReceipt",
             ]
         );
         assert!(methods.iter().all(|method| {
@@ -827,9 +673,9 @@ mod tests {
     }
 
     #[test]
-    fn chain_identity_mismatch_fails_closed_before_genesis_read() {
+    fn chains_mismatch_fails_closed_before_genesis_read() {
         let client = ScriptedClient::new(vec![success("eth_chainId", json!("0x1"))]);
-        let error = match block_on(EthereumHttpBlockSource::connect(client.clone(), config())) {
+        let error = match block_on(BlockClient::connect(client.clone(), config())) {
             Ok(_) => panic!("wrong chain ID must fail closed"),
             Err(error) => error,
         };
@@ -858,7 +704,7 @@ mod tests {
             ),
             raw_success("eth_getBlockReceipts", raw_receipt_array),
         ]);
-        let source = block_on(EthereumHttpBlockSource::connect(client, config()))
+        let source = block_on(BlockClient::connect(client, config()))
             .expect("matching chain identity must connect");
 
         let block = block_on(source.block_at(BlockHeight(10)))
@@ -895,7 +741,7 @@ mod tests {
             raw_success("eth_getTransactionReceipt", first_receipt.clone()),
             raw_success("eth_getTransactionReceipt", second_receipt.clone()),
         ]);
-        let source = block_on(EthereumHttpBlockSource::connect(client, config()))
+        let source = block_on(BlockClient::connect(client, config()))
             .expect("matching chain identity must connect");
 
         let block = block_on(source.block_at(BlockHeight(10)))

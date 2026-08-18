@@ -1,9 +1,9 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use chain_bitcoin::{BitcoinNetwork, format_bitcoin_block_hash, parse_bitcoin_block_hash};
-use chain_identity::ChainId;
+use chain_bitcoin::{Network, format_bitcoin_block_hash, parse_bitcoin_block_hash};
 use clap::{Args, Parser, Subcommand};
-use http::{AuthenticationMode, BearerToken};
+use http::server::{AuthenticationMode, BearerToken};
+use indexing::ChainId;
 use indexing::{BlockHash, BlockHeight, ConfirmationPolicy, IndexError, IndexScope};
 use url::{Host, Url};
 
@@ -21,17 +21,15 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Run canonical synchronization and the public HTTP API.
-    Serve(ServeOptions),
+    Serve(EthereumServe),
     /// Create a consistent RocksDB BackupEngine snapshot.
-    Backup(BackupOptions),
-    /// Apply an explicit physical-schema or semantic-policy migration.
-    Migrate(MigrationOptions),
+    Backup(Backup),
     /// Build and atomically activate a shadow indexing generation.
-    Rebuild(RebuildOptions),
+    Rebuild(EthereumRebuild),
     /// Remove an unpublished shadow generation after a failed rebuild.
-    RebuildAbort(GenerationOptions),
+    RebuildAbort(EthereumGeneration),
     /// Remove one inactive projection generation after operator verification.
-    Cleanup(GenerationOptions),
+    Cleanup(EthereumGeneration),
     /// Operate one Bitcoin Indexer Service scope.
     Bitcoin(BitcoinOptions),
 }
@@ -45,30 +43,28 @@ pub struct BitcoinOptions {
 #[derive(Subcommand)]
 pub enum BitcoinCommand {
     /// Run Bitcoin canonical synchronization and the public HTTP API.
-    Serve(BitcoinServeOptions),
+    Serve(BitcoinServe),
     /// Create a consistent RocksDB BackupEngine snapshot.
-    Backup(BackupOptions),
-    /// Apply a Bitcoin physical-schema or semantic-policy migration.
-    Migrate(BitcoinMigrationOptions),
+    Backup(Backup),
     /// Build and atomically activate a Bitcoin shadow indexing generation.
-    Rebuild(BitcoinRebuildOptions),
+    Rebuild(BitcoinRebuild),
     /// Remove an unpublished Bitcoin shadow generation after a failed rebuild.
-    RebuildAbort(BitcoinGenerationOptions),
+    RebuildAbort(BitcoinGeneration),
     /// Remove one inactive Bitcoin projection generation after operator verification.
-    Cleanup(BitcoinGenerationOptions),
+    Cleanup(BitcoinGeneration),
 }
 
 #[derive(Args, Clone)]
-pub struct DatabaseOptions {
+pub struct Database {
     /// Exclusive RocksDB directory for this Indexer scope.
     #[arg(long, env = "IX_DATABASE_PATH")]
     pub database_path: PathBuf,
 }
 
 #[derive(Args, Clone)]
-pub struct RepositoryOptions {
+pub struct EthereumRepository {
     #[command(flatten)]
-    pub database: DatabaseOptions,
+    pub database: Database,
 
     #[arg(long, env = "IX_NETWORK")]
     pub network: String,
@@ -83,13 +79,13 @@ pub struct RepositoryOptions {
     pub reorg_retention: u64,
 }
 
-impl RepositoryOptions {
+impl EthereumRepository {
     pub fn scope(&self) -> Result<IndexScope, ConfigError> {
         if self.network.trim().is_empty() {
             return Err(ConfigError::new("network slug must not be empty"));
         }
         Ok(IndexScope {
-            chain: ChainId("ethereum".to_owned()),
+            chain: ChainId(chain_ethereum::CHAIN.to_owned()),
             network: self.network.clone(),
         })
     }
@@ -124,9 +120,9 @@ impl RepositoryOptions {
 /// deployment and every policy-sensitive maintenance command must provide both
 /// values explicitly.
 #[derive(Args, Clone)]
-pub struct BitcoinRepositoryOptions {
+pub struct BitcoinRepository {
     #[command(flatten)]
-    pub database: DatabaseOptions,
+    pub database: Database,
 
     /// Bitcoin Core network: mainnet, testnet3, testnet4, signet, or regtest.
     #[arg(long, env = "IX_NETWORK")]
@@ -142,15 +138,15 @@ pub struct BitcoinRepositoryOptions {
     pub reorg_retention: u64,
 }
 
-impl BitcoinRepositoryOptions {
-    pub fn network(&self) -> Result<BitcoinNetwork, ConfigError> {
+impl BitcoinRepository {
+    pub fn network(&self) -> Result<Network, ConfigError> {
         parse_bitcoin_network(&self.network)
     }
 
     pub fn scope(&self) -> Result<IndexScope, ConfigError> {
         let network = self.network()?;
         Ok(IndexScope {
-            chain: ChainId("bitcoin".to_owned()),
+            chain: ChainId(chain_bitcoin::CHAIN.to_owned()),
             network: network.canonical_name().to_owned(),
         })
     }
@@ -180,7 +176,7 @@ impl BitcoinRepositoryOptions {
 }
 
 #[derive(Args, Clone)]
-pub struct SourceOptions {
+pub struct EthereumSource {
     #[arg(long, env = "IX_EXPECTED_CHAIN_ID")]
     pub expected_chain_id: u64,
 
@@ -200,7 +196,7 @@ pub struct SourceOptions {
     pub rpc_timeout_seconds: u64,
 }
 
-impl SourceOptions {
+impl EthereumSource {
     pub fn genesis_hash(&self) -> Result<BlockHash, ConfigError> {
         decode_hash(&self.expected_genesis_hash)
     }
@@ -232,7 +228,7 @@ impl SourceOptions {
 }
 
 #[derive(Args, Clone)]
-pub struct BitcoinSourceOptions {
+pub struct BitcoinSource {
     /// Conventional 64-hex Bitcoin Core block-zero hash (display byte order).
     #[arg(long, env = "IX_EXPECTED_GENESIS_HASH")]
     pub expected_genesis_hash: String,
@@ -259,7 +255,7 @@ pub struct BitcoinSourceOptions {
     pub rpc_max_response_bytes: usize,
 }
 
-impl BitcoinSourceOptions {
+impl BitcoinSource {
     pub fn genesis_hash(&self) -> Result<BlockHash, ConfigError> {
         let hash = parse_bitcoin_block_hash(&self.expected_genesis_hash)
             .map_err(|error| ConfigError::new(error.message))?;
@@ -329,18 +325,15 @@ impl BitcoinSourceOptions {
 }
 
 #[derive(Args, Clone)]
-pub struct ServeOptions {
+pub struct EthereumServe {
     #[command(flatten)]
-    pub repository: RepositoryOptions,
+    pub repository: EthereumRepository,
 
     #[command(flatten)]
-    pub source: SourceOptions,
+    pub source: EthereumSource,
 
     #[arg(long, env = "IX_HTTP_BIND", default_value = "127.0.0.1:8080")]
     pub http_bind: SocketAddr,
-
-    #[arg(long, env = "IX_METRICS_BIND", default_value = "127.0.0.1:9090")]
-    pub metrics_bind: SocketAddr,
 
     /// Require service bearer authentication (`true`) or trust every reachable caller (`false`).
     #[arg(
@@ -366,13 +359,12 @@ pub struct ServeOptions {
     pub ready_max_age_seconds: u64,
 }
 
-impl ServeOptions {
+impl EthereumServe {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.repository.validate()?;
         self.source.validate()?;
         validate_service_options(
             self.http_bind,
-            self.metrics_bind,
             self.authentication_mode,
             self.bearer_token.as_deref(),
             self.upstream_tls_terminated,
@@ -393,18 +385,15 @@ impl ServeOptions {
 }
 
 #[derive(Args, Clone)]
-pub struct BitcoinServeOptions {
+pub struct BitcoinServe {
     #[command(flatten)]
-    pub repository: BitcoinRepositoryOptions,
+    pub repository: BitcoinRepository,
 
     #[command(flatten)]
-    pub source: BitcoinSourceOptions,
+    pub source: BitcoinSource,
 
     #[arg(long, env = "IX_HTTP_BIND", default_value = "127.0.0.1:8080")]
     pub http_bind: SocketAddr,
-
-    #[arg(long, env = "IX_METRICS_BIND", default_value = "127.0.0.1:9090")]
-    pub metrics_bind: SocketAddr,
 
     /// Require service bearer authentication (`true`) or trust every reachable caller (`false`).
     #[arg(
@@ -430,13 +419,12 @@ pub struct BitcoinServeOptions {
     pub ready_max_age_seconds: u64,
 }
 
-impl BitcoinServeOptions {
+impl BitcoinServe {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.repository.validate()?;
         self.source.validate()?;
         validate_service_options(
             self.http_bind,
-            self.metrics_bind,
             self.authentication_mode,
             self.bearer_token.as_deref(),
             self.upstream_tls_terminated,
@@ -457,156 +445,21 @@ impl BitcoinServeOptions {
 }
 
 #[derive(Args, Clone)]
-pub struct BackupOptions {
+pub struct Backup {
     #[command(flatten)]
-    pub database: DatabaseOptions,
+    pub database: Database,
 
     #[arg(long, env = "IX_BACKUP_PATH")]
     pub backup_path: PathBuf,
 }
 
-#[derive(Args)]
-pub struct MigrationOptions {
-    #[command(subcommand)]
-    pub command: MigrationCommand,
-}
-
-#[derive(Subcommand)]
-pub enum MigrationCommand {
-    /// Apply registered physical RocksDB schema migrations.
-    Schema(SchemaMigrationOptions),
-    /// Atomically change confirmation/retention policy; checkpointed state must be Ready and is rebuilt afterward.
-    Policy(PolicyMigrationOptions),
-}
-
-#[derive(Args)]
-pub struct BitcoinMigrationOptions {
-    #[command(subcommand)]
-    pub command: BitcoinMigrationCommand,
-}
-
-#[derive(Subcommand)]
-pub enum BitcoinMigrationCommand {
-    /// Apply registered physical RocksDB schema migrations.
-    Schema(SchemaMigrationOptions),
-    /// Atomically change Bitcoin confirmation/retention policy.
-    Policy(BitcoinPolicyMigrationOptions),
-}
-
 #[derive(Args, Clone)]
-pub struct SchemaMigrationOptions {
+pub struct EthereumRebuild {
     #[command(flatten)]
-    pub database: DatabaseOptions,
-
-    /// Verified safety backup created before the first schema mutation.
-    #[arg(long, env = "IX_BACKUP_PATH")]
-    pub backup_path: PathBuf,
-}
-
-#[derive(Args, Clone)]
-pub struct PolicyMigrationOptions {
-    /// Target repository configuration. Scope and bootstrap height are
-    /// immutable; confirmation depth and retention are the new values.
-    #[command(flatten)]
-    pub repository: RepositoryOptions,
-
-    #[arg(long, env = "IX_FROM_CONFIRMATION_DEPTH")]
-    pub from_confirmation_depth: u64,
-
-    #[arg(long, env = "IX_FROM_REORG_RETENTION")]
-    pub from_reorg_retention: u64,
-
-    /// Stable operator-supplied idempotency key for safe retries.
-    #[arg(long, env = "IX_POLICY_MIGRATION_ID")]
-    pub migration_id: String,
-
-    /// Human-readable audit reason persisted with the immutable migration row.
-    #[arg(long, env = "IX_POLICY_MIGRATION_REASON")]
-    pub reason: String,
-
-    /// Verified safety backup created before any physical or semantic mutation.
-    #[arg(long, env = "IX_BACKUP_PATH")]
-    pub backup_path: PathBuf,
-}
-
-impl PolicyMigrationOptions {
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        self.repository.validate()?;
-        if self.from_confirmation_depth == 0 || self.from_reorg_retention == 0 {
-            return Err(ConfigError::new(
-                "source confirmation depth and reorg retention must be greater than zero",
-            ));
-        }
-        if self.migration_id.trim().is_empty() || self.migration_id.len() > 256 {
-            return Err(ConfigError::new(
-                "policy migration ID must contain 1 through 256 bytes",
-            ));
-        }
-        if self.reason.trim().is_empty() || self.reason.len() > 4_096 {
-            return Err(ConfigError::new(
-                "policy migration reason must contain 1 through 4096 bytes",
-            ));
-        }
-        Ok(())
-    }
-
-    #[must_use]
-    pub const fn expected_confirmation_policy(&self) -> ConfirmationPolicy {
-        ConfirmationPolicy {
-            minimum_confirmations: self.from_confirmation_depth,
-            require_chain_finality: false,
-        }
-    }
-}
-
-#[derive(Args, Clone)]
-pub struct BitcoinPolicyMigrationOptions {
-    #[command(flatten)]
-    pub repository: BitcoinRepositoryOptions,
-
-    #[arg(long, env = "IX_FROM_CONFIRMATION_DEPTH")]
-    pub from_confirmation_depth: u64,
-
-    #[arg(long, env = "IX_FROM_REORG_RETENTION")]
-    pub from_reorg_retention: u64,
-
-    #[arg(long, env = "IX_POLICY_MIGRATION_ID")]
-    pub migration_id: String,
-
-    #[arg(long, env = "IX_POLICY_MIGRATION_REASON")]
-    pub reason: String,
-
-    #[arg(long, env = "IX_BACKUP_PATH")]
-    pub backup_path: PathBuf,
-}
-
-impl BitcoinPolicyMigrationOptions {
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        self.repository.validate()?;
-        validate_policy_migration(
-            self.from_confirmation_depth,
-            self.from_reorg_retention,
-            &self.migration_id,
-            &self.reason,
-        )
-    }
-
-    #[must_use]
-    pub const fn expected_confirmation_policy(&self) -> ConfirmationPolicy {
-        ConfirmationPolicy {
-            minimum_confirmations: self.from_confirmation_depth,
-            require_chain_finality: false,
-        }
-    }
-}
-
-#[derive(Args, Clone)]
-pub struct RebuildOptions {
-    #[command(flatten)]
-    pub repository: RepositoryOptions,
+    pub repository: EthereumRepository,
 
     #[command(flatten)]
-    pub source: SourceOptions,
+    pub source: EthereumSource,
 
     /// Verified safety backup created before staging the rebuild.
     #[arg(long, env = "IX_BACKUP_PATH")]
@@ -614,12 +467,12 @@ pub struct RebuildOptions {
 }
 
 #[derive(Args, Clone)]
-pub struct BitcoinRebuildOptions {
+pub struct BitcoinRebuild {
     #[command(flatten)]
-    pub repository: BitcoinRepositoryOptions,
+    pub repository: BitcoinRepository,
 
     #[command(flatten)]
-    pub source: BitcoinSourceOptions,
+    pub source: BitcoinSource,
 
     /// Verified safety backup created before staging the rebuild.
     #[arg(long, env = "IX_BACKUP_PATH")]
@@ -627,9 +480,9 @@ pub struct BitcoinRebuildOptions {
 }
 
 #[derive(Args, Clone)]
-pub struct GenerationOptions {
+pub struct EthereumGeneration {
     #[command(flatten)]
-    pub repository: RepositoryOptions,
+    pub repository: EthereumRepository,
 
     #[arg(long)]
     pub generation: u64,
@@ -640,9 +493,9 @@ pub struct GenerationOptions {
 }
 
 #[derive(Args, Clone)]
-pub struct BitcoinGenerationOptions {
+pub struct BitcoinGeneration {
     #[command(flatten)]
-    pub repository: BitcoinRepositoryOptions,
+    pub repository: BitcoinRepository,
 
     #[arg(long)]
     pub generation: u64,
@@ -680,22 +533,22 @@ impl From<IndexError> for ConfigError {
 }
 
 #[must_use]
-pub const fn bootstrap_height(options: &RepositoryOptions) -> BlockHeight {
+pub const fn bootstrap_height(options: &EthereumRepository) -> BlockHeight {
     BlockHeight(options.bootstrap_height)
 }
 
 #[must_use]
-pub const fn bitcoin_bootstrap_height(options: &BitcoinRepositoryOptions) -> BlockHeight {
+pub const fn bitcoin_bootstrap_height(options: &BitcoinRepository) -> BlockHeight {
     BlockHeight(options.bootstrap_height)
 }
 
-fn parse_bitcoin_network(input: &str) -> Result<BitcoinNetwork, ConfigError> {
+fn parse_bitcoin_network(input: &str) -> Result<Network, ConfigError> {
     match input {
-        "mainnet" => Ok(BitcoinNetwork::Mainnet),
-        "testnet3" => Ok(BitcoinNetwork::Testnet3),
-        "testnet4" => Ok(BitcoinNetwork::Testnet4),
-        "signet" => Ok(BitcoinNetwork::Signet),
-        "regtest" => Ok(BitcoinNetwork::Regtest),
+        "mainnet" => Ok(Network::Mainnet),
+        "testnet3" => Ok(Network::Testnet3),
+        "testnet4" => Ok(Network::Testnet4),
+        "signet" => Ok(Network::Signet),
+        "regtest" => Ok(Network::Regtest),
         _ => Err(ConfigError::new(
             "Bitcoin network must be mainnet, testnet3, testnet4, signet, or regtest",
         )),
@@ -704,7 +557,6 @@ fn parse_bitcoin_network(input: &str) -> Result<BitcoinNetwork, ConfigError> {
 
 fn validate_service_options(
     http_bind: SocketAddr,
-    metrics_bind: SocketAddr,
     authentication_mode: AuthenticationMode,
     bearer_token: Option<&str>,
     upstream_tls_terminated: bool,
@@ -714,11 +566,6 @@ fn validate_service_options(
     if poll_seconds == 0 || ready_max_age_seconds == 0 {
         return Err(ConfigError::new(
             "poll and readiness-age intervals must be greater than zero",
-        ));
-    }
-    if !metrics_bind.ip().is_loopback() {
-        return Err(ConfigError::new(
-            "the Prometheus listener must bind to loopback",
         ));
     }
     if authentication_mode.is_strict() {
@@ -732,30 +579,6 @@ fn validate_service_options(
     if !http_bind.ip().is_loopback() && !upstream_tls_terminated {
         return Err(ConfigError::new(
             "a non-loopback API bind requires trusted upstream TLS",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_policy_migration(
-    from_confirmation_depth: u64,
-    from_reorg_retention: u64,
-    migration_id: &str,
-    reason: &str,
-) -> Result<(), ConfigError> {
-    if from_confirmation_depth == 0 || from_reorg_retention == 0 {
-        return Err(ConfigError::new(
-            "source confirmation depth and reorg retention must be greater than zero",
-        ));
-    }
-    if migration_id.trim().is_empty() || migration_id.len() > 256 {
-        return Err(ConfigError::new(
-            "policy migration ID must contain 1 through 256 bytes",
-        ));
-    }
-    if reason.trim().is_empty() || reason.len() > 4_096 {
-        return Err(ConfigError::new(
-            "policy migration reason must contain 1 through 4096 bytes",
         ));
     }
     Ok(())
@@ -846,50 +669,6 @@ mod tests {
         assert_eq!(parsed, BlockHash(vec![0xab; 32]));
         assert!(decode_hash("ab").is_err());
         assert!(decode_hash(&format!("0x{}", "ab".repeat(31))).is_err());
-    }
-
-    #[test]
-    fn parses_an_explicit_policy_migration() {
-        let cli = Cli::try_parse_from([
-            "indexer-worker",
-            "migrate",
-            "policy",
-            "--database-path",
-            "ix.db",
-            "--network",
-            "devnet",
-            "--bootstrap-height",
-            "1",
-            "--confirmation-depth",
-            "24",
-            "--reorg-retention",
-            "75",
-            "--from-confirmation-depth",
-            "12",
-            "--from-reorg-retention",
-            "50",
-            "--migration-id",
-            "depth-24-v1",
-            "--reason",
-            "increase the accounting safety margin",
-            "--backup-path",
-            "ix.backup",
-        ])
-        .expect("the complete policy migration command must parse");
-
-        let Command::Migrate(MigrationOptions {
-            command: MigrationCommand::Policy(options),
-        }) = cli.command
-        else {
-            panic!("the policy migration subcommand must be selected");
-        };
-        options
-            .validate()
-            .expect("the parsed policy migration must validate");
-        assert_eq!(options.from_confirmation_depth, 12);
-        assert_eq!(options.from_reorg_retention, 50);
-        assert_eq!(options.repository.confirmation_depth, 24);
-        assert_eq!(options.repository.reorg_retention, 75);
     }
 
     #[test]
@@ -997,7 +776,7 @@ mod tests {
 
     #[test]
     fn bitcoin_rpc_headers_reject_injection_and_duplicates() {
-        let options = BitcoinSourceOptions {
+        let options = BitcoinSource {
             expected_genesis_hash: "11".repeat(32),
             rpc_http_url: "http://127.0.0.1:18443".to_owned(),
             rpc_headers: vec!["authorization=Basic hidden".to_owned()],
@@ -1017,7 +796,7 @@ mod tests {
         ];
         assert!(duplicate.parsed_rpc_headers().is_err());
 
-        let missing = BitcoinSourceOptions {
+        let missing = BitcoinSource {
             expected_genesis_hash: "11".repeat(32),
             rpc_http_url: "http://127.0.0.1:18443".to_owned(),
             rpc_headers: Vec::new(),
@@ -1031,13 +810,13 @@ mod tests {
     fn bitcoin_identity_configuration_requires_canonical_wire_values() {
         assert_eq!(
             parse_bitcoin_network("regtest").expect("canonical network must parse"),
-            BitcoinNetwork::Regtest
+            Network::Regtest
         );
         for noncanonical in ["Regtest", " regtest", "regtest ", "main", "test"] {
             assert!(parse_bitcoin_network(noncanonical).is_err());
         }
 
-        let options = BitcoinSourceOptions {
+        let options = BitcoinSource {
             expected_genesis_hash: "AB".repeat(32),
             rpc_http_url: "http://127.0.0.1:18443".to_owned(),
             rpc_headers: vec!["authorization=Basic hidden".to_owned()],

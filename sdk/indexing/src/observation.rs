@@ -1,11 +1,13 @@
+use base::Decimal;
+
+use crate::{AssetId, CanonicalAddress, TransactionRef};
 use crate::{BlockHeight, BlockRef, IndexScope, WatchId};
-use chain_identity::{AssetId, AtomicAmount, CanonicalAddress, CanonicalTransactionId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObservationRevision(pub u64);
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ObservationEventId(pub String);
+pub struct EventId(pub String);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EventCursor(pub u64);
@@ -15,33 +17,138 @@ pub struct MovementId(pub String);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MovementKind {
-    /// Account-model or explicitly parsed value transfer.
     Transfer,
-    /// UTXO consumed by this transaction.
     Input,
-    /// UTXO created by this transaction.
     Output,
     InternalTransfer,
     Mint,
     Burn,
 }
 
-/// A transaction can contain many movements. Optional endpoints avoid inventing
-/// a false one-to-one `from -> to` relationship for UTXO transactions.
+/// One independently meaningful value change within a transaction.
+///
+/// UTXO inputs and outputs are intentionally separate movements. Indexing never
+/// invents a one-to-one transfer between them because a transaction can consume
+/// and create any number of outputs. The variants also make impossible endpoint
+/// combinations unrepresentable.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ValueMovement {
-    pub id: MovementId,
-    pub asset: AssetId,
-    pub amount: AtomicAmount,
-    pub from: Option<CanonicalAddress>,
-    pub to: Option<CanonicalAddress>,
-    pub kind: MovementKind,
+pub enum ValueMovement {
+    Transfer {
+        id: MovementId,
+        asset: AssetId,
+        amount: Decimal,
+        from: CanonicalAddress,
+        to: CanonicalAddress,
+    },
+    Input {
+        id: MovementId,
+        asset: AssetId,
+        amount: Decimal,
+        owner: Option<CanonicalAddress>,
+    },
+    Output {
+        id: MovementId,
+        asset: AssetId,
+        amount: Decimal,
+        owner: Option<CanonicalAddress>,
+    },
+    InternalTransfer {
+        id: MovementId,
+        asset: AssetId,
+        amount: Decimal,
+        from: CanonicalAddress,
+        to: CanonicalAddress,
+    },
+    Mint {
+        id: MovementId,
+        asset: AssetId,
+        amount: Decimal,
+        to: CanonicalAddress,
+    },
+    Burn {
+        id: MovementId,
+        asset: AssetId,
+        amount: Decimal,
+        from: CanonicalAddress,
+    },
+}
+
+impl ValueMovement {
+    #[must_use]
+    pub fn id(&self) -> &MovementId {
+        match self {
+            Self::Transfer { id, .. }
+            | Self::Input { id, .. }
+            | Self::Output { id, .. }
+            | Self::InternalTransfer { id, .. }
+            | Self::Mint { id, .. }
+            | Self::Burn { id, .. } => id,
+        }
+    }
+
+    #[must_use]
+    pub fn asset(&self) -> &AssetId {
+        match self {
+            Self::Transfer { asset, .. }
+            | Self::Input { asset, .. }
+            | Self::Output { asset, .. }
+            | Self::InternalTransfer { asset, .. }
+            | Self::Mint { asset, .. }
+            | Self::Burn { asset, .. } => asset,
+        }
+    }
+
+    #[must_use]
+    pub fn amount(&self) -> &Decimal {
+        match self {
+            Self::Transfer { amount, .. }
+            | Self::Input { amount, .. }
+            | Self::Output { amount, .. }
+            | Self::InternalTransfer { amount, .. }
+            | Self::Mint { amount, .. }
+            | Self::Burn { amount, .. } => amount,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> MovementKind {
+        match self {
+            Self::Transfer { .. } => MovementKind::Transfer,
+            Self::Input { .. } => MovementKind::Input,
+            Self::Output { .. } => MovementKind::Output,
+            Self::InternalTransfer { .. } => MovementKind::InternalTransfer,
+            Self::Mint { .. } => MovementKind::Mint,
+            Self::Burn { .. } => MovementKind::Burn,
+        }
+    }
+
+    #[must_use]
+    pub fn from(&self) -> Option<&CanonicalAddress> {
+        match self {
+            Self::Transfer { from, .. }
+            | Self::InternalTransfer { from, .. }
+            | Self::Burn { from, .. } => Some(from),
+            Self::Input { owner, .. } => owner.as_ref(),
+            Self::Output { .. } | Self::Mint { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn to(&self) -> Option<&CanonicalAddress> {
+        match self {
+            Self::Transfer { to, .. }
+            | Self::InternalTransfer { to, .. }
+            | Self::Mint { to, .. } => Some(to),
+            Self::Output { owner, .. } => owner.as_ref(),
+            Self::Input { .. } | Self::Burn { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NetworkFee {
     pub asset: AssetId,
-    pub amount: AtomicAmount,
+    pub amount: Decimal,
     pub payer: Option<CanonicalAddress>,
 }
 
@@ -78,7 +185,7 @@ pub enum TransactionStatus {
         reason: Option<String>,
     },
     Replaced {
-        by: CanonicalTransactionId,
+        by: TransactionRef,
     },
     Dropped,
     Reorged {
@@ -90,7 +197,7 @@ pub enum TransactionStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservedTransaction {
     pub scope: IndexScope,
-    pub transaction_id: CanonicalTransactionId,
+    pub transaction_id: TransactionRef,
     pub revision: ObservationRevision,
     pub status: TransactionStatus,
     pub movements: Vec<ValueMovement>,
@@ -103,7 +210,7 @@ pub struct ObservedTransaction {
 /// can legitimately occur again after a reorg and re-inclusion.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservationEvent {
-    pub id: ObservationEventId,
+    pub id: EventId,
     pub cursor: EventCursor,
     pub watch_ids: Vec<WatchId>,
     pub previous_status: Option<TransactionStatus>,
@@ -117,7 +224,7 @@ pub struct ObservationEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservationDraft {
     pub scope: IndexScope,
-    pub transaction_id: CanonicalTransactionId,
+    pub transaction_id: TransactionRef,
     pub status: ObservationDraftStatus,
     pub movements: Vec<ValueMovement>,
     pub fee: Option<NetworkFee>,
@@ -139,7 +246,7 @@ pub enum ObservationDraftStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WatchSelector {
     Address(CanonicalAddress),
-    Transaction(CanonicalTransactionId),
+    Transaction(TransactionRef),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,20 +271,27 @@ pub struct WatchReceipt {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RegisterWatchCommand<T> {
+pub struct RegisterWatch<T> {
     pub request: WatchRequest,
     pub target: T,
     pub registered_at: Option<BlockRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RegisterWatchOutcome {
+pub enum WatchOutcome {
     Registered(WatchReceipt),
     Existing(WatchReceipt),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnwatchCommand {
+pub struct UnwatchRequest {
+    pub scope: IndexScope,
+    pub watch_id: WatchId,
+}
+
+/// Persistence command that deactivates a watch at an exact canonical boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeactivateWatch {
     pub scope: IndexScope,
     pub watch_id: WatchId,
     pub inactive_from: BlockHeight,
@@ -191,21 +305,21 @@ pub enum UnwatchOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TransactionRequest {
+pub struct TransactionQuery {
     pub scope: IndexScope,
-    pub transaction_id: CanonicalTransactionId,
+    pub transaction_id: TransactionRef,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TransactionPageRequest {
+pub struct HistoryQuery {
     pub scope: IndexScope,
     pub address: CanonicalAddress,
-    pub after: Option<CanonicalTransactionId>,
+    pub after: Option<TransactionRef>,
     pub limit: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AddressWatchRequest {
+pub struct AddressQuery {
     pub scope: IndexScope,
     pub address: CanonicalAddress,
 }
@@ -213,34 +327,18 @@ pub struct AddressWatchRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransactionPage {
     pub transactions: Vec<ObservedTransaction>,
-    pub next: Option<CanonicalTransactionId>,
-}
-
-/// IX store query used after every checkpoint advance, including blocks with no
-/// watched movements, to find inclusions that have just reached proof depth.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FinalityScanRequest {
-    pub scope: crate::IndexScope,
-    pub included_through: BlockHeight,
-    pub after: Option<CanonicalTransactionId>,
-    pub limit: usize,
+    pub next: Option<TransactionRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FinalityScanPage {
-    pub transactions: Vec<ObservedTransaction>,
-    pub next: Option<CanonicalTransactionId>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ObservationEventRequest {
+pub struct EventQuery {
     pub scope: IndexScope,
     pub after: Option<EventCursor>,
     pub limit: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ObservationEventPage {
+pub struct EventPage {
     pub events: Vec<ObservationEvent>,
     pub next: Option<EventCursor>,
 }

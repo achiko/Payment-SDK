@@ -1,30 +1,39 @@
-use std::collections::{BTreeMap, BTreeSet};
-
-use bitcoin::ScriptBuf;
-use chain_identity::{AssetId, AtomicAmount, CanonicalAddress, CanonicalTransactionId, ChainId};
-use indexing::{
-    BlockInterpreter, IndexError, IndexErrorKind, IndexScope, InterpretedBlock, MovementId,
-    MovementKind, NetworkFee, ObservationDraft, ObservationDraftStatus, RawBlockData,
-    ValueMovement, WatchId, WatchSelector, WatchTarget,
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+    sync::LazyLock,
 };
 
-use crate::{BitcoinAddress, BitcoinNetwork, BitcoinTransactionId};
+use base::Decimal;
+use indexing::{
+    AssetId, BlockInterpreter as IndexBlockInterpreter, CanonicalAddress, ChainId, IndexChanges,
+    IndexError, IndexErrorKind, IndexScope, IndexUndo, InterpretedBlock, ObservationDraft,
+    ObservationDraftStatus, OutputChanges, OutputId, OutputKey, RawBlock, TransactionRef, WatchId,
+    WatchSelector, WatchTarget,
+};
+
+use crate::{Address, Network, TransactionId};
 
 use super::{
-    BitcoinBlock, BitcoinIndexRecordCodec, BitcoinIndexedOutput, BitcoinOutPoint, BitcoinUndo,
-    BitcoinUtxoKey, BitcoinUtxoProjection, BitcoinWatchTarget,
-    model::{ParsedTransaction, address_for_script, parse_block},
+    Block, IndexedOutput, Outpoint, UtxoKey,
+    transaction::{Canonicalize, InterpretedTransaction},
 };
 
+static CHAIN_ID: LazyLock<ChainId> = LazyLock::new(|| ChainId(crate::CHAIN.to_owned()));
+pub(super) static NATIVE_ASSET: LazyLock<AssetId> = LazyLock::new(|| AssetId {
+    chain: (*CHAIN_ID).clone(),
+    asset: "native".to_owned(),
+});
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BitcoinBlockInterpreter {
+pub struct BlockInterpreter {
     scope: IndexScope,
-    network: BitcoinNetwork,
+    network: Network,
 }
 
-impl BitcoinBlockInterpreter {
-    pub fn new(scope: IndexScope, network: BitcoinNetwork) -> Result<Self, IndexError> {
-        if scope.chain != bitcoin_chain() {
+impl BlockInterpreter {
+    pub fn new(scope: IndexScope, network: Network) -> Result<Self, IndexError> {
+        if scope.chain != *CHAIN_ID {
             return Err(IndexError::new(
                 IndexErrorKind::ScopeMismatch,
                 "Bitcoin interpreter scope must use the bitcoin chain ID",
@@ -47,102 +56,34 @@ impl BitcoinBlockInterpreter {
     }
 
     #[must_use]
-    pub const fn network(&self) -> BitcoinNetwork {
+    pub const fn network(&self) -> Network {
         self.network
     }
 
     fn validated_watches(
         &self,
-        watches: &[WatchTarget<BitcoinWatchTarget>],
+        watches: &[WatchTarget<WatchSelector>],
         height: indexing::BlockHeight,
     ) -> Result<ValidatedWatches, IndexError> {
         let mut validated = ValidatedWatches::default();
         for watch in watches {
-            if watch.scope != self.scope {
-                return Err(invalid_watch("Bitcoin watch belongs to a different scope"));
-            }
-            match (&watch.target, &watch.selector) {
-                (BitcoinWatchTarget::Address(address), WatchSelector::Address(selector)) => {
-                    let canonical = BitcoinAddress::parse_for_network(&address.0, self.network)
-                        .map_err(|_| {
-                            invalid_watch("Bitcoin watch address is invalid or wrong-network")
-                        })?;
-                    let script =
-                        canonical
-                            .script_pubkey_for_network(self.network)
-                            .map_err(|_| {
-                                invalid_watch("Bitcoin watch address cannot produce a script")
-                            })?;
-                    if !script.is_p2wpkh() && !script.is_p2tr() {
-                        return Err(invalid_watch(
-                            "Bitcoin v1 address watches support P2WPKH and P2TR only",
-                        ));
-                    }
-                    if selector.chain != bitcoin_chain() || selector.value != canonical.0 {
-                        return Err(invalid_watch(
-                            "Bitcoin watch target does not match its canonical address selector",
-                        ));
-                    }
-                    if watch.is_active_at(height) {
-                        validated
-                            .active_addresses
-                            .entry(canonical.0)
-                            .or_default()
-                            .insert(watch.id.clone());
-                    }
-                }
-                (
-                    BitcoinWatchTarget::Transaction(transaction_id),
-                    WatchSelector::Transaction(selector),
-                ) => {
-                    if selector.chain != bitcoin_chain()
-                        || selector.value != transaction_id.to_string()
-                    {
-                        return Err(invalid_watch(
-                            "Bitcoin watch target does not match its canonical transaction selector",
-                        ));
-                    }
-                    if watch.is_active_at(height) {
-                        validated
-                            .transactions
-                            .entry(*transaction_id)
-                            .or_default()
-                            .insert(watch.id.clone());
-                    }
-                }
-                _ => {
-                    return Err(invalid_watch(
-                        "Bitcoin watch target kind does not match its selector",
-                    ));
-                }
-            }
+            validated.add(watch, &self.scope, self.network, height)?;
         }
         Ok(validated)
     }
 }
 
-impl BlockInterpreter for BitcoinBlockInterpreter {
-    type Block = BitcoinBlock;
-    type Target = BitcoinWatchTarget;
-    type Undo = BitcoinUndo;
+impl IndexBlockInterpreter for BlockInterpreter {
+    type Block = Block;
+    type Target = WatchSelector;
+    type Effect = IndexChanges;
+    type Undo = IndexUndo;
 
     fn inspect(
         &self,
         block: &Self::Block,
         watches: &[WatchTarget<Self::Target>],
-    ) -> Result<InterpretedBlock<Self::Undo>, IndexError> {
-        let parsed = parse_block(
-            &block.raw_block,
-            Some(block.reference.height),
-            Some(&block.reference.hash),
-            self.network,
-        )
-        .map_err(invalid_block)?;
-        if parsed.reference != block.reference {
-            return Err(invalid_block(
-                "retained Bitcoin block reference does not match its raw payload",
-            ));
-        }
+    ) -> Result<InterpretedBlock<Self::Effect, Self::Undo>, IndexError> {
         let observed_at = block
             .reference
             .timestamp
@@ -150,16 +91,17 @@ impl BlockInterpreter for BitcoinBlockInterpreter {
         let watches = self.validated_watches(watches, block.reference.height)?;
 
         let mut drafts = Vec::new();
-        let mut creates = BTreeMap::<BitcoinOutPoint, BitcoinIndexedOutput>::new();
-        let mut spends = BTreeMap::<BitcoinOutPoint, BitcoinUtxoKey>::new();
-        let mut conditional_spends = BTreeMap::<BitcoinOutPoint, BitcoinUtxoKey>::new();
+        let mut creates = BTreeMap::<Outpoint, IndexedOutput>::new();
+        let mut spends = BTreeMap::<Outpoint, UtxoKey>::new();
+        let mut tracked_spends = BTreeMap::<Outpoint, UtxoKey>::new();
         let mut all_spent_outpoints = BTreeSet::new();
 
-        for transaction in &parsed.transactions {
-            let interpreted = interpret_transaction(
+        for transaction in block.transactions() {
+            let interpreted = InterpretedTransaction::from_transaction(
                 transaction,
                 block.reference.height,
                 self.network,
+                &self.scope,
                 &watches,
                 &mut all_spent_outpoints,
             )?;
@@ -174,7 +116,7 @@ impl BlockInterpreter for BitcoinBlockInterpreter {
                 if creates.remove(&output.outpoint).is_some() {
                     // A watched output created and spent within this block did
                     // not exist before or after the block. Movements remain,
-                    // but canonical projection and undo must contain no effect.
+                    // but canonical UTXO state and rollback contain no effect.
                     continue;
                 }
                 if spends.insert(output.outpoint, output).is_some() {
@@ -183,20 +125,20 @@ impl BlockInterpreter for BitcoinBlockInterpreter {
                     ));
                 }
             }
-            for output in interpreted.conditional_spends {
+            for output in interpreted.tracked_spends {
                 if creates.remove(&output.outpoint).is_some() {
                     continue;
                 }
-                if conditional_spends.insert(output.outpoint, output).is_some() {
+                if tracked_spends.insert(output.outpoint, output).is_some() {
                     return Err(invalid_block(
-                        "Bitcoin block conditionally spends a watched outpoint more than once",
+                        "Bitcoin block contains the same tracked spend more than once",
                     ));
                 }
             }
             if !interpreted.watch_ids.is_empty() {
                 drafts.push(ObservationDraft {
                     scope: self.scope.clone(),
-                    transaction_id: canonical_transaction(transaction.id),
+                    transaction_id: transaction.id.canonical(&self.scope),
                     status: ObservationDraftStatus::Included,
                     movements: interpreted.movements,
                     fee: interpreted.fee,
@@ -209,239 +151,175 @@ impl BlockInterpreter for BitcoinBlockInterpreter {
 
         let creates: Vec<_> = creates.into_values().collect();
         let spends: Vec<_> = spends.into_values().collect();
-        let conditional_spends: Vec<_> = conditional_spends.into_values().collect();
-        let chain_projection = BitcoinUtxoProjection {
-            creates: creates.clone(),
-            spends: spends.clone(),
-            conditional_spends: conditional_spends.clone(),
+        let tracked_spends: Vec<_> = tracked_spends.into_values().collect();
+        let created = creates
+            .iter()
+            .map(|output| indexed_output(output, &self.scope))
+            .collect::<Result<Vec<_>, _>>()?;
+        let spent = spends
+            .iter()
+            .map(|output| canonical_key(output, &self.scope))
+            .collect::<Vec<_>>();
+        let tracked_spends = tracked_spends
+            .iter()
+            .map(|output| canonical_key(output, &self.scope))
+            .collect::<Vec<_>>();
+        let effect = IndexChanges {
+            outputs: OutputChanges {
+                created,
+                spent: spent.clone(),
+                tracked_spends: tracked_spends.clone(),
+            },
         };
-        let projection = BitcoinIndexRecordCodec::projection_batch(&chain_projection)?;
         Ok(InterpretedBlock {
             block: block.reference.clone(),
             drafts,
-            projection,
-            undo: BitcoinUndo {
-                remove_created: creates.iter().map(utxo_key).collect(),
-                remove_spent_markers: spends.iter().cloned().chain(conditional_spends).collect(),
+            effect,
+            undo: IndexUndo {
+                created: creates
+                    .iter()
+                    .map(|output| output_key(output, &self.scope))
+                    .collect(),
+                spent: spent.into_iter().chain(tracked_spends).collect(),
             },
-            raw: RawBlockData {
-                block: block.raw_block.clone(),
+            raw: RawBlock {
+                block: block.raw().to_vec(),
                 receipts: Vec::new(),
             },
         })
     }
-}
 
-fn utxo_key(output: &BitcoinIndexedOutput) -> BitcoinUtxoKey {
-    BitcoinUtxoKey {
-        address: output.address.clone(),
-        outpoint: output.outpoint,
+    fn backfill_effect(&self, mut effect: Self::Effect) -> Result<Self::Effect, IndexError> {
+        effect.outputs.tracked_spends.clear();
+        Ok(effect)
     }
 }
 
-#[derive(Default)]
-struct ValidatedWatches {
-    active_addresses: BTreeMap<String, BTreeSet<WatchId>>,
-    transactions: BTreeMap<BitcoinTransactionId, BTreeSet<WatchId>>,
+fn output_key(output: &IndexedOutput, scope: &IndexScope) -> OutputKey {
+    OutputKey {
+        address: output.address.clone().canonical(scope),
+        output: OutputId {
+            transaction: output.outpoint.transaction_id.canonical(scope),
+            index: output.outpoint.output_index,
+        },
+    }
 }
 
-struct InterpretedTransaction {
-    movements: Vec<ValueMovement>,
-    fee: Option<NetworkFee>,
-    watch_ids: Vec<WatchId>,
-    creates: Vec<BitcoinIndexedOutput>,
-    spends: Vec<BitcoinUtxoKey>,
-    conditional_spends: Vec<BitcoinUtxoKey>,
+fn canonical_key(output: &UtxoKey, scope: &IndexScope) -> OutputKey {
+    OutputKey {
+        address: output.address.clone().canonical(scope),
+        output: OutputId {
+            transaction: output.outpoint.transaction_id.canonical(scope),
+            index: output.outpoint.output_index,
+        },
+    }
 }
 
-fn interpret_transaction(
-    transaction: &ParsedTransaction,
-    block_height: indexing::BlockHeight,
-    network: BitcoinNetwork,
-    watches: &ValidatedWatches,
-    all_spent_outpoints: &mut BTreeSet<BitcoinOutPoint>,
-) -> Result<InterpretedTransaction, IndexError> {
-    let transaction_id = transaction.id.to_string();
-    let mut movements = Vec::with_capacity(
-        transaction
-            .inputs
-            .len()
-            .checked_add(transaction.outputs.len())
-            .ok_or_else(|| invalid_block("Bitcoin transaction movement count overflowed"))?,
-    );
-    let mut watch_ids = watches
-        .transactions
-        .get(&transaction.id)
-        .cloned()
-        .unwrap_or_default();
-    let mut input_total = 0_u64;
-    let mut output_total = 0_u64;
-    let mut payer: Option<BitcoinAddress> = None;
-    let mut ambiguous_payer = false;
-    let mut spends = Vec::new();
-    let mut conditional_spends = Vec::new();
-
-    for (index, input) in transaction.inputs.iter().enumerate() {
-        let Some(previous) = input.previous_output.as_ref() else {
-            if !transaction.coinbase {
-                return Err(invalid_block(
-                    "non-coinbase Bitcoin transaction has an unresolved input",
-                ));
-            }
-            continue;
-        };
-        if !all_spent_outpoints.insert(previous.outpoint) {
-            return Err(invalid_block(
-                "Bitcoin block spends the same outpoint more than once",
-            ));
-        }
-        input_total = input_total
-            .checked_add(previous.value.0)
-            .ok_or_else(|| invalid_block("Bitcoin transaction input value overflowed u64"))?;
-        let from = previous
-            .address
-            .as_ref()
-            .map(|address| canonical_address(address.clone()));
-        movements.push(ValueMovement {
-            id: MovementId(format!("{transaction_id}:vin:{index}")),
-            asset: native_asset(),
-            amount: atomic(previous.value.0),
-            from,
-            to: None,
-            kind: MovementKind::Input,
-        });
-        match (&payer, &previous.address) {
-            (None, Some(address)) if !ambiguous_payer => payer = Some(address.clone()),
-            (Some(current), Some(address)) if current == address => {}
-            _ => ambiguous_payer = true,
-        }
-        if let Some(address) = &previous.address {
-            if let Some(ids) = watches.active_addresses.get(&address.0) {
-                watch_ids.extend(ids.iter().cloned());
-                spends.push(BitcoinUtxoKey {
-                    address: address.clone(),
-                    outpoint: previous.outpoint,
-                });
-            } else {
-                let script = address.script_pubkey_for_network(network).map_err(|_| {
-                    invalid_block("Bitcoin compact prevout address cannot produce a script")
-                })?;
-                if script.is_p2wpkh() || script.is_p2tr() {
-                    conditional_spends.push(BitcoinUtxoKey {
-                        address: address.clone(),
-                        outpoint: previous.outpoint,
-                    });
-                }
-            }
-        }
-    }
-
-    let mut creates = Vec::new();
-    for (index, output) in transaction.outputs.iter().enumerate() {
-        output_total = output_total
-            .checked_add(output.value.0)
-            .ok_or_else(|| invalid_block("Bitcoin transaction output value overflowed u64"))?;
-        let script = ScriptBuf::from_bytes(output.script_pubkey.clone());
-        let address = address_for_script(&script, network);
-        movements.push(ValueMovement {
-            id: MovementId(format!("{transaction_id}:vout:{index}")),
-            asset: native_asset(),
-            amount: atomic(output.value.0),
-            from: None,
-            to: address.clone().map(canonical_address),
-            kind: MovementKind::Output,
-        });
-        if let Some(address) = address {
-            if let Some(ids) = watches.active_addresses.get(&address.0) {
-                watch_ids.extend(ids.iter().cloned());
-                let output_index = u32::try_from(index)
-                    .map_err(|_| invalid_block("Bitcoin output index exceeds u32"))?;
-                creates.push(BitcoinIndexedOutput {
-                    outpoint: BitcoinOutPoint {
-                        transaction_id: transaction.id,
-                        output_index,
-                    },
-                    value: output.value,
-                    script_pubkey: output.script_pubkey.clone(),
-                    address,
-                    created_height: block_height,
-                    coinbase: transaction.coinbase,
-                });
-            }
-        }
-    }
-
-    let fee = if transaction.coinbase {
-        if transaction
-            .inputs
-            .iter()
-            .any(|input| input.previous_output.is_some())
-        {
-            return Err(invalid_block(
-                "Bitcoin coinbase transaction contains a resolved normal input",
-            ));
-        }
-        None
-    } else {
-        let amount = input_total.checked_sub(output_total).ok_or_else(|| {
-            invalid_block("Bitcoin transaction outputs exceed its resolved inputs")
-        })?;
-        Some(NetworkFee {
-            asset: native_asset(),
-            amount: atomic(amount),
-            payer: (!ambiguous_payer)
-                .then_some(payer)
-                .flatten()
-                .map(canonical_address),
-        })
-    };
-
-    Ok(InterpretedTransaction {
-        movements,
-        fee,
-        watch_ids: watch_ids.into_iter().collect(),
-        creates,
-        spends,
-        conditional_spends,
+fn indexed_output(
+    output: &IndexedOutput,
+    scope: &IndexScope,
+) -> Result<indexing::IndexedOutput, IndexError> {
+    Ok(indexing::IndexedOutput {
+        id: OutputId {
+            transaction: output.outpoint.transaction_id.canonical(scope),
+            index: output.outpoint.output_index,
+        },
+        address: output.address.clone().canonical(scope),
+        asset: (*NATIVE_ASSET).clone(),
+        amount: Decimal::from(output.value.0),
+        evidence: output.script_pubkey.clone(),
+        created_at: output.created_height,
+        coinbase: output.coinbase,
     })
 }
 
-fn atomic(value: u64) -> AtomicAmount {
-    let mut bytes = [0_u8; 32];
-    bytes[24..].copy_from_slice(&value.to_be_bytes());
-    AtomicAmount(bytes)
+#[derive(Default)]
+pub(super) struct ValidatedWatches {
+    pub(super) active_addresses: BTreeMap<String, BTreeSet<WatchId>>,
+    pub(super) transactions: BTreeMap<TransactionId, BTreeSet<WatchId>>,
 }
 
-fn native_asset() -> AssetId {
-    AssetId {
-        chain: bitcoin_chain(),
-        asset: "native".to_owned(),
+impl ValidatedWatches {
+    fn add(
+        &mut self,
+        watch: &WatchTarget<WatchSelector>,
+        scope: &IndexScope,
+        network: Network,
+        height: indexing::BlockHeight,
+    ) -> Result<(), IndexError> {
+        if watch.scope != *scope {
+            return Err(invalid_watch("Bitcoin watch belongs to a different scope"));
+        }
+        if watch.target != watch.selector {
+            return Err(invalid_watch(
+                "Bitcoin watch target does not match its canonical selector",
+            ));
+        }
+        match &watch.selector {
+            WatchSelector::Address(selector) => self.add_address(watch, selector, network, height),
+            WatchSelector::Transaction(selector) => self.add_transaction(watch, selector, height),
+        }
     }
-}
 
-fn canonical_address(address: BitcoinAddress) -> CanonicalAddress {
-    CanonicalAddress {
-        chain: bitcoin_chain(),
-        value: address.0,
+    fn add_address(
+        &mut self,
+        watch: &WatchTarget<WatchSelector>,
+        selector: &CanonicalAddress,
+        network: Network,
+        height: indexing::BlockHeight,
+    ) -> Result<(), IndexError> {
+        let canonical = Address::parse_for_network(&selector.value, network)
+            .map_err(|_| invalid_watch("Bitcoin watch address is invalid or wrong-network"))?;
+        let script = canonical
+            .script_pubkey_for_network(network)
+            .map_err(|_| invalid_watch("Bitcoin watch address cannot produce a script"))?;
+        if !script.is_p2wpkh() && !script.is_p2tr() {
+            return Err(invalid_watch(
+                "Bitcoin v1 address watches support P2WPKH and P2TR only",
+            ));
+        }
+        if !selector.belongs_to(&watch.scope) || selector.value != canonical.encoded() {
+            return Err(invalid_watch(
+                "Bitcoin watch target does not match its canonical address selector",
+            ));
+        }
+        if watch.is_active_at(height) {
+            self.active_addresses
+                .entry(canonical.encoded().to_owned())
+                .or_default()
+                .insert(watch.id.clone());
+        }
+        Ok(())
     }
-}
 
-fn canonical_transaction(transaction: BitcoinTransactionId) -> CanonicalTransactionId {
-    CanonicalTransactionId {
-        chain: bitcoin_chain(),
-        value: transaction.to_string(),
+    fn add_transaction(
+        &mut self,
+        watch: &WatchTarget<WatchSelector>,
+        selector: &TransactionRef,
+        height: indexing::BlockHeight,
+    ) -> Result<(), IndexError> {
+        if !selector.belongs_to(&watch.scope) {
+            return Err(invalid_watch(
+                "Bitcoin watch target does not match its canonical transaction selector",
+            ));
+        }
+        let transaction_id = TransactionId::from_str(&selector.value)
+            .map_err(|_| invalid_watch("Bitcoin transaction watch is invalid"))?;
+        if watch.is_active_at(height) {
+            self.transactions
+                .entry(transaction_id)
+                .or_default()
+                .insert(watch.id.clone());
+        }
+        Ok(())
     }
-}
-
-fn bitcoin_chain() -> ChainId {
-    ChainId("bitcoin".to_owned())
 }
 
 fn invalid_watch(message: impl Into<String>) -> IndexError {
     IndexError::new(IndexErrorKind::InvalidWatch, message, false)
 }
 
-fn invalid_block(message: impl ToString) -> IndexError {
+pub(super) fn invalid_block(message: impl ToString) -> IndexError {
     IndexError::new(IndexErrorKind::InvalidBlock, message.to_string(), false)
 }
 
@@ -454,7 +332,7 @@ mod tests {
         Transaction, TxIn, TxOut, Txid, Witness, XOnlyPublicKey, absolute, consensus, hashes::Hash,
         hex::DisplayHex, secp256k1::Secp256k1, transaction::Version,
     };
-    use indexing::{BlockHash, BlockHeight, MovementKind, ProjectionMutation, WatchSelector};
+    use indexing::{BlockHash, BlockHeight, MovementId, MovementKind, WatchSelector};
     use serde_json::{Number, Value, json};
 
     use super::*;
@@ -469,7 +347,7 @@ mod tests {
 
     fn scope() -> IndexScope {
         IndexScope {
-            chain: bitcoin_chain(),
+            chain: (*CHAIN_ID).clone(),
             network: "regtest".to_owned(),
         }
     }
@@ -559,7 +437,7 @@ mod tests {
         })
     }
 
-    fn block(transactions: Vec<Value>) -> BitcoinBlock {
+    fn block(transactions: Vec<Value>) -> Block {
         let native_hash = bitcoin::BlockHash::from_byte_array([0xaa; 32]);
         let parent = bitcoin::BlockHash::from_byte_array([0xbb; 32]);
         let raw_block = serde_json::to_vec(&json!({
@@ -571,15 +449,13 @@ mod tests {
             "tx": transactions
         }))
         .expect("test block JSON must encode");
-        BitcoinBlock {
-            reference: indexing::BlockRef {
-                height: BlockHeight(10),
-                hash: BlockHash(native_hash.to_byte_array().to_vec()),
-                parent_hash: Some(BlockHash(parent.to_byte_array().to_vec())),
-                timestamp: Some(100),
-            },
+        Block::parse(
             raw_block,
-        }
+            Some(BlockHeight(10)),
+            Some(&BlockHash(native_hash.to_byte_array().to_vec())),
+            Network::Regtest,
+        )
+        .expect("test block must parse once at its boundary")
     }
 
     fn coinbase(output: TxOut) -> Transaction {
@@ -596,13 +472,14 @@ mod tests {
         }
     }
 
-    fn address_watch(id: &str, address: &Address) -> WatchTarget<BitcoinWatchTarget> {
-        let address = BitcoinAddress(address.to_string());
+    fn address_watch(id: &str, address: &Address) -> WatchTarget<WatchSelector> {
+        let address = crate::Address::from_encoded(address.to_string());
+        let selector = WatchSelector::Address(address.canonical(&scope()));
         WatchTarget {
             id: WatchId(id.to_owned()),
             scope: scope(),
-            selector: WatchSelector::Address(canonical_address(address.clone())),
-            target: BitcoinWatchTarget::Address(address),
+            selector: selector.clone(),
+            target: selector,
             idempotency_key: format!("{id}-key"),
             start_height: BlockHeight(0),
             registered_at: None,
@@ -610,12 +487,13 @@ mod tests {
         }
     }
 
-    fn transaction_watch(id: BitcoinTransactionId) -> WatchTarget<BitcoinWatchTarget> {
+    fn transaction_watch(id: TransactionId) -> WatchTarget<WatchSelector> {
+        let selector = WatchSelector::Transaction(id.canonical(&scope()));
         WatchTarget {
             id: WatchId("watch-tx".to_owned()),
             scope: scope(),
-            selector: WatchSelector::Transaction(canonical_transaction(id)),
-            target: BitcoinWatchTarget::Transaction(id),
+            selector: selector.clone(),
+            target: selector,
             idempotency_key: "tx-key".to_owned(),
             start_height: BlockHeight(0),
             registered_at: None,
@@ -624,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn same_block_spend_resolves_locally_and_nets_projection_while_emitting_movements() {
+    fn same_block_spend_nets_utxo_state_while_emitting_movements() {
         let source = p2wpkh_address(0x02);
         let destination = p2tr_address();
         let funding = coinbase(TxOut {
@@ -662,7 +540,7 @@ mod tests {
             value
         }]);
 
-        let interpreted = BitcoinBlockInterpreter::new(scope(), BitcoinNetwork::Regtest)
+        let interpreted = BlockInterpreter::new(scope(), Network::Regtest)
             .expect("scope must be valid")
             .inspect(
                 &block,
@@ -676,11 +554,11 @@ mod tests {
         assert_eq!(interpreted.drafts.len(), 2);
         let spend = &interpreted.drafts[1];
         assert_eq!(spend.movements.len(), 2);
-        assert_eq!(spend.movements[0].kind, MovementKind::Input);
-        assert_eq!(spend.movements[1].kind, MovementKind::Output);
+        assert_eq!(spend.movements[0].kind(), MovementKind::Input);
+        assert_eq!(spend.movements[1].kind(), MovementKind::Output);
         assert_eq!(
-            spend.movements[0].id,
-            MovementId(format!("{}:vin:0", spending.compute_txid()))
+            spend.movements[0].id(),
+            &MovementId(format!("{}:vin:0", spending.compute_txid()))
         );
         assert_eq!(
             spend
@@ -688,15 +566,22 @@ mod tests {
                 .as_ref()
                 .expect("normal transaction has a fee")
                 .amount,
-            atomic(1_000)
+            Decimal::from(1_000_u64)
         );
-        assert_eq!(interpreted.projection.mutations.len(), 1);
-        assert!(matches!(
-            interpreted.projection.mutations[0],
-            ProjectionMutation::Put { .. }
-        ));
-        assert_eq!(interpreted.undo.remove_created.len(), 1);
-        assert_eq!(interpreted.undo.remove_spent_markers.len(), 0);
+        assert_eq!(
+            spend
+                .fee
+                .as_ref()
+                .expect("normal transaction has a fee")
+                .amount
+                .scale(),
+            0
+        );
+        assert_eq!(interpreted.effect.outputs.created.len(), 1);
+        assert!(interpreted.effect.outputs.spent.is_empty());
+        assert!(interpreted.effect.outputs.tracked_spends.is_empty());
+        assert_eq!(interpreted.undo.created.len(), 1);
+        assert_eq!(interpreted.undo.spent.len(), 0);
     }
 
     #[test]
@@ -742,30 +627,25 @@ mod tests {
                 }),
             ],
         )]);
-        let id = BitcoinTransactionId::from(transaction.compute_txid());
+        let id = TransactionId::from(transaction.compute_txid());
 
-        let interpreted = BitcoinBlockInterpreter::new(scope(), BitcoinNetwork::Regtest)
+        let interpreted = BlockInterpreter::new(scope(), Network::Regtest)
             .expect("scope must be valid")
             .inspect(&block, &[transaction_watch(id)])
             .expect("valid watched transaction must interpret");
 
         let draft = &interpreted.drafts[0];
         assert_eq!(draft.movements.len(), 3);
-        assert_eq!(draft.movements[2].to, None);
+        assert_eq!(draft.movements[2].to(), None);
         assert_eq!(draft.fee.as_ref().expect("fee must exist").payer, None);
-        assert_eq!(interpreted.projection.mutations.len(), 2);
-        assert!(
-            interpreted
-                .projection
-                .mutations
-                .iter()
-                .all(|mutation| { matches!(mutation, ProjectionMutation::PutIfPresent { .. }) })
-        );
-        assert_eq!(interpreted.undo.remove_spent_markers.len(), 2);
+        assert_eq!(interpreted.effect.outputs.tracked_spends.len(), 2);
+        assert!(interpreted.effect.outputs.created.is_empty());
+        assert!(interpreted.effect.outputs.spent.is_empty());
+        assert_eq!(interpreted.undo.spent.len(), 2);
     }
 
     #[test]
-    fn active_address_spend_uses_an_unconditional_marker() {
+    fn active_address_spend_is_recorded_directly() {
         let source = p2wpkh_address(0x02);
         let destination = p2tr_address();
         let transaction = Transaction {
@@ -792,23 +672,21 @@ mod tests {
             })],
         )]);
 
-        let interpreted = BitcoinBlockInterpreter::new(scope(), BitcoinNetwork::Regtest)
+        let interpreted = BlockInterpreter::new(scope(), Network::Regtest)
             .expect("scope must be valid")
             .inspect(&block, &[address_watch("active-source", &source)])
             .expect("active watch spend must interpret");
 
         assert_eq!(interpreted.drafts.len(), 1);
-        assert_eq!(interpreted.projection.mutations.len(), 1);
-        assert!(matches!(
-            interpreted.projection.mutations[0],
-            ProjectionMutation::Put { .. }
-        ));
-        assert!(interpreted.undo.remove_created.is_empty());
-        assert_eq!(interpreted.undo.remove_spent_markers.len(), 1);
+        assert_eq!(interpreted.effect.outputs.spent.len(), 1);
+        assert!(interpreted.effect.outputs.created.is_empty());
+        assert!(interpreted.effect.outputs.tracked_spends.is_empty());
+        assert!(interpreted.undo.created.is_empty());
+        assert_eq!(interpreted.undo.spent.len(), 1);
     }
 
     #[test]
-    fn inactive_or_absent_address_watch_uses_an_input_bounded_conditional_marker() {
+    fn inactive_address_spend_is_limited_to_previously_tracked_outputs() {
         let source = p2wpkh_address(0x02);
         let destination = p2tr_address();
         let transaction = Transaction {
@@ -837,42 +715,25 @@ mod tests {
         let mut watch = address_watch("inactive-source", &source);
         watch.inactive_from = Some(BlockHeight(10));
 
-        let interpreted = BitcoinBlockInterpreter::new(scope(), BitcoinNetwork::Regtest)
+        let interpreted = BlockInterpreter::new(scope(), Network::Regtest)
             .expect("scope must be valid")
             .inspect(&block, &[watch])
-            .expect("inactive projection interest must remain valid");
+            .expect("inactive tracked-output interest must remain valid");
 
         assert!(interpreted.drafts.is_empty());
-        assert_eq!(interpreted.projection.mutations.len(), 1);
-        let ProjectionMutation::PutIfPresent {
-            required_key, key, ..
-        } = &interpreted.projection.mutations[0]
-        else {
-            panic!("inactive spend must use a conditional marker");
-        };
-        assert!(matches!(
-            BitcoinIndexRecordCodec::decode_projection_key(required_key)
-                .expect("required creation key must decode"),
-            super::super::BitcoinProjectionKey::Utxo { .. }
-        ));
-        assert!(matches!(
-            BitcoinIndexRecordCodec::decode_projection_key(key)
-                .expect("conditional marker key must decode"),
-            super::super::BitcoinProjectionKey::SpentMarker { .. }
-        ));
-        assert!(interpreted.undo.remove_created.is_empty());
-        assert_eq!(interpreted.undo.remove_spent_markers.len(), 1);
+        assert_eq!(interpreted.effect.outputs.tracked_spends.len(), 1);
+        assert!(interpreted.effect.outputs.created.is_empty());
+        assert!(interpreted.effect.outputs.spent.is_empty());
+        assert!(interpreted.undo.created.is_empty());
+        assert_eq!(interpreted.undo.spent.len(), 1);
 
-        let without_watch = BitcoinBlockInterpreter::new(scope(), BitcoinNetwork::Regtest)
+        let without_watch = BlockInterpreter::new(scope(), Network::Regtest)
             .expect("scope must be valid")
             .inspect(&block, &[])
             .expect("unwatched supported input must interpret");
         assert!(without_watch.drafts.is_empty());
-        assert!(matches!(
-            without_watch.projection.mutations.as_slice(),
-            [ProjectionMutation::PutIfPresent { .. }]
-        ));
-        assert_eq!(without_watch.undo.remove_spent_markers.len(), 1);
+        assert_eq!(without_watch.effect.outputs.tracked_spends.len(), 1);
+        assert_eq!(without_watch.undo.spent.len(), 1);
     }
 
     #[test]
@@ -905,19 +766,27 @@ mod tests {
             .as_object_mut()
             .expect("test input must be an object")
             .remove("prevout");
-        let block = block(vec![value]);
+        let native_hash = bitcoin::BlockHash::from_byte_array([0xaa; 32]);
+        let parent = bitcoin::BlockHash::from_byte_array([0xbb; 32]);
+        let raw = serde_json::to_vec(&json!({
+            "hash": native_hash.to_string(),
+            "height": 10,
+            "previousblockhash": parent.to_string(),
+            "time": 100,
+            "nTx": 1,
+            "tx": [value]
+        }))
+        .expect("test block JSON must encode");
 
-        let error = BitcoinBlockInterpreter::new(scope(), BitcoinNetwork::Regtest)
-            .expect("scope must be valid")
-            .inspect(
-                &block,
-                &[transaction_watch(BitcoinTransactionId::from(
-                    transaction.compute_txid(),
-                ))],
-            )
-            .expect_err("missing prevout evidence must fail the block");
+        let error = Block::parse(
+            raw,
+            Some(BlockHeight(10)),
+            Some(&BlockHash(native_hash.to_byte_array().to_vec())),
+            Network::Regtest,
+        )
+        .expect_err("missing prevout evidence must fail while parsing the block");
 
-        assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+        assert_eq!(error.kind, crate::ChainErrorKind::InvalidTransaction);
         assert!(error.message.contains("resolved previous output"));
     }
 }

@@ -1,7 +1,12 @@
 use crate::{
-    BlockHash, BlockHeight, BlockRef, BoxFuture, IndexError, IndexedBlock, InterpretedBlock,
-    SourceError, WatchTarget,
+    BlockHash, BlockHeight, BlockRef, BoxFuture, IndexError, InterpretedBlock, SourceError,
+    WatchTarget,
 };
+
+/// Gives generic synchronization access to a chain-native block identity.
+pub trait IndexedBlock: Clone + Send + Sync + 'static {
+    fn block_ref(&self) -> BlockRef;
+}
 
 /// Fetches canonical chain data. Concrete RPC methods remain in the chain crate.
 pub trait BlockSource: Send + Sync {
@@ -25,18 +30,16 @@ pub trait BlockSource: Send + Sync {
 pub trait BlockInterpreter: Send + Sync {
     type Block: IndexedBlock;
     type Target: Clone + Send + Sync + 'static;
+    type Effect: Clone + Send + Sync + 'static;
     type Undo: Clone + Send + Sync + 'static;
 
     fn inspect(
         &self,
         block: &Self::Block,
         watches: &[WatchTarget<Self::Target>],
-    ) -> Result<InterpretedBlock<Self::Undo>, IndexError>;
-}
+    ) -> Result<InterpretedBlock<Self::Effect, Self::Undo>, IndexError>;
 
-/// Mempool state is non-canonical and is intentionally separate from block sync.
-pub trait MempoolSource: Send + Sync {
-    type Transaction: Clone + Send + Sync + 'static;
-
-    fn transactions<'a>(&'a self) -> BoxFuture<'a, Result<Vec<Self::Transaction>, SourceError>>;
+    fn backfill_effect(&self, effect: Self::Effect) -> Result<Self::Effect, IndexError> {
+        Ok(effect)
+    }
 }

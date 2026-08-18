@@ -1,24 +1,13 @@
-//! WS composition root: authenticated stateless Ethereum or Bitcoin operations.
-
-mod config;
-mod runtime;
-
-use clap::Parser;
-use config::{BitcoinCommand, Cli, Command};
-use tracing_subscriber::EnvFilter;
+use wallet_worker::{Config, ENV_KEYS};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(filter)
-        .try_init()?;
-
-    match Cli::parse().command {
-        Command::Serve(options) => runtime::serve(options).await,
-        Command::Bitcoin(options) => match options.command {
-            BitcoinCommand::Serve(options) => runtime::serve_bitcoin(options).await,
-        },
-    }
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let values = ENV_KEYS.iter().filter_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| ((*name).to_owned(), value))
+    });
+    let (server, service) = wallet_worker::compose(Config::from_variables(values)?).await?;
+    wallet_worker::run(server, service).await?;
+    Ok(())
 }

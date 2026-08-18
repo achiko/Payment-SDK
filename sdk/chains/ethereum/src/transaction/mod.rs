@@ -1,13 +1,11 @@
 mod builder;
-mod codec;
+mod operations;
 mod signed;
 mod unsigned;
 
-pub use builder::{EthereumBuildContext, EthereumTransactionBuilder, EthereumTransferRequest};
-pub use codec::EthereumTransactionCodec;
+pub use builder::{BuildContext, Builder as TransactionBuilder, TransferRequest};
 pub use signed::{
-    EthereumEip1559FeeInspection, EthereumEip1559InspectionError, EthereumReceipt,
-    EthereumSignedTransaction, EthereumSignedTransactionError, EthereumTransactionId,
-    EthereumTransactionIdParseError,
+    FeeInspection, Id as TransactionId, IdError, InspectionError, Receipt, SignedError,
+    SignedTransaction,
 };
-pub use unsigned::{EthereumTransactionSigning, UnsignedEthereumTransaction};
+pub use unsigned::UnsignedTransaction;

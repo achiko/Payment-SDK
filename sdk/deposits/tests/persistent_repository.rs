@@ -7,32 +7,31 @@ use std::{
     task::{Poll, Waker},
 };
 
-use bincode::Encode;
-use chain_identity::{AssetId, AtomicAmount, CanonicalAddress, CanonicalTransactionId, ChainId};
+use base::Decimal;
+use deposits::KeyId;
 use deposits::{
-    AccountingCommand, AppendObservation, ApplyResult, AwaitingWatchPageRequest, CloseDeposit,
-    CollectionId, CommandIdentity, CommandOperation, CommandPrincipal, ConsumerCheckpointName,
-    CreateDeposit, CreateDepositWithLedger, DepositBalances, DepositErrorKind, DepositId,
-    DepositIndexRebuildRequest, DepositLedger, DepositObservationLogRequest, DepositPageRequest,
-    DepositState, DepositStateKind, DepositStore, IdempotencyKey, LEGACY_DEPOSIT_KEY_PURPOSE,
-    LedgerEffect, LedgerEntryCause, LedgerEntryId, LedgerPageRequest, MirrorObservation,
-    MirrorOutcome, MirroredObservation, ObservationConsumerCheckpoints, ObservationEventLog,
-    PersistentPaymentRepository, ProjectObservation, ProjectionFeeTreatment, ProjectionId,
-    ReconciliationCase, ReconciliationCaseId, ReconciliationDecision, ReconciliationReason,
-    ReconciliationState, ReconciliationStore, RecordObservation, RequestHash,
-    ResolveReconciliation, UserId,
+    AccountingCommand, ActionGuard, AppendObservation, ApplyResult, AwaitingQuery, CaseId,
+    CaseOpener, CaseReader, CaseResolver, CloseDeposit, CollectionId, CommandIdentity,
+    CommandOperation, CommandPrincipal, ConsumerCheckpointName, DepositBalances, DepositCreator,
+    DepositErrorKind, DepositFilter, DepositId, DepositLifecycle, DepositPlan, DepositQuery,
+    DepositReader, DepositState, DepositStateKind, EntryId, EventProjector, EventReader,
+    EventWriter, IdempotencyKey, IndexRebuilder, LedgerEffect, LedgerEntryCause, LedgerReader,
+    LedgerWriter, MirrorObservation, MirrorOutcome, MirroredObservation, OpenDeposit, PaymentStore,
+    ProgressReader, ProjectObservation, ProjectionFeeTreatment, ProjectionId, RebuildRequest,
+    ReconciliationCase, ReconciliationDecision, ReconciliationReason, ReconciliationState,
+    RecordObservation, RequestHash, ResolveReconciliation, UserId, WatchQueue,
 };
+use indexing::{AssetId, CanonicalAddress, ChainId, TransactionRef};
 use indexing::{
-    BlockHash, BlockHeight, BlockRef, ConfirmationProof, EventCursor, IndexScope, MovementId,
-    MovementKind, NetworkFee, ObservationEvent, ObservationEventId, ObservationRevision,
-    ObservedTransaction, TransactionStatus, ValueMovement, WatchId,
+    BlockHash, BlockHeight, BlockRef, ConfirmationProof, EventCursor, EventId, IndexScope,
+    MovementId, NetworkFee, ObservationEvent, ObservationRevision, ObservedTransaction,
+    TransactionStatus, ValueMovement, WatchId,
 };
-use signer::KeyLocator;
 use storage::{
-    BoxFuture as StorageFuture, CommitResult, Key, Namespace, Operation, ScanPage, ScanRequest,
-    Storage, StorageError, StoredValue, Value, WriteBatch,
+    BoxFuture as StorageFuture, CommitResult, Error, Key, Namespace, ScanPage, ScanRequest, Store,
+    StoredValue, WriteBatch,
 };
-use storage_rocksdb::RocksDbStorage;
+use storage_rocksdb::RocksDb;
 use tempfile::TempDir;
 
 #[derive(Clone)]
@@ -100,29 +99,23 @@ impl TwoPartyBarrier {
     }
 }
 
-impl<S> Storage for CommitBarrierStorage<S>
+impl<S> Store for CommitBarrierStorage<S>
 where
-    S: Storage,
+    S: Store,
 {
     fn get<'a>(
         &'a self,
         namespace: &'a Namespace,
         key: &'a Key,
-    ) -> StorageFuture<'a, Result<Option<StoredValue>, StorageError>> {
+    ) -> StorageFuture<'a, Result<Option<StoredValue>, Error>> {
         self.inner.get(namespace, key)
     }
 
-    fn scan<'a>(
-        &'a self,
-        request: ScanRequest,
-    ) -> StorageFuture<'a, Result<ScanPage, StorageError>> {
+    fn scan<'a>(&'a self, request: ScanRequest) -> StorageFuture<'a, Result<ScanPage, Error>> {
         self.inner.scan(request)
     }
 
-    fn commit<'a>(
-        &'a self,
-        batch: WriteBatch,
-    ) -> StorageFuture<'a, Result<CommitResult, StorageError>> {
+    fn commit<'a>(&'a self, batch: WriteBatch) -> StorageFuture<'a, Result<CommitResult, Error>> {
         Box::pin(async move {
             if self.synchronize_commits.load(Ordering::Acquire) {
                 self.barrier.wait().await;
@@ -132,14 +125,12 @@ where
     }
 }
 
-fn amount(value: u64) -> AtomicAmount {
-    let mut bytes = [0_u8; 32];
-    bytes[24..].copy_from_slice(&value.to_be_bytes());
-    AtomicAmount(bytes)
+fn amount(value: u64) -> Decimal {
+    Decimal::from(value)
 }
 
 fn chain() -> ChainId {
-    ChainId("ethereum".to_owned())
+    ChainId("chain-a".to_owned())
 }
 
 fn asset() -> AssetId {
@@ -151,20 +142,23 @@ fn asset() -> AssetId {
 
 fn address(value: &str) -> CanonicalAddress {
     CanonicalAddress {
-        chain: chain(),
+        scope: IndexScope {
+            chain: chain(),
+            network: "test".to_owned(),
+        },
         value: value.to_owned(),
     }
 }
 
-fn create_deposit() -> CreateDepositWithLedger {
-    CreateDepositWithLedger {
-        deposit: CreateDeposit {
+fn create_deposit() -> OpenDeposit {
+    OpenDeposit {
+        deposit: DepositPlan {
             id: DepositId("deposit-1".to_owned()),
             idempotency_key: IdempotencyKey("create-1".to_owned()),
             user_id: UserId("user-1".to_owned()),
             asset: asset(),
             address: address("0x1111111111111111111111111111111111111111"),
-            key: KeyLocator::Identifier("deposit-key-1".to_owned()),
+            key: KeyId::Identifier("deposit-key-1".to_owned()),
             key_purpose: "payment-service-deposit-address-v1".to_owned(),
             expected: amount(100),
             birthday: BlockHeight(10),
@@ -175,201 +169,37 @@ fn create_deposit() -> CreateDepositWithLedger {
     }
 }
 
-fn create_deposit_named(id: &str, user_id: &str, address_suffix: u8) -> CreateDepositWithLedger {
+fn create_deposit_named(id: &str, user_id: &str, address_suffix: u8) -> OpenDeposit {
     let mut command = create_deposit();
     command.deposit.id = DepositId(id.to_owned());
     command.deposit.idempotency_key = IdempotencyKey(format!("create-{id}"));
     command.deposit.user_id = UserId(user_id.to_owned());
     command.deposit.address = address(&format!("0x{address_suffix:040x}"));
-    command.deposit.key = KeyLocator::Identifier(format!("key-{id}"));
+    command.deposit.key = KeyId::Identifier(format!("key-{id}"));
     command
 }
 
-#[derive(Encode)]
-struct LegacyAddressRecordV1 {
-    chain: String,
-    value: String,
-}
+#[tokio::test]
+async fn identical_address_text_on_distinct_networks_has_distinct_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = TempDir::new()?;
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
+    let first = create_deposit_named("deposit-network-a", "user-1", 7);
+    let mut second = create_deposit_named("deposit-network-b", "user-1", 7);
+    second.deposit.address.scope.network = "other-testnet".to_owned();
 
-#[derive(Encode)]
-enum LegacyKeyLocatorRecordV1 {
-    Identifier(String),
-}
+    let first_created = repository.create_with_ledger(first.clone()).await?;
+    let second_created = repository.create_with_ledger(second.clone()).await?;
 
-#[allow(dead_code)]
-#[derive(Encode)]
-enum LegacyDepositStateRecordV1 {
-    AwaitingWatch,
-    Active(String),
-    Expired,
-    Closed,
-}
-
-#[derive(Encode)]
-struct LegacyDepositRecordV1 {
-    version: u16,
-    id: String,
-    idempotency_key: String,
-    user_id: String,
-    asset_chain: String,
-    asset: String,
-    address: LegacyAddressRecordV1,
-    key: LegacyKeyLocatorRecordV1,
-    expected: [u8; 32],
-    birthday: u64,
-    expires_at: u64,
-    state: LegacyDepositStateRecordV1,
-    created_at: u64,
-}
-
-fn legacy_deposit(id: &str, state: LegacyDepositStateRecordV1) -> LegacyDepositRecordV1 {
-    LegacyDepositRecordV1 {
-        version: 1,
-        id: id.to_owned(),
-        idempotency_key: format!("legacy-create-{id}"),
-        user_id: "legacy-user".to_owned(),
-        asset_chain: "ethereum".to_owned(),
-        asset: "native".to_owned(),
-        address: LegacyAddressRecordV1 {
-            chain: "ethereum".to_owned(),
-            value: "0x1111111111111111111111111111111111111111".to_owned(),
-        },
-        key: LegacyKeyLocatorRecordV1::Identifier("legacy-key".to_owned()),
-        expected: [0; 32],
-        birthday: 10,
-        expires_at: 2_000,
-        state,
-        created_at: 1_000,
-    }
-}
-
-fn encode_legacy_deposit(
-    record: &LegacyDepositRecordV1,
-) -> Result<Value, bincode::error::EncodeError> {
-    bincode::encode_to_vec(
-        record,
-        bincode::config::standard()
-            .with_fixed_int_encoding()
-            .with_big_endian(),
-    )
-    .map(Value)
-}
-
-#[derive(Encode)]
-enum LegacyReconciliationReasonRecordV1 {
-    PostCreditReorg {
-        accounted: [u8; 32],
-        corrected_confirmed: [u8; 32],
-    },
-}
-
-#[allow(dead_code)]
-#[derive(Encode)]
-enum LegacyReconciliationStateRecordV1 {
-    Open,
-    Resolved {
-        resolution: String,
-        resolved_at: u64,
-    },
-}
-
-#[derive(Encode)]
-struct LegacyReconciliationRecordV1 {
-    version: u16,
-    id: String,
-    deposit_id: String,
-    triggering_event_id: String,
-    reason: LegacyReconciliationReasonRecordV1,
-    state: LegacyReconciliationStateRecordV1,
-    created_at: u64,
-}
-
-fn encode_legacy_reconciliation(
-    record: &LegacyReconciliationRecordV1,
-) -> Result<Value, bincode::error::EncodeError> {
-    bincode::encode_to_vec(
-        record,
-        bincode::config::standard()
-            .with_fixed_int_encoding()
-            .with_big_endian(),
-    )
-    .map(Value)
-}
-
-#[derive(Encode)]
-struct LegacyBlockRecordV1 {
-    height: u64,
-    hash: Vec<u8>,
-    parent_hash: Option<Vec<u8>>,
-    timestamp: Option<u64>,
-}
-
-#[allow(dead_code)]
-#[derive(Encode)]
-enum LegacyStatusRecordV1 {
-    Pending,
-    Included {
-        block: LegacyBlockRecordV1,
-        confirmations: u64,
-    },
-}
-
-#[allow(dead_code)]
-#[derive(Encode)]
-enum LegacyLedgerCauseRecordV1 {
-    Opened {
-        idempotency_key: String,
-    },
-    Observation {
-        projection_id: String,
-        event_id: String,
-        revision: u64,
-        status: LegacyStatusRecordV1,
-        kind: u8,
-        movement_ids: Vec<String>,
-    },
-}
-
-#[derive(Encode)]
-struct LegacyBalancesRecordV1 {
-    received: [u8; 32],
-    confirmed: [u8; 32],
-    balance: [u8; 32],
-    collected: [u8; 32],
-    accounted: [u8; 32],
-}
-
-#[derive(Encode)]
-struct LegacyLedgerEntryRecordV1 {
-    version: u16,
-    id: String,
-    deposit_id: String,
-    previous: Option<String>,
-    cause: LegacyLedgerCauseRecordV1,
-    balances: LegacyBalancesRecordV1,
-    recorded_at: u64,
-}
-
-fn encode_legacy_ledger(
-    record: &LegacyLedgerEntryRecordV1,
-) -> Result<Value, bincode::error::EncodeError> {
-    bincode::encode_to_vec(
-        record,
-        bincode::config::standard()
-            .with_fixed_int_encoding()
-            .with_big_endian(),
-    )
-    .map(Value)
-}
-
-fn component_key(parts: &[&[u8]]) -> Key {
-    let mut output = Vec::new();
-    for part in parts {
-        let length = u32::try_from(part.len()).expect("test key components fit in u32");
-        output.extend_from_slice(&length.to_be_bytes());
-        output.extend_from_slice(part);
-    }
-    Key(output)
+    assert_eq!(
+        repository.by_address(&first.deposit.address).await?,
+        Some(first_created.deposit)
+    );
+    assert_eq!(
+        repository.by_address(&second.deposit.address).await?,
+        Some(second_created.deposit)
+    );
+    Ok(())
 }
 
 fn block(height: u64, hash: u8) -> BlockRef {
@@ -382,24 +212,22 @@ fn block(height: u64, hash: u8) -> BlockRef {
 }
 
 fn movement(id: &str, value: u64) -> ValueMovement {
-    ValueMovement {
+    ValueMovement::Transfer {
         id: MovementId(id.to_owned()),
         asset: asset(),
         amount: amount(value),
-        from: Some(address("0x2222222222222222222222222222222222222222")),
-        to: Some(address("0x1111111111111111111111111111111111111111")),
-        kind: MovementKind::Transfer,
+        from: address("0x2222222222222222222222222222222222222222"),
+        to: address("0x1111111111111111111111111111111111111111"),
     }
 }
 
 fn outgoing_movement(id: &str, value: u64) -> ValueMovement {
-    ValueMovement {
+    ValueMovement::Transfer {
         id: MovementId(id.to_owned()),
         asset: asset(),
         amount: amount(value),
-        from: Some(address("0x1111111111111111111111111111111111111111")),
-        to: Some(address("0x2222222222222222222222222222222222222222")),
-        kind: MovementKind::Transfer,
+        from: address("0x1111111111111111111111111111111111111111"),
+        to: address("0x2222222222222222222222222222222222222222"),
     }
 }
 
@@ -414,7 +242,7 @@ fn network_fee(value: u64, payer: CanonicalAddress, fee_asset: AssetId) -> Netwo
 fn confirmed_observation() -> MirroredObservation {
     MirroredObservation {
         event: ObservationEvent {
-            id: ObservationEventId("event-confirmed-1".to_owned()),
+            id: EventId("event-confirmed-1".to_owned()),
             cursor: EventCursor(1),
             watch_ids: vec![WatchId("watch-1".to_owned())],
             previous_status: None,
@@ -423,8 +251,11 @@ fn confirmed_observation() -> MirroredObservation {
                     chain: chain(),
                     network: "test".to_owned(),
                 },
-                transaction_id: CanonicalTransactionId {
-                    chain: chain(),
+                transaction_id: TransactionRef {
+                    scope: IndexScope {
+                        chain: chain(),
+                        network: "test".to_owned(),
+                    },
                     value: "0xtransaction".to_owned(),
                 },
                 revision: ObservationRevision(1),
@@ -449,7 +280,7 @@ fn reorg_observation_at(cursor: u64) -> MirroredObservation {
     let previous_block = block(20, 20);
     MirroredObservation {
         event: ObservationEvent {
-            id: ObservationEventId("event-reorg-1".to_owned()),
+            id: EventId("event-reorg-1".to_owned()),
             cursor: EventCursor(cursor),
             watch_ids: vec![WatchId("watch-1".to_owned())],
             previous_status: Some(TransactionStatus::Confirmed {
@@ -464,8 +295,11 @@ fn reorg_observation_at(cursor: u64) -> MirroredObservation {
                     chain: chain(),
                     network: "test".to_owned(),
                 },
-                transaction_id: CanonicalTransactionId {
-                    chain: chain(),
+                transaction_id: TransactionRef {
+                    scope: IndexScope {
+                        chain: chain(),
+                        network: "test".to_owned(),
+                    },
                     value: "0xtransaction".to_owned(),
                 },
                 revision: ObservationRevision(2),
@@ -508,9 +342,9 @@ fn reconciliation_case(
     triggering_event_id: &str,
 ) -> ReconciliationCase {
     ReconciliationCase {
-        id: ReconciliationCaseId(id.to_owned()),
+        id: CaseId(id.to_owned()),
         deposit_id,
-        triggering_event_id: ObservationEventId(triggering_event_id.to_owned()),
+        triggering_event_id: EventId(triggering_event_id.to_owned()),
         reason: ReconciliationReason::PostCreditReorg {
             accounted: amount(1),
             corrected_confirmed: amount(0),
@@ -554,7 +388,7 @@ fn observation_revision_with_fee(
 ) -> MirroredObservation {
     MirroredObservation {
         event: ObservationEvent {
-            id: ObservationEventId(event_id.to_owned()),
+            id: EventId(event_id.to_owned()),
             cursor: EventCursor(cursor),
             watch_ids: vec![WatchId("watch-1".to_owned())],
             previous_status,
@@ -563,8 +397,11 @@ fn observation_revision_with_fee(
                     chain: chain(),
                     network: "test".to_owned(),
                 },
-                transaction_id: CanonicalTransactionId {
-                    chain: chain(),
+                transaction_id: TransactionRef {
+                    scope: IndexScope {
+                        chain: chain(),
+                        network: "test".to_owned(),
+                    },
                     value: transaction_id.to_owned(),
                 },
                 revision: ObservationRevision(revision),
@@ -600,7 +437,7 @@ fn confirmed_status() -> TransactionStatus {
 async fn deposit_creation_is_atomic_idempotent_and_activates_exactly_one_watch()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
     let command = create_deposit();
 
     let created = repository.create_with_ledger(command.clone()).await?;
@@ -614,7 +451,7 @@ async fn deposit_creation_is_atomic_idempotent_and_activates_exactly_one_watch()
     let retry = repository.create_with_ledger(command.clone()).await?;
     assert_eq!(retry, created);
     let awaiting = repository
-        .awaiting_watch(AwaitingWatchPageRequest {
+        .awaiting_watch(AwaitingQuery {
             after: None,
             limit: 10,
         })
@@ -678,7 +515,7 @@ async fn deposit_creation_is_atomic_idempotent_and_activates_exactly_one_watch()
     assert_eq!(different_watch.kind, DepositErrorKind::Conflict);
     assert!(
         repository
-            .awaiting_watch(AwaitingWatchPageRequest {
+            .awaiting_watch(AwaitingQuery {
                 after: None,
                 limit: 10,
             })
@@ -697,8 +534,8 @@ async fn deposit_creation_is_atomic_idempotent_and_activates_exactly_one_watch()
 async fn concurrent_watch_activation_converges_on_the_same_acknowledgement()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let storage = CommitBarrierStorage::new(RocksDbStorage::open(directory.path())?);
-    let repository = PersistentPaymentRepository::new(storage.clone());
+    let storage = CommitBarrierStorage::new(RocksDb::open(directory.path())?);
+    let repository = PaymentStore::new(storage.clone());
     let command = create_deposit();
     let created = repository.create_with_ledger(command.clone()).await?;
     let watch_id = WatchId("watch-race".to_owned());
@@ -736,8 +573,8 @@ async fn concurrent_watch_activation_converges_on_the_same_acknowledgement()
 async fn close_and_incoming_projection_cannot_both_commit_from_the_same_zero_head()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let storage = CommitBarrierStorage::new(RocksDbStorage::open(directory.path())?);
-    let repository = PersistentPaymentRepository::new(storage.clone());
+    let storage = CommitBarrierStorage::new(RocksDb::open(directory.path())?);
+    let repository = PaymentStore::new(storage.clone());
     let command = create_deposit();
     let created = repository.create_with_ledger(command.clone()).await?;
     let active = repository
@@ -795,7 +632,7 @@ async fn close_and_incoming_projection_cannot_both_commit_from_the_same_zero_hea
         .expect("racing close must preserve the ledger head");
     if close.is_ok() {
         assert_eq!(durable_deposit.state, DepositState::Closed);
-        assert_eq!(durable_head.balances.balance, AtomicAmount::ZERO);
+        assert_eq!(durable_head.balances.balance, Decimal::zero());
         assert_eq!(
             projection
                 .expect_err("projection must lose when close commits")
@@ -818,7 +655,7 @@ async fn close_and_incoming_projection_cannot_both_commit_from_the_same_zero_hea
 #[tokio::test]
 async fn closed_deposit_keeps_projecting_late_payments() -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
     let command = create_deposit();
     let created = repository.create_with_ledger(command.clone()).await?;
     let active = repository
@@ -883,10 +720,10 @@ async fn closed_deposit_keeps_projecting_late_payments() -> Result<(), Box<dyn s
 }
 
 #[tokio::test]
-async fn deposit_listing_rebuilds_legacy_indexes_and_expiration_preserves_the_watch()
+async fn deposit_listing_rebuilds_indexes_and_expiration_preserves_the_watch()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
     for command in [
         create_deposit_named("deposit-1", "user-1", 1),
         create_deposit_named("deposit-2", "user-1", 2),
@@ -896,10 +733,10 @@ async fn deposit_listing_rebuilds_legacy_indexes_and_expiration_preserves_the_wa
         repository.create_with_ledger(command).await?;
     }
 
-    // Before the migration marker exists, filtered reads use authoritative
-    // deposit rows and therefore cannot hide records created by older code.
+    // Before the completion marker exists, filtered reads use authoritative
+    // deposit rows and therefore cannot hide records missing derived indexes.
     let pre_rebuild = repository
-        .deposits(DepositPageRequest {
+        .deposits(DepositQuery {
             after: None,
             limit: 4,
             user_id: Some(UserId("user-1".to_owned())),
@@ -916,7 +753,7 @@ async fn deposit_listing_rebuilds_legacy_indexes_and_expiration_preserves_the_wa
     );
 
     let first_rebuild = repository
-        .rebuild_deposit_indexes(DepositIndexRebuildRequest {
+        .rebuild_deposit_indexes(RebuildRequest {
             after: None,
             limit: 2,
         })
@@ -925,7 +762,7 @@ async fn deposit_listing_rebuilds_legacy_indexes_and_expiration_preserves_the_wa
     assert_eq!(first_rebuild.next, Some(DepositId("deposit-2".to_owned())));
     assert!(!first_rebuild.complete);
     let completed = repository
-        .rebuild_deposit_indexes(DepositIndexRebuildRequest {
+        .rebuild_deposit_indexes(RebuildRequest {
             after: first_rebuild.next,
             limit: 2,
         })
@@ -935,7 +772,7 @@ async fn deposit_listing_rebuilds_legacy_indexes_and_expiration_preserves_the_wa
     assert!(completed.complete);
 
     let first_user_page = repository
-        .deposits(DepositPageRequest {
+        .deposits(DepositQuery {
             after: None,
             limit: 1,
             user_id: Some(UserId("user-1".to_owned())),
@@ -948,7 +785,7 @@ async fn deposit_listing_rebuilds_legacy_indexes_and_expiration_preserves_the_wa
         Some(DepositId("deposit-1".to_owned()))
     );
     let second_user_page = repository
-        .deposits(DepositPageRequest {
+        .deposits(DepositQuery {
             after: first_user_page.next,
             limit: 1,
             user_id: Some(UserId("user-1".to_owned())),
@@ -992,7 +829,7 @@ async fn deposit_listing_rebuilds_legacy_indexes_and_expiration_preserves_the_wa
     assert_eq!(expired.state.watch_id(), Some(&watch_id));
 
     let expired_for_user = repository
-        .deposits(DepositPageRequest {
+        .deposits(DepositQuery {
             after: None,
             limit: 10,
             user_id: Some(UserId("user-1".to_owned())),
@@ -1016,84 +853,6 @@ async fn deposit_listing_rebuilds_legacy_indexes_and_expiration_preserves_the_wa
 }
 
 #[tokio::test]
-async fn version_one_deposits_decode_with_an_explicit_marker_and_backfill_without_disappearing()
--> Result<(), Box<dyn std::error::Error>> {
-    let directory = TempDir::new()?;
-    let storage = RocksDbStorage::open(directory.path())?;
-    storage
-        .commit(WriteBatch {
-            conditions: Vec::new(),
-            operations: vec![Operation::Put {
-                namespace: Namespace("ps.v1.deposit".to_owned()),
-                key: Key(b"deposit-legacy".to_vec()),
-                value: encode_legacy_deposit(&legacy_deposit(
-                    "deposit-legacy",
-                    LegacyDepositStateRecordV1::AwaitingWatch,
-                ))?,
-            }],
-        })
-        .await?;
-    let repository = PersistentPaymentRepository::new(storage);
-
-    let decoded = repository
-        .deposit(&DepositId("deposit-legacy".to_owned()))
-        .await?
-        .expect("the version-one row must remain readable");
-    assert_eq!(decoded.key_purpose, LEGACY_DEPOSIT_KEY_PURPOSE);
-    let before_backfill = repository
-        .deposits(DepositPageRequest {
-            after: None,
-            limit: 10,
-            user_id: Some(UserId("legacy-user".to_owned())),
-            state: Some(DepositStateKind::AwaitingWatch),
-        })
-        .await?;
-    assert_eq!(before_backfill.deposits, vec![decoded.clone()]);
-
-    let rebuilt = repository
-        .rebuild_deposit_indexes(DepositIndexRebuildRequest {
-            after: None,
-            limit: 10,
-        })
-        .await?;
-    assert_eq!(rebuilt.scanned, 1);
-    assert!(rebuilt.complete);
-    let after_backfill = repository
-        .deposits(DepositPageRequest {
-            after: None,
-            limit: 10,
-            user_id: Some(UserId("legacy-user".to_owned())),
-            state: Some(DepositStateKind::AwaitingWatch),
-        })
-        .await?;
-    assert_eq!(after_backfill.deposits, vec![decoded]);
-
-    let expired_directory = TempDir::new()?;
-    let expired_storage = RocksDbStorage::open(expired_directory.path())?;
-    expired_storage
-        .commit(WriteBatch {
-            conditions: Vec::new(),
-            operations: vec![Operation::Put {
-                namespace: Namespace("ps.v1.deposit".to_owned()),
-                key: Key(b"deposit-legacy-expired".to_vec()),
-                value: encode_legacy_deposit(&legacy_deposit(
-                    "deposit-legacy-expired",
-                    LegacyDepositStateRecordV1::Expired,
-                ))?,
-            }],
-        })
-        .await?;
-    let expired_repository = PersistentPaymentRepository::new(expired_storage);
-    let error = expired_repository
-        .deposit(&DepositId("deposit-legacy-expired".to_owned()))
-        .await
-        .expect_err("a legacy Expired row cannot safely invent a missing IX watch ID");
-    assert_eq!(error.kind, DepositErrorKind::Storage);
-    assert!(error.message.contains("explicit migration"));
-    Ok(())
-}
-
-#[tokio::test]
 async fn mirror_cursor_and_duplicate_semantics_survive_restart()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
@@ -1104,7 +863,7 @@ async fn mirror_cursor_and_duplicate_semantics_survive_restart()
     };
 
     {
-        let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+        let repository = PaymentStore::new(RocksDb::open(directory.path())?);
         assert_eq!(
             repository.mirror_and_advance(command.clone()).await?,
             MirrorOutcome::Appended {
@@ -1113,7 +872,7 @@ async fn mirror_cursor_and_duplicate_semantics_survive_restart()
         );
     }
 
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
     assert_eq!(
         repository
             .consumer_checkpoint(ConsumerCheckpointName::IxIngestion)
@@ -1152,7 +911,7 @@ async fn mirror_cursor_and_duplicate_semantics_survive_restart()
 async fn post_credit_reorg_projection_opens_and_resolves_a_blocking_case()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
     let created = repository.create_with_ledger(create_deposit()).await?;
 
     let confirmation = confirmed_observation();
@@ -1192,7 +951,7 @@ async fn post_credit_reorg_projection_opens_and_resolves_a_blocking_case()
         }
     };
     let observations = repository
-        .observations_for_deposit(DepositObservationLogRequest {
+        .observations_for_deposit(DepositFilter {
             deposit_id: created.deposit.id.clone(),
             after: None,
             limit: 10,
@@ -1251,7 +1010,7 @@ async fn post_credit_reorg_projection_opens_and_resolves_a_blocking_case()
         })
         .await?;
     let reconciliation = ReconciliationCase {
-        id: ReconciliationCaseId("reconciliation-1".to_owned()),
+        id: CaseId("reconciliation-1".to_owned()),
         deposit_id: created.deposit.id.clone(),
         triggering_event_id: observation.event.id.clone(),
         reason: ReconciliationReason::PostCreditReorg {
@@ -1400,7 +1159,7 @@ async fn post_credit_reorg_projection_opens_and_resolves_a_blocking_case()
 async fn non_ledger_reconciliation_decisions_preserve_the_absolute_ledger()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
 
     let liability_deposit = repository
         .create_with_ledger(create_deposit_named(
@@ -1498,7 +1257,7 @@ async fn non_ledger_reconciliation_decisions_preserve_the_absolute_ledger()
 async fn reverse_credit_head_conflict_leaves_case_and_ledger_unchanged()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
     let created = repository
         .create_with_ledger(create_deposit_named(
             "deposit-stale-head",
@@ -1518,7 +1277,7 @@ async fn reverse_credit_head_conflict_leaves_case_and_ledger_unchanged()
             command: reconciliation_identity("stale-reverse-credit", 24),
             case_id: case.id.clone(),
             decision: ReconciliationDecision::ReverseCredit {
-                expected_head: LedgerEntryId("not-the-current-head".to_owned()),
+                expected_head: EntryId("not-the-current-head".to_owned()),
                 reason: "reverse the credited value".to_owned(),
             },
             resolved_at: 2_200,
@@ -1535,77 +1294,10 @@ async fn reverse_credit_head_conflict_leaves_case_and_ledger_unchanged()
 }
 
 #[tokio::test]
-async fn legacy_free_form_resolution_decodes_without_becoming_a_typed_replay()
--> Result<(), Box<dyn std::error::Error>> {
-    let directory = TempDir::new()?;
-    let storage = RocksDbStorage::open(directory.path())?;
-    let namespace = Namespace("ps.v1.reconciliation".to_owned());
-    let key = Key(b"reconciliation-legacy-resolved".to_vec());
-    let legacy_value = encode_legacy_reconciliation(&LegacyReconciliationRecordV1 {
-        version: 1,
-        id: "reconciliation-legacy-resolved".to_owned(),
-        deposit_id: "deposit-legacy".to_owned(),
-        triggering_event_id: "event-legacy".to_owned(),
-        reason: LegacyReconciliationReasonRecordV1::PostCreditReorg {
-            accounted: amount(100).0,
-            corrected_confirmed: amount(0).0,
-        },
-        state: LegacyReconciliationStateRecordV1::Resolved {
-            resolution: "operator accepted the historical loss".to_owned(),
-            resolved_at: 3_000,
-        },
-        created_at: 2_900,
-    })?;
-    storage
-        .commit(WriteBatch {
-            conditions: Vec::new(),
-            operations: vec![Operation::Put {
-                namespace: namespace.clone(),
-                key: key.clone(),
-                value: legacy_value.clone(),
-            }],
-        })
-        .await?;
-    let repository = PersistentPaymentRepository::new(storage);
-    let case_id = ReconciliationCaseId("reconciliation-legacy-resolved".to_owned());
-    let decoded = repository
-        .case(&case_id)
-        .await?
-        .expect("the legacy reconciliation row must remain readable");
-    assert_eq!(
-        decoded.state,
-        ReconciliationState::LegacyResolved {
-            description: "operator accepted the historical loss".to_owned(),
-            resolved_at: 3_000,
-        }
-    );
-
-    let error = repository
-        .resolve_case(ResolveReconciliation {
-            command: reconciliation_identity("resolve-legacy", 25),
-            case_id,
-            decision: ReconciliationDecision::AcceptLiability {
-                reason: "try to reinterpret the old resolution".to_owned(),
-            },
-            resolved_at: 3_100,
-        })
-        .await
-        .expect_err("a V1 resolution cannot masquerade as typed command replay");
-    assert_eq!(error.kind, DepositErrorKind::Conflict);
-    let stored = repository
-        .storage()
-        .get(&namespace, &key)
-        .await?
-        .expect("legacy row must remain present");
-    assert_eq!(stored.value, legacy_value);
-    Ok(())
-}
-
-#[tokio::test]
 async fn rocksdb_projects_included_confirmed_reorged_and_reincluded_revisions_once()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
     let created = repository.create_with_ledger(create_deposit()).await?;
     let movement_ids = vec![
         MovementId("part-a".to_owned()),
@@ -1839,7 +1531,7 @@ async fn rocksdb_projects_included_confirmed_reorged_and_reincluded_revisions_on
 async fn input_output_net_projection_handles_debit_credit_zero_and_atomic_conflict_case()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
     let created = repository.create_with_ledger(create_deposit()).await?;
     let deposit_address = created.deposit.address.clone();
 
@@ -1850,13 +1542,11 @@ async fn input_output_net_projection_handles_debit_credit_zero_and_atomic_confli
         1,
         included_status(),
         None,
-        vec![ValueMovement {
+        vec![ValueMovement::Output {
             id: MovementId("net-funding-output".to_owned()),
             asset: asset(),
             amount: amount(100),
-            from: None,
-            to: Some(deposit_address.clone()),
-            kind: MovementKind::Output,
+            owner: Some(deposit_address.clone()),
         }],
     );
     repository
@@ -1897,13 +1587,11 @@ async fn input_output_net_projection_handles_debit_credit_zero_and_atomic_confli
         1,
         included_status(),
         None,
-        vec![ValueMovement {
+        vec![ValueMovement::Input {
             id: MovementId("input-collection-debit".to_owned()),
             asset: asset(),
             amount: amount(20),
-            from: Some(deposit_address.clone()),
-            to: None,
-            kind: MovementKind::Input,
+            owner: Some(deposit_address.clone()),
         }],
         Some(network_fee(5, deposit_address.clone(), asset())),
     );
@@ -1953,21 +1641,17 @@ async fn input_output_net_projection_handles_debit_credit_zero_and_atomic_confli
         included_status(),
         None,
         vec![
-            ValueMovement {
+            ValueMovement::Input {
                 id: MovementId("net-debit-input".to_owned()),
                 asset: asset(),
                 amount: amount(100),
-                from: Some(deposit_address.clone()),
-                to: None,
-                kind: MovementKind::Input,
+                owner: Some(deposit_address.clone()),
             },
-            ValueMovement {
+            ValueMovement::Output {
                 id: MovementId("net-debit-return".to_owned()),
                 asset: asset(),
                 amount: amount(40),
-                from: None,
-                to: Some(deposit_address.clone()),
-                kind: MovementKind::Output,
+                owner: Some(deposit_address.clone()),
             },
         ],
         Some(network_fee(10, deposit_address.clone(), asset())),
@@ -1979,7 +1663,7 @@ async fn input_output_net_projection_handles_debit_credit_zero_and_atomic_confli
         })
         .await?;
     let conflict_case = ReconciliationCase {
-        id: ReconciliationCaseId("reserved-spend-conflict".to_owned()),
+        id: CaseId("reserved-spend-conflict".to_owned()),
         deposit_id: created.deposit.id.clone(),
         triggering_event_id: debit.event.id.clone(),
         reason: ReconciliationReason::ReservedSpendConflict {
@@ -2049,21 +1733,17 @@ async fn input_output_net_projection_handles_debit_credit_zero_and_atomic_confli
             included_status(),
             None,
             vec![
-                ValueMovement {
+                ValueMovement::Input {
                     id: input_id.clone(),
                     asset: asset(),
                     amount: amount(input),
-                    from: Some(deposit_address.clone()),
-                    to: None,
-                    kind: MovementKind::Input,
+                    owner: Some(deposit_address.clone()),
                 },
-                ValueMovement {
+                ValueMovement::Output {
                     id: output_id.clone(),
                     asset: asset(),
                     amount: amount(output),
-                    from: None,
-                    to: Some(deposit_address.clone()),
-                    kind: MovementKind::Output,
+                    owner: Some(deposit_address.clone()),
                 },
             ],
             Some(network_fee(1, deposit_address.clone(), asset())),
@@ -2108,7 +1788,7 @@ async fn input_output_net_projection_handles_debit_credit_zero_and_atomic_confli
 async fn rocksdb_record_observation_uses_actual_amounts_and_rejects_arithmetic_failure()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
     let created = repository.create_with_ledger(create_deposit()).await?;
 
     let partial = observation_revision(
@@ -2184,9 +1864,15 @@ async fn rocksdb_record_observation_uses_actual_amounts_and_rejects_arithmetic_f
         1,
         included_status(),
         None,
-        vec![ValueMovement {
-            amount: AtomicAmount([u8::MAX; 32]),
-            ..movement("overflow", 0)
+        vec![ValueMovement::Transfer {
+            id: MovementId("overflow".to_owned()),
+            asset: asset(),
+            amount:
+                "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+                    .parse()
+                    .expect("maximum u256 is a valid decimal"),
+            from: address("0x2222222222222222222222222222222222222222"),
+            to: address("0x1111111111111111111111111111111111111111"),
         }],
     );
     repository
@@ -2255,7 +1941,7 @@ async fn rocksdb_record_observation_uses_actual_amounts_and_rejects_arithmetic_f
 async fn rocksdb_collection_changes_collected_only_after_confirmation()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
     let created = repository.create_with_ledger(create_deposit()).await?;
 
     let incoming = observation_revision(
@@ -2409,7 +2095,7 @@ async fn rocksdb_collection_changes_collected_only_after_confirmation()
 async fn rocksdb_projects_repository_derived_collection_fee_and_reverses_it_exactly()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
     let created = repository.create_with_ledger(create_deposit()).await?;
 
     let seed_observation = observation_revision(
@@ -2564,7 +2250,7 @@ async fn rocksdb_projects_repository_derived_collection_fee_and_reverses_it_exac
 async fn rocksdb_projects_and_reorgs_a_fee_only_block_failure()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
     let created = repository.create_with_ledger(create_deposit()).await?;
     let seed_observation = observation_revision(
         "event-failed-fee-seed",
@@ -2674,7 +2360,7 @@ async fn rocksdb_projects_and_reorgs_a_fee_only_block_failure()
 async fn rocksdb_ignores_fees_not_paid_by_the_deposit_in_its_asset()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
     let created = repository.create_with_ledger(create_deposit()).await?;
     let mismatched_fees = [
         network_fee(
@@ -2734,77 +2420,5 @@ async fn rocksdb_ignores_fees_not_paid_by_the_deposit_in_its_asset()
             .balances,
         DepositBalances::default()
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn legacy_observation_ledger_rows_decode_without_a_projected_fee()
--> Result<(), Box<dyn std::error::Error>> {
-    let directory = TempDir::new()?;
-    let storage = RocksDbStorage::open(directory.path())?;
-    let repository = PersistentPaymentRepository::new(storage.clone());
-    let created = repository.create_with_ledger(create_deposit()).await?;
-    let legacy_id = "projection:legacy-v1";
-    let legacy = LegacyLedgerEntryRecordV1 {
-        version: 1,
-        id: legacy_id.to_owned(),
-        deposit_id: created.deposit.id.0.clone(),
-        previous: Some(created.ledger.id.0),
-        cause: LegacyLedgerCauseRecordV1::Observation {
-            projection_id: "legacy-v1".to_owned(),
-            event_id: "event-legacy-v1".to_owned(),
-            revision: 1,
-            status: LegacyStatusRecordV1::Included {
-                block: LegacyBlockRecordV1 {
-                    height: 30,
-                    hash: vec![30; 32],
-                    parent_hash: Some(vec![29; 32]),
-                    timestamp: Some(1_030),
-                },
-                confirmations: 1,
-            },
-            kind: 0,
-            movement_ids: vec!["legacy-movement".to_owned()],
-        },
-        balances: LegacyBalancesRecordV1 {
-            received: amount(25).0,
-            confirmed: amount(0).0,
-            balance: amount(25).0,
-            collected: amount(0).0,
-            accounted: amount(0).0,
-        },
-        recorded_at: 8_001,
-    };
-    storage
-        .commit(WriteBatch {
-            conditions: Vec::new(),
-            operations: vec![Operation::Put {
-                namespace: Namespace("ps.v1.ledger_entry".to_owned()),
-                key: component_key(&[created.deposit.id.0.as_bytes(), legacy_id.as_bytes()]),
-                value: encode_legacy_ledger(&legacy)?,
-            }],
-        })
-        .await?;
-
-    let page = repository
-        .entries(LedgerPageRequest {
-            deposit_id: created.deposit.id,
-            after: None,
-            limit: 10,
-        })
-        .await?;
-    let decoded = page
-        .entries
-        .into_iter()
-        .find(|entry| entry.id.0 == legacy_id)
-        .expect("legacy observation row remains readable");
-    assert_eq!(decoded.balances.balance, amount(25));
-    assert!(matches!(
-        decoded.cause,
-        LedgerEntryCause::Observation {
-            network_fee: None,
-            ..
-        }
-    ));
     Ok(())
 }

@@ -1,17 +1,15 @@
 mod builder;
-mod codec;
+mod operations;
 mod sighash;
 mod signed;
 mod unsigned;
 
 pub use builder::{
-    BitcoinBuildRequest, BitcoinInput, BitcoinOutput, BitcoinTransactionBuilder, BitcoinUtxo,
-    SatoshisPerKvb,
+    BuildRequest, Builder as TransactionBuilder, FeeRate, Input, Output, SpendSource,
 };
-pub use codec::BitcoinTransactionCodec;
 pub use sighash::SighashType;
 pub use signed::{
-    BitcoinReceipt, BitcoinSignedInputInspection, BitcoinSignedOutputInspection,
-    BitcoinSignedTransaction, BitcoinSignedTransactionInspection, BitcoinTransactionId,
+    Id as TransactionId, InputInspection, Inspection as TransactionInspection, OutputInspection,
+    Receipt, SignedTransaction,
 };
-pub use unsigned::{BitcoinTransactionSigning, UnsignedBitcoinTransaction};
+pub use unsigned::UnsignedTransaction;

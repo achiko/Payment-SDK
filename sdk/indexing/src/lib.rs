@@ -1,57 +1,50 @@
 //! Reorg-safe, chain-independent block synchronization contracts.
 
-mod block;
 mod changes;
 mod error;
+mod indexer;
 mod observation;
 mod observer;
-mod persistent;
-mod projection;
+mod output;
 mod service;
 mod source;
 mod store;
+mod value;
 mod watch;
 mod worker;
 
-pub use block::{BlockHash, BlockHeight, BlockRef, IndexedBlock};
-pub use changes::{BlockChanges, CommitBlockCommand, IndexedEvent, InterpretedBlock, RawBlockData};
+pub use base::{BlockHash, BlockHeight, BlockRef};
+pub use changes::{CommitBlock, InterpretedBlock, RawBlock};
 pub use error::{IndexError, IndexErrorKind, SourceError};
+pub use indexer::{Checkpoint, Composer, History, Indexer, Observer, Watcher};
 pub use observation::{
-    AddressWatchRequest, ConfirmationPolicy, ConfirmationProof, EventCursor, FinalityScanPage,
-    FinalityScanRequest, MovementId, MovementKind, NetworkFee, ObservationDraft,
-    ObservationDraftStatus, ObservationEvent, ObservationEventId, ObservationEventPage,
-    ObservationEventRequest, ObservationRevision, ObservedTransaction, RegisterWatchCommand,
-    RegisterWatchOutcome, TransactionPage, TransactionPageRequest, TransactionRequest,
-    TransactionStatus, UnwatchCommand, UnwatchOutcome, ValueMovement, WatchReceipt, WatchRequest,
-    WatchSelector,
+    AddressQuery, ConfirmationPolicy, ConfirmationProof, DeactivateWatch, EventCursor, EventId,
+    EventPage, EventQuery, HistoryQuery, MovementId, MovementKind, NetworkFee, ObservationDraft,
+    ObservationDraftStatus, ObservationEvent, ObservationRevision, ObservedTransaction,
+    RegisterWatch, TransactionPage, TransactionQuery, TransactionStatus, UnwatchOutcome,
+    UnwatchRequest, ValueMovement, WatchOutcome, WatchReceipt, WatchRequest, WatchSelector,
 };
 pub use observer::{
-    BlockCommitObservation, BlockCommitObservationOutcome, NoopSyncObserver, ReorgDepth,
-    ReorgObservation, SyncObserver,
+    CommitObservation, CommitStatus, NoopWorkerObserver, ReorgDepth, ReorgObservation,
+    WorkerObserver,
 };
-pub use persistent::{
-    IndexRecordCodec, PersistentIndexConfig, PersistentIndexRepository, RawBytesIndexCodec,
+pub use output::{
+    IndexChanges, IndexUndo, IndexedOutput, OutputChanges, OutputCursor, OutputId, OutputKey,
+    OutputPage, OutputQuery, OutputRequest, OutputSnapshot,
 };
-pub use projection::{
-    ProjectionBatch, ProjectionCursor, ProjectionEntry, ProjectionGetRequest,
-    ProjectionGetResponse, ProjectionMutation, ProjectionPage, ProjectionQuery,
-    ProjectionScanRequest, ProjectionSnapshot,
-};
-pub use service::{
-    IndexingWorker, ObservationEventSource, ObservationQuery, ObservationRegistry, RebuildReason,
-    SyncPhase, SyncRequest, SyncStatus,
-};
-pub use source::{BlockInterpreter, BlockSource, MempoolSource};
+pub use service::{RebuildReason, SyncPhase, SyncRequest, SyncStatus, Worker};
+pub use source::{BlockInterpreter, BlockSource, IndexedBlock};
 pub use store::{
-    AbortRebuildCommand, ActivateRebuildCommand, BeginRebuildCommand, CleanupGenerationCommand,
-    CleanupGenerationOutcome, CommitBlockOutcome, CommitRebuildBlockCommand,
-    CommitWatchBackfillCommand, CommitWatchBackfillOutcome, IndexRepository,
-    MigrateIndexPolicyCommand, MigrateIndexPolicyOutcome, PolicyMigrationVersion,
-    PrepareRebuildActivationCommand, RebuildGeneration, RebuildPhase, RebuildState,
-    RevertTipCommand, RevertTipOutcome, ValidateRebuildCommand,
+    AbortRebuild, BackfillOutcome, BackfillReader, BackfillWriter, BeginRebuild, BlockOutcome,
+    CanonicalReader, ChainWriter, CleanupGeneration, CleanupOutcome, CommitBackfill, EventReader,
+    IndexTypes, PrepareActivation, RebuildActivation, RebuildAdmin, RebuildBlock, RebuildBuilder,
+    RebuildGeneration, RebuildPhase, RebuildPublisher, RebuildReader, RebuildState,
+    RebuildValidation, RevertOutcome, RevertTip, StatusStore, TransactionReader, WatchLookup,
+    WatchReader, WatchStore,
 };
+pub use value::{AssetId, CanonicalAddress, ChainId, TransactionRef};
 pub use watch::{IndexScope, WatchBackfill, WatchId, WatchSnapshot, WatchTarget, WatchVersion};
-pub use worker::{OrderedSyncConfig, OrderedSyncWorker, V1_CONFIRMATION_DEPTH, V1_REORG_RETENTION};
+pub use worker::{SyncConfig, SyncWorker, V1_CONFIRMATION_DEPTH, V1_REORG_RETENTION};
 
 use std::{future::Future, pin::Pin};
 

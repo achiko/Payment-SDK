@@ -1,12 +1,13 @@
 use crate::{CollectionId, DepositError, DepositId};
-use chain_identity::{AssetId, AtomicAmount};
+use base::Decimal;
+use indexing::AssetId;
 use indexing::{MovementId, ObservationEvent};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClassifiedMovement {
     pub movement_id: MovementId,
     pub asset: AssetId,
-    pub amount: AtomicAmount,
+    pub amount: Decimal,
 }
 
 /// PS semantics derived by consulting deposits and collection records.
@@ -21,7 +22,7 @@ pub enum ObservationClassification {
         deposit_id: DepositId,
         debits: Vec<ClassifiedMovement>,
         master_credits: Vec<ClassifiedMovement>,
-        allocated_fee: Option<AtomicAmount>,
+        allocated_fee: Option<Decimal>,
     },
     GasFunding {
         collection_id: CollectionId,

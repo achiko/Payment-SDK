@@ -12,7 +12,7 @@ pub enum DepositErrorKind {
     Conflict,
     InvalidState,
     InvariantViolation,
-    Storage,
+    Store,
     Other,
 }
 

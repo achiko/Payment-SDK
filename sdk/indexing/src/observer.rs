@@ -1,27 +1,27 @@
 use std::time::Duration;
 
-use crate::{BlockHeight, BlockRef, CommitBlockOutcome, IndexErrorKind, IndexScope};
+use crate::{BlockHeight, BlockOutcome, BlockRef, IndexErrorKind, IndexScope};
 
 /// Result of one repository block-commit attempt.
 ///
 /// Failure observations intentionally omit the error message so observers do
 /// not become an accidental sink for backend or RPC details.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BlockCommitObservationOutcome {
-    Success(CommitBlockOutcome),
+pub enum CommitStatus {
+    Success(BlockOutcome),
     Failure {
         kind: IndexErrorKind,
         retryable: bool,
     },
 }
 
-/// Timing and result of one call to `IndexRepository::commit_block`.
+/// Timing and result of one canonical block commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BlockCommitObservation {
+pub struct CommitObservation {
     pub scope: IndexScope,
     pub block: BlockRef,
     pub elapsed: Duration,
-    pub outcome: BlockCommitObservationOutcome,
+    pub outcome: CommitStatus,
 }
 
 /// Reorg depth found by canonical reconciliation.
@@ -51,14 +51,17 @@ pub struct ReorgObservation {
 /// Implementations should return quickly and must not perform blocking I/O on
 /// the synchronization task. Both methods default to no-ops so consumers may
 /// implement only the signals they need.
-pub trait SyncObserver: Send + Sync + 'static {
-    fn block_commit(&self, _observation: BlockCommitObservation) {}
+pub trait WorkerObserver: Send + Sync + 'static {
+    fn block_commit(&self, _observation: CommitObservation) {}
 
     fn reorg_detected(&self, _observation: ReorgObservation) {}
 }
 
-/// Default observer used by `OrderedSyncWorker::new`.
+/// Default observer used by `SyncWorker::new`.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct NoopSyncObserver;
+pub enum NoopWorkerObserver {
+    #[default]
+    Ignore,
+}
 
-impl SyncObserver for NoopSyncObserver {}
+impl WorkerObserver for NoopWorkerObserver {}

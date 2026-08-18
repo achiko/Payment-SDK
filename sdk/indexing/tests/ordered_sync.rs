@@ -3,29 +3,28 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use chain_identity::{CanonicalAddress, CanonicalTransactionId, ChainId};
 use futures_executor::block_on;
 use indexing::{
-    AbortRebuildCommand, ActivateRebuildCommand, AddressWatchRequest, BeginRebuildCommand,
-    BlockCommitObservation, BlockCommitObservationOutcome, BlockHash, BlockHeight,
-    BlockInterpreter, BlockRef, BlockSource, BoxFuture, CleanupGenerationCommand,
-    CleanupGenerationOutcome, CommitBlockCommand, CommitBlockOutcome, CommitRebuildBlockCommand,
-    CommitWatchBackfillCommand, CommitWatchBackfillOutcome, ConfirmationPolicy, ConfirmationProof,
-    EventCursor, IndexError, IndexErrorKind, IndexRepository, IndexedBlock, IndexingWorker,
-    InterpretedBlock, MigrateIndexPolicyCommand, MigrateIndexPolicyOutcome, ObservationDraft,
-    ObservationDraftStatus, ObservationEvent, ObservationEventId, ObservationEventPage,
-    ObservationEventRequest, ObservationRevision, ObservedTransaction, OrderedSyncConfig,
-    OrderedSyncWorker, PrepareRebuildActivationCommand, RawBlockData, RebuildGeneration,
-    RebuildPhase, RebuildState, RegisterWatchCommand, RegisterWatchOutcome, ReorgDepth,
-    ReorgObservation, RevertTipCommand, RevertTipOutcome, SourceError, SyncObserver, SyncPhase,
-    SyncRequest, SyncStatus, TransactionPage, TransactionPageRequest, TransactionRequest,
-    TransactionStatus, UnwatchCommand, UnwatchOutcome, ValidateRebuildCommand, WatchBackfill,
-    WatchId, WatchReceipt, WatchSelector, WatchSnapshot, WatchTarget, WatchVersion,
+    AbortRebuild, AddressQuery, BackfillOutcome, BackfillReader, BackfillWriter, BeginRebuild,
+    BlockHash, BlockHeight, BlockInterpreter, BlockOutcome, BlockRef, BlockSource, BoxFuture,
+    CanonicalAddress, CanonicalReader, ChainId, ChainWriter, CleanupGeneration, CleanupOutcome,
+    CommitBackfill, CommitBlock, CommitObservation, CommitStatus, ConfirmationPolicy,
+    ConfirmationProof, DeactivateWatch, EventCursor, EventId, EventPage, EventQuery, EventReader,
+    HistoryQuery, IndexError, IndexErrorKind, IndexTypes, IndexedBlock, InterpretedBlock,
+    ObservationDraft, ObservationDraftStatus, ObservationEvent, ObservationRevision,
+    ObservedTransaction, PrepareActivation, RawBlock, RebuildActivation, RebuildAdmin,
+    RebuildBlock, RebuildBuilder, RebuildGeneration, RebuildPhase, RebuildPublisher, RebuildReader,
+    RebuildState, RebuildValidation, RegisterWatch, ReorgDepth, ReorgObservation, RevertOutcome,
+    RevertTip, SourceError, StatusStore, SyncConfig, SyncPhase, SyncRequest, SyncStatus,
+    SyncWorker, TransactionPage, TransactionQuery, TransactionReader, TransactionRef,
+    TransactionStatus, UnwatchOutcome, WatchBackfill, WatchId, WatchLookup, WatchOutcome,
+    WatchReader, WatchReceipt, WatchSelector, WatchSnapshot, WatchStore, WatchTarget, WatchVersion,
+    Worker, WorkerObserver,
 };
 
 fn scope() -> indexing::IndexScope {
     indexing::IndexScope {
-        chain: ChainId("ethereum".to_owned()),
+        chain: ChainId("chain-a".to_owned()),
         network: "test".to_owned(),
     }
 }
@@ -41,9 +40,9 @@ fn hash(tag: &str, height: u64) -> BlockHash {
     BlockHash(format!("{tag}-{height}").into_bytes())
 }
 
-fn transaction_id(value: &str) -> CanonicalTransactionId {
-    CanonicalTransactionId {
-        chain: ChainId("ethereum".to_owned()),
+fn transaction_id(value: &str) -> TransactionRef {
+    TransactionRef {
+        scope: scope(),
         value: value.to_owned(),
     }
 }
@@ -262,19 +261,20 @@ struct TestInterpreter;
 impl BlockInterpreter for TestInterpreter {
     type Block = TestBlock;
     type Target = ();
+    type Effect = ();
     type Undo = ();
 
     fn inspect(
         &self,
         block: &Self::Block,
         _watches: &[WatchTarget<Self::Target>],
-    ) -> Result<InterpretedBlock<Self::Undo>, IndexError> {
+    ) -> Result<InterpretedBlock<Self::Effect, Self::Undo>, IndexError> {
         Ok(InterpretedBlock {
             block: block.reference.clone(),
             drafts: block.drafts.clone(),
-            projection: indexing::ProjectionBatch::default(),
+            effect: (),
             undo: (),
-            raw: RawBlockData {
+            raw: RawBlock {
                 block: block.reference.hash.0.clone(),
                 receipts: Vec::new(),
             },
@@ -283,13 +283,13 @@ impl BlockInterpreter for TestInterpreter {
 }
 
 #[derive(Clone, Default)]
-struct RecordingSyncObserver {
-    commits: Arc<Mutex<Vec<BlockCommitObservation>>>,
+struct RecordingObserver {
+    commits: Arc<Mutex<Vec<CommitObservation>>>,
     reorgs: Arc<Mutex<Vec<ReorgObservation>>>,
 }
 
-impl RecordingSyncObserver {
-    fn commits(&self) -> Vec<BlockCommitObservation> {
+impl RecordingObserver {
+    fn commits(&self) -> Vec<CommitObservation> {
         self.commits
             .lock()
             .expect("test observer commit lock is healthy")
@@ -304,8 +304,8 @@ impl RecordingSyncObserver {
     }
 }
 
-impl SyncObserver for RecordingSyncObserver {
-    fn block_commit(&self, observation: BlockCommitObservation) {
+impl WorkerObserver for RecordingObserver {
+    fn block_commit(&self, observation: CommitObservation) {
         self.commits
             .lock()
             .expect("test observer commit lock is healthy")
@@ -328,7 +328,7 @@ struct TestRepository {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StoredBundle {
     block: BlockRef,
-    transaction_ids: Vec<CanonicalTransactionId>,
+    transaction_ids: Vec<TransactionRef>,
 }
 
 struct TestState {
@@ -337,8 +337,8 @@ struct TestState {
     checkpoint: Option<BlockRef>,
     canonical: BTreeMap<u64, BlockRef>,
     bundles: BTreeMap<u64, StoredBundle>,
-    observations: BTreeMap<CanonicalTransactionId, ObservedTransaction>,
-    observation_watches: BTreeMap<CanonicalTransactionId, Vec<WatchId>>,
+    observations: BTreeMap<TransactionRef, ObservedTransaction>,
+    observation_watches: BTreeMap<TransactionRef, Vec<WatchId>>,
     events: Vec<ObservationEvent>,
     watches: BTreeMap<String, WatchTarget<()>>,
     watch_version: WatchVersion,
@@ -414,13 +414,13 @@ struct TestSnapshot {
     events: Vec<ObservationEvent>,
     commit_order: Vec<u64>,
     revert_count: u64,
-    observations: BTreeMap<CanonicalTransactionId, ObservedTransaction>,
+    observations: BTreeMap<TransactionRef, ObservedTransaction>,
 }
 
 impl TestState {
     fn append_transition(
         &mut self,
-        transaction_id: CanonicalTransactionId,
+        transaction_id: TransactionRef,
         status: TransactionStatus,
         draft: Option<&ObservationDraft>,
         observed_at: u64,
@@ -482,7 +482,7 @@ impl TestState {
             .insert(transaction_id.clone(), transaction.clone());
         let cursor = EventCursor(self.events.len() as u64 + 1);
         self.events.push(ObservationEvent {
-            id: ObservationEventId(format!(
+            id: EventId(format!(
                 "{}:{}:{}",
                 self.scope.network, transaction_id.value, revision.0
             )),
@@ -580,10 +580,7 @@ impl TestState {
         }
     }
 
-    fn commit(
-        &mut self,
-        command: CommitBlockCommand<()>,
-    ) -> Result<CommitBlockOutcome, IndexError> {
+    fn commit(&mut self, command: CommitBlock<(), ()>) -> Result<BlockOutcome, IndexError> {
         TestRepository::check_scope(self, &command.scope)?;
         let block = &command.block.block;
         if self
@@ -591,7 +588,7 @@ impl TestState {
             .get(&block.height.0)
             .is_some_and(|canonical| canonical.hash == block.hash)
         {
-            return Ok(CommitBlockOutcome::AlreadyApplied);
+            return Ok(BlockOutcome::AlreadyApplied);
         }
         if self.checkpoint != command.expected_checkpoint {
             return Err(IndexError::new(
@@ -669,14 +666,17 @@ impl TestState {
         let anchor = block.height.0.saturating_sub(command.reorg_retention);
         self.canonical.retain(|height, _| *height >= anchor);
         self.bundles.retain(|height, _| *height > anchor);
-        Ok(CommitBlockOutcome::Applied)
+        Ok(BlockOutcome::Applied)
     }
 }
 
-impl IndexRepository for TestRepository {
+impl IndexTypes for TestRepository {
     type Target = ();
+    type Effect = ();
     type Undo = ();
+}
 
+impl CanonicalReader for TestRepository {
     fn checkpoint<'a>(
         &'a self,
         scope: &'a indexing::IndexScope,
@@ -700,7 +700,9 @@ impl IndexRepository for TestRepository {
         };
         Box::pin(async move { result })
     }
+}
 
+impl WatchReader for TestRepository {
     fn watches_at<'a>(
         &'a self,
         scope: &'a indexing::IndexScope,
@@ -720,11 +722,13 @@ impl IndexRepository for TestRepository {
         };
         Box::pin(async move { result })
     }
+}
 
-    fn register_watch<'a>(
+impl TestRepository {
+    fn register_watch_impl<'a>(
         &'a self,
-        command: RegisterWatchCommand<Self::Target>,
-    ) -> BoxFuture<'a, Result<RegisterWatchOutcome, IndexError>> {
+        command: RegisterWatch<()>,
+    ) -> BoxFuture<'a, Result<WatchOutcome, IndexError>> {
         let result = {
             let mut state = self.state.lock().expect("test repository lock is healthy");
             TestRepository::check_scope(&state, &command.request.scope).and_then(|()| {
@@ -738,7 +742,7 @@ impl IndexRepository for TestRepository {
                             false,
                         ));
                     }
-                    return Ok(RegisterWatchOutcome::Existing(WatchReceipt {
+                    return Ok(WatchOutcome::Existing(WatchReceipt {
                         id: existing.id.clone(),
                         scope: existing.scope.clone(),
                         selector: existing.selector.clone(),
@@ -763,7 +767,7 @@ impl IndexRepository for TestRepository {
                     .watches
                     .insert(command.request.idempotency_key, target);
                 state.watch_version.0 += 1;
-                Ok(RegisterWatchOutcome::Registered(WatchReceipt {
+                Ok(WatchOutcome::Registered(WatchReceipt {
                     id,
                     scope: command.request.scope,
                     selector: command.request.selector,
@@ -776,7 +780,9 @@ impl IndexRepository for TestRepository {
         };
         Box::pin(async move { result })
     }
+}
 
+impl BackfillReader for TestRepository {
     fn pending_watch_backfills<'a>(
         &'a self,
         _scope: &'a indexing::IndexScope,
@@ -784,11 +790,13 @@ impl IndexRepository for TestRepository {
     ) -> BoxFuture<'a, Result<Vec<WatchBackfill>, IndexError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
+}
 
+impl BackfillWriter for TestRepository {
     fn commit_watch_backfill<'a>(
         &'a self,
-        _command: CommitWatchBackfillCommand,
-    ) -> BoxFuture<'a, Result<CommitWatchBackfillOutcome, IndexError>> {
+        _command: CommitBackfill,
+    ) -> BoxFuture<'a, Result<BackfillOutcome, IndexError>> {
         Box::pin(async {
             Err(IndexError::new(
                 IndexErrorKind::InvalidRequest,
@@ -798,9 +806,19 @@ impl IndexRepository for TestRepository {
         })
     }
 
-    fn unwatch<'a>(
+    fn commit_watch_backfill_effect<'a>(
         &'a self,
-        command: UnwatchCommand,
+        command: CommitBackfill,
+        _effect: Self::Effect,
+    ) -> BoxFuture<'a, Result<BackfillOutcome, IndexError>> {
+        self.commit_watch_backfill(command)
+    }
+}
+
+impl TestRepository {
+    fn deactivate_impl<'a>(
+        &'a self,
+        command: DeactivateWatch,
     ) -> BoxFuture<'a, Result<UnwatchOutcome, IndexError>> {
         let result = {
             let mut state = self.state.lock().expect("test repository lock is healthy");
@@ -822,18 +840,36 @@ impl IndexRepository for TestRepository {
         };
         Box::pin(async move { result })
     }
+}
 
+impl WatchStore for TestRepository {
+    fn register_watch<'a>(
+        &'a self,
+        command: RegisterWatch<Self::Target>,
+    ) -> BoxFuture<'a, Result<WatchOutcome, IndexError>> {
+        self.register_watch_impl(command)
+    }
+
+    fn deactivate<'a>(
+        &'a self,
+        command: DeactivateWatch,
+    ) -> BoxFuture<'a, Result<UnwatchOutcome, IndexError>> {
+        self.deactivate_impl(command)
+    }
+}
+
+impl ChainWriter for TestRepository {
     fn commit_block<'a>(
         &'a self,
-        command: CommitBlockCommand<Self::Undo>,
-    ) -> BoxFuture<'a, Result<CommitBlockOutcome, IndexError>> {
+        command: CommitBlock<Self::Effect, Self::Undo>,
+    ) -> BoxFuture<'a, Result<BlockOutcome, IndexError>> {
         let result = {
             let mut state = self.state.lock().expect("test repository lock is healthy");
             let result = state.commit(command);
             if result.is_ok() && state.fail_after_next_commit {
                 state.fail_after_next_commit = false;
                 Err(IndexError::new(
-                    IndexErrorKind::Storage,
+                    IndexErrorKind::Store,
                     "simulated lost commit acknowledgement",
                     true,
                 ))
@@ -846,8 +882,8 @@ impl IndexRepository for TestRepository {
 
     fn revert_tip<'a>(
         &'a self,
-        command: RevertTipCommand,
-    ) -> BoxFuture<'a, Result<RevertTipOutcome, IndexError>> {
+        command: RevertTip,
+    ) -> BoxFuture<'a, Result<RevertOutcome, IndexError>> {
         let result = {
             let mut state = self.state.lock().expect("test repository lock is healthy");
             TestRepository::check_scope(&state, &command.scope).and_then(|()| {
@@ -857,7 +893,7 @@ impl IndexRepository for TestRepository {
                         .as_ref()
                         .is_none_or(|tip| tip.height < command.expected_tip.height)
                     {
-                        return Ok(RevertTipOutcome::AlreadyReverted {
+                        return Ok(RevertOutcome::AlreadyReverted {
                             checkpoint: state.checkpoint.clone(),
                         });
                     }
@@ -879,7 +915,7 @@ impl IndexRepository for TestRepository {
                     })?;
                 if bundle.block != command.expected_tip {
                     return Err(IndexError::new(
-                        IndexErrorKind::Storage,
+                        IndexErrorKind::Store,
                         "undo bundle block mismatch",
                         false,
                     ));
@@ -906,17 +942,19 @@ impl IndexRepository for TestRepository {
                 }
                 state.correct_confirmations_after_revert(new_checkpoint.as_ref());
                 state.revert_count += 1;
-                Ok(RevertTipOutcome::Reverted {
+                Ok(RevertOutcome::Reverted {
                     checkpoint: new_checkpoint,
                 })
             })
         };
         Box::pin(async move { result })
     }
+}
 
+impl TransactionReader for TestRepository {
     fn transaction<'a>(
         &'a self,
-        request: TransactionRequest,
+        request: TransactionQuery,
     ) -> BoxFuture<'a, Result<Option<ObservedTransaction>, IndexError>> {
         let result = {
             let state = self.state.lock().expect("test repository lock is healthy");
@@ -928,7 +966,7 @@ impl IndexRepository for TestRepository {
 
     fn transactions_by_address<'a>(
         &'a self,
-        request: TransactionPageRequest,
+        request: HistoryQuery,
     ) -> BoxFuture<'a, Result<TransactionPage, IndexError>> {
         let result = {
             let state = self.state.lock().expect("test repository lock is healthy");
@@ -938,8 +976,8 @@ impl IndexRepository for TestRepository {
                     .values()
                     .filter(|transaction| {
                         transaction.movements.iter().any(|movement| {
-                            movement.from.as_ref() == Some(&request.address)
-                                || movement.to.as_ref() == Some(&request.address)
+                            movement.from() == Some(&request.address)
+                                || movement.to() == Some(&request.address)
                         })
                     })
                     .take(request.limit)
@@ -950,10 +988,12 @@ impl IndexRepository for TestRepository {
         };
         Box::pin(async move { result })
     }
+}
 
+impl WatchLookup for TestRepository {
     fn watches_for_address<'a>(
         &'a self,
-        request: AddressWatchRequest,
+        request: AddressQuery,
     ) -> BoxFuture<'a, Result<Vec<WatchReceipt>, IndexError>> {
         let result = {
             let state = self.state.lock().expect("test repository lock is healthy");
@@ -978,11 +1018,10 @@ impl IndexRepository for TestRepository {
         };
         Box::pin(async move { result })
     }
+}
 
-    fn events<'a>(
-        &'a self,
-        request: ObservationEventRequest,
-    ) -> BoxFuture<'a, Result<ObservationEventPage, IndexError>> {
+impl EventReader for TestRepository {
+    fn events<'a>(&'a self, request: EventQuery) -> BoxFuture<'a, Result<EventPage, IndexError>> {
         let result = {
             let state = self.state.lock().expect("test repository lock is healthy");
             TestRepository::check_scope(&state, &request.scope).map(|()| {
@@ -993,7 +1032,7 @@ impl IndexRepository for TestRepository {
                     .take(request.limit)
                     .cloned()
                     .collect();
-                ObservationEventPage {
+                EventPage {
                     next: events.last().map(|event| event.cursor),
                     events,
                 }
@@ -1013,7 +1052,9 @@ impl IndexRepository for TestRepository {
         };
         Box::pin(async move { result })
     }
+}
 
+impl StatusStore for TestRepository {
     fn status<'a>(
         &'a self,
         scope: &'a indexing::IndexScope,
@@ -1034,20 +1075,9 @@ impl IndexRepository for TestRepository {
         };
         Box::pin(async move { result })
     }
+}
 
-    fn migrate_policy<'a>(
-        &'a self,
-        _command: MigrateIndexPolicyCommand,
-    ) -> BoxFuture<'a, Result<MigrateIndexPolicyOutcome, IndexError>> {
-        Box::pin(async {
-            Err(IndexError::new(
-                IndexErrorKind::InvalidRequest,
-                "ordered-sync test repository does not persist policy migrations",
-                false,
-            ))
-        })
-    }
-
+impl RebuildReader for TestRepository {
     fn rebuild_state<'a>(
         &'a self,
         scope: &'a indexing::IndexScope,
@@ -1058,10 +1088,12 @@ impl IndexRepository for TestRepository {
         };
         Box::pin(async move { result })
     }
+}
 
+impl RebuildBuilder for TestRepository {
     fn begin_rebuild<'a>(
         &'a self,
-        command: BeginRebuildCommand,
+        command: BeginRebuild,
     ) -> BoxFuture<'a, Result<RebuildState, IndexError>> {
         let result = {
             let mut state = self.state.lock().expect("test repository lock is healthy");
@@ -1083,8 +1115,8 @@ impl IndexRepository for TestRepository {
 
     fn commit_rebuild_block<'a>(
         &'a self,
-        _command: CommitRebuildBlockCommand<Self::Undo>,
-    ) -> BoxFuture<'a, Result<CommitBlockOutcome, IndexError>> {
+        _command: RebuildBlock<Self::Effect, Self::Undo>,
+    ) -> BoxFuture<'a, Result<BlockOutcome, IndexError>> {
         Box::pin(async {
             Err(IndexError::new(
                 IndexErrorKind::InvalidRequest,
@@ -1096,7 +1128,7 @@ impl IndexRepository for TestRepository {
 
     fn validate_rebuild<'a>(
         &'a self,
-        command: ValidateRebuildCommand,
+        command: RebuildValidation,
     ) -> BoxFuture<'a, Result<RebuildState, IndexError>> {
         let result = {
             let mut state = self.state.lock().expect("test repository lock is healthy");
@@ -1125,10 +1157,12 @@ impl IndexRepository for TestRepository {
         };
         Box::pin(async move { result })
     }
+}
 
+impl RebuildPublisher for TestRepository {
     fn prepare_rebuild_activation<'a>(
         &'a self,
-        command: PrepareRebuildActivationCommand,
+        command: PrepareActivation,
     ) -> BoxFuture<'a, Result<RebuildState, IndexError>> {
         let result = {
             let mut state = self.state.lock().expect("test repository lock is healthy");
@@ -1161,7 +1195,7 @@ impl IndexRepository for TestRepository {
 
     fn activate_rebuild<'a>(
         &'a self,
-        _command: ActivateRebuildCommand,
+        _command: RebuildActivation,
     ) -> BoxFuture<'a, Result<(), IndexError>> {
         Box::pin(async {
             Err(IndexError::new(
@@ -1171,11 +1205,10 @@ impl IndexRepository for TestRepository {
             ))
         })
     }
+}
 
-    fn abort_rebuild<'a>(
-        &'a self,
-        command: AbortRebuildCommand,
-    ) -> BoxFuture<'a, Result<(), IndexError>> {
+impl RebuildAdmin for TestRepository {
+    fn abort_rebuild<'a>(&'a self, command: AbortRebuild) -> BoxFuture<'a, Result<(), IndexError>> {
         let result = {
             let mut state = self.state.lock().expect("test repository lock is healthy");
             TestRepository::check_scope(&state, &command.scope).map(|()| {
@@ -1193,26 +1226,26 @@ impl IndexRepository for TestRepository {
 
     fn cleanup_generation<'a>(
         &'a self,
-        _command: CleanupGenerationCommand,
-    ) -> BoxFuture<'a, Result<CleanupGenerationOutcome, IndexError>> {
-        Box::pin(async { Ok(CleanupGenerationOutcome::AlreadyAbsent) })
+        _command: CleanupGeneration,
+    ) -> BoxFuture<'a, Result<CleanupOutcome, IndexError>> {
+        Box::pin(async { Ok(CleanupOutcome::AlreadyAbsent) })
     }
 }
 
 fn worker(
     source: TestSource,
     repository: TestRepository,
-) -> OrderedSyncWorker<TestSource, TestInterpreter, TestRepository> {
-    OrderedSyncWorker::new(
+) -> SyncWorker<TestSource, TestInterpreter, TestRepository> {
+    SyncWorker::new(
         source,
         TestInterpreter,
         repository,
-        OrderedSyncConfig::ethereum_v1(scope(), BlockHeight(1)),
+        SyncConfig::default_v1(scope(), BlockHeight(1)),
     )
 }
 
 fn sync_all(
-    worker: &OrderedSyncWorker<TestSource, TestInterpreter, TestRepository>,
+    worker: &SyncWorker<TestSource, TestInterpreter, TestRepository>,
 ) -> Result<SyncStatus, IndexError> {
     block_on(worker.sync(SyncRequest {
         scope: scope(),
@@ -1296,11 +1329,11 @@ fn observer_reports_each_repository_commit_attempt_with_its_outcome() {
     let source = TestSource::linear(2, None);
     let repository = TestRepository::new();
     repository.fail_after_next_commit();
-    let observer = Arc::new(RecordingSyncObserver::default());
+    let observer = Arc::new(RecordingObserver::default());
     let worker = worker(source, repository).with_observer(observer.clone());
 
     let error = sync_all(&worker).expect_err("the first commit acknowledgement is lost");
-    assert_eq!(error.kind, IndexErrorKind::Storage);
+    assert_eq!(error.kind, IndexErrorKind::Store);
     assert!(error.retryable);
     assert_eq!(
         sync_all(&worker)
@@ -1315,15 +1348,15 @@ fn observer_reports_each_repository_commit_attempt_with_its_outcome() {
     assert_eq!(commits[0].block.height, BlockHeight(1));
     assert_eq!(
         commits[0].outcome,
-        BlockCommitObservationOutcome::Failure {
-            kind: IndexErrorKind::Storage,
+        CommitStatus::Failure {
+            kind: IndexErrorKind::Store,
             retryable: true,
         }
     );
     assert_eq!(commits[1].block.height, BlockHeight(2));
     assert_eq!(
         commits[1].outcome,
-        BlockCommitObservationOutcome::Success(CommitBlockOutcome::Applied)
+        CommitStatus::Success(BlockOutcome::Applied)
     );
 }
 
@@ -1489,7 +1522,7 @@ fn reorg_depths_one_twelve_forty_nine_and_fifty_replay_from_common_ancestor() {
 fn observer_reports_an_exact_reorg_depth_once_per_reconciliation() {
     let source = TestSource::linear(5, None);
     let repository = TestRepository::new();
-    let observer = Arc::new(RecordingSyncObserver::default());
+    let observer = Arc::new(RecordingObserver::default());
     let worker = worker(source.clone(), repository).with_observer(observer.clone());
     sync_all(&worker).expect("the original chain synchronizes");
 
@@ -1550,7 +1583,7 @@ fn observer_reports_beyond_retention_once_with_a_minimum_depth() {
     let tip = 60;
     let source = TestSource::linear(tip, None);
     let repository = TestRepository::new();
-    let observer = Arc::new(RecordingSyncObserver::default());
+    let observer = Arc::new(RecordingObserver::default());
     let worker = worker(source.clone(), repository).with_observer(observer.clone());
     sync_all(&worker).expect("the original chain synchronizes");
 
@@ -1601,10 +1634,10 @@ fn non_retryable_block_error_becomes_a_sticky_halted_status() {
 fn watch_idempotency_is_scoped_and_changed_payload_conflicts() {
     let repository = TestRepository::new();
     let address = CanonicalAddress {
-        chain: ChainId("ethereum".to_owned()),
+        scope: scope(),
         value: "0xabc".to_owned(),
     };
-    let command = RegisterWatchCommand {
+    let command = RegisterWatch {
         request: indexing::WatchRequest {
             scope: scope(),
             selector: WatchSelector::Address(address),
@@ -1618,8 +1651,8 @@ fn watch_idempotency_is_scoped_and_changed_payload_conflicts() {
         .expect("first watch registration succeeds");
     let second = block_on(repository.register_watch(command.clone()))
         .expect("identical watch registration is idempotent");
-    assert!(matches!(first, RegisterWatchOutcome::Registered(_)));
-    assert!(matches!(second, RegisterWatchOutcome::Existing(_)));
+    assert!(matches!(first, WatchOutcome::Registered(_)));
+    assert!(matches!(second, WatchOutcome::Existing(_)));
 
     let mut changed = command;
     changed.request.start_height = BlockHeight(4);

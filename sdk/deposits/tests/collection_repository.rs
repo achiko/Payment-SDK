@@ -1,26 +1,23 @@
-use chain_identity::{AssetId, AtomicAmount, CanonicalAddress, CanonicalTransactionId, ChainId};
+use base::Decimal;
 use deposits::{
-    AcceptCollectionBroadcast, AttachCollectionWatch, CollectionAllocation, CollectionId,
-    CollectionLegId, CollectionLegKind, CollectionLegReference, CollectionLegState, CollectionMode,
-    CollectionPageRequest, CollectionReservationState, CollectionState, CollectionStore,
-    CollectionTransitionGuard, ConfirmCollectionLeg, CreateCollection, CreateCollectionLeg,
-    CreateCollectionOutcome, DepositErrorKind, DepositId, FailCollectionLeg, JobId,
-    PersistentPaymentRepository, PolicyIdentity, RecordSignedCollectionLeg,
-    ReleaseCollectionReservation, ReorgCollectionLeg, ReservationReleaseReason,
-    SafeCollectionError, SignedEnvelopeBytes, UserId,
+    AcceptBroadcast, AttachWatch, CollectionAllocation, CollectionCreator, CollectionError,
+    CollectionHistory, CollectionId, CollectionLegKind, CollectionLegState, CollectionMode,
+    CollectionPlan, CollectionQuery, CollectionReservationState, CollectionRetry, CollectionState,
+    ConfirmLeg, CreateCollectionOutcome, CreateLeg, DepositErrorKind, DepositId, FailLeg, JobId,
+    LegId, LegOutcome, LegRef, PaymentStore, PolicyIdentity, RecordSignature, ReleaseReservation,
+    ReorgLeg, ReservationReleaseReason, SignedBytes, SubmissionWriter, TransitionGuard, UserId,
 };
 use indexing::WatchId;
-use storage_rocksdb::RocksDbStorage;
+use indexing::{AssetId, CanonicalAddress, ChainId, TransactionRef};
+use storage_rocksdb::RocksDb;
 use tempfile::TempDir;
 
-fn amount(value: u64) -> AtomicAmount {
-    let mut bytes = [0; 32];
-    bytes[24..].copy_from_slice(&value.to_be_bytes());
-    AtomicAmount(bytes)
+fn amount(value: u64) -> Decimal {
+    Decimal::from(value)
 }
 
 fn chain() -> ChainId {
-    ChainId("ethereum".to_owned())
+    ChainId("chain-a".to_owned())
 }
 
 fn asset() -> AssetId {
@@ -30,8 +27,8 @@ fn asset() -> AssetId {
     }
 }
 
-fn create_collection(collection_id: &str, job_id: &str, deposit_id: &str) -> CreateCollection {
-    CreateCollection {
+fn create_collection(collection_id: &str, job_id: &str, deposit_id: &str) -> CollectionPlan {
+    CollectionPlan {
         id: CollectionId(collection_id.to_owned()),
         job_id: JobId(job_id.to_owned()),
         user_id: UserId("user-1".to_owned()),
@@ -39,7 +36,10 @@ fn create_collection(collection_id: &str, job_id: &str, deposit_id: &str) -> Cre
         mode: CollectionMode::AccountTransfer,
         asset: asset(),
         destination: CanonicalAddress {
-            chain: chain(),
+            scope: indexing::IndexScope {
+                chain: chain(),
+                network: "test".to_owned(),
+            },
             value: "0x2222222222222222222222222222222222222222".to_owned(),
         },
         policy: PolicyIdentity {
@@ -47,8 +47,8 @@ fn create_collection(collection_id: &str, job_id: &str, deposit_id: &str) -> Cre
             digest: [7; 32],
         },
         reservation_amount: amount(100),
-        legs: vec![CreateCollectionLeg {
-            id: CollectionLegId("sweep".to_owned()),
+        legs: vec![CreateLeg {
+            id: LegId("sweep".to_owned()),
             kind: CollectionLegKind::Sweep,
             planned_amount: None,
         }],
@@ -56,22 +56,25 @@ fn create_collection(collection_id: &str, job_id: &str, deposit_id: &str) -> Cre
     }
 }
 
-fn transaction(value: &str) -> CanonicalTransactionId {
-    CanonicalTransactionId {
-        chain: chain(),
+fn transaction(value: &str) -> TransactionRef {
+    TransactionRef {
+        scope: indexing::IndexScope {
+            chain: chain(),
+            network: "test".to_owned(),
+        },
         value: value.to_owned(),
     }
 }
 
-fn guard(collection: &deposits::Collection, position: usize) -> CollectionTransitionGuard {
-    CollectionTransitionGuard {
+fn guard(collection: &deposits::Collection, position: usize) -> TransitionGuard {
+    TransitionGuard {
         collection_state: collection.state,
         leg_state: collection.legs[position].state.clone(),
     }
 }
 
-fn safe_error(code: &str) -> SafeCollectionError {
-    SafeCollectionError {
+fn safe_error(code: &str) -> CollectionError {
+    CollectionError {
         code: code.to_owned(),
         message: "safe diagnostic".to_owned(),
         retryable: true,
@@ -79,9 +82,9 @@ fn safe_error(code: &str) -> SafeCollectionError {
 }
 
 async fn create_and_broadcast(
-    repository: &PersistentPaymentRepository<RocksDbStorage>,
-    command: CreateCollection,
-    transaction_id: CanonicalTransactionId,
+    repository: &PaymentStore<RocksDb>,
+    command: CollectionPlan,
+    transaction_id: TransactionRef,
 ) -> Result<deposits::Collection, Box<dyn std::error::Error>> {
     let created = repository
         .create_or_replay_collection(command)
@@ -89,19 +92,20 @@ async fn create_and_broadcast(
         .collection()
         .clone();
     let signed = repository
-        .record_signed(RecordSignedCollectionLeg {
+        .record_signed(RecordSignature {
             collection_id: created.id.clone(),
             leg_id: created.legs[0].id.clone(),
             expected: guard(&created, 0),
             expected_transaction_id: transaction_id.clone(),
-            envelope: SignedEnvelopeBytes::new(vec![1, 2, 3, 4])?,
+            envelope: SignedBytes::new(vec![1, 2, 3, 4])?,
             allocations: Vec::new(),
+            fee_limit: Some(amount(10)),
             signed_at: 110,
             expires_at: 1_000,
         })
         .await?;
     let broadcast = repository
-        .accept_broadcast(AcceptCollectionBroadcast {
+        .accept_broadcast(AcceptBroadcast {
             collection_id: signed.id.clone(),
             leg_id: signed.legs[0].id.clone(),
             expected: guard(&signed, 0),
@@ -113,11 +117,11 @@ async fn create_and_broadcast(
 }
 
 async fn attach_watch(
-    repository: &PersistentPaymentRepository<RocksDbStorage>,
+    repository: &PaymentStore<RocksDb>,
     collection: deposits::Collection,
 ) -> Result<deposits::Collection, Box<dyn std::error::Error>> {
     Ok(repository
-        .attach_watch(AttachCollectionWatch {
+        .attach_watch(AttachWatch {
             collection_id: collection.id.clone(),
             leg_id: collection.legs[0].id.clone(),
             expected: guard(&collection, 0),
@@ -142,7 +146,7 @@ fn allocation(deposit_id: &DepositId) -> CollectionAllocation {
 async fn create_replays_exactly_rejects_conflicts_and_reserves_deposit_asset()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
     let command = create_collection("collection-1", "job-1", "deposit-1");
 
     let created = repository
@@ -173,38 +177,39 @@ async fn create_replays_exactly_rejects_conflicts_and_reserves_deposit_asset()
 }
 
 #[tokio::test]
-async fn signed_envelope_and_transaction_attribution_survive_restart_before_broadcast()
+async fn signed_envelope_and_transaction_attribution_survive_restart_and_broadcast()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
     let command = create_collection("collection-restart", "job-restart", "deposit-restart");
     let tx = transaction("0xaaa");
     let signed;
     {
-        let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+        let repository = PaymentStore::new(RocksDb::open(directory.path())?);
         let created = repository
             .create_or_replay_collection(command)
             .await?
             .collection()
             .clone();
         signed = repository
-            .record_signed(RecordSignedCollectionLeg {
+            .record_signed(RecordSignature {
                 collection_id: created.id.clone(),
                 leg_id: created.legs[0].id.clone(),
                 expected: guard(&created, 0),
                 expected_transaction_id: tx.clone(),
-                envelope: SignedEnvelopeBytes::new(vec![9, 8, 7])?,
+                envelope: SignedBytes::new(vec![9, 8, 7])?,
                 allocations: Vec::new(),
+                fee_limit: Some(amount(10)),
                 signed_at: 110,
                 expires_at: 1_000,
             })
             .await?;
     }
 
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
     let page = repository
         .collections_for_deposit(
             &DepositId("deposit-restart".to_owned()),
-            CollectionPageRequest {
+            CollectionQuery {
                 after: None,
                 limit: 10,
             },
@@ -220,14 +225,14 @@ async fn signed_envelope_and_transaction_attribution_survive_restart_before_broa
     assert_eq!(envelope.expected_transaction_id, tx);
     assert_eq!(
         repository.leg_for_transaction(&tx).await?,
-        Some(CollectionLegReference {
+        Some(LegRef {
             collection_id: signed.id.clone(),
             leg_id: signed.legs[0].id.clone(),
         })
     );
 
     let mismatch = repository
-        .accept_broadcast(AcceptCollectionBroadcast {
+        .accept_broadcast(AcceptBroadcast {
             collection_id: signed.id.clone(),
             leg_id: signed.legs[0].id.clone(),
             expected: guard(&signed, 0),
@@ -245,7 +250,7 @@ async fn signed_envelope_and_transaction_attribution_survive_restart_before_broa
     );
 
     let broadcast = repository
-        .accept_broadcast(AcceptCollectionBroadcast {
+        .accept_broadcast(AcceptBroadcast {
             collection_id: signed.id.clone(),
             leg_id: signed.legs[0].id.clone(),
             expected: guard(&signed, 0),
@@ -261,11 +266,11 @@ async fn signed_envelope_and_transaction_attribution_survive_restart_before_broa
         repository
             .signed_envelope(&signed.id, &signed.legs[0].id)
             .await?
-            .is_none()
+            .is_some()
     );
     assert_eq!(
         repository.leg_for_transaction(&tx).await?,
-        Some(CollectionLegReference {
+        Some(LegRef {
             collection_id: signed.id,
             leg_id: signed.legs[0].id.clone(),
         })
@@ -277,7 +282,7 @@ async fn signed_envelope_and_transaction_attribution_survive_restart_before_broa
 async fn optimistic_state_and_confirmation_attribution_are_enforced()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
     let command = create_collection("collection-confirm", "job-confirm", "deposit-confirm");
     let created = repository
         .create_or_replay_collection(command)
@@ -286,20 +291,21 @@ async fn optimistic_state_and_confirmation_attribution_are_enforced()
         .clone();
     let tx = transaction("0xccc");
     let signed = repository
-        .record_signed(RecordSignedCollectionLeg {
+        .record_signed(RecordSignature {
             collection_id: created.id.clone(),
             leg_id: created.legs[0].id.clone(),
             expected: guard(&created, 0),
             expected_transaction_id: tx.clone(),
-            envelope: SignedEnvelopeBytes::new(vec![4, 5, 6])?,
+            envelope: SignedBytes::new(vec![4, 5, 6])?,
             allocations: Vec::new(),
+            fee_limit: Some(amount(10)),
             signed_at: 110,
             expires_at: 1_000,
         })
         .await?;
 
     let stale = repository
-        .accept_broadcast(AcceptCollectionBroadcast {
+        .accept_broadcast(AcceptBroadcast {
             collection_id: signed.id.clone(),
             leg_id: signed.legs[0].id.clone(),
             expected: guard(&created, 0),
@@ -311,7 +317,7 @@ async fn optimistic_state_and_confirmation_attribution_are_enforced()
     assert_eq!(stale.kind, DepositErrorKind::Conflict);
 
     let broadcast = repository
-        .accept_broadcast(AcceptCollectionBroadcast {
+        .accept_broadcast(AcceptBroadcast {
             collection_id: signed.id.clone(),
             leg_id: signed.legs[0].id.clone(),
             expected: guard(&signed, 0),
@@ -320,9 +326,9 @@ async fn optimistic_state_and_confirmation_attribution_are_enforced()
         })
         .await?;
     let watched = attach_watch(&repository, broadcast).await?;
-    let attribution = allocation(&watched.deposit_id);
+    let attribution = allocation(watched.deposit_id());
     let confirmed = repository
-        .confirm_leg(ConfirmCollectionLeg {
+        .confirm_leg(ConfirmLeg {
             collection_id: watched.id.clone(),
             leg_id: watched.legs[0].id.clone(),
             expected: guard(&watched, 0),
@@ -334,7 +340,7 @@ async fn optimistic_state_and_confirmation_attribution_are_enforced()
     assert_eq!(confirmed.state, CollectionState::Completed);
     assert_eq!(confirmed.legs[0].allocation, Some(attribution));
     assert!(matches!(
-        confirmed.reservation.state,
+        confirmed.reservation().state,
         CollectionReservationState::Consumed { .. }
     ));
     Ok(())
@@ -344,7 +350,7 @@ async fn optimistic_state_and_confirmation_attribution_are_enforced()
 async fn failure_and_reorg_keep_reservations_until_explicit_release()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = TempDir::new()?;
-    let repository = PersistentPaymentRepository::new(RocksDbStorage::open(directory.path())?);
+    let repository = PaymentStore::new(RocksDb::open(directory.path())?);
 
     let failed_broadcast = create_and_broadcast(
         &repository,
@@ -353,7 +359,7 @@ async fn failure_and_reorg_keep_reservations_until_explicit_release()
     )
     .await?;
     let failed = repository
-        .fail_leg(FailCollectionLeg {
+        .fail_leg(FailLeg {
             collection_id: failed_broadcast.id.clone(),
             leg_id: failed_broadcast.legs[0].id.clone(),
             expected: guard(&failed_broadcast, 0),
@@ -363,7 +369,10 @@ async fn failure_and_reorg_keep_reservations_until_explicit_release()
         })
         .await?;
     assert_eq!(failed.state, CollectionState::Failed);
-    assert_eq!(failed.reservation.state, CollectionReservationState::Active);
+    assert_eq!(
+        failed.reservation().state,
+        CollectionReservationState::Active
+    );
     let blocked = repository
         .create_or_replay_collection(create_collection(
             "collection-blocked",
@@ -374,7 +383,7 @@ async fn failure_and_reorg_keep_reservations_until_explicit_release()
         .expect_err("terminal failure must retain the reservation until explicit release");
     assert_eq!(blocked.kind, DepositErrorKind::Conflict);
     let released = repository
-        .release_reservation(ReleaseCollectionReservation {
+        .release_reservation(ReleaseReservation {
             collection_id: failed.id.clone(),
             expected_collection_state: CollectionState::Failed,
             expected_reservation_state: CollectionReservationState::Active,
@@ -383,7 +392,7 @@ async fn failure_and_reorg_keep_reservations_until_explicit_release()
         })
         .await?;
     assert!(matches!(
-        released.reservation.state,
+        released.reservation().state,
         CollectionReservationState::Released { .. }
     ));
     repository
@@ -403,17 +412,17 @@ async fn failure_and_reorg_keep_reservations_until_explicit_release()
     .await?;
     let watched = attach_watch(&repository, reorg_broadcast).await?;
     let confirmed = repository
-        .confirm_leg(ConfirmCollectionLeg {
+        .confirm_leg(ConfirmLeg {
             collection_id: watched.id.clone(),
             leg_id: watched.legs[0].id.clone(),
             expected: guard(&watched, 0),
             transaction_id: reorg_tx.clone(),
-            allocation: Some(allocation(&watched.deposit_id)),
+            allocation: Some(allocation(watched.deposit_id())),
             confirmed_at: 140,
         })
         .await?;
     let reorged = repository
-        .reorg_leg(ReorgCollectionLeg {
+        .reorg_leg(ReorgLeg {
             collection_id: confirmed.id.clone(),
             leg_id: confirmed.legs[0].id.clone(),
             expected: guard(&confirmed, 0),
@@ -424,7 +433,7 @@ async fn failure_and_reorg_keep_reservations_until_explicit_release()
         .await?;
     assert_eq!(reorged.state, CollectionState::Reorged);
     assert_eq!(
-        reorged.reservation.state,
+        reorged.reservation().state,
         CollectionReservationState::Active
     );
     assert!(matches!(
@@ -433,13 +442,13 @@ async fn failure_and_reorg_keep_reservations_until_explicit_release()
     ));
     assert_eq!(
         repository.leg_for_transaction(&reorg_tx).await?,
-        Some(CollectionLegReference {
+        Some(LegRef {
             collection_id: reorged.id.clone(),
             leg_id: reorged.legs[0].id.clone(),
         })
     );
     let released = repository
-        .release_reservation(ReleaseCollectionReservation {
+        .release_reservation(ReleaseReservation {
             collection_id: reorged.id,
             expected_collection_state: CollectionState::Reorged,
             expected_reservation_state: CollectionReservationState::Active,
@@ -448,7 +457,7 @@ async fn failure_and_reorg_keep_reservations_until_explicit_release()
         })
         .await?;
     assert!(matches!(
-        released.reservation.state,
+        released.reservation().state,
         CollectionReservationState::Released {
             reason: ReservationReleaseReason::Reorg,
             ..

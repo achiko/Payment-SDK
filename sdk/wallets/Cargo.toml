@@ -1,0 +1,19 @@
+[package]
+name = "wallets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base = { path = "../chains/base" }
+crypto = { path = "../../packages/crypto" }
+indexing = { path = "../indexing" }
+hex.workspace = true
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+futures-executor.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
