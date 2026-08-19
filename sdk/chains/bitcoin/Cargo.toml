@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 base = { path = "../base" }
+base64 = "0.22"
 crypto = { path = "../../../packages/crypto" }
 wallets = { path = "../../wallets" }
 bitcoin.workspace = true

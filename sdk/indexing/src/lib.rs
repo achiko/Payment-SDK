@@ -5,6 +5,7 @@ mod composer;
 mod error;
 mod indexer;
 mod observation;
+mod observer;
 mod output;
 mod service;
 mod source;
@@ -13,7 +14,7 @@ mod synchronizer;
 mod synchronizer_test;
 mod value;
 
-pub use base::{BlockHash, BlockHeight, BlockRef};
+pub use base::{BlockHash, BlockHeight, BlockRef, Decimal};
 pub use block::{BlockAddition, BlockOutcome, BlockSelector, Blocks, InterpretedBlock};
 pub use composer::Composer;
 pub use error::{IndexError, IndexErrorKind, SourceError};
@@ -23,6 +24,7 @@ pub use observation::{
     HistoryQuery, MovementId, MovementKind, NetworkFee, ObservationDraft, ObservationDraftStatus,
     ObservedTransaction, TransactionPage, TransactionStatus, Transactions, ValueMovement,
 };
+pub use observer::{BlockObservation, Observer};
 pub use output::{
     IndexedOutput, OutputChanges, OutputCursor, OutputId, OutputKey, OutputPage, OutputRequest,
     Outputs,

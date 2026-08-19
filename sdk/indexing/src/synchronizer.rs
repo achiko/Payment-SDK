@@ -1,11 +1,15 @@
 use std::{
     collections::BTreeSet,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::{
-    AddressFilter, BlockAddition, BlockHeight, BlockInterpreter, BlockRef, BlockSelector,
-    BlockSource, Blocks, IndexError, IndexErrorKind, IndexedBlock, SyncPhase, SyncStatus,
+    AddressFilter, BlockAddition, BlockHeight, BlockInterpreter, BlockObservation, BlockOutcome,
+    BlockRef, BlockSelector, BlockSource, Blocks, IndexError, IndexErrorKind, IndexedBlock,
+    Observer, SyncPhase, SyncStatus,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +72,7 @@ pub(crate) struct Synchronizer<S, I, R> {
     repository: R,
     config: SyncConfig,
     running: AtomicBool,
+    observer: Option<Arc<dyn Observer>>,
 }
 
 impl<S, I, R> Synchronizer<S, I, R> {
@@ -79,7 +84,13 @@ impl<S, I, R> Synchronizer<S, I, R> {
             repository,
             config,
             running: AtomicBool::new(false),
+            observer: None,
         }
+    }
+
+    /// Notifies `observer` after each block this synchronizer commits.
+    pub(crate) fn observe(&mut self, observer: Arc<dyn Observer>) {
+        self.observer = Some(observer);
     }
 }
 
@@ -238,14 +249,30 @@ where
                 true,
             ));
         }
-        self.repository
-            .add(BlockAddition::new(
-                self.config.scope.clone(),
-                checkpoint,
-                self.config.reorg_retention,
-                interpreted,
-            )?)
-            .await?;
+        let addition = BlockAddition::new(
+            self.config.scope.clone(),
+            checkpoint,
+            self.config.reorg_retention,
+            interpreted,
+        )?;
+        // Storage consumes the addition, so keep the facts an observer needs —
+        // but only when one is actually listening.
+        let observed = self
+            .observer
+            .as_ref()
+            .map(|_| addition.transactions().to_vec());
+        let outcome = self.repository.add(addition).await?;
+        if outcome == BlockOutcome::Applied
+            && let (Some(observer), Some(transactions)) = (&self.observer, observed)
+        {
+            observer
+                .observed(BlockObservation {
+                    scope: self.config.scope.clone(),
+                    block: block.clone(),
+                    transactions,
+                })
+                .await;
+        }
         Ok(block)
     }
 

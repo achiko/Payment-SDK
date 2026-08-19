@@ -1,0 +1,13 @@
+[package]
+name = "indexing-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+indexing = { path = ".." }
+tokio = { workspace = true, features = ["sync", "time"] }
+
+
+[lints]
+workspace = true

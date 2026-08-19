@@ -2,9 +2,11 @@
 
 mod interpreter;
 mod model;
+mod settings;
 mod source;
 
 pub use interpreter::BlockInterpreter;
+pub use settings::{IndexerSettings, Network};
 pub use source::{BlockClient, SourceConfig};
 
 /// Standard chain-owned block source name used by embedded indexer composition.

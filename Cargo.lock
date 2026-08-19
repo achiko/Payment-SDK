@@ -1086,6 +1086,7 @@ name = "chain-bitcoin"
 version = "0.1.0"
 dependencies = [
  "base",
+ "base64",
  "bitcoin",
  "crypto",
  "futures-executor",
@@ -2219,6 +2220,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "indexing-runtime"
+version = "0.1.0"
+dependencies = [
+ "indexing",
+ "tokio",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2798,7 +2807,7 @@ dependencies = [
  "http-body-util",
  "indexing",
  "indexing-rocksdb",
- "json-rpc",
+ "indexing-runtime",
  "reqwest",
  "serde",
  "serde_json",

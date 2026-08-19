@@ -1,4 +1,6 @@
-use crate::{BlockHeight, BlockRef, CanonicalAddress, IndexScope};
+use std::sync::Arc;
+
+use crate::{BlockHeight, BlockRef, CanonicalAddress, IndexScope, Observer};
 
 use crate::{
     BlockInterpreter, BlockSource, Blocks, Checkpoint, History, HistoryQuery, IndexError, Indexer,
@@ -46,6 +48,14 @@ where
             synchronizer: Synchronizer::new(source, interpreter, repository, config),
             index,
         }
+    }
+
+    /// Notifies `observer` after each block this service commits.
+    ///
+    /// Set before synchronization starts; blocks committed earlier are not
+    /// replayed.
+    pub fn observe(&mut self, observer: Arc<dyn Observer>) {
+        self.synchronizer.observe(observer);
     }
 }
 
