@@ -10,7 +10,7 @@ name = "wallet_api"
 path = "tests/wallet_api.rs"
 
 [dependencies]
-axum = "=0.8.4"
+axum = "0.8"
 base = { path = "../../sdk/chains/base" }
 base64 = "=0.22.1"
 chain-bitcoin = { path = "../../sdk/chains/bitcoin" }
@@ -21,7 +21,7 @@ indexing = { path = "../../sdk/indexing" }
 indexing-rocksdb = { path = "../../sdk/indexing/rocksdb" }
 storage-rocksdb = { path = "../../packages/storage/rocksdb" }
 json-rpc = { path = "../../packages/json-rpc" }
-serde = { version = "=1.0.219", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["fs", "net", "process", "rt", "signal", "sync", "time"] }
 utoipa = { version = "=5.5.0", features = ["axum_extras"] }
