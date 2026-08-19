@@ -6,8 +6,7 @@ use crate::Error;
 ///
 /// The protocol-neutral `Address` remains opaque bytes. A concrete wallet
 /// owns the reversible conversion for its configured chain and network.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AddressText {
     pub encoding: AddressEncoding,
     pub text: String,
@@ -23,8 +22,7 @@ impl AddressText {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddressEncoding {
     Base58Check,
     Bech32,

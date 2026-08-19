@@ -1,22 +1,21 @@
-use crate::{BlockHeight, BlockRef, ConfirmationPolicy, IndexScope};
+use crate::{BlockHeight, BlockRef, CanonicalAddress, IndexScope};
 
+use crate::{
+    BlockInterpreter, BlockSource, Blocks, Checkpoint, History, HistoryQuery, IndexError, Indexer,
+    SyncConfig, TransactionPage, Transactions, indexer::Index, synchronizer::Synchronizer,
+};
+
+/// Caller-owned selection of one address and the first block worth inspecting.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SyncRequest {
-    pub scope: IndexScope,
-    /// `None` means follow the source's observed tip.
-    pub through: Option<BlockHeight>,
-    /// Allows a synchronizer to bound one invocation and yield fairly.
-    pub max_blocks: Option<usize>,
+pub struct AddressFilter {
+    pub address: CanonicalAddress,
+    pub start_height: BlockHeight,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncPhase {
-    Starting,
-    Reconciling,
     CatchingUp,
     Ready,
-    Reverting,
-    Halted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,21 +23,77 @@ pub struct SyncStatus {
     pub scope: IndexScope,
     pub checkpoint: Option<BlockRef>,
     pub observed_tip: Option<BlockRef>,
-    pub confirmation_policy: ConfirmationPolicy,
     pub phase: SyncPhase,
-    pub halted_reason: Option<String>,
 }
 
-impl SyncStatus {
+/// One chain's reusable synchronization and query implementation.
+pub struct Service<S, I, R> {
+    scope: IndexScope,
+    synchronizer: Synchronizer<S, I, R>,
+    index: Index<R>,
+}
+
+impl<S, I, R> Service<S, I, R>
+where
+    R: Clone,
+{
     #[must_use]
-    pub fn starting(scope: IndexScope, confirmation_policy: ConfirmationPolicy) -> Self {
+    pub fn new(source: S, interpreter: I, repository: R, config: SyncConfig) -> Self {
+        let scope = config.scope.clone();
+        let index = Index::new(repository.clone(), config.minimum_confirmations);
         Self {
             scope,
-            checkpoint: None,
-            observed_tip: None,
-            confirmation_policy,
-            phase: SyncPhase::Starting,
-            halted_reason: None,
+            synchronizer: Synchronizer::new(source, interpreter, repository, config),
+            index,
         }
+    }
+}
+
+impl<S, I, R> Checkpoint for Service<S, I, R>
+where
+    S: Send + Sync,
+    I: Send + Sync,
+    R: Blocks,
+{
+    fn checkpoint<'a>(
+        &'a self,
+        scope: &'a IndexScope,
+    ) -> crate::BoxFuture<'a, Result<Option<BlockRef>, IndexError>> {
+        self.index.checkpoint(scope)
+    }
+}
+
+impl<S, I, R> History for Service<S, I, R>
+where
+    S: Send + Sync,
+    I: Send + Sync,
+    R: Transactions,
+{
+    fn history<'a>(
+        &'a self,
+        request: HistoryQuery,
+    ) -> crate::BoxFuture<'a, Result<TransactionPage, IndexError>> {
+        self.index.history(request)
+    }
+}
+
+impl<S, I, R> Indexer for Service<S, I, R>
+where
+    S: BlockSource<Block = I::Block>,
+    I: BlockInterpreter,
+    R: Blocks + Transactions,
+{
+    fn scopes(&self) -> &[IndexScope] {
+        std::slice::from_ref(&self.scope)
+    }
+
+    fn sync<'a>(
+        &'a self,
+        filters: Vec<AddressFilter>,
+    ) -> crate::BoxFuture<'a, Result<Vec<SyncStatus>, IndexError>> {
+        Box::pin(async move {
+            let status = self.synchronizer.sync(filters).await?;
+            Ok(vec![status])
+        })
     }
 }

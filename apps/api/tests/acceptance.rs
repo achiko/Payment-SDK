@@ -24,8 +24,8 @@ async fn configured_wallet_history_survives_restart() -> Result<(), Box<dyn std:
     let bitcoin = BitcoinNode::start().await;
     let ethereum = EthereumNode::start().await;
     let wallets = json!([
-        {"id": "btc-restart", "chain": "bitcoin", "secret_env": "BTC_TEST_SECRET"},
-        {"id": "eth-restart", "chain": "ethereum", "secret_env": "ETH_TEST_SECRET"}
+        {"id": "btc-restart", "chain": "bitcoin", "secret_env": "BTC_TEST_SECRET", "start_height": 1},
+        {"id": "eth-restart", "chain": "ethereum", "secret_env": "ETH_TEST_SECRET", "start_height": 1}
     ]);
     let secrets = [
         ("BTC_TEST_SECRET", hex::encode([3_u8; 32])),
@@ -78,7 +78,8 @@ async fn configured_wallet_history_survives_restart() -> Result<(), Box<dyn std:
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bitcoin_and_ethereum_history_records_reorgs() -> Result<(), Box<dyn std::error::Error>> {
+async fn bitcoin_and_ethereum_history_follow_canonical_reorgs()
+-> Result<(), Box<dyn std::error::Error>> {
     let files = TempDir::new()?;
     let bitcoin = BitcoinNode::start().await;
     let ethereum = EthereumNode::start().await;
@@ -110,8 +111,8 @@ async fn bitcoin_and_ethereum_history_records_reorgs() -> Result<(), Box<dyn std
 
     bitcoin.reorg();
     ethereum.reorg();
-    wait_reorged(&api.root, wallet_id(&btc), &btc_id).await;
-    wait_reorged(&api.root, wallet_id(&eth), &eth_id).await;
+    wait_removed(&api.root, wallet_id(&btc), &btc_id).await;
+    wait_removed(&api.root, wallet_id(&eth), &eth_id).await;
 
     api.stop().await;
     bitcoin.stop().await;
@@ -119,23 +120,22 @@ async fn bitcoin_and_ethereum_history_records_reorgs() -> Result<(), Box<dyn std
     Ok(())
 }
 
-async fn wait_reorged(root: &str, wallet: &str, transaction: &str) {
+async fn wait_removed(root: &str, wallet: &str, transaction: &str) {
     let url = format!("{root}/v1/wallets/{wallet}/transactions?limit=20");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         if get(&url).await.is_some_and(|value| {
             value["transactions"].as_array().is_some_and(|items| {
-                items.iter().any(|item| {
-                    item["transaction_id"]["value"] == transaction
-                        && item["status"]["kind"] == "reorged"
-                })
+                items
+                    .iter()
+                    .all(|item| item["transaction_id"] != transaction)
             })
         }) {
             return;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "wallet history did not mark transaction {transaction} as reorged"
+            "wallet history retained non-canonical transaction {transaction}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

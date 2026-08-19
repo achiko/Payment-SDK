@@ -19,15 +19,10 @@ pub enum IndexErrorKind {
     Store,
     Conflict,
     ScopeMismatch,
-    PolicyMismatch,
     InvalidBlock,
     CannotConnect,
-    ReorgBeyondRetention,
-    RebuildRequired,
-    InvalidWatch,
+    ReorgTooDeep,
     InvalidRequest,
-    Halted,
-    Other,
 }
 
 impl IndexError {

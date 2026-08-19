@@ -4,7 +4,7 @@ use syn::{
     TraitItem, Type, visit::Visit,
 };
 
-use super::{CheckFn, finding};
+use super::{CheckFn, finding, production::test_only};
 use crate::{
     Finding, Policy, Result,
     source::{SourceFile, Workspace},
@@ -168,10 +168,6 @@ impl<'ast> Visit<'ast> for ApiVisitor<'_> {
             syn::visit::visit_item_mod(self, item);
         }
     }
-}
-
-fn test_only(attributes: &[syn::Attribute]) -> bool {
-    attributes.iter().any(|attribute| attribute.path().is_ident("test") || (attribute.path().is_ident("cfg") && matches!(&attribute.meta, syn::Meta::List(list) if list.tokens.to_string().contains("test"))))
 }
 
 fn returns_self(output: &ReturnType) -> bool {

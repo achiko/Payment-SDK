@@ -11,7 +11,7 @@ fn openapi_contains_every_route_method_and_schema() {
         .split_for_parts();
     let (_, public) = OpenApiRouter::new()
         .merge(health::routes())
-        .merge(contract::routes())
+        .merge(openapi::routes())
         .split_for_parts();
     contract.merge(public);
     let document = serde_json::to_value(contract).expect("OpenAPI contract must serialize");
@@ -43,9 +43,7 @@ fn openapi_contains_every_route_method_and_schema() {
         "Fee",
         "Movement",
         "MovementKind",
-        "Proof",
         "Scope",
-        "ScopedId",
         "SendFunds",
         "Status",
         "Submission",
@@ -72,6 +70,25 @@ fn openapi_contains_every_route_method_and_schema() {
     assert_pointer(
         &document,
         "/components/schemas/Transaction/properties/movements/items/$ref",
+    );
+    assert_eq!(
+        document.pointer("/components/schemas/Transaction/properties/transaction_id/type"),
+        Some(&Value::String("string".to_owned())),
+    );
+    assert!(document.pointer("/components/schemas/ScopedId").is_none());
+    assert!(document.pointer("/components/schemas/Proof").is_none());
+    assert!(
+        document["components"]["schemas"]["MovementKind"]["enum"]
+            .as_array()
+            .is_some_and(|variants| {
+                variants
+                    .iter()
+                    .all(|value| value.as_str() != Some("internal_transfer"))
+            })
+    );
+    assert_pointer(
+        &document,
+        "/paths/~1v1~1wallets~1{id}~1transactions/get/responses/409",
     );
 }
 

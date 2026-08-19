@@ -1,7 +1,4 @@
-use indexing::ChainId;
-use indexing::{
-    BlockHash, BlockHeight, BlockRef, IndexedBlock, MovementKind, WatchId, WatchSelector,
-};
+use indexing::{BlockHash, BlockHeight, BlockRef, ChainId, IndexedBlock, MovementKind};
 use serde_json::{Value, json};
 
 use super::*;
@@ -123,25 +120,12 @@ fn ethereum_block(transaction: Value, receipt: Value) -> Block {
     }
 }
 
-fn address_watch(value: &str) -> WatchTarget<WatchSelector> {
-    let value = address(value);
-    let selector = value.canonical(&scope());
-    WatchTarget {
-        id: WatchId("watch-address".to_owned()),
-        scope: scope(),
-        selector: selector.clone(),
-        target: selector,
-        idempotency_key: "address-key".to_owned(),
-        start_height: BlockHeight(1),
-        registered_at: None,
-    }
+fn canonical_address(value: &str) -> CanonicalAddress {
+    address(value).canonical(&scope())
 }
 
-fn inspect(
-    block: &Block,
-    watches: &[WatchTarget<WatchSelector>],
-) -> Result<InterpretedBlock<IndexChanges, IndexUndo>, IndexError> {
-    BlockInterpreter::new(scope())?.inspect(block, watches)
+fn inspect(block: &Block, addresses: &[CanonicalAddress]) -> Result<InterpretedBlock, IndexError> {
+    BlockInterpreter::new(scope())?.inspect(block, addresses)
 }
 
 #[test]
@@ -150,8 +134,11 @@ fn interprets_successful_native_transfer_and_actual_fee() {
         transaction(Some(TO), "0x2a"),
         receipt(true, Some(TO), None, "0x3", Vec::new()),
     );
-    let interpreted = inspect(&block, &[address_watch(TO)]).expect("block must interpret");
-    let draft = interpreted.drafts.first().expect("watched tx must emit");
+    let interpreted = inspect(&block, &[canonical_address(TO)]).expect("block must interpret");
+    let draft = interpreted
+        .transactions
+        .first()
+        .expect("relevant tx must emit");
     assert_eq!(draft.movements.len(), 1);
     assert_eq!(
         draft.movements[0].id(),
@@ -176,9 +163,9 @@ fn sends_contract_creation_value_to_receipt_contract() {
         receipt(true, None, Some(CONTRACT), "0x1", Vec::new()),
     );
     let interpreted =
-        inspect(&block, &[address_watch(CONTRACT)]).expect("contract creation must interpret");
+        inspect(&block, &[canonical_address(CONTRACT)]).expect("contract creation must interpret");
     assert_eq!(
-        interpreted.drafts[0].movements[0].to(),
+        interpreted.transactions[0].movements[0].to(),
         Some(&address(CONTRACT).canonical(&scope()))
     );
 }
@@ -189,14 +176,41 @@ fn failed_receipt_is_fee_only() {
         transaction(Some(TO), "0x2a"),
         receipt(false, Some(TO), None, "0x2", Vec::new()),
     );
-    let interpreted = inspect(&block, &[address_watch(FROM)]).expect("failure must interpret");
-    let draft = &interpreted.drafts[0];
+    let interpreted = inspect(&block, &[canonical_address(FROM)]).expect("failure must interpret");
+    let draft = &interpreted.transactions[0];
     assert!(draft.movements.is_empty());
     assert!(matches!(
         draft.status,
         ObservationDraftStatus::Failed { .. }
     ));
     assert!(draft.fee.is_some());
+}
+
+#[test]
+fn ignores_transactions_unrelated_to_the_address_filter() {
+    let block = ethereum_block(
+        transaction(Some(TO), "0x2a"),
+        receipt(true, Some(TO), None, "0x2", Vec::new()),
+    );
+
+    let interpreted = inspect(&block, &[canonical_address(CONTRACT)])
+        .expect("unrelated transaction must still interpret");
+
+    assert!(interpreted.transactions.is_empty());
+}
+
+#[test]
+fn rejects_an_address_filter_from_another_scope() {
+    let block = ethereum_block(
+        transaction(Some(TO), "0x2a"),
+        receipt(true, Some(TO), None, "0x2", Vec::new()),
+    );
+    let mut foreign = canonical_address(TO);
+    foreign.scope.network = "other".to_owned();
+
+    let error = inspect(&block, &[foreign]).expect_err("foreign scope must be rejected");
+
+    assert_eq!(error.kind, IndexErrorKind::ScopeMismatch);
 }
 
 #[test]
@@ -211,7 +225,7 @@ fn rejects_fee_multiplication_overflow() {
             Vec::new(),
         ),
     );
-    let error = inspect(&block, &[address_watch(FROM)])
+    let error = inspect(&block, &[canonical_address(FROM)])
         .expect_err("overflowing actual fee must fail the block");
     assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
     assert!(error.message.contains("fee exceeds"));
@@ -229,8 +243,8 @@ fn interprets_transfer_mint_and_burn_logs() {
         transaction(Some(TO), "0x0"),
         receipt(true, Some(TO), None, "0x1", logs),
     );
-    let interpreted = inspect(&block, &[address_watch(FROM)]).expect("logs must interpret");
-    let movements = &interpreted.drafts[0].movements;
+    let interpreted = inspect(&block, &[canonical_address(FROM)]).expect("logs must interpret");
+    let movements = &interpreted.transactions[0].movements;
     assert_eq!(movements.len(), 3);
     assert_eq!(movements[0].kind(), MovementKind::Transfer);
     assert_eq!(movements[1].kind(), MovementKind::Mint);
@@ -248,9 +262,9 @@ fn ignores_structurally_malformed_transfer_log() {
         transaction(Some(TO), "0x0"),
         receipt(true, Some(TO), None, "0x1", vec![malformed]),
     );
-    let interpreted = inspect(&block, &[address_watch(FROM)])
+    let interpreted = inspect(&block, &[canonical_address(FROM)])
         .expect("malformed token log must not poison the block");
-    assert!(interpreted.drafts[0].movements.is_empty());
+    assert!(interpreted.transactions[0].movements.is_empty());
 }
 
 #[test]
@@ -260,8 +274,8 @@ fn rejects_receipt_transaction_mismatch() {
         "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
     );
     let block = ethereum_block(transaction(Some(TO), "0x0"), wrong_receipt);
-    let error =
-        inspect(&block, &[address_watch(FROM)]).expect_err("receipt mismatch must fail the block");
+    let error = inspect(&block, &[canonical_address(FROM)])
+        .expect_err("receipt mismatch must fail the block");
     assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
     assert!(error.message.contains("transaction hash"));
 }

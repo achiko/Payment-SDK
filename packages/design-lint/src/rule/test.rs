@@ -169,6 +169,139 @@ fn repository_limits_are_policy_owned() {
 }
 
 #[test]
+fn file_length_ignores_inline_test_module_lines() {
+    let mut source = "fn production() {}\n".repeat(500);
+    source.push_str("#[cfg(test)]\nmod tests {\n");
+    source.push_str(&"    // test-only coverage\n".repeat(997));
+    source.push_str("}\n");
+    let (root, workspace) = fixture(&[
+        ("Cargo.toml", "[package]\nname='sample'\nversion='0.0.0'"),
+        ("src/lib.rs", &source),
+    ]);
+    let policy = Policy {
+        repository: Repository {
+            maximum_rust_lines: 500,
+            ..Repository::default()
+        },
+        ..Policy::default()
+    };
+    assert!(
+        repository::file_length(&workspace, &policy)
+            .unwrap()
+            .is_empty()
+    );
+    clean(root);
+}
+
+#[test]
+fn file_length_counts_production_after_inline_test_module() {
+    let source =
+        "#[cfg(test)]\nmod tests {\n    fn scenario() {}\n}\nfn first() {}\nfn second() {}\n";
+    let (root, workspace) = fixture(&[
+        ("Cargo.toml", "[package]\nname='sample'\nversion='0.0.0'"),
+        ("src/lib.rs", source),
+    ]);
+    let policy = Policy {
+        repository: Repository {
+            maximum_rust_lines: 1,
+            ..Repository::default()
+        },
+        ..Policy::default()
+    };
+    let findings = repository::file_length(&workspace, &policy).unwrap();
+    assert_eq!(findings.len(), 1);
+    assert!(findings[0].message.contains("2 production lines"));
+    clean(root);
+}
+
+#[test]
+fn file_length_ignores_proven_test_only_items() {
+    let source = "fn production() {}\n#[cfg(all(test, unix))]\nfn platform_test() {}\n#[test]\nfn direct_test() {}\n";
+    let (root, workspace) = fixture(&[
+        ("Cargo.toml", "[package]\nname='sample'\nversion='0.0.0'"),
+        ("src/lib.rs", source),
+    ]);
+    let policy = Policy {
+        repository: Repository {
+            maximum_rust_lines: 1,
+            ..Repository::default()
+        },
+        ..Policy::default()
+    };
+    assert!(
+        repository::file_length(&workspace, &policy)
+            .unwrap()
+            .is_empty()
+    );
+    clean(root);
+}
+
+#[test]
+fn file_length_counts_items_that_can_compile_without_tests() {
+    let source = "#[cfg(any(test, feature = \"support\"))]\nfn support() {}\n";
+    let (root, workspace) = fixture(&[
+        ("Cargo.toml", "[package]\nname='sample'\nversion='0.0.0'"),
+        ("src/lib.rs", source),
+    ]);
+    let policy = Policy {
+        repository: Repository {
+            maximum_rust_lines: 1,
+            ..Repository::default()
+        },
+        ..Policy::default()
+    };
+    let findings = repository::file_length(&workspace, &policy).unwrap();
+    assert_eq!(findings.len(), 1);
+    assert!(findings[0].message.contains("2 production lines"));
+    clean(root);
+}
+
+#[test]
+fn file_length_ignores_standalone_test_sources() {
+    let test_source = "fn scenario() {}\n".repeat(20);
+    let (root, workspace) = fixture(&[
+        ("Cargo.toml", "[package]\nname='sample'\nversion='0.0.0'"),
+        ("src/lib.rs", "fn production() {}\n"),
+        ("src/lib_test.rs", &test_source),
+        ("tests/workflow.rs", &test_source),
+    ]);
+    let policy = Policy {
+        repository: Repository {
+            maximum_rust_lines: 1,
+            ..Repository::default()
+        },
+        ..Policy::default()
+    };
+    assert!(
+        repository::file_length(&workspace, &policy)
+            .unwrap()
+            .is_empty()
+    );
+    clean(root);
+}
+
+#[test]
+fn file_length_does_not_treat_cfg_text_as_an_attribute() {
+    let source = "const MARKER: &str = \"#[cfg(test)]\";\nfn production() {}\n";
+    let (root, workspace) = fixture(&[
+        ("Cargo.toml", "[package]\nname='sample'\nversion='0.0.0'"),
+        ("src/lib.rs", source),
+    ]);
+    let policy = Policy {
+        repository: Repository {
+            maximum_rust_lines: 1,
+            ..Repository::default()
+        },
+        ..Policy::default()
+    };
+    assert_eq!(
+        repository::file_length(&workspace, &policy).unwrap().len(),
+        1
+    );
+    clean(root);
+}
+
+#[test]
 fn chain_layout_reports_missing_paths() {
     let (root, workspace) = fixture(&[
         (

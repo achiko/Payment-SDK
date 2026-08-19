@@ -1,6 +1,6 @@
 use crate::{
-    BlockHash, BlockHeight, BlockRef, BoxFuture, IndexError, InterpretedBlock, SourceError,
-    WatchTarget,
+    BlockHash, BlockHeight, BlockRef, BoxFuture, CanonicalAddress, IndexError, InterpretedBlock,
+    SourceError,
 };
 
 /// Gives generic synchronization access to a chain-native block identity.
@@ -26,16 +26,13 @@ pub trait BlockSource: Send + Sync {
     ) -> BoxFuture<'a, Result<Option<BlockHash>, SourceError>>;
 }
 
-/// Converts a chain-native block into relevant, reversible index changes.
+/// Converts a chain-native block into relevant canonical changes.
 pub trait BlockInterpreter: Send + Sync {
     type Block: IndexedBlock;
-    type Target: Clone + Send + Sync + 'static;
-    type Effect: Clone + Send + Sync + 'static;
-    type Undo: Clone + Send + Sync + 'static;
 
     fn inspect(
         &self,
         block: &Self::Block,
-        watches: &[WatchTarget<Self::Target>],
-    ) -> Result<InterpretedBlock<Self::Effect, Self::Undo>, IndexError>;
+        addresses: &[CanonicalAddress],
+    ) -> Result<InterpretedBlock, IndexError>;
 }

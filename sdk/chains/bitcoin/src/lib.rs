@@ -12,7 +12,7 @@ mod wallet;
 pub use address::Address;
 pub use address::Address as BitcoinAddress;
 pub use error::{ChainError, ChainErrorKind};
-pub use indexer::{Block, BlockInterpreter, Blocks, IndexEvent, Outpoint, Source, SourceConfig};
+pub use indexer::{Block, BlockInterpreter, Blocks, Indexer, Outpoint, Source, SourceConfig};
 pub use network::Network;
 pub use rpc::{
     BITCOIN_CORE_MAX_FEE_RATE_SATOSHIS_PER_KVB, Client as RpcClient, CoreConfig, FeeClient, Fees,

@@ -5,7 +5,7 @@ use std::{
 
 use proc_macro2::Span;
 
-use super::{CheckFn, finding};
+use super::{CheckFn, finding, production};
 use crate::{
     Finding, Location, Policy, Result,
     source::{Workspace, slash},
@@ -199,7 +199,7 @@ pub(super) fn file_length(workspace: &Workspace, policy: &Policy) -> Result<Vec<
         .sources
         .iter()
         .filter_map(|source| {
-            let count = source.text.lines().count();
+            let count = production::line_count(source);
             (count > policy.repository.maximum_rust_lines).then(|| {
                 finding(
                     "file-length",
@@ -210,7 +210,7 @@ pub(super) fn file_length(workspace: &Workspace, policy: &Policy) -> Result<Vec<
                         .unwrap_or("source"),
                     source.location(Span::call_site()),
                     format!(
-                        "Rust source contains {count} lines; maximum is {}",
+                        "Rust source contains {count} production lines; maximum is {}",
                         policy.repository.maximum_rust_lines
                     ),
                     "split the file by cohesive domain ownership",

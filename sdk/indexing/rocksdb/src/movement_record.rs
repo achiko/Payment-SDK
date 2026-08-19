@@ -1,99 +1,167 @@
-use indexing::{
-    AssetId, ChainId, IndexError, IndexErrorKind, MovementId, MovementKind, ValueMovement,
-};
+use indexing::{IndexError, MovementId, ValueMovement};
 
-use crate::record::{ChainValue, MovementKindRecord, MovementRecord, ScopedValue};
+use crate::record::{AddressRecord, AssetRecord, MovementRecord, MovementTag};
 
-fn kind_to_record(value: MovementKind) -> MovementKindRecord {
-    match value {
-        MovementKind::Transfer => MovementKindRecord::Transfer,
-        MovementKind::Input => MovementKindRecord::Input,
-        MovementKind::Output => MovementKindRecord::Output,
-        MovementKind::InternalTransfer => MovementKindRecord::InternalTransfer,
-        MovementKind::Mint => MovementKindRecord::Mint,
-        MovementKind::Burn => MovementKindRecord::Burn,
+impl MovementRecord {
+    pub(super) fn from_domain(value: &ValueMovement) -> Self {
+        let (kind, from, to) = match value {
+            ValueMovement::Transfer { from, to, .. } => (
+                MovementTag::Transfer,
+                Some(AddressRecord::from_domain(from)),
+                Some(AddressRecord::from_domain(to)),
+            ),
+            ValueMovement::Input { owner, .. } => (
+                MovementTag::Input,
+                owner.as_ref().map(AddressRecord::from_domain),
+                None,
+            ),
+            ValueMovement::Output { owner, .. } => (
+                MovementTag::Output,
+                None,
+                owner.as_ref().map(AddressRecord::from_domain),
+            ),
+            ValueMovement::Mint { to, .. } => (
+                MovementTag::Mint,
+                None,
+                Some(AddressRecord::from_domain(to)),
+            ),
+            ValueMovement::Burn { from, .. } => (
+                MovementTag::Burn,
+                Some(AddressRecord::from_domain(from)),
+                None,
+            ),
+        };
+        Self {
+            kind,
+            id: value.id().0.clone(),
+            asset: AssetRecord::from_domain(value.asset()),
+            amount: crate::amount_record::encode(value.amount()),
+            from,
+            to,
+        }
+    }
+
+    pub(super) fn into_domain(self) -> Result<ValueMovement, IndexError> {
+        let Self {
+            kind,
+            id,
+            asset,
+            amount,
+            from,
+            to,
+        } = self;
+        let id = MovementId(id);
+        let asset = asset.into_domain();
+        let amount = crate::amount_record::decode(&amount)?;
+        Ok(match (kind, from, to) {
+            (MovementTag::Transfer, Some(from), Some(to)) => ValueMovement::Transfer {
+                id,
+                asset,
+                amount,
+                from: from.into_domain(),
+                to: to.into_domain(),
+            },
+            (MovementTag::Input, owner, None) => ValueMovement::Input {
+                id,
+                asset,
+                amount,
+                owner: owner.map(AddressRecord::into_domain),
+            },
+            (MovementTag::Output, None, owner) => ValueMovement::Output {
+                id,
+                asset,
+                amount,
+                owner: owner.map(AddressRecord::into_domain),
+            },
+            (MovementTag::Mint, None, Some(to)) => ValueMovement::Mint {
+                id,
+                asset,
+                amount,
+                to: to.into_domain(),
+            },
+            (MovementTag::Burn, Some(from), None) => ValueMovement::Burn {
+                id,
+                asset,
+                amount,
+                from: from.into_domain(),
+            },
+            _ => {
+                return Err(crate::Repository::record_error(
+                    "movement record shape is invalid",
+                ));
+            }
+        })
     }
 }
 
-fn kind_from_record(value: MovementKindRecord) -> MovementKind {
-    match value {
-        MovementKindRecord::Transfer => MovementKind::Transfer,
-        MovementKindRecord::Input => MovementKind::Input,
-        MovementKindRecord::Output => MovementKind::Output,
-        MovementKindRecord::InternalTransfer => MovementKind::InternalTransfer,
-        MovementKindRecord::Mint => MovementKind::Mint,
-        MovementKindRecord::Burn => MovementKind::Burn,
-    }
-}
+#[cfg(test)]
+mod tests {
+    use base::Decimal;
+    use indexing::{AssetId, CanonicalAddress, ChainId, IndexScope};
 
-pub(super) fn to_record(value: &ValueMovement) -> MovementRecord {
-    MovementRecord {
-        id: value.id().0.clone(),
-        asset: ChainValue {
-            chain: value.asset().chain.0.clone(),
-            value: value.asset().asset.clone(),
-        },
-        amount: crate::amount_record::encode(value.amount()),
-        from: value.from().map(ScopedValue::from_address),
-        to: value.to().map(ScopedValue::from_address),
-        kind: kind_to_record(value.kind()),
-    }
-}
+    use super::*;
 
-pub(super) fn from_record(value: MovementRecord) -> Result<ValueMovement, IndexError> {
-    let id = MovementId(value.id);
-    let asset = AssetId {
-        chain: ChainId(value.asset.chain),
-        asset: value.asset.value,
-    };
-    let amount = crate::amount_record::decode(&value.amount)?;
-    let from = value.from.map(ScopedValue::into_address);
-    let to = value.to.map(ScopedValue::into_address);
-    let invalid = || {
-        IndexError::new(
-            IndexErrorKind::Store,
-            "stored movement has endpoints incompatible with its kind",
-            false,
-        )
-    };
-    match kind_from_record(value.kind) {
-        MovementKind::Transfer => Ok(ValueMovement::Transfer {
-            id,
-            asset,
-            amount,
-            from: from.ok_or_else(&invalid)?,
-            to: to.ok_or_else(&invalid)?,
-        }),
-        MovementKind::Input => Ok(ValueMovement::Input {
-            id,
-            asset,
-            amount,
-            owner: from,
-        }),
-        MovementKind::Output => Ok(ValueMovement::Output {
-            id,
-            asset,
-            amount,
-            owner: to,
-        }),
-        MovementKind::InternalTransfer => Ok(ValueMovement::InternalTransfer {
-            id,
-            asset,
-            amount,
-            from: from.ok_or_else(&invalid)?,
-            to: to.ok_or_else(&invalid)?,
-        }),
-        MovementKind::Mint => Ok(ValueMovement::Mint {
-            id,
-            asset,
-            amount,
-            to: to.ok_or_else(&invalid)?,
-        }),
-        MovementKind::Burn => Ok(ValueMovement::Burn {
-            id,
-            asset,
-            amount,
-            from: from.ok_or_else(&invalid)?,
-        }),
+    fn address(value: &str) -> CanonicalAddress {
+        CanonicalAddress {
+            scope: IndexScope {
+                chain: ChainId("chain".into()),
+                network: "test".into(),
+            },
+            value: value.into(),
+        }
+    }
+
+    fn asset() -> AssetId {
+        AssetId {
+            chain: ChainId("chain".into()),
+            asset: "native".into(),
+        }
+    }
+
+    #[test]
+    fn every_movement_shape_round_trips() {
+        let amount = Decimal::from(7_u64);
+        let movements = vec![
+            ValueMovement::Transfer {
+                id: MovementId("transfer".into()),
+                asset: asset(),
+                amount: amount.clone(),
+                from: address("from"),
+                to: address("to"),
+            },
+            ValueMovement::Input {
+                id: MovementId("input".into()),
+                asset: asset(),
+                amount: amount.clone(),
+                owner: Some(address("owner")),
+            },
+            ValueMovement::Output {
+                id: MovementId("output".into()),
+                asset: asset(),
+                amount: amount.clone(),
+                owner: None,
+            },
+            ValueMovement::Mint {
+                id: MovementId("mint".into()),
+                asset: asset(),
+                amount: amount.clone(),
+                to: address("to"),
+            },
+            ValueMovement::Burn {
+                id: MovementId("burn".into()),
+                asset: asset(),
+                amount,
+                from: address("from"),
+            },
+        ];
+
+        for movement in movements {
+            assert_eq!(
+                MovementRecord::from_domain(&movement)
+                    .into_domain()
+                    .expect("movement record"),
+                movement
+            );
+        }
     }
 }

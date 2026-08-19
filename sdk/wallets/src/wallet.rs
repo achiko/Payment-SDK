@@ -1,10 +1,9 @@
 use std::{future::Future, pin::Pin};
 
-use base::{Addresser, Broadcaster, Decimal, Signer, TransactionBuilder};
+use base::{Addresser, Broadcaster, Decimal, Signer, TransactionBuilder, TransactionId};
 use indexing::{
-    AssetId, BlockRef, CanonicalAddress, ConfirmationProof, IndexScope, MovementId, MovementKind,
-    ObservationRevision, ObservedTransaction, TransactionPage, TransactionRef, TransactionStatus,
-    ValueMovement,
+    AssetId, BlockRef, CanonicalAddress, HistoryCursor, IndexScope, MovementId, MovementKind,
+    ObservedTransaction, TransactionRef, TransactionStatus, ValueMovement,
 };
 
 use crate::{AddressFormat, Error};
@@ -19,7 +18,7 @@ pub struct Balance {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryRequest {
-    pub after: Option<TransactionRef>,
+    pub after: Option<HistoryCursor>,
     pub limit: usize,
 }
 
@@ -32,8 +31,9 @@ impl HistoryRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct History {
+    pub checkpoint: Option<BlockRef>,
     pub transactions: Vec<HistoryEntry>,
-    pub next: Option<TransactionRef>,
+    pub next: Option<HistoryCursor>,
 }
 
 /// Asset metadata attached to every wallet-facing amount.
@@ -76,25 +76,17 @@ pub struct HistoryFee {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HistoryStatus {
-    Pending,
     Included {
         block: BlockRef,
         confirmations: u64,
     },
     Confirmed {
         block: BlockRef,
-        proof: ConfirmationProof,
+        confirmations: u64,
     },
     Failed {
-        block: Option<BlockRef>,
+        block: BlockRef,
         reason: Option<String>,
-    },
-    Replaced {
-        by: TransactionRef,
-    },
-    Dropped,
-    Reorged {
-        previous_block: BlockRef,
     },
 }
 
@@ -102,19 +94,16 @@ pub enum HistoryStatus {
 pub struct HistoryEntry {
     pub scope: IndexScope,
     pub transaction_id: TransactionRef,
-    pub revision: ObservationRevision,
     pub status: HistoryStatus,
     pub movements: Vec<HistoryMovement>,
     pub fee: Option<HistoryFee>,
-    pub first_seen_at: u64,
-    pub observed_at: u64,
 }
 
 impl History {
     /// Converts exact atomic indexing facts into wallet display units. The
     /// concrete wallet resolves asset precision and trusted display metadata.
     pub fn from_index<F>(
-        page: TransactionPage,
+        page: indexing::TransactionPage,
         expected_scope: &IndexScope,
         asset: F,
     ) -> Result<Self, Error>
@@ -124,7 +113,7 @@ impl History {
         if page
             .next
             .as_ref()
-            .is_some_and(|next| !next.belongs_to(expected_scope))
+            .is_some_and(|next| !next.position.transaction.belongs_to(expected_scope))
         {
             return Err(history_error(
                 "indexed history cursor does not belong to the requested scope",
@@ -136,6 +125,7 @@ impl History {
             .map(|transaction| HistoryEntry::from_index(transaction, expected_scope, &asset))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
+            checkpoint: page.checkpoint,
             transactions,
             next: page.next,
         })
@@ -159,13 +149,6 @@ impl HistoryEntry {
         if !transaction.transaction_id.belongs_to(expected_scope) {
             return Err(history_error(
                 "indexed transaction identity does not belong to its observation scope",
-            ));
-        }
-        if let TransactionStatus::Replaced { by } = &transaction.status
-            && !by.belongs_to(expected_scope)
-        {
-            return Err(history_error(
-                "replacement transaction does not belong to the transaction scope",
             ));
         }
         let scope = transaction.scope;
@@ -198,12 +181,9 @@ impl HistoryEntry {
         Ok(Self {
             scope,
             transaction_id: transaction.transaction_id,
-            revision: transaction.revision,
             status: transaction.status.into(),
             movements,
             fee,
-            first_seen_at: transaction.first_seen_at,
-            observed_at: transaction.observed_at,
         })
     }
 }
@@ -211,7 +191,6 @@ impl HistoryEntry {
 impl From<TransactionStatus> for HistoryStatus {
     fn from(status: TransactionStatus) -> Self {
         match status {
-            TransactionStatus::Pending => Self::Pending,
             TransactionStatus::Included {
                 block,
                 confirmations,
@@ -219,11 +198,14 @@ impl From<TransactionStatus> for HistoryStatus {
                 block,
                 confirmations,
             },
-            TransactionStatus::Confirmed { block, proof } => Self::Confirmed { block, proof },
+            TransactionStatus::Confirmed {
+                block,
+                confirmations,
+            } => Self::Confirmed {
+                block,
+                confirmations,
+            },
             TransactionStatus::Failed { block, reason } => Self::Failed { block, reason },
-            TransactionStatus::Replaced { by } => Self::Replaced { by },
-            TransactionStatus::Dropped => Self::Dropped,
-            TransactionStatus::Reorged { previous_block } => Self::Reorged { previous_block },
         }
     }
 }
@@ -239,13 +221,6 @@ where
     let kind = movement.kind();
     let (id, asset_id, atomic, from, to) = match movement {
         ValueMovement::Transfer {
-            id,
-            asset,
-            amount,
-            from,
-            to,
-        }
-        | ValueMovement::InternalTransfer {
             id,
             asset,
             amount,
@@ -355,6 +330,35 @@ pub trait Wallet:
     + Send
     + Sync
 {
+    /// Builds, signs, and submits one transfer through this wallet's native
+    /// transaction implementation. Inclusion and confirmation remain indexing
+    /// facts rather than RPC results.
+    fn send<'a>(
+        &'a self,
+        destination: crate::AddressText,
+        amount: Decimal,
+    ) -> FutureResult<'a, TransactionId> {
+        Box::pin(async move {
+            if amount <= Decimal::zero() {
+                return Err(Error::new(
+                    crate::ErrorKind::InvalidAmount,
+                    "amount must be positive",
+                ));
+            }
+            let destination = self.parse_address(&destination)?;
+            let mut transaction = self.transaction();
+            transaction.transfer(destination, amount)?;
+            let signed = transaction.prepare().await?;
+            let submitted = self.broadcaster().broadcast(&signed).await?;
+            if submitted.id != *signed.id() {
+                return Err(Error::new(
+                    crate::ErrorKind::Transaction,
+                    "broadcaster returned a different transaction ID",
+                ));
+            }
+            Ok(submitted.id)
+        })
+    }
 }
 
 impl<T> Wallet for T where
@@ -372,8 +376,8 @@ impl<T> Wallet for T where
 #[cfg(test)]
 mod tests {
     use indexing::{
-        CanonicalAddress, ChainId, IndexScope, MovementId, NetworkFee, ObservationRevision,
-        TransactionPage, TransactionRef,
+        BlockHash, BlockHeight, CanonicalAddress, ChainId, HistoryCursor, HistoryPosition,
+        IndexScope, MovementId, NetworkFee, TransactionPage, TransactionRef,
     };
 
     use super::*;
@@ -404,6 +408,15 @@ mod tests {
         }
     }
 
+    fn block(height: u64) -> BlockRef {
+        BlockRef {
+            height: BlockHeight(height),
+            hash: BlockHash(vec![height as u8; 32]),
+            parent_hash: None,
+            timestamp: None,
+        }
+    }
+
     #[test]
     fn converts_each_atomic_asset_with_its_own_precision() {
         let transaction = ObservedTransaction {
@@ -412,8 +425,10 @@ mod tests {
                 scope: scope(),
                 value: "tx".to_owned(),
             },
-            revision: ObservationRevision(3),
-            status: TransactionStatus::Pending,
+            status: TransactionStatus::Included {
+                block: block(7),
+                confirmations: 1,
+            },
             movements: vec![ValueMovement::Transfer {
                 id: MovementId("transfer".to_owned()),
                 asset: AssetId {
@@ -432,16 +447,21 @@ mod tests {
                 amount: Decimal::from(21_000_000_000_000_u64),
                 payer: Some(address("from")),
             }),
-            first_seen_at: 10,
-            observed_at: 11,
         };
 
         let history = History::from_index(
             TransactionPage {
+                checkpoint: Some(block(7)),
                 transactions: vec![transaction],
-                next: Some(TransactionRef {
-                    scope: scope(),
-                    value: "next".to_owned(),
+                next: Some(HistoryCursor {
+                    checkpoint: Some(block(7)),
+                    position: HistoryPosition {
+                        height: BlockHeight(7),
+                        transaction: TransactionRef {
+                            scope: scope(),
+                            value: "next".to_owned(),
+                        },
+                    },
                 }),
             },
             &scope(),
@@ -467,7 +487,10 @@ mod tests {
             "0.000021"
         );
         assert_eq!(
-            history.next.as_ref().map(|next| next.value.as_str()),
+            history
+                .next
+                .as_ref()
+                .map(|next| next.position.transaction.value.as_str()),
             Some("next")
         );
         assert_eq!(history.transactions[0].scope, scope());

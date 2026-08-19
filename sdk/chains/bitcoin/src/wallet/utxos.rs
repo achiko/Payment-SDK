@@ -4,8 +4,8 @@ use std::{
 };
 
 use indexing::{
-    AssetId, CanonicalAddress, ChainId, IndexError, IndexScope, OutputCursor, OutputQuery,
-    OutputRequest, OutputSnapshot, SourceError,
+    AssetId, BlockRef, CanonicalAddress, ChainId, IndexError, IndexScope, OutputCursor,
+    OutputRequest, Outputs, SourceError,
 };
 
 use crate::{Address, Network, Satoshi, TransactionId, UnspentOutput, UtxoSet};
@@ -22,14 +22,14 @@ static NATIVE_ASSET: LazyLock<AssetId> = LazyLock::new(|| AssetId {
 pub struct IndexUtxos {
     scope: IndexScope,
     network: Network,
-    outputs: Arc<dyn OutputQuery>,
+    outputs: Arc<dyn Outputs>,
 }
 
 impl IndexUtxos {
     pub fn new(
         scope: IndexScope,
         network: Network,
-        outputs: Arc<dyn OutputQuery>,
+        outputs: Arc<dyn Outputs>,
     ) -> Result<Self, SourceError> {
         if scope.chain != *CHAIN_ID || scope.network != network.canonical_name() {
             return Err(source_error(
@@ -47,7 +47,7 @@ impl IndexUtxos {
     async fn load(
         &self,
         address: Address,
-        expected: &mut Option<OutputSnapshot>,
+        expected_checkpoint: &mut Option<BlockRef>,
         seen: &mut BTreeSet<([u8; 32], u32)>,
     ) -> Result<Vec<UnspentOutput>, SourceError> {
         let canonical = CanonicalAddress {
@@ -63,7 +63,7 @@ impl IndexUtxos {
         loop {
             let page = self
                 .outputs
-                .outputs(OutputRequest {
+                .list(OutputRequest {
                     scope: self.scope.clone(),
                     address: canonical.clone(),
                     after: after.clone(),
@@ -71,10 +71,10 @@ impl IndexUtxos {
                 })
                 .await
                 .map_err(index_error)?;
-            validate_snapshot(expected, &page.snapshot)?;
-            let checkpoint = page.snapshot.checkpoint.as_ref().ok_or_else(|| {
+            let checkpoint = page.checkpoint.as_ref().ok_or_else(|| {
                 source_error("indexed outputs have no canonical checkpoint", true)
             })?;
+            validate_checkpoint(expected_checkpoint, checkpoint)?;
             for output in page.outputs {
                 if output.address != canonical
                     || output.asset != *NATIVE_ASSET
@@ -132,7 +132,7 @@ impl IndexUtxos {
             let Some(next) = page.next else {
                 break;
             };
-            validate_cursor(after.as_ref(), &next, &page.snapshot)?;
+            validate_cursor(after.as_ref(), &next, &page.checkpoint)?;
             after = Some(next);
         }
         Ok(outputs)
@@ -147,14 +147,13 @@ impl IndexUtxos {
                 false,
             ));
         }
-        let mut snapshot = None;
+        let mut checkpoint = None;
         let mut seen = BTreeSet::new();
         let mut outputs = Vec::new();
         for address in addresses {
-            outputs.extend(self.load(address, &mut snapshot, &mut seen).await?);
+            outputs.extend(self.load(address, &mut checkpoint, &mut seen).await?);
         }
-        let checkpoint = snapshot
-            .and_then(|value| value.checkpoint)
+        let checkpoint = checkpoint
             .ok_or_else(|| source_error("indexed outputs have no canonical checkpoint", true))?;
         Ok(UtxoSet {
             checkpoint,
@@ -163,13 +162,13 @@ impl IndexUtxos {
     }
 }
 
-fn validate_snapshot(
-    expected: &mut Option<OutputSnapshot>,
-    actual: &OutputSnapshot,
+fn validate_checkpoint(
+    expected: &mut Option<BlockRef>,
+    actual: &BlockRef,
 ) -> Result<(), SourceError> {
     match expected {
         Some(expected) if expected != actual => Err(source_error(
-            "indexed output snapshot changed while loading Bitcoin outputs",
+            "indexed output checkpoint changed while loading Bitcoin outputs",
             true,
         )),
         Some(_) => Ok(()),
@@ -183,9 +182,9 @@ fn validate_snapshot(
 fn validate_cursor(
     previous: Option<&OutputCursor>,
     next: &OutputCursor,
-    snapshot: &OutputSnapshot,
+    checkpoint: &Option<BlockRef>,
 ) -> Result<(), SourceError> {
-    if &next.snapshot != snapshot || previous == Some(next) || next.position.is_empty() {
+    if &next.checkpoint != checkpoint || previous == Some(next) || next.position.is_empty() {
         return Err(source_error(
             "indexed output query returned an invalid pagination cursor",
             false,
@@ -220,6 +219,52 @@ mod tests {
     use base::{Decimal, DecimalErrorKind};
 
     use super::*;
+
+    fn checkpoint(height: u64) -> BlockRef {
+        BlockRef {
+            height: indexing::BlockHeight(height),
+            hash: indexing::BlockHash(vec![height as u8]),
+            parent_hash: None,
+            timestamp: None,
+        }
+    }
+
+    #[test]
+    fn output_pages_must_keep_one_checkpoint() {
+        let first = checkpoint(10);
+        let mut expected = None;
+
+        validate_checkpoint(&mut expected, &first).expect("first page establishes checkpoint");
+        validate_checkpoint(&mut expected, &first).expect("same checkpoint remains valid");
+        let error = validate_checkpoint(&mut expected, &checkpoint(11))
+            .expect_err("changed checkpoint must restart the output read");
+
+        assert_eq!(expected, Some(first));
+        assert!(error.retryable);
+        assert!(error.message.contains("checkpoint changed"));
+    }
+
+    #[test]
+    fn output_cursor_must_match_page_checkpoint_and_advance() {
+        let page_checkpoint = Some(checkpoint(10));
+        let cursor = OutputCursor {
+            checkpoint: page_checkpoint.clone(),
+            position: vec![1],
+        };
+        validate_cursor(None, &cursor, &page_checkpoint).expect("advancing cursor must be valid");
+
+        let wrong_checkpoint = OutputCursor {
+            checkpoint: Some(checkpoint(11)),
+            position: vec![1],
+        };
+        assert!(validate_cursor(None, &wrong_checkpoint, &page_checkpoint).is_err());
+        assert!(validate_cursor(Some(&cursor), &cursor, &page_checkpoint).is_err());
+        let empty = OutputCursor {
+            checkpoint: page_checkpoint.clone(),
+            position: Vec::new(),
+        };
+        assert!(validate_cursor(None, &empty, &page_checkpoint).is_err());
+    }
 
     #[test]
     fn indexed_amount_is_already_satoshis() {

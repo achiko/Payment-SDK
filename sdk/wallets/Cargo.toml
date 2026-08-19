@@ -8,8 +8,6 @@ rust-version.workspace = true
 base = { path = "../chains/base" }
 crypto = { path = "../../packages/crypto" }
 indexing = { path = "../indexing" }
-hex.workspace = true
-serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 futures-executor.workspace = true

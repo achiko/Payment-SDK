@@ -6,8 +6,8 @@ use indexing::{IndexError, IndexErrorKind};
 /// Stable storage representation for an exact monetary value.
 ///
 /// Canonical base-10 text is independent of the in-memory big-integer
-/// implementation. The surrounding repository and projection record versions
-/// identify this representation on disk.
+/// implementation. The surrounding private repository record identifies this
+/// representation on disk.
 pub(super) fn encode(value: &Decimal) -> String {
     value.to_string()
 }

@@ -23,7 +23,7 @@ refreshes `lint/errors` while retaining `.gitkeep` files.
 | `empty-struct` | Structs carry meaningful state. |
 | `struct-word-count` | Struct names contain at most two semantic words; trailing version suffixes are ignored. |
 | `self-constructor-static` | Constructor-shaped functions returning `Self` are associated functions, not receiver methods. |
-| `file-length` | Production Rust files stay below the configured physical line limit. |
+| `file-length` | Rust files stay below the configured production-line limit. Parsed `#[cfg(test)]` modules and items, exact `#[test]` items, and standalone test sources do not count. |
 | `forbidden-path` | Deleted architecture does not return. |
 | `empty-directory` | Repository-owned directories contain real source. |
 | `chain-layout` | Concrete chain crates share the configured indexer, RPC, transaction, operations, source, and wallet directory topology; protocol-owned files inside those directories may differ. |

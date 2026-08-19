@@ -4170,9 +4170,7 @@ dependencies = [
  "base",
  "crypto",
  "futures-executor",
- "hex",
  "indexing",
- "serde",
  "serde_json",
 ]
 

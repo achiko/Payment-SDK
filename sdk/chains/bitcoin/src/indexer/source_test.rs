@@ -207,7 +207,7 @@ fn external_prevout_block() -> (Value, Transaction, Transaction, Transaction) {
                 value: Amount::from_sat(25_000),
                 // This historical script is deliberately large. The
                 // source must derive the absence of a canonical address
-                // and discard the script before retaining the block.
+                // and discard the script before returning the parsed block.
                 script_pubkey: ScriptBuf::from_bytes(vec![0x61; 65_536]),
             },
         ],

@@ -1,151 +1,272 @@
 # Public contracts
 
-This document explains how reusable Rust boundaries compose. Exact signatures
-live in source and are authoritative.
+This document describes the reusable Rust boundaries. Current source is
+authoritative for exact lifetimes, generic bounds, and error types.
 
-## Wallet construction
+## Wallet collection
 
-```rust,ignore
-let mut providers = wallets::Providers::new();
-providers.register(bitcoin_key, bitcoin_provider)?;
-providers.register(ethereum_key, ethereum_provider)?;
-
-let wallet: Arc<dyn wallets::Wallet> = providers.generate(&bitcoin_key).await?;
-let imported = providers.create(&ethereum_key, secret).await?;
-
-let mut wallets = wallets::Wallets::new();
-wallets.insert(wallet_id, wallet)?;
-```
-
-`Providers<K>` is a constructor map owned by the application. `K` is an
-application-defined typed key describing a configured chain/network/asset.
-`Provider::create` imports caller-supplied secret material, while its default
-`Provider::generate` uses the OS RNG before delegating to `create`. Neither
-operation exports a secret. `Wallets<K>` separately maps application-owned
-wallet IDs to already-created `Arc<dyn Wallet>` values; request handlers never
-select a concrete provider.
-
-`Wallet` is the intersection of deliberately small capabilities. Important
-ones are:
-
-- `Addresser` and `AddressFormat` for canonical bytes and external text;
-- `BalanceReader` for the current indexed exact balance;
-- `HistoryReader` for complete paginated transaction history;
-- `TransactionFactory` for a chain-native-backed builder and broadcaster;
-- `Signer` for the builder's minimal cryptographic requests.
-
-`Provider` is the separate two-method construction boundary; it is not a
-wallet capability after construction.
-
-Code needing only an address accepts `&dyn Addresser`; code needing history
-accepts `&dyn HistoryReader`. `dyn Wallet` is appropriate only at the API
-facade where the full composed capability is actually required.
-
-Concrete chain and base crates retain approved chain-native transaction and
-minimal signing capabilities. `wallets::Wallet` composes them behind
-`TransactionFactory`, and the API uses that boundary for one ordinary transfer.
-The one-method `Transactions::send(Vec<Transfer>)` capability owns batch
-submission; each `Transfer` carries an already-resolved abstract wallet,
-external destination, and exact amount.
-
-## Sending
-
-For one transfer, the API asks the abstract wallet for a builder, adds one
-destination/amount, prepares the signed chain-native transaction, and submits
-it through the wallet's broadcaster. The response transaction ID must equal the
-ID computed from the signed bytes.
-
-`TransactionFactory` has three operations: create an empty builder, restore a
-builder snapshot, and expose its broadcaster. A snapshot is versioned JSON that
-contains transaction intent only. Restoring through `dyn Wallet` verifies the
-snapshot kind, chain, network, asset, and source-wallet identity, then injects
-that wallet's live signer, RPC adapters, and fee policy. Private keys and RPC
-handles are never serialized. Bitcoin snapshots retain every destination and
-amount in the UTXO transfer set; Ethereum snapshots retain its single native or
-ERC-20 transfer.
-
-A batch is not a loop with identical semantics on every chain:
-
-- Bitcoin groups requested outputs by source wallet, reads every source's UTXOs
-  at one checkpoint, preserves per-source change, signs inputs with their
-  owners, and broadcasts one transaction; and
-- Ethereum prepares consecutive-nonce transactions and broadcasts them in
-  order. A later failure cannot undo the already accepted prefix.
-
-Confirmation is read from indexed history. No sender polls receipts or creates
-a durable payment/collection state machine.
-
-## Indexing consumers
-
-Consumer traits are small:
+`wallets::Wallets<I, F>` is the chain-neutral application surface. `I` is the
+embedding application's wallet identity. `F` is its configured family key,
+such as the public API's `Chain` enum.
 
 ```rust,ignore
-pub trait Checkpoint { /* checkpoint(scope) */ }
-pub trait Watcher { /* watch(request) */ }
-pub trait History { /* transaction(query), history(query) */ }
+let mut wallets = wallets::Wallets::new(checkpoints.clone());
+
+wallets.register(
+    Chain::Bitcoin,
+    bitcoin_scope,
+    bitcoin_provider,
+    bitcoin_sender,
+)?;
+wallets.register(
+    Chain::Ethereum,
+    ethereum_scope,
+    ethereum_provider,
+    ethereum_sender,
+)?;
+
+let imported = wallets
+    .import(id, &Chain::Bitcoin, secret, BlockHeight(birthday))
+    .await?;
+let generated = wallets.generate(other_id, &Chain::Ethereum).await?;
 ```
 
-`Index<R>` is the consumer facade over one repository. Its available traits are
-determined by `R`'s bounds. One instance represents one exact `IndexScope`; the
-application selects the configured instance at its composition boundary.
+Each family registration contains exactly one `IndexScope`, concrete
+`Provider`, and chain batch `Sender`. Duplicate family keys fail during
+composition. A separate provider registry would duplicate that same family map
+and is not part of the target API.
 
-An API wallet generally uses `History` and the output/balance query capability
-provided by its concrete provider. An API handler never opens RocksDB or calls
-a chain interpreter directly.
+`Provider::create` imports secret bytes. Its default `Provider::generate` uses
+the operating-system RNG before delegating to `create`. Both return an abstract
+wallet and never return secret material.
 
-## Indexing producers
+Import requires a birthday. Generation assigns the next block after the
+current checkpoint, or block zero when the scope has no checkpoint. `Wallets`
+stores the abstract instance, public identity/scope/address metadata, and the
+deduplicated `AddressFilter` used for synchronization.
 
-Each chain provides:
+`import` requires exclusive mutable access and is a startup-only operation.
+After imports finish, composition wraps the collection in `Arc`; runtime code
+can generate forward-only wallets but cannot add historical coverage.
+Wallet lookup state uses a standard `RwLock`; operations clone the required
+entry and release the lock before every `.await`.
 
-- a `BlockSource` that reads canonical chain-native blocks from its RPC client;
-- a `BlockInterpreter` that inspects a block against the active watch snapshot;
+The collection owns application operations:
+
+```rust,ignore
+let wallet = wallets.get(&id)?;
+let balance = wallets.balance(&id).await?;
+let page = wallets.history(&id, HistoryRequest::first(100)).await?;
+let id = wallets.send(&id, destination, amount).await?;
+let ids = wallets.send_all(transfers).await?;
+let filters = wallets.filters()?;
+```
+
+Business and HTTP code use these methods without matching on the concrete
+chain. The current registry is in memory. An embedding product that needs
+durable custody loads encrypted secrets, identities, family keys, and
+birthdays from its own trusted store before synchronization.
+
+## Wallet capabilities
+
+`Wallet` composes only capabilities that every constructed wallet actually
+supports:
+
+- `Addresser` and `AddressFormat` for canonical and external address forms;
+- `BalanceReader` for exact balance at an indexed checkpoint;
+- `HistoryReader` for complete checkpoint-bound history;
+- `TransactionFactory` for a chain-backed transaction builder and broadcaster;
   and
-- chain-owned effect/undo values sufficient to update and roll back its
-  projection.
+- `Signer` for the minimal signing request.
 
-`Synchronizer` coordinates source, interpreter, and five semantic persistence
-traits: `CanonicalStore`, `WatchStore`, `BlockStore`, `HistoryStore`, and
-`StatusStore`. Each trait has two cohesive methods.
+Code needing one capability accepts that capability rather than `dyn Wallet`.
+`Provider` is construction and does not become a post-construction wallet
+capability.
 
-`apps/api` opens storage, constructs a
-`sdk/indexing/rocksdb::Repository`, gives a clone to `Synchronizer`, and
-wraps another clone in `Index<R>`. The RocksDB adapter has no runtime or public
-synchronizer handle; task ownership belongs to the application.
+One-wallet sending belongs to the wallet abstraction. It validates the
+destination and exact positive amount, constructs the chain-native-backed
+builder, prepares/signs, broadcasts the exact signed bytes, and verifies the
+returned transaction ID. `Wallets::send` owns lookup and delegates this
+operation.
 
-This concrete construction is written directly in `apps/api/src/main.rs`.
-`payment-api` deliberately exports no runtime, configuration, index handle, or
-storage facade: its library surface is the typed HTTP contract and the
-abstraction-backed `Gateway` state used by handlers.
+A non-empty ordered batch belongs to the registered family's `Sender`:
 
-The concrete construction details differ by chain but remain in `apps/api`
-startup. Routes receive consumer contracts, not repositories or synchronizers.
-The application owns a shutdown channel and task set directly; on shutdown it
-signals and joins every synchronizer, while any fatal task exit terminates the
-process.
+- Bitcoin may fund one transaction from several abstract wallets, creates the
+  requested outputs and per-source change, signs every input with its owner,
+  and returns one submitted ID; and
+- Ethereum prepares consecutive per-source nonces, broadcasts in input order,
+  stops on the first failure, and returns the accepted prefix with the failed
+  index.
 
-The current watch target is a canonical address. There is no transaction
-watch, unwatch, event feed, raw-block archive, backfill/rebuild command, or
-migration API. Reorg correction remains represented by durable observation
-revisions queryable through history.
+All preflight validation occurs before the first external effect. Mixed-family
+batches fail rather than being split. RPC acceptance means submitted; indexed
+history establishes canonical inclusion and confirmation.
+
+## Indexer
+
+A one-chain service and multi-chain composer share one object-safe surface:
+
+```rust,ignore
+pub trait Checkpoint {
+    fn checkpoint(&self, scope: &IndexScope)
+        -> BoxFuture<Result<Option<BlockRef>, IndexError>>;
+}
+
+pub trait History {
+    fn history(&self, query: HistoryQuery)
+        -> BoxFuture<Result<TransactionPage, IndexError>>;
+}
+
+pub trait Indexer: Checkpoint + History {
+    fn scopes(&self) -> &[IndexScope];
+
+    fn sync(&self, filters: Vec<AddressFilter>)
+        -> BoxFuture<Result<Vec<SyncStatus>, IndexError>>;
+}
+```
+
+`Service<S, I, R>` implements `Indexer` for one exact scope. `Composer` requires
+at least one child, rejects duplicate scopes, validates a complete filter
+snapshot, partitions it by scope, routes checkpoint/history calls, and
+synchronizes every child.
+
+Synchronization policy stays concrete and small:
+
+```rust,ignore
+SyncConfig::new(scope, minimum_confirmations, reorg_retention, batch_size)?;
+```
+
+The three numeric inputs must be greater than zero. Confirmation depth is the
+`u64` value itself; it does not need a one-field policy wrapper.
+
+`Wallets` owns the filter snapshot and receives the composed `Checkpoint`
+capability to choose safe runtime birthdays. Indexing owns no address registry
+or watch lifecycle. The sync task repeatedly passes `wallets.filters()` to the
+composed indexer.
+
+Filter addresses are non-empty, unique, and scoped to a configured child.
+Composer validates the whole snapshot before any source I/O; `Wallets` keeps
+the earliest birthday when several wallets have the same canonical address.
+
+`Outputs` is an independent capability. It is injected only into consumers
+that need live UTXOs; it is not a supertrait of `Indexer`.
+
+## Chain indexing contracts
+
+Each chain implements:
+
+- `BlockSource`, wrapping native RPC tip, block-at-height, and canonical hash
+  reads; and
+- `BlockInterpreter`, converting one native block and the active canonical
+  addresses into `InterpretedBlock`.
+
+`InterpretedBlock` contains a `BlockRef`, complete transaction drafts, and
+`OutputChanges`. It contains no storage key, record, journal, or backend type.
+Bitcoin and Ethereum remain free to use different native RPC and transaction
+models.
+
+## Persistence collections
+
+```rust,ignore
+pub trait Blocks {
+    fn get(&self, selector: BlockSelector)
+        -> BoxFuture<Result<Option<BlockRef>, IndexError>>;
+    fn add(&self, addition: BlockAddition)
+        -> BoxFuture<Result<BlockOutcome, IndexError>>;
+    fn remove(&self, scope: IndexScope, expected_tip: BlockRef)
+        -> BoxFuture<Result<Option<BlockRef>, IndexError>>;
+}
+
+pub trait Transactions {
+    fn list(&self, query: HistoryQuery)
+        -> BoxFuture<Result<CanonicalPage, IndexError>>;
+}
+
+pub trait Outputs {
+    fn list(&self, request: OutputRequest)
+        -> BoxFuture<Result<OutputPage, IndexError>>;
+}
+```
+
+`Blocks::add` compares the expected checkpoint and atomically writes canonical
+address history, live output changes, a storage-derived bounded journal entry,
+and the new checkpoint. `Blocks::remove` verifies the current tip and derives
+the entire inverse from that private journal. No caller can author commit or
+rollback state.
+
+`Transactions` and `Outputs` are read projections over that atomic block
+lifecycle. A persistence implementation may use RocksDB, PostgreSQL, or
+another transactional backend, but backend records never cross these
+contracts. Only RocksDB is implemented now.
 
 ## History model
 
-An `ObservedTransaction` contains:
+`CanonicalTransaction` stores:
 
-- scoped transaction identity and monotonically revised observation identity;
-- pending/included/confirmed/failed/replaced/dropped/reorged status;
-- zero or more stable `ValueMovement` values;
-- optional exact network fee; and
-- first-seen and latest-observed ordering fields.
+- scoped transaction identity;
+- included or failed state tied to a canonical `BlockRef`;
+- every stable `ValueMovement`; and
+- optional exact network fee.
 
-UTXO transactions use separate input and output movements. Account chains use
-transfers; tokens use their own asset ID. `wallets::History` resolves trusted
-asset metadata and converts atomic integer facts into exact display decimals.
+The `History` implementation reads canonical transactions and derives
+`ObservedTransaction` confirmation from inclusion height and the page
+checkpoint. `Confirmed` carries the observed depth. The current API neither
+stores confirmation transitions nor claims chain-finality proof.
 
-## HTTP boundary
+Bitcoin inputs and outputs are separate movements, so multi-input and
+multi-output history remains truthful. Transfer, input, output, mint, and burn
+are the current movement variants. Native and token assets have different
+`AssetId` values. Wallet history resolves trusted asset metadata and converts
+exact atomic values into exact display decimals.
 
-`apps/api` maps public JSON DTOs to these in-process contracts. Its resource
-modules group wallet, transaction, health, and OpenAPI-contract handlers;
-Utoipa derives `/openapi.json` from those same routes. No SDK crate depends on
-Axum, public route names, bearer tokens, or HTTP response shapes. `packages/http` supplies
-generic authentication and request-limit mechanics only.
+History and output cursors carry the checkpoint snapshot from their first
+page. A changed checkpoint produces a conflict and requires pagination to
+restart.
+
+## Address coverage contract
+
+All imported wallets and birthdays for an existing scope form one
+authoritative startup set. They are registered before the first sync. A fresh
+scope anchors immediately before the earliest birthday and scans forward; an
+empty scope anchors at the current tip.
+
+A wallet created at runtime starts at `checkpoint + 1`. A historical address
+cannot be added after `Wallets` becomes shared because import is startup-only.
+If the authoritative startup set changes below the persisted checkpoint, the
+embedding application recreates and rescans that scope. Indexing stores no
+filter registry and cannot infer selection drift across restarts.
+
+## Composition contract
+
+The process is assembled directly in `apps/api/src/main.rs`:
+
+1. read and validate configuration;
+2. construct one long-lived RPC client per configured chain;
+3. construct chain sources, interpreters, RocksDB repositories, and services;
+4. combine the services in one concrete `Arc<Composer>`;
+5. clone that object into narrow `Indexer`, `Checkpoint`, and `History` views;
+6. expose the Bitcoin repository separately as `Outputs`, construct `Wallets`,
+   register chain families, and import configured wallets;
+7. start one sync loop with the current wallet filter snapshots;
+8. wait for persisted ready checkpoints before binding HTTP; and
+9. supervise HTTP, sync, fatal exits, cancellation, and graceful shutdown.
+
+There is no process facade or app-local service facade. HTTP state contains the
+abstract wallet collection and readiness state only. Concrete handles and
+chain selection remain in `main`.
+
+## HTTP contract
+
+`apps/api` owns all public wire models, Utoipa schema derivation, extraction,
+authentication, request limits, error/status mapping, and encoding. SDK crates
+know no Axum route or response shape.
+
+Each endpoint-specific input and output struct is declared immediately above
+its handler. A handler performs extraction, one `Wallets` call, mapping, and
+encoding. Catch-all DTO modules are not part of the target structure. A wire
+type is shared only when several endpoints use the exact same contract;
+reusable domain values remain in their SDK owner.
+
+Public routes remain chain-neutral for wallet generation, metadata, balance,
+paginated transactions, one send, and ordered batch send. Health distinguishes
+liveness from index readiness. There is no public indexing command surface.

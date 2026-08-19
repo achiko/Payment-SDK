@@ -1,44 +1,66 @@
 # Payment SDK
 
-This workspace is a design-stage Rust SDK and one executable API for Bitcoin
-and Ethereum wallets. The API embeds indexing synchronizers and RocksDB storage in
-the same process. There are no internal HTTP hops and no separately deployed
-wallet or indexer services.
+Payment-SDK is a design-stage Rust workspace for one Bitcoin/Ethereum wallet
+API process. It composes native chain clients, wallet implementations, embedded
+indexers, and RocksDB persistence in memory. There are no internal HTTP hops or
+separately deployed wallet/indexer services.
 
 The current scope is deliberately small:
 
-- create Bitcoin and Ethereum wallets through one chain-neutral wallet API;
-- watch addresses and index blocks with reorg-safe checkpoints;
-- read wallet balances and complete transaction history; and
-- send one or several transfers through the same wallet abstraction; and
-- compose concrete RPC clients, indexers, storage, and wallet providers once
-  in `apps/api`.
+- generate or import wallets through one chain-neutral `Wallets` collection;
+- index the authoritative wallet address/birthday set with one reusable
+  `Indexer` contract;
+- read exact balances and complete checkpoint-bound transaction history;
+- submit one transfer or a non-empty ordered batch; and
+- survive restarts and retained reorgs without serving orphan history.
 
-Deposit accounting, collections, payment workflows, custody services,
-hardware wallets, remote signers, and service-to-service transports are not in
-the workspace. They may be designed later on top of the wallet and indexing
-contracts, but are not retained as dormant V1/V2 code.
+Deposit accounting, ledgers, collections/sweeps, payment workflows, custody
+services, hardware wallets, raw-block archives, and indexing command APIs are
+not part of the workspace.
 
 ## Workspace
 
 ```text
-apps/api                 one process and composition root
-sdk/chains/base          approved chain-neutral values and small capabilities
-sdk/chains/bitcoin       Bitcoin-native RPC, transactions, wallets, indexing
-sdk/chains/ethereum      Ethereum-native RPC, transactions, wallets, indexing
-sdk/wallets              chain-neutral wallet capabilities and provider map
-sdk/indexing             chain-neutral indexing contracts and synchronizer
-sdk/indexing/rocksdb     indexing repository implementation
+apps/api                 explicit composition root and public HTTP process
+sdk/chains/base          approved chain-neutral values and capabilities
+sdk/chains/bitcoin       Bitcoin RPC, transactions, wallets, and interpretation
+sdk/chains/ethereum      Ethereum RPC, transactions, wallets, and interpretation
+sdk/wallets              wallet families, instances, birthdays, and sending
+sdk/indexing             Indexer, Composer, synchronization, and collections
+sdk/indexing/rocksdb     indexing Blocks/Transactions/Outputs persistence
 packages/*               generic HTTP, JSON-RPC, crypto, and storage mechanics
-apps/api/tests           deterministic composed-binary tests
 ```
 
-Dependencies point inward: `packages/*` are generic, SDK crates implement
-reusable domain behavior, and `apps/api` chooses concrete implementations.
-Concrete chain crates never leak into generic indexing, wallets, or packages.
-They retain chain-native transaction/signing implementations; the wallet/API
-surface exposes one small send capability without inventing one universal
-Bitcoin/Ethereum transaction representation.
+`apps/api/src/main.rs` is deliberately the visible object graph. It creates one
+long-lived RPC client per configured chain, the chain sources/interpreters and
+repositories, one chain index service per scope, a multi-chain `Composer`, and
+one `Wallets` collection. The sync task passes `Wallets::filters()` to the same
+composed indexer used by query consumers. HTTP receives only the wallet
+abstraction and readiness state.
+
+Index persistence is expressed by three nouns: `Blocks` atomically adds and
+removes canonical blocks, `Transactions` lists address-primary history, and
+`Outputs` lists current live UTXOs. The repository stores only checkpoint,
+canonical history, live outputs, and a bounded rollback journal. Address
+filters remain caller-owned.
+
+Dependencies point toward generic contracts. Packages import no SDK/application
+crate; indexing imports no concrete chain or RocksDB record; chain-native
+transaction and RPC semantics stay in each chain crate. After composition,
+business and endpoint code do not branch on Bitcoin or Ethereum.
+
+## Documentation
+
+- [`docs/SYSTEM_REQUIREMENTS.md`](docs/SYSTEM_REQUIREMENTS.md) defines canonical
+  scope and acceptance criteria.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) defines ownership and dependency
+  direction.
+- [`docs/CONTRACTS.md`](docs/CONTRACTS.md) describes reusable Rust boundaries.
+- [`docs/INDEXING.md`](docs/INDEXING.md) defines synchronization and persistence
+  semantics.
+- [`docs/refactoring.md`](docs/refactoring.md) shows the target API, composition,
+  business usage, and refactoring acceptance evidence.
+- [`docs/API.md`](docs/API.md) documents the public HTTP surface.
 
 ## Validation
 
@@ -50,12 +72,9 @@ cargo check --locked --workspace --all-targets
 cargo test --locked --workspace
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo doc --locked --workspace --no-deps
-cargo run --locked -p design-lint -- check .
+cargo run --locked -p design-lint -- --policy lint.toml check .
 git diff --check
 ```
 
-The deterministic tests use loopback RPC doubles. Do not point tests or
-examples at a funded key or live broadcast endpoint.
-
-See [`docs/API.md`](docs/API.md) for the current single-process configuration
-and public wallet routes.
+Tests use loopback RPC doubles and temporary databases. Never point tests or
+examples at a funded key or public broadcast endpoint.

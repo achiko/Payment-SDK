@@ -3,10 +3,9 @@ use std::{collections::BTreeSet, sync::LazyLock};
 use alloy_primitives::U256;
 use base::Decimal;
 use indexing::{
-    AssetId, BlockInterpreter as IndexBlockInterpreter, CanonicalAddress, ChainId, IndexChanges,
-    IndexError, IndexErrorKind, IndexScope, IndexUndo, InterpretedBlock, MovementId, NetworkFee,
-    ObservationDraft, ObservationDraftStatus, TransactionRef, ValueMovement, WatchId,
-    WatchSelector, WatchTarget,
+    AssetId, BlockInterpreter as IndexBlockInterpreter, CanonicalAddress, ChainId, IndexError,
+    IndexErrorKind, IndexScope, InterpretedBlock, MovementId, NetworkFee, ObservationDraft,
+    ObservationDraftStatus, OutputChanges, TransactionRef, ValueMovement,
 };
 use num_bigint::BigUint;
 
@@ -25,6 +24,97 @@ static NATIVE_ASSET: LazyLock<AssetId> = LazyLock::new(|| AssetId {
     chain: (*CHAIN_ID).clone(),
     asset: "native".to_owned(),
 });
+
+struct Movements(Vec<ValueMovement>);
+
+impl Movements {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn successful(
+        transaction: &ParsedTransaction,
+        receipt: &ParsedReceipt,
+        scope: &IndexScope,
+    ) -> Result<Self, IndexError> {
+        let transaction_id = encode_hex(&transaction.hash);
+        let mut movements = Self::new();
+        if !transaction.value.is_zero() {
+            let to = transaction.to.or(receipt.contract_address).ok_or_else(|| {
+                IndexError::new(
+                    IndexErrorKind::InvalidBlock,
+                    "successful value-bearing Ethereum transaction has no recipient",
+                    false,
+                )
+            })?;
+            movements.0.push(ValueMovement::Transfer {
+                id: MovementId(format!("{transaction_id}:value")),
+                asset: (*NATIVE_ASSET).clone(),
+                amount: atomic_decimal(transaction.value),
+                from: transaction.from.canonical(scope),
+                to: to.canonical(scope),
+            });
+        }
+
+        movements.0.extend(
+            receipt
+                .logs
+                .iter()
+                .filter_map(|log| log.movement(&transaction_id, scope)),
+        );
+        Ok(movements)
+    }
+
+    fn into_vec(self) -> Vec<ValueMovement> {
+        self.0
+    }
+}
+
+impl ParsedLog {
+    fn movement(&self, transaction_id: &str, scope: &IndexScope) -> Option<ValueMovement> {
+        let [signature, from, to] = self.topics.as_slice() else {
+            return None;
+        };
+        if *signature != TRANSFER_TOPIC
+            || self.data.len() != 32
+            || from[..12] != [0; 12]
+            || to[..12] != [0; 12]
+        {
+            return None;
+        }
+        let from: [u8; 20] = from[12..].try_into().ok()?;
+        let to: [u8; 20] = to[12..].try_into().ok()?;
+        let amount = U256::from_be_slice(&self.data);
+        let id = MovementId(format!("{transaction_id}:{}", self.log_index));
+        let asset = AssetId {
+            chain: (*CHAIN_ID).clone(),
+            asset: encode_hex(&self.address),
+        };
+        if from == ZERO_ADDRESS {
+            (to != ZERO_ADDRESS).then(|| ValueMovement::Mint {
+                id,
+                asset,
+                amount: atomic_decimal(amount),
+                to: to.canonical(scope),
+            })
+        } else if to == ZERO_ADDRESS {
+            Some(ValueMovement::Burn {
+                id,
+                asset,
+                amount: atomic_decimal(amount),
+                from: from.canonical(scope),
+            })
+        } else {
+            Some(ValueMovement::Transfer {
+                id,
+                asset,
+                amount: atomic_decimal(amount),
+                from: from.canonical(scope),
+                to: to.canonical(scope),
+            })
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockInterpreter {
@@ -55,32 +145,13 @@ impl BlockInterpreter {
         &self.scope
     }
 
-    fn validate_watch(&self, watch: &WatchTarget<WatchSelector>) -> Result<(), IndexError> {
-        if watch.scope != self.scope {
-            return Err(IndexError::new(
-                IndexErrorKind::ScopeMismatch,
-                "Ethereum watch belongs to a different scope",
-                false,
-            ));
-        }
-        if watch.target != watch.selector {
-            return Err(IndexError::new(
-                IndexErrorKind::InvalidWatch,
-                "Ethereum watch target does not match its canonical selector",
-                false,
-            ));
-        }
-        Ok(())
-    }
-
-    fn watch_ids(
+    fn matches_address(
         &self,
         transaction: &ParsedTransaction,
         receipt: &ParsedReceipt,
-        movements: &[ValueMovement],
-        watches: &[WatchTarget<WatchSelector>],
-        height: indexing::BlockHeight,
-    ) -> Result<Vec<WatchId>, IndexError> {
+        movements: &Movements,
+        addresses: &[CanonicalAddress],
+    ) -> Result<bool, IndexError> {
         let mut touched_addresses = BTreeSet::from([transaction.from]);
         if let Some(to) = transaction.to {
             touched_addresses.insert(to);
@@ -88,46 +159,37 @@ impl BlockInterpreter {
         if let Some(contract) = receipt.contract_address {
             touched_addresses.insert(contract);
         }
-        for movement in movements {
+        for movement in &movements.0 {
             for endpoint in [movement.from(), movement.to()].into_iter().flatten() {
                 let bytes = parse_canonical_address(endpoint)?;
                 touched_addresses.insert(bytes);
             }
         }
 
-        let mut ids = BTreeSet::new();
-        for watch in watches {
-            self.validate_watch(watch)?;
-            if !watch.is_active_at(height) {
-                continue;
-            }
-            if !watch.selector.belongs_to(&self.scope) {
+        for address in addresses {
+            if !address.belongs_to(&self.scope) {
                 return Err(IndexError::new(
                     IndexErrorKind::ScopeMismatch,
-                    "Ethereum address watch belongs to a different scope",
+                    "Ethereum address filter belongs to a different scope",
                     false,
                 ));
             }
-            let matched = touched_addresses.contains(&parse_canonical_address(&watch.selector)?);
-            if matched {
-                ids.insert(watch.id.clone());
+            if touched_addresses.contains(&parse_canonical_address(address)?) {
+                return Ok(true);
             }
         }
-        Ok(ids.into_iter().collect())
+        Ok(false)
     }
 }
 
 impl IndexBlockInterpreter for BlockInterpreter {
     type Block = Block;
-    type Target = WatchSelector;
-    type Effect = IndexChanges;
-    type Undo = IndexUndo;
 
     fn inspect(
         &self,
         block: &Self::Block,
-        watches: &[WatchTarget<Self::Target>],
-    ) -> Result<InterpretedBlock<Self::Effect, Self::Undo>, IndexError> {
+        addresses: &[CanonicalAddress],
+    ) -> Result<InterpretedBlock, IndexError> {
         let parsed = ParsedBlock::parse(&block.raw_block, Some(block.reference.height), true)
             .map_err(invalid_block)?;
         if parsed.reference != block.reference {
@@ -139,15 +201,7 @@ impl IndexBlockInterpreter for BlockInterpreter {
         }
         let receipts =
             ParsedReceipt::parse_all(&block.raw_receipts, &parsed).map_err(invalid_block)?;
-        let observed_at = block.reference.timestamp.ok_or_else(|| {
-            IndexError::new(
-                IndexErrorKind::InvalidBlock,
-                "Ethereum block timestamp is unavailable",
-                false,
-            )
-        })?;
-
-        let mut drafts = Vec::new();
+        let mut transactions = Vec::new();
         for (transaction, receipt) in parsed.transactions.iter().zip(&receipts) {
             let fee_amount = receipt
                 .effective_gas_price
@@ -165,23 +219,16 @@ impl IndexBlockInterpreter for BlockInterpreter {
                 payer: Some(transaction.from.canonical(&self.scope)),
             };
             let movements = if receipt.succeeded {
-                successful_movements(transaction, receipt, &self.scope)?
+                Movements::successful(transaction, receipt, &self.scope)?
             } else {
-                Vec::new()
+                Movements::new()
             };
-            let watch_ids = self.watch_ids(
-                transaction,
-                receipt,
-                &movements,
-                watches,
-                block.reference.height,
-            )?;
-            if watch_ids.is_empty() {
+            if !self.matches_address(transaction, receipt, &movements, addresses)? {
                 continue;
             }
 
             let transaction_id = transaction.hash.canonical(&self.scope);
-            drafts.push(ObservationDraft {
+            transactions.push(ObservationDraft {
                 scope: self.scope.clone(),
                 transaction_id,
                 status: if receipt.succeeded {
@@ -191,101 +238,17 @@ impl IndexBlockInterpreter for BlockInterpreter {
                         reason: Some("ethereum receipt status is zero".to_owned()),
                     }
                 },
-                movements,
+                movements: movements.into_vec(),
                 fee: Some(fee),
-                watch_ids,
-                first_seen_at: observed_at,
-                observed_at,
             });
         }
 
         Ok(InterpretedBlock {
             block: block.reference.clone(),
-            drafts,
-            effect: IndexChanges::default(),
-            undo: IndexUndo::default(),
+            transactions,
+            outputs: OutputChanges::default(),
         })
     }
-}
-
-fn successful_movements(
-    transaction: &ParsedTransaction,
-    receipt: &ParsedReceipt,
-    scope: &IndexScope,
-) -> Result<Vec<ValueMovement>, IndexError> {
-    let transaction_id = encode_hex(&transaction.hash);
-    let mut movements = Vec::new();
-    if !transaction.value.is_zero() {
-        let to = transaction.to.or(receipt.contract_address).ok_or_else(|| {
-            IndexError::new(
-                IndexErrorKind::InvalidBlock,
-                "successful value-bearing Ethereum transaction has no recipient",
-                false,
-            )
-        })?;
-        movements.push(ValueMovement::Transfer {
-            id: MovementId(format!("{transaction_id}:value")),
-            asset: (*NATIVE_ASSET).clone(),
-            amount: atomic_decimal(transaction.value),
-            from: transaction.from.canonical(scope),
-            to: to.canonical(scope),
-        });
-    }
-
-    for log in &receipt.logs {
-        if let Some(movement) = transfer_movement(&transaction_id, log, scope) {
-            movements.push(movement);
-        }
-    }
-    Ok(movements)
-}
-
-fn transfer_movement(
-    transaction_id: &str,
-    log: &ParsedLog,
-    scope: &IndexScope,
-) -> Option<ValueMovement> {
-    if log.topics.len() != 3 || log.topics[0] != TRANSFER_TOPIC || log.data.len() != 32 {
-        return None;
-    }
-    let from = topic_address(log.topics[1])?;
-    let to = topic_address(log.topics[2])?;
-    let amount = U256::from_be_slice(&log.data);
-    let id = MovementId(format!("{transaction_id}:{}", log.log_index));
-    let asset = AssetId {
-        chain: (*CHAIN_ID).clone(),
-        asset: encode_hex(&log.address),
-    };
-    if from == ZERO_ADDRESS {
-        (to != ZERO_ADDRESS).then(|| ValueMovement::Mint {
-            id,
-            asset,
-            amount: atomic_decimal(amount),
-            to: to.canonical(scope),
-        })
-    } else if to == ZERO_ADDRESS {
-        Some(ValueMovement::Burn {
-            id,
-            asset,
-            amount: atomic_decimal(amount),
-            from: from.canonical(scope),
-        })
-    } else {
-        Some(ValueMovement::Transfer {
-            id,
-            asset,
-            amount: atomic_decimal(amount),
-            from: from.canonical(scope),
-            to: to.canonical(scope),
-        })
-    }
-}
-
-fn topic_address(topic: [u8; 32]) -> Option<[u8; 20]> {
-    if topic[..12] != [0; 12] {
-        return None;
-    }
-    topic[12..].try_into().ok()
 }
 
 fn parse_canonical_address(address: &CanonicalAddress) -> Result<[u8; 20], IndexError> {

@@ -1,9 +1,9 @@
-use axum::http::StatusCode;
+use axum::{extract::State, http::StatusCode};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-use crate::Gateway;
+use super::State as HttpState;
 
-pub fn routes() -> OpenApiRouter<Gateway> {
+pub fn routes() -> OpenApiRouter<HttpState> {
     OpenApiRouter::new()
         .routes(routes!(live))
         .routes(routes!(ready))
@@ -22,10 +22,16 @@ async fn live() -> StatusCode {
 #[utoipa::path(
     get,
     path = "/health/ready",
-    responses((status = 204, description = "Wallets and indexes are ready")),
+    responses(
+        (status = 204, description = "Wallets and indexes are ready"),
+        (status = 503, description = "Wallets or indexes are not ready")
+    ),
     tag = "health"
 )]
-async fn ready() -> StatusCode {
-    // Runtime construction waits for every configured index before binding.
-    StatusCode::NO_CONTENT
+async fn ready(State(state): State<HttpState>) -> StatusCode {
+    if state.readiness.has_changed().is_ok() && *state.readiness.borrow() {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }

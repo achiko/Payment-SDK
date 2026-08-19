@@ -3,20 +3,15 @@ use std::{
     sync::LazyLock,
 };
 
-use base::Decimal;
 use indexing::{
-    AssetId, BlockInterpreter as IndexBlockInterpreter, CanonicalAddress, ChainId, IndexChanges,
-    IndexError, IndexErrorKind, IndexScope, IndexUndo, InterpretedBlock, ObservationDraft,
-    ObservationDraftStatus, OutputChanges, OutputId, OutputKey, WatchId, WatchSelector,
-    WatchTarget,
+    AssetId, BlockInterpreter as IndexBlockInterpreter, CanonicalAddress, ChainId, IndexError,
+    IndexErrorKind, IndexScope, InterpretedBlock, ObservationDraft, ObservationDraftStatus,
+    OutputChanges,
 };
 
 use crate::{Address, Network};
 
-use super::{
-    Block, IndexedOutput, Outpoint, UtxoKey,
-    transaction::{Canonicalize, InterpretedTransaction},
-};
+use super::{Block, IndexedOutput, Outpoint, UtxoKey, transaction::Canonicalize};
 
 static CHAIN_ID: LazyLock<ChainId> = LazyLock::new(|| ChainId(crate::CHAIN.to_owned()));
 pub(super) static NATIVE_ASSET: LazyLock<AssetId> = LazyLock::new(|| AssetId {
@@ -58,69 +53,49 @@ impl BlockInterpreter {
     pub const fn network(&self) -> Network {
         self.network
     }
-
-    fn validated_watches(
-        &self,
-        watches: &[WatchTarget<WatchSelector>],
-        height: indexing::BlockHeight,
-    ) -> Result<ValidatedWatches, IndexError> {
-        let mut validated = ValidatedWatches::default();
-        for watch in watches {
-            validated.add(watch, &self.scope, self.network, height)?;
-        }
-        Ok(validated)
-    }
 }
 
 impl IndexBlockInterpreter for BlockInterpreter {
     type Block = Block;
-    type Target = WatchSelector;
-    type Effect = IndexChanges;
-    type Undo = IndexUndo;
 
     fn inspect(
         &self,
         block: &Self::Block,
-        watches: &[WatchTarget<Self::Target>],
-    ) -> Result<InterpretedBlock<Self::Effect, Self::Undo>, IndexError> {
-        let observed_at = block
-            .reference
-            .timestamp
-            .ok_or_else(|| invalid_block("Bitcoin block timestamp is unavailable"))?;
-        let watches = self.validated_watches(watches, block.reference.height)?;
+        addresses: &[CanonicalAddress],
+    ) -> Result<InterpretedBlock, IndexError> {
+        let addresses = ValidatedAddresses::new(addresses, &self.scope, self.network)?;
 
-        let mut drafts = Vec::new();
+        let mut transactions = Vec::new();
         let mut creates = BTreeMap::<Outpoint, IndexedOutput>::new();
         let mut spends = BTreeMap::<Outpoint, UtxoKey>::new();
         let mut tracked_spends = BTreeMap::<Outpoint, UtxoKey>::new();
         let mut all_spent_outpoints = BTreeSet::new();
 
         for transaction in block.transactions() {
-            let interpreted = InterpretedTransaction::from_transaction(
-                transaction,
+            let interpreted = transaction.interpret(
                 block.reference.height,
                 self.network,
                 &self.scope,
-                &watches,
+                &addresses,
                 &mut all_spent_outpoints,
             )?;
             for output in interpreted.creates {
                 if creates.insert(output.outpoint, output).is_some() {
                     return Err(invalid_block(
-                        "Bitcoin block creates a duplicate watched outpoint",
+                        "Bitcoin block creates a duplicate indexed outpoint",
                     ));
                 }
             }
             for output in interpreted.spends {
                 if creates.remove(&output.outpoint).is_some() {
-                    // A watched output created and spent within this block did
+                    // An indexed output created and spent within this block did
                     // not exist before or after the block. Movements remain,
-                    // but canonical UTXO state and rollback contain no effect.
+                    // but canonical UTXO state contains no change.
                     continue;
                 }
                 if spends.insert(output.outpoint, output).is_some() {
                     return Err(invalid_block(
-                        "Bitcoin block spends a watched outpoint more than once",
+                        "Bitcoin block spends an indexed outpoint more than once",
                     ));
                 }
             }
@@ -134,16 +109,13 @@ impl IndexBlockInterpreter for BlockInterpreter {
                     ));
                 }
             }
-            if !interpreted.watch_ids.is_empty() {
-                drafts.push(ObservationDraft {
+            if interpreted.relevant {
+                transactions.push(ObservationDraft {
                     scope: self.scope.clone(),
                     transaction_id: transaction.id.canonical(&self.scope),
                     status: ObservationDraftStatus::Included,
                     movements: interpreted.movements,
                     fee: interpreted.fee,
-                    watch_ids: interpreted.watch_ids,
-                    first_seen_at: observed_at,
-                    observed_at,
                 });
             }
         }
@@ -153,134 +125,82 @@ impl IndexBlockInterpreter for BlockInterpreter {
         let tracked_spends: Vec<_> = tracked_spends.into_values().collect();
         let created = creates
             .iter()
-            .map(|output| indexed_output(output, &self.scope))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|output| output.canonical(&self.scope))
+            .collect();
         let spent = spends
             .iter()
-            .map(|output| canonical_key(output, &self.scope))
-            .collect::<Vec<_>>();
+            .map(|output| output.canonical(&self.scope))
+            .collect();
         let tracked_spends = tracked_spends
             .iter()
-            .map(|output| canonical_key(output, &self.scope))
-            .collect::<Vec<_>>();
-        let effect = IndexChanges {
-            outputs: OutputChanges {
-                created,
-                spent: spent.clone(),
-                tracked_spends: tracked_spends.clone(),
-            },
+            .map(|output| output.canonical(&self.scope))
+            .collect();
+        let outputs = OutputChanges {
+            created,
+            spent,
+            tracked_spends,
         };
         Ok(InterpretedBlock {
             block: block.reference.clone(),
-            drafts,
-            effect,
-            undo: IndexUndo {
-                created: creates
-                    .iter()
-                    .map(|output| output_key(output, &self.scope))
-                    .collect(),
-                spent: spent.into_iter().chain(tracked_spends).collect(),
-            },
+            transactions,
+            outputs,
         })
     }
 }
 
-fn output_key(output: &IndexedOutput, scope: &IndexScope) -> OutputKey {
-    OutputKey {
-        address: output.address.clone().canonical(scope),
-        output: OutputId {
-            transaction: output.outpoint.transaction_id.canonical(scope),
-            index: output.outpoint.output_index,
-        },
-    }
-}
-
-fn canonical_key(output: &UtxoKey, scope: &IndexScope) -> OutputKey {
-    OutputKey {
-        address: output.address.clone().canonical(scope),
-        output: OutputId {
-            transaction: output.outpoint.transaction_id.canonical(scope),
-            index: output.outpoint.output_index,
-        },
-    }
-}
-
-fn indexed_output(
-    output: &IndexedOutput,
-    scope: &IndexScope,
-) -> Result<indexing::IndexedOutput, IndexError> {
-    Ok(indexing::IndexedOutput {
-        id: OutputId {
-            transaction: output.outpoint.transaction_id.canonical(scope),
-            index: output.outpoint.output_index,
-        },
-        address: output.address.clone().canonical(scope),
-        asset: (*NATIVE_ASSET).clone(),
-        amount: Decimal::from(output.value.0),
-        evidence: output.script_pubkey.clone(),
-        created_at: output.created_height,
-        coinbase: output.coinbase,
-    })
-}
-
 #[derive(Default)]
-pub(super) struct ValidatedWatches {
-    pub(super) active_addresses: BTreeMap<String, BTreeSet<WatchId>>,
+pub(super) struct ValidatedAddresses {
+    addresses: BTreeSet<String>,
 }
 
-impl ValidatedWatches {
-    fn add(
-        &mut self,
-        watch: &WatchTarget<WatchSelector>,
+impl ValidatedAddresses {
+    fn new(
+        addresses: &[CanonicalAddress],
         scope: &IndexScope,
         network: Network,
-        height: indexing::BlockHeight,
-    ) -> Result<(), IndexError> {
-        if watch.scope != *scope {
-            return Err(invalid_watch("Bitcoin watch belongs to a different scope"));
+    ) -> Result<Self, IndexError> {
+        let mut validated = Self::default();
+        for address in addresses {
+            validated.add(address, scope, network)?;
         }
-        if watch.target != watch.selector {
-            return Err(invalid_watch(
-                "Bitcoin watch target does not match its canonical selector",
-            ));
-        }
-        self.add_address(watch, &watch.selector, network, height)
+        Ok(validated)
     }
 
-    fn add_address(
+    pub(super) fn contains(&self, address: &Address) -> bool {
+        self.addresses.contains(address.encoded())
+    }
+
+    fn add(
         &mut self,
-        watch: &WatchTarget<WatchSelector>,
-        selector: &CanonicalAddress,
+        address: &CanonicalAddress,
+        scope: &IndexScope,
         network: Network,
-        height: indexing::BlockHeight,
     ) -> Result<(), IndexError> {
-        let canonical = Address::parse_for_network(&selector.value, network)
-            .map_err(|_| invalid_watch("Bitcoin watch address is invalid or wrong-network"))?;
+        if !address.belongs_to(scope) {
+            return Err(invalid_address(
+                "Bitcoin indexed address belongs to a different scope",
+            ));
+        }
+        let canonical = Address::parse_for_network(&address.value, network)
+            .map_err(|_| invalid_address("Bitcoin indexed address is invalid or wrong-network"))?;
         let script = canonical
             .script_pubkey_for_network(network)
-            .map_err(|_| invalid_watch("Bitcoin watch address cannot produce a script"))?;
+            .map_err(|_| invalid_address("Bitcoin indexed address cannot produce a script"))?;
         if !script.is_p2wpkh() && !script.is_p2tr() {
-            return Err(invalid_watch(
-                "Bitcoin address watches support P2WPKH and P2TR only",
+            return Err(invalid_address(
+                "Bitcoin indexing supports P2WPKH and P2TR addresses only",
             ));
         }
-        if !selector.belongs_to(&watch.scope) || selector.value != canonical.encoded() {
-            return Err(invalid_watch(
-                "Bitcoin watch target does not match its canonical address selector",
-            ));
+        if address.value != canonical.encoded() {
+            return Err(invalid_address("Bitcoin indexed address is not canonical"));
         }
-        if watch.is_active_at(height) {
-            self.active_addresses
-                .entry(canonical.encoded().to_owned())
-                .or_default()
-                .insert(watch.id.clone());
-        }
+        self.addresses.insert(canonical.encoded().to_owned());
         Ok(())
     }
 }
 
-fn invalid_watch(message: impl Into<String>) -> IndexError {
-    IndexError::new(IndexErrorKind::InvalidWatch, message, false)
+fn invalid_address(message: impl Into<String>) -> IndexError {
+    IndexError::new(IndexErrorKind::InvalidRequest, message, false)
 }
 
 pub(super) fn invalid_block(message: impl ToString) -> IndexError {

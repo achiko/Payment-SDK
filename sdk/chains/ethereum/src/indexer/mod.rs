@@ -10,6 +10,9 @@ pub use source::{BlockClient, SourceConfig};
 /// Standard chain-owned block source name used by embedded indexer composition.
 pub type Source<C> = BlockClient<C>;
 
+/// Ethereum implementation of the shared indexing service.
+pub type Indexer<C, R> = indexing::Service<Source<C>, BlockInterpreter, R>;
+
 use indexing::{BlockRef, IndexedBlock};
 
 /// Canonical source payload retained by IX for replay and reorg recovery.

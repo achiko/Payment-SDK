@@ -4,6 +4,9 @@ use std::{error, fmt};
 pub enum ErrorKind {
     Unsupported,
     Duplicate,
+    NotFound,
+    Conflict,
+    Unavailable,
     Generation,
     InvalidSecret,
     InvalidAddress,
@@ -37,3 +40,41 @@ impl fmt::Display for Error {
 }
 
 impl error::Error for Error {}
+
+impl From<base::TransactionError> for Error {
+    fn from(error: base::TransactionError) -> Self {
+        let kind = match error.kind {
+            base::TransactionErrorKind::InvalidAddress => ErrorKind::InvalidAddress,
+            base::TransactionErrorKind::InvalidAmount => ErrorKind::InvalidAmount,
+            base::TransactionErrorKind::Unavailable
+            | base::TransactionErrorKind::Unknown
+            | base::TransactionErrorKind::Timeout => ErrorKind::Unavailable,
+            base::TransactionErrorKind::InvalidSnapshot
+            | base::TransactionErrorKind::InvalidTransaction
+            | base::TransactionErrorKind::Unsupported
+            | base::TransactionErrorKind::InsufficientFunds
+            | base::TransactionErrorKind::Fee
+            | base::TransactionErrorKind::Signing
+            | base::TransactionErrorKind::Divergent
+            | base::TransactionErrorKind::Rejected => ErrorKind::Transaction,
+        };
+        Self::new(kind, error.message)
+    }
+}
+
+impl From<indexing::IndexError> for Error {
+    fn from(error: indexing::IndexError) -> Self {
+        let kind = match error.kind {
+            indexing::IndexErrorKind::Conflict => ErrorKind::Conflict,
+            indexing::IndexErrorKind::ScopeMismatch | indexing::IndexErrorKind::InvalidRequest => {
+                ErrorKind::Unsupported
+            }
+            indexing::IndexErrorKind::Source
+            | indexing::IndexErrorKind::Store
+            | indexing::IndexErrorKind::InvalidBlock
+            | indexing::IndexErrorKind::CannotConnect
+            | indexing::IndexErrorKind::ReorgTooDeep => ErrorKind::Unavailable,
+        };
+        Self::new(kind, error.message)
+    }
+}

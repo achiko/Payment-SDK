@@ -1,10 +1,11 @@
+use std::collections::BTreeSet;
+
 use base::Decimal;
 
-use crate::{AssetId, CanonicalAddress, TransactionRef};
-use crate::{BlockHeight, BlockRef, IndexScope, WatchId};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ObservationRevision(pub u64);
+use crate::{
+    AssetId, BlockHeight, BlockRef, BoxFuture, CanonicalAddress, IndexError, IndexErrorKind,
+    IndexScope, TransactionRef,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MovementId(pub String);
@@ -14,17 +15,11 @@ pub enum MovementKind {
     Transfer,
     Input,
     Output,
-    InternalTransfer,
     Mint,
     Burn,
 }
 
 /// One independently meaningful value change within a transaction.
-///
-/// UTXO inputs and outputs are intentionally separate movements. Indexing never
-/// invents a one-to-one transfer between them because a transaction can consume
-/// and create any number of outputs. The variants also make impossible endpoint
-/// combinations unrepresentable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValueMovement {
     Transfer {
@@ -45,13 +40,6 @@ pub enum ValueMovement {
         asset: AssetId,
         amount: Decimal,
         owner: Option<CanonicalAddress>,
-    },
-    InternalTransfer {
-        id: MovementId,
-        asset: AssetId,
-        amount: Decimal,
-        from: CanonicalAddress,
-        to: CanonicalAddress,
     },
     Mint {
         id: MovementId,
@@ -74,7 +62,6 @@ impl ValueMovement {
             Self::Transfer { id, .. }
             | Self::Input { id, .. }
             | Self::Output { id, .. }
-            | Self::InternalTransfer { id, .. }
             | Self::Mint { id, .. }
             | Self::Burn { id, .. } => id,
         }
@@ -86,7 +73,6 @@ impl ValueMovement {
             Self::Transfer { asset, .. }
             | Self::Input { asset, .. }
             | Self::Output { asset, .. }
-            | Self::InternalTransfer { asset, .. }
             | Self::Mint { asset, .. }
             | Self::Burn { asset, .. } => asset,
         }
@@ -98,7 +84,6 @@ impl ValueMovement {
             Self::Transfer { amount, .. }
             | Self::Input { amount, .. }
             | Self::Output { amount, .. }
-            | Self::InternalTransfer { amount, .. }
             | Self::Mint { amount, .. }
             | Self::Burn { amount, .. } => amount,
         }
@@ -110,7 +95,6 @@ impl ValueMovement {
             Self::Transfer { .. } => MovementKind::Transfer,
             Self::Input { .. } => MovementKind::Input,
             Self::Output { .. } => MovementKind::Output,
-            Self::InternalTransfer { .. } => MovementKind::InternalTransfer,
             Self::Mint { .. } => MovementKind::Mint,
             Self::Burn { .. } => MovementKind::Burn,
         }
@@ -119,9 +103,7 @@ impl ValueMovement {
     #[must_use]
     pub fn from(&self) -> Option<&CanonicalAddress> {
         match self {
-            Self::Transfer { from, .. }
-            | Self::InternalTransfer { from, .. }
-            | Self::Burn { from, .. } => Some(from),
+            Self::Transfer { from, .. } | Self::Burn { from, .. } => Some(from),
             Self::Input { owner, .. } => owner.as_ref(),
             Self::Output { .. } | Self::Mint { .. } => None,
         }
@@ -130,9 +112,7 @@ impl ValueMovement {
     #[must_use]
     pub fn to(&self) -> Option<&CanonicalAddress> {
         match self {
-            Self::Transfer { to, .. }
-            | Self::InternalTransfer { to, .. }
-            | Self::Mint { to, .. } => Some(to),
+            Self::Transfer { to, .. } | Self::Mint { to, .. } => Some(to),
             Self::Output { owner, .. } => owner.as_ref(),
             Self::Input { .. } | Self::Burn { .. } => None,
         }
@@ -146,64 +126,81 @@ pub struct NetworkFee {
     pub payer: Option<CanonicalAddress>,
 }
 
-/// IX configuration for one chain/network scope. A transaction cannot become
-/// `Confirmed` until this policy is proven against the persisted canonical tip.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConfirmationPolicy {
-    pub minimum_confirmations: u64,
-    /// For chains exposing a finalized checkpoint, depth alone is insufficient.
-    pub require_chain_finality: bool,
+/// Canonical state stored for a transaction. Confirmation is deliberately absent:
+/// it is derived from the inclusion block and the current checkpoint when read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CanonicalStatus {
+    Included {
+        block: BlockRef,
+    },
+    Failed {
+        block: BlockRef,
+        reason: Option<String>,
+    },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConfirmationProof {
-    Depth { required: u64, observed: u64 },
-    ChainFinalized,
-    DepthAndChainFinalized { required: u64, observed: u64 },
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalTransaction {
+    pub scope: IndexScope,
+    pub transaction_id: TransactionRef,
+    pub status: CanonicalStatus,
+    pub movements: Vec<ValueMovement>,
+    pub fee: Option<NetworkFee>,
+}
+
+impl CanonicalTransaction {
+    #[must_use]
+    pub fn block(&self) -> &BlockRef {
+        match &self.status {
+            CanonicalStatus::Included { block } | CanonicalStatus::Failed { block, .. } => block,
+        }
+    }
+
+    #[must_use]
+    pub fn addresses(&self) -> BTreeSet<CanonicalAddress> {
+        let mut addresses = self
+            .movements
+            .iter()
+            .flat_map(|movement| {
+                movement
+                    .from()
+                    .cloned()
+                    .into_iter()
+                    .chain(movement.to().cloned())
+            })
+            .collect::<BTreeSet<_>>();
+        if let Some(payer) = self.fee.as_ref().and_then(|fee| fee.payer.clone()) {
+            addresses.insert(payer);
+        }
+        addresses
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TransactionStatus {
-    Pending,
-    /// Canonically included, but not yet deep/final enough for business accounting.
     Included {
         block: BlockRef,
         confirmations: u64,
     },
     Confirmed {
         block: BlockRef,
-        proof: ConfirmationProof,
+        confirmations: u64,
     },
     Failed {
-        block: Option<BlockRef>,
+        block: BlockRef,
         reason: Option<String>,
-    },
-    Replaced {
-        by: TransactionRef,
-    },
-    Dropped,
-    Reorged {
-        previous_block: BlockRef,
     },
 }
 
-/// IX fact only. It deliberately contains no deposit, user, incoming, or sweep label.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservedTransaction {
     pub scope: IndexScope,
     pub transaction_id: TransactionRef,
-    pub revision: ObservationRevision,
     pub status: TransactionStatus,
     pub movements: Vec<ValueMovement>,
     pub fee: Option<NetworkFee>,
-    pub first_seen_at: u64,
-    pub observed_at: u64,
 }
 
-/// Chain-interpreted state before the repository assigns durable identity.
-///
-/// Revisions, event IDs, cursors, and previous state are deliberately absent:
-/// the repository allocates all four in the same atomic block commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservationDraft {
     pub scope: IndexScope,
@@ -211,65 +208,126 @@ pub struct ObservationDraft {
     pub status: ObservationDraftStatus,
     pub movements: Vec<ValueMovement>,
     pub fee: Option<NetworkFee>,
-    pub watch_ids: Vec<WatchId>,
-    pub first_seen_at: u64,
-    pub observed_at: u64,
+}
+
+impl ObservationDraft {
+    pub(crate) fn canonical(
+        self,
+        scope: &IndexScope,
+        block: &BlockRef,
+    ) -> Result<CanonicalTransaction, IndexError> {
+        if self.scope != *scope || !self.transaction_id.belongs_to(scope) {
+            return Err(IndexError::new(
+                IndexErrorKind::ScopeMismatch,
+                "transaction belongs to another scope",
+                false,
+            ));
+        }
+        if matches!(self.status, ObservationDraftStatus::Failed { .. })
+            && !self.movements.is_empty()
+        {
+            return Err(IndexError::new(
+                IndexErrorKind::InvalidBlock,
+                "failed transaction contains movements",
+                false,
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        for movement in &self.movements {
+            if movement.id().0.is_empty()
+                || !ids.insert(movement.id())
+                || movement.asset().chain != scope.chain
+                || movement.amount().validate_amount().is_err()
+                || movement
+                    .from()
+                    .is_some_and(|value| !value.belongs_to(scope))
+                || movement.to().is_some_and(|value| !value.belongs_to(scope))
+            {
+                return Err(IndexError::new(
+                    IndexErrorKind::InvalidBlock,
+                    "transaction contains an invalid movement",
+                    false,
+                ));
+            }
+        }
+        if self.fee.as_ref().is_some_and(|fee| {
+            fee.asset.chain != scope.chain
+                || fee.amount.validate_amount().is_err()
+                || fee
+                    .payer
+                    .as_ref()
+                    .is_some_and(|payer| !payer.belongs_to(scope))
+        }) {
+            return Err(IndexError::new(
+                IndexErrorKind::InvalidBlock,
+                "transaction contains an invalid network fee",
+                false,
+            ));
+        }
+        let status = match self.status {
+            ObservationDraftStatus::Included => CanonicalStatus::Included {
+                block: block.clone(),
+            },
+            ObservationDraftStatus::Failed { reason } => CanonicalStatus::Failed {
+                block: block.clone(),
+                reason,
+            },
+        };
+        Ok(CanonicalTransaction {
+            scope: self.scope,
+            transaction_id: self.transaction_id,
+            status,
+            movements: self.movements,
+            fee: self.fee,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ObservationDraftStatus {
     Included,
-    /// A canonical failed receipt. Interpreters must emit no movements for it;
-    /// the network fee may still be present.
-    Failed {
-        reason: Option<String>,
-    },
-}
-
-pub type WatchSelector = CanonicalAddress;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WatchRequest {
-    pub scope: IndexScope,
-    pub selector: WatchSelector,
-    /// First block that can contain relevant history.
-    pub start_height: BlockHeight,
-    /// Caller idempotency key, distinct from the IX-assigned watch ID.
-    pub idempotency_key: String,
+    Failed { reason: Option<String> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WatchReceipt {
-    pub id: WatchId,
-    pub scope: IndexScope,
-    pub selector: WatchSelector,
-    pub start_height: BlockHeight,
-    pub registered_at: Option<BlockRef>,
+pub struct HistoryPosition {
+    pub height: BlockHeight,
+    pub transaction: TransactionRef,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RegisterWatch<T> {
-    pub request: WatchRequest,
-    pub target: T,
-    pub registered_at: Option<BlockRef>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TransactionQuery {
-    pub scope: IndexScope,
-    pub transaction_id: TransactionRef,
+pub struct HistoryCursor {
+    pub checkpoint: Option<BlockRef>,
+    pub position: HistoryPosition,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryQuery {
     pub scope: IndexScope,
     pub address: CanonicalAddress,
-    pub after: Option<TransactionRef>,
+    pub after: Option<HistoryCursor>,
     pub limit: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalPage {
+    pub checkpoint: Option<BlockRef>,
+    pub transactions: Vec<CanonicalTransaction>,
+    pub next: Option<HistoryCursor>,
+}
+
+/// Address-primary canonical transaction history.
+pub trait Transactions: Send + Sync {
+    /// Lists one checkpoint-consistent page for an address.
+    fn list<'a>(
+        &'a self,
+        request: HistoryQuery,
+    ) -> BoxFuture<'a, Result<CanonicalPage, IndexError>>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransactionPage {
+    pub checkpoint: Option<BlockRef>,
     pub transactions: Vec<ObservedTransaction>,
-    pub next: Option<TransactionRef>,
+    pub next: Option<HistoryCursor>,
 }

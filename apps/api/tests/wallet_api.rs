@@ -4,6 +4,8 @@ mod acceptance;
 mod bitcoin_node;
 #[path = "ethereum_stack.rs"]
 mod ethereum_node;
+#[path = "route_contract.rs"]
+mod route_contract;
 
 use std::{net::SocketAddr, process::Stdio, time::Duration};
 
@@ -53,8 +55,7 @@ impl Drop for RunningApi {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bitcoin_wallet_is_generated_watched_and_indexed() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn bitcoin_wallet_is_generated_and_indexed() -> Result<(), Box<dyn std::error::Error>> {
     let files = TempDir::new()?;
     let node = BitcoinNode::start().await;
     let api = start_api(json!({
@@ -131,8 +132,7 @@ async fn bitcoin_wallet_is_generated_watched_and_indexed() -> Result<(), Box<dyn
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ethereum_wallet_is_generated_watched_and_indexed() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn ethereum_wallet_is_generated_and_indexed() -> Result<(), Box<dyn std::error::Error>> {
     let files = TempDir::new()?;
     let node = EthereumNode::start().await;
     let api = start_api(json!({
@@ -418,10 +418,9 @@ async fn wait_history(root: &str, wallet: &str, transaction: &str) -> Value {
     loop {
         if let Some(value) = get(&url).await
             && value["transactions"].as_array().is_some_and(|items| {
-                items.iter().any(|item| {
-                    item["transaction_id"]["value"] == transaction
-                        || item["transaction_id"] == transaction
-                })
+                items
+                    .iter()
+                    .any(|item| item["transaction_id"] == transaction)
             })
         {
             return value;

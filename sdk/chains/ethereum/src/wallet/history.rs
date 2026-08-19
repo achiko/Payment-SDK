@@ -4,7 +4,7 @@ use wallets::{
     HistoryReader, HistoryRequest,
 };
 
-use super::{AssetKind, Wallet, wallet_error};
+use super::{AssetKind, Wallet};
 
 impl HistoryReader for Wallet {
     fn history<'a>(&'a self, request: HistoryRequest) -> FutureResult<'a, History> {
@@ -21,7 +21,7 @@ impl HistoryReader for Wallet {
                     limit: request.limit,
                 })
                 .await
-                .map_err(|error| wallet_error(WalletErrorKind::History, error))?;
+                .map_err(WalletError::from)?;
             History::from_index(transactions, &self.config.scope, |asset| {
                 ethereum_asset(&self.config, asset)
             })

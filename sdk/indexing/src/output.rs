@@ -1,25 +1,20 @@
 use base::Decimal;
 
+use std::collections::BTreeSet;
+
 use crate::{
-    AssetId, BlockHeight, BlockRef, BoxFuture, CanonicalAddress, IndexError, IndexScope,
-    TransactionRef,
+    AssetId, BlockHeight, BlockRef, BoxFuture, CanonicalAddress, IndexError, IndexErrorKind,
+    IndexScope, TransactionRef,
 };
 
 /// Stable position in a snapshot-consistent output listing.
 ///
 /// `position` is opaque to callers. It may only be returned to the same
-/// [`OutputQuery`] implementation in a later request.
+/// [`Outputs`] implementation in a later request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputCursor {
-    pub snapshot: OutputSnapshot,
-    pub position: Vec<u8>,
-}
-
-/// Canonical state against which an output page was read.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OutputSnapshot {
-    pub revision: u64,
     pub checkpoint: Option<BlockRef>,
+    pub position: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,17 +27,15 @@ pub struct OutputRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputPage {
-    pub snapshot: OutputSnapshot,
+    pub checkpoint: Option<BlockRef>,
     pub outputs: Vec<IndexedOutput>,
     pub next: Option<OutputCursor>,
 }
 
-/// Reads currently spendable outputs for canonical addresses.
-pub trait OutputQuery: Send + Sync {
-    fn outputs<'a>(
-        &'a self,
-        request: OutputRequest,
-    ) -> BoxFuture<'a, Result<OutputPage, IndexError>>;
+/// Current live outputs indexed for canonical addresses.
+pub trait Outputs: Send + Sync {
+    /// Lists one checkpoint-consistent page of spendable outputs.
+    fn list<'a>(&'a self, request: OutputRequest) -> BoxFuture<'a, Result<OutputPage, IndexError>>;
 }
 
 /// Chain-neutral identity of one transaction output.
@@ -89,19 +82,47 @@ impl IndexedOutput {
 pub struct OutputChanges {
     pub created: Vec<IndexedOutput>,
     pub spent: Vec<OutputKey>,
-    /// Spends for inactive watches are applied only if the output is already
-    /// materialized. This preserves correctness across watch lifetimes.
+    /// Spends outside the current address filter are applied only if the output
+    /// is already materialized. This preserves previously indexed outputs.
     pub tracked_spends: Vec<OutputKey>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct IndexChanges {
-    pub outputs: OutputChanges,
-}
-
-/// Projection identities removed when one canonical block is reverted.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct IndexUndo {
-    pub created: Vec<OutputKey>,
-    pub spent: Vec<OutputKey>,
+impl OutputChanges {
+    pub(crate) fn validate(
+        &self,
+        scope: &IndexScope,
+        block_height: BlockHeight,
+    ) -> Result<(), IndexError> {
+        let mut created = BTreeSet::new();
+        for output in &self.created {
+            if !output.address.belongs_to(scope)
+                || !output.id.transaction.belongs_to(scope)
+                || output.asset.chain != scope.chain
+                || output.amount.validate_amount().is_err()
+                || output.created_at != block_height
+                || !created.insert(output.key())
+            {
+                return Err(IndexError::new(
+                    IndexErrorKind::InvalidBlock,
+                    "block contains an invalid output",
+                    false,
+                ));
+            }
+        }
+        let mut spent = BTreeSet::new();
+        for key in self.spent.iter().chain(&self.tracked_spends) {
+            if !key.address.belongs_to(scope)
+                || !key.output.transaction.belongs_to(scope)
+                || created.contains(key)
+                || !spent.insert(key)
+            {
+                return Err(IndexError::new(
+                    IndexErrorKind::InvalidBlock,
+                    "block contains overlapping or duplicate output changes",
+                    false,
+                ));
+            }
+        }
+        Ok(())
+    }
 }

@@ -353,8 +353,8 @@ impl PreviousOutput {
             });
         }
 
-        // Accept the original verbosity-3-compatible shape so durable raw block
-        // records written before compact enrichment remain replayable.
+        // Direct Block::parse callers may supply Bitcoin Core's
+        // verbosity-3-compatible previous-output shape.
         let value = Satoshi(parse_btc_amount(
             prevout
                 .get("value")

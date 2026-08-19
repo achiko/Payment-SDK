@@ -1,8 +1,5 @@
 use base::{BlockHash, BlockHeight, BlockRef, Decimal};
-use indexing::{
-    AssetId, CanonicalAddress, ChainId, ConfirmationProof, IndexScope, MovementId,
-    ObservationRevision, TransactionRef,
-};
+use indexing::{AssetId, CanonicalAddress, ChainId, IndexScope, MovementId, TransactionRef};
 
 use super::*;
 
@@ -41,19 +38,16 @@ fn history_conversion_preserves_typed_facts() {
         timestamp: Some(44),
     };
     let history = wallets::History {
+        checkpoint: Some(block.clone()),
         transactions: vec![wallets::HistoryEntry {
             scope: scope(),
             transaction_id: TransactionRef {
                 scope: scope(),
                 value: "tx-1".to_owned(),
             },
-            revision: ObservationRevision(3),
             status: wallets::HistoryStatus::Confirmed {
                 block,
-                proof: ConfirmationProof::Depth {
-                    required: 6,
-                    observed: 7,
-                },
+                confirmations: 7,
             },
             movements: vec![
                 wallets::HistoryMovement {
@@ -78,15 +72,15 @@ fn history_conversion_preserves_typed_facts() {
                 amount: "0.01000000".parse::<Decimal>().expect("decimal"),
                 payer: Some(address("sender")),
             }),
-            first_seen_at: 40,
-            observed_at: 44,
         }],
         next: None,
     };
 
     let page = TransactionPage::try_from(history).expect("typed history");
     let transaction = &page.transactions[0];
-    assert_eq!(transaction.transaction_id.scope.network, "regtest");
+    assert_eq!(page.checkpoint.as_ref().map(|value| value.height), Some(12));
+    assert_eq!(transaction.scope.network, "regtest");
+    assert_eq!(transaction.transaction_id, "tx-1");
     assert_eq!(transaction.movements.len(), 2);
     assert_eq!(transaction.movements[0].amount, "1.23");
     assert_eq!(transaction.movements[1].kind, MovementKind::Output);
@@ -94,11 +88,37 @@ fn history_conversion_preserves_typed_facts() {
     assert!(matches!(
         transaction.status,
         Status::Confirmed {
-            proof: Proof::Depth {
-                required: 6,
-                observed: 7
-            },
+            confirmations: 7,
             ..
         }
     ));
+    let status = serde_json::to_value(&transaction.status).expect("status serializes");
+    assert_eq!(status["kind"], "confirmed");
+    assert_eq!(status["confirmations"], 7);
+    assert!(status.get("proof").is_none());
+}
+
+#[test]
+fn history_cursor_preserves_checkpoint_and_position() {
+    let checkpoint = BlockRef {
+        height: BlockHeight(12),
+        hash: BlockHash(vec![0xab; 32]),
+        parent_hash: Some(BlockHash(vec![0xcd; 32])),
+        timestamp: Some(44),
+    };
+    let cursor = indexing::HistoryCursor {
+        checkpoint: Some(checkpoint),
+        position: indexing::HistoryPosition {
+            height: BlockHeight(9),
+            transaction: TransactionRef {
+                scope: scope(),
+                value: "tx-1".to_owned(),
+            },
+        },
+    };
+
+    let encoded = HistoryCursor::encode(&cursor).expect("cursor encodes");
+    let decoded = HistoryCursor::decode(&encoded).expect("cursor decodes");
+
+    assert_eq!(decoded, cursor);
 }

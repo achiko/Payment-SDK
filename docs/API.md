@@ -32,7 +32,6 @@ Minimal shape with both chains:
         "timeout_seconds": 15,
         "max_response_bytes": 67108864
       },
-      "bootstrap_height": 0,
       "confirmation_depth": 1,
       "reorg_retention": 100,
       "poll_millis": 1000,
@@ -49,7 +48,6 @@ Minimal shape with both chains:
         "timeout_seconds": 15,
         "max_response_bytes": 67108864
       },
-      "bootstrap_height": 0,
       "confirmation_depth": 1,
       "reorg_retention": 100,
       "poll_millis": 1000,
@@ -79,11 +77,11 @@ Authorization: Bearer <value from PAYMENT_API_TOKEN>
 ```
 
 `GET /health/live` and `GET /health/ready` return `204 No Content` and are
-public. Liveness means the process is running. Before binding the listener,
-`Runtime` waits until every
-configured embedded index reports `SyncPhase::Ready` and has persisted a
-canonical checkpoint. This guarantees a newly created wallet can derive a
-watch birthday immediately. A worker exit fails startup; a fatal worker error
+public. Liveness means the process is running. Before binding the listener, the
+composition root waits until every configured synchronizer reports that it has
+caught up with its node. Readiness is runtime state; it is not persisted in
+RocksDB. This guarantees a newly created wallet can derive an address birthday
+immediately. A synchronizer exit fails startup; a fatal error
 after startup terminates the runtime rather than leave a silently stale API.
 
 `GET /openapi.json` is also public and returns the generated OpenAPI 3 contract.
@@ -113,14 +111,14 @@ Response (`201 Created`):
 
 The chain must have been configured at startup. Network is selected by that
 configuration, not accepted from the request. Before returning `201`, the API
-durably registers an address watch whose birthday is immediately after the
-current checkpoint (or the configured bootstrap beginning when no checkpoint
-exists).
+adds the address to the synchronizer's in-memory filters. Its birthday is
+immediately after the current checkpoint, or the configured beginning when no
+checkpoint exists.
 
 The current key and wallet catalog are intentionally in memory. Restarting the
-process loses generated private keys and wallet IDs, although indexing watches,
-checkpoints, and history remain in RocksDB. This is development behavior, not
-production custody or durable wallet management.
+process loses generated private keys, wallet IDs, and their indexing filters.
+Canonical checkpoints and indexed history remain in RocksDB. This is
+development behavior, not production custody or durable wallet management.
 
 ## Read wallet metadata
 
@@ -154,6 +152,11 @@ GET /v1/wallets/{id}/transactions?limit=100&cursor=<opaque>
 
 ```json
 {
+  "checkpoint": {
+    "height": 42,
+    "hash": "<hex>",
+    "parent_hash": "<hex>"
+  },
   "transactions": [],
   "next_cursor": null
 }
@@ -162,10 +165,11 @@ GET /v1/wallets/{id}/transactions?limit=100&cursor=<opaque>
 `GET` and `POST` deliberately share the wallet transaction resource: `GET`
 reads indexed transactions and `POST` submits one new transaction. `limit`
 defaults to 100 and must be between 1 and 1000. Treat `cursor` as an opaque value
-and return it unchanged on the next request. Transactions contain the wallet SDK's complete
-transaction representation: scoped identity, revision, status, all movements,
-optional fee, and observation ordering values. Bitcoin inputs and outputs
-remain separate movements.
+and return it unchanged on the next request. The cursor binds pagination to the
+response checkpoint; if canonical history changes, the API returns a conflict
+and the caller restarts from the first page. Transactions contain scoped
+identity, canonical inclusion/confirmation status, all movements, and an
+optional fee. Bitcoin inputs and outputs remain separate movements.
 
 ## Send one transfer
 

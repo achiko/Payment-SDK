@@ -1,185 +1,264 @@
 # Architecture
 
-## One application
+## One process and one composition root
 
-`apps/api` is the only executable and the only composition root. Its startup
-code constructs concrete Bitcoin and Ethereum RPC clients, RocksDB indexing
-repositories, synchronization synchronizers, wallet providers, and the HTTP router.
-Those objects communicate directly in-process.
+`apps/api` is the only executable and composition root. Its `main.rs` reads and
+validates configuration, constructs concrete Bitcoin and Ethereum objects,
+combines their indexing capabilities, registers wallet families, imports
+configured wallets, starts synchronization, builds the router, and supervises
+shutdown.
 
-Each configured chain establishes one JSON-RPC client shared by its block
-source and wallet-side fee/account/transaction capabilities. Endpoint failover
-therefore has one configuration and does not create an artificial RPC service
-interface.
+Construction is intentionally visible. There is no process facade, app-local
+service facade, separate wallet process, separate indexer process, or internal
+wallet/indexer HTTP protocol.
 
 ```text
-HTTP request
-    -> apps/api facade
-        -> sdk/wallets abstraction
-            -> sdk/chains/bitcoin or sdk/chains/ethereum
-        -> sdk/indexing abstraction
-            -> chain block source + interpreter
-            -> sdk/indexing/rocksdb repository
+main
+  |- Bitcoin RPC/source/interpreter/repository/Service --\
+  |                                                       -> Composer
+  |- Ethereum RPC/source/interpreter/repository/Service -/
+  |
+  |- Bitcoin provider/sender --\
+  |                             -> Wallets(instances, birthdays, Checkpoint)
+  `- Ethereum provider/sender -/
 
-background task
-    -> chain block source
-    -> sdk/indexing Synchronizer
-    -> sdk/indexing/rocksdb repository
+sync task: Wallets::filters() -> Composer
+HTTP: State { Wallets, readiness }
 ```
 
-There is no `apps/wallet`, `apps/indexer`, remote indexing client, or internal
-wallet/indexer HTTP protocol. HTTP is only the public edge of `apps/api`.
-Public handlers are grouped by resource (`wallet`, `transaction`, `health`,
-and `contract`) and generate one OpenAPI contract through Utoipa. Resource
-modules translate HTTP DTOs only; `Gateway` owns in-process application
-behavior.
+Each configured chain has one long-lived JSON-RPC client shared by its indexing
+source and wallet-side capabilities. Retry and ordered endpoint failover are
+configured once; the architecture does not invent a universal chain RPC
+interface.
+
+The concrete `Arc<Composer>` is cloned into narrow `Indexer`, `Checkpoint`, and
+`History` trait-object views. Bitcoin separately receives an `Arc<dyn Outputs>`
+view of its own repository; `Composer` does not force UTXO semantics onto
+account chains. These are views of already-composed state, not parallel
+registries.
+
+## Dependency direction
+
+```text
+apps/api
+  -> sdk/chains/{bitcoin,ethereum}
+  -> sdk/wallets
+  -> sdk/indexing
+  -> sdk/indexing/rocksdb
+
+sdk/chains/{bitcoin,ethereum}
+  -> sdk/chains/base
+  -> sdk/wallets
+  -> sdk/indexing
+  -> packages/{crypto,json-rpc}
+
+sdk/wallets -> sdk/chains/base, sdk/indexing, packages/crypto
+sdk/indexing/rocksdb -> sdk/indexing, packages/storage/rocksdb
+sdk/indexing -> sdk/chains/base
+sdk/chains/base -> packages/crypto
+```
+
+- A package may depend on external crates or another package, never SDK/apps.
+- `sdk/chains/base` imports no concrete chain, RPC, indexing, or wallets.
+- `sdk/indexing` imports no chain-native block, RocksDB record, wallet, or HTTP
+  type.
+- Concrete chain crates implement generic wallet/indexing contracts while
+  retaining their native protocol semantics.
+- `sdk/indexing/rocksdb` implements persistence collections only and owns no
+  synchronizer runtime.
+- No crate depends on `apps/api`.
 
 ## Ownership
 
-### Packages
+### Generic packages
 
-`packages/*` contains infrastructure that can be copied to a non-blockchain
-project without bringing business concepts with it:
+`packages/*` must remain useful outside a blockchain project:
 
-- `crypto`: secret memory and generic cryptographic operations;
-- `http`: small client/server mechanics;
-- `json-rpc`: bounded `jsonrpsee` transport, retry, and endpoint failover;
-- `storage`: atomic key/value mechanics;
-- `storage/rocksdb`: generic RocksDB engine; and
-- `design-lint`: repository architecture and API checks.
+- `crypto` owns secret memory and generic cryptographic operations;
+- `http` owns small server/client mechanics;
+- `json-rpc` wraps `jsonrpsee` with bounded transport, retry, and endpoint
+  failover;
+- `storage` owns backend-neutral atomic key/value mechanics;
+- `storage/rocksdb` owns the generic RocksDB engine; and
+- `design-lint` enforces repository architecture and API rules.
 
-A package may depend on another package or an external library. It must not
-depend on `sdk/*` or `apps/*`.
+Packages contain no wallet, chain, indexing, asset, or transaction policy.
 
 ### Chain base
 
-`sdk/chains/base` contains only approved values and capabilities that genuinely
-apply across chains: address bytes and formatting contracts, network/chain/
-asset metadata, exact decimal amounts, block identity, signing inputs and
-outputs, transaction builder snapshots, and broadcasting.
+`sdk/chains/base` contains the explicitly approved values and capabilities
+that genuinely apply across substantially different chains: addresses,
+network/chain/asset metadata, exact decimals, block identity, derivation and
+key/signature values, minimal signing, transaction snapshots, and broadcast
+results.
 
-It does not contain indexing policy, RPC DTOs, UTXOs, Ethereum envelopes,
-wallet construction, or a universal transaction representation.
+It is not a home for UTXOs, Ethereum envelopes, chain RPC DTOs, wallet
+construction, indexing policy, or a universal transaction representation.
 
 ### Concrete chains
 
-Each concrete chain owns everything whose semantics disappear when that chain
-is removed:
+A concrete chain owns everything that disappears when that chain is deleted:
 
 - canonical address parsing and network validation;
-- RPC methods and wire DTOs;
-- chain-native blocks and transaction types;
-- fee, nonce, UTXO, script, gas, and signing rules;
-- wallet provider and implementation; and
-- block source and interpreter for generic indexing.
+- native RPC methods and wire DTOs;
+- native block and transaction parsing;
+- UTXO/script/fee or account/nonce/gas rules;
+- transaction building, signing, encoding, and broadcasting;
+- wallet provider, balance implementation, and batch sender; and
+- block source and interpreter.
 
-Every concrete chain has the same ownership skeleton:
+Bitcoin and Ethereum share an enforced directory skeleton but may have
+different protocol-specific files. Equivalent boundaries use equivalent
+directories; native semantics are not flattened to make file names identical.
 
-```text
-src/address.rs
-src/batch.rs
-src/error.rs
-src/lib.rs
-src/indexer/mod.rs
-src/rpc/mod.rs
-src/transaction/mod.rs
-src/wallet/mod.rs
-```
-
-Protocol-specific files may be added below these boundaries. The
-`chain-layout` design-lint rule rejects missing paths and complex modules
-declared as a single file instead of a directory module.
-
-Deleting Bitcoin must leave Ethereum, base, wallets, indexing, and packages
-compilable. The inverse applies to Ethereum.
-
-### Wallets
-
-`sdk/wallets` defines the application-facing capabilities. Traits remain small
-and composable: address formatting, balance, history, sending, generation, and
-provider construction. `Wallets<K>` maps an
-application-owned ID to an already-created abstract wallet. `Providers<K>`
-maps a typed chain/configuration key to the concrete provider selected at
-startup.
-
-The wallet send boundary is one operation over a non-empty list of transfers.
-It delegates protocol construction/signing to the concrete chain:
-
-- Bitcoin accepts several source wallets, reads every source at one canonical
-  checkpoint, and creates one transaction with their inputs, requested outputs,
-  and distinct per-source change; and
-- Ethereum creates one transaction per requested transfer, assigns consecutive
-  nonces per source wallet, and broadcasts them strictly in input order.
-
-This is batch submission, not a collection/accounting domain and not a
-universal chain transaction object.
-
-The wallet API returns exact amounts and complete transaction movements. It
-does not flatten a multi-input/multi-output UTXO transaction into a fictional
-single transfer.
+Deleting one chain must leave the other chain and every generic crate coherent.
 
 ### Indexing
 
-`sdk/indexing` owns chain-neutral synchronization and query semantics:
+`sdk/indexing` owns:
 
-- canonical checkpoints contain block height and hash;
-- watches identify canonical addresses and have a birthday height;
-- block interpretations contain normalized transaction movements plus a
-  chain-owned opaque effect used for rollback;
-- block effects, undo data, observation revisions, and checkpoint
-  movement commit atomically;
-- reorgs append corrected revisions rather than erase history; and
-- history cursors are stable and scoped to one chain/network.
+- exact chain/network scopes and height-plus-hash checkpoints;
+- address filters with birthday heights;
+- canonical transaction, movement, and live-output facts;
+- block-source/interpreter contracts;
+- `Blocks`, `Transactions`, and `Outputs` persistence collections;
+- confirmation derivation and checkpoint-bound pagination;
+- one-scope synchronization; and
+- the multi-scope `Composer`.
 
-`Index<R>` exposes checkpoint, address-watch registration, and history without
-exposing the repository implementation. `Synchronizer` consumes the same
-repository through five semantic persistence traits: `CanonicalStore`,
-`WatchStore`, `BlockStore`, `HistoryStore`, and `StatusStore`. Each trait has
-exactly two cohesive methods. `sdk/indexing/rocksdb::Repository`
-implements those contracts and owns all physical encoding. A future PostgreSQL
-adapter can implement them without changing a chain interpreter or wallet.
+One-chain `Service` and `Composer` implement the same `Indexer` trait. The sync
+caller supplies a complete filter snapshot on every invocation. Indexing does
+not own or persist the selected address lifecycle.
+
+`Blocks::add` atomically commits canonical history, live output changes, a
+storage-derived bounded journal entry, and checkpoint movement. `Blocks::remove`
+uses only that private journal to remove an orphan tip and restore live outputs.
+`Transactions` and `Outputs` are read projections over this lifecycle.
+
+`sdk/indexing/rocksdb` owns all indexing key encoding, records, scans,
+compare-and-swap conditions, atomic batches, and journal encoding. Those types
+never appear in a chain interpreter or generic consumer.
+
+The durable set is deliberately limited to checkpoint, address-primary
+canonical history, live outputs, and a bounded rollback journal. Confirmation,
+readiness, status, filters, watches, revisions, raw blocks, and event feeds are
+not persisted.
+
+### Wallets
+
+`sdk/wallets::Wallets<I, F>` owns the application-facing collection:
+
+- a family map from `F` to scope, provider, and sender;
+- abstract wallet instances and public metadata keyed by `I`;
+- authoritative canonical address birthdays; and
+- the shared `Checkpoint` capability used to choose safe runtime birthdays.
+
+`Provider` constructs a concrete wallet by generating or importing secret
+material without returning that secret. A separate provider map is redundant;
+family registration owns the provider exactly once.
+
+`Wallets` exposes startup-only import plus chain-neutral runtime generation,
+get, balance, history, one send, and batch send operations. It delegates native
+behavior to registered wallets and senders. Business and endpoint code do not
+match on Bitcoin or Ethereum.
+
+The wallet/key registry is in memory. Durable custody is the embedding
+application's responsibility and is not represented as an indexing concern.
+
+### Public HTTP
+
+`apps/api` owns public routing, Utoipa schemas, transport validation,
+authentication, limits, HTTP errors, and encoding. HTTP state contains the
+abstract wallet collection and readiness state, not repositories, sources,
+interpreters, or concrete chains.
+
+Handlers are grouped by resource. Every endpoint-specific request and response
+struct is declared immediately above its one handler. A handler is limited to
+extraction, one `Wallets` operation, error/status mapping, and encoding. Shared
+wire types exist only for exact reuse; domain types remain with their domain.
+
+## Indexing flow
+
+```text
+Wallets::filters()
+    -> Composer::sync
+    -> partition filters by IndexScope
+    -> chain Service
+    -> verify local checkpoint against canonical hash
+    -> retained reorg removal when needed
+    -> source block at next height
+    -> interpreter(native block, active addresses)
+    -> BlockAddition::new
+    -> Blocks::add
+```
+
+All configured historical wallets are registered before the first sync. A
+fresh scope anchors immediately before its earliest birthday and scans forward;
+an empty filter set anchors at the source tip. A generated wallet begins at the
+next height.
+
+The persisted checkpoint is valid for the authoritative historical address set
+that produced it. A changed set below the checkpoint requires recreating and
+rescanning the scope. Indexing cannot infer that change across restarts because
+it deliberately stores no filter registry.
+
+A retained reorg removes orphan blocks until the common ancestor, then indexes
+the replacement branch normally. When the ancestor is outside retention,
+`ReorgTooDeep` requires a scope rescan.
 
 ## Transaction flow
 
-Transactions remain chain-native throughout protocol work:
-
 ```text
-chain-native request
-    -> unsigned chain-native transaction
-    -> chain computes payload/digest
-    -> injected Signer signs it
-    -> chain validates and inserts signature
-    -> signed chain-native bytes
-    -> chain broadcaster submits bytes
-    -> indexer observes inclusion, confirmation, or reorg
+abstract wallet request
+    -> concrete chain-native builder
+    -> unsigned native transaction
+    -> chain computes signing request
+    -> injected Signer
+    -> chain verifies and inserts signature
+    -> exact signed bytes
+    -> native broadcaster
+    -> submitted transaction ID
+    -> indexing observes canonical inclusion/confirmation/reorg
 ```
 
-The generic builder interface exists for application orchestration and emits a
-JSON-serializable snapshot. The originating wallet restores that snapshot and
-reinjects its live signer, RPC client, and chain policy after validating the
-version, chain, network, source wallet, asset, and transaction kind. The
-snapshot contains intent only; it does not serialize secrets or replace Bitcoin
-inputs/outputs or Ethereum typed transactions with a universal model.
+Submission is not confirmation. No broadcaster polls receipts to establish a
+second confirmation system.
 
-For multi-transfer sending, validation and preparation occur before the first
-external effect. Bitcoin allocates the fee deterministically across funding
-groups, signs every input with its owning wallet, and has one broadcast result.
-Ethereum cannot make
-several broadcasts atomic: it stops at the first failure and must report the
-accepted prefix precisely. RPC acceptance remains submission rather than
-confirmation.
+Bitcoin preserves outpoints, every input/output, scripts, checked satoshi
+fees, per-input signers, and deterministic change. Ethereum preserves chain ID,
+nonces, EIP-1559 fees, typed envelopes, recovered signer, receipts, and logs.
+The shared wallet surface does not replace those native models.
 
-## Runtime rules
+For batches, validate every request and the one-family constraint before the
+first external effect. Bitcoin may produce one multi-source native transaction.
+Ethereum broadcasts an ordered sequence and reports its accepted prefix if a
+later transaction fails.
 
-- RPC submission means submitted, not confirmed. Confirmation is an indexing
-  fact; the API does not poll receipts with a second confirmation subsystem.
-- The public listener starts only after every configured embedded index reaches
-  `SyncPhase::Ready` with a persisted canonical checkpoint; a fatal synchronizer exit
-  fails startup or terminates runtime.
-- Money uses checked integer atomic units and `Decimal` for exact display-unit
-  conversion. Floating point is forbidden.
-- Private keys never appear in logs, serialization, responses, or `Debug`.
-- The current in-process key pair is development custody, not a production
-  HSM/KMS boundary.
-- Startup owns task supervision and graceful shutdown for both indexing synchronizers
-  and HTTP serving.
+## Runtime lifecycle
+
+Startup order is part of correctness:
+
+1. validate configuration and server security;
+2. open chain clients and RocksDB repositories;
+3. construct chain services and `Composer`;
+4. construct `Wallets`, register families, and import startup wallets;
+5. start one sync loop with `Wallets::filters()`;
+6. wait for every configured scope to report `Ready` with a persisted
+   checkpoint;
+7. bind the public listener; and
+8. supervise HTTP, synchronization, Ctrl-C, cancellation, and task joins.
+
+`SyncStatus` reports only progress (`CatchingUp` or `Ready`). Failures are typed
+errors, not cached status variants. A fatal synchronizer exit fails startup or
+terminates runtime rather than serving stale data.
+
+## Product boundary
+
+The architecture currently supports wallet generation/import, canonical
+address and exact balance, complete paginated history, one or ordered batch
+submission, and continuous filtered indexing.
+
+It does not contain deposit accounting, ledgers, payment state machines,
+collection/sweep jobs, reservations, hardware-wallet workflows, remote
+custody, public index-management commands, raw-block archives, event feeds, or
+pre-release compatibility layers.

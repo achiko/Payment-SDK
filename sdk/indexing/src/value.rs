@@ -2,6 +2,13 @@
 pub struct ChainId(pub String);
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IndexScope {
+    pub chain: ChainId,
+    /// Chain-owned canonical network name, such as mainnet, sepolia, or regtest.
+    pub network: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AssetId {
     pub chain: ChainId,
     pub asset: String,

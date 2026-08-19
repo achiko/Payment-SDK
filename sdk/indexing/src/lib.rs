@@ -1,59 +1,38 @@
 //! Reorg-safe, chain-independent block synchronization contracts.
 
-mod changes;
+mod block;
+mod composer;
 mod error;
 mod indexer;
 mod observation;
 mod output;
-mod planning;
-mod planning_revert;
-mod planning_watch;
 mod service;
 mod source;
-mod store;
 mod synchronizer;
 #[cfg(test)]
 mod synchronizer_test;
 mod value;
-mod watch;
 
 pub use base::{BlockHash, BlockHeight, BlockRef};
-pub use changes::{
-    CommitBlock, CommitContext, CommitPlan, InterpretedBlock, ObservationTransition, PendingChange,
-    RevertBlock, RevertContext, RevertDecision, RevertObservation, RevertPlan, StoredObservation,
-};
+pub use block::{BlockAddition, BlockOutcome, BlockSelector, Blocks, InterpretedBlock};
+pub use composer::Composer;
 pub use error::{IndexError, IndexErrorKind, SourceError};
-pub use indexer::{Checkpoint, History, Index, Watcher};
+pub use indexer::{Checkpoint, History, Indexer};
 pub use observation::{
-    ConfirmationPolicy, ConfirmationProof, HistoryQuery, MovementId, MovementKind, NetworkFee,
-    ObservationDraft, ObservationDraftStatus, ObservationRevision, ObservedTransaction,
-    RegisterWatch, TransactionPage, TransactionQuery, TransactionStatus, ValueMovement,
-    WatchReceipt, WatchRequest, WatchSelector,
+    CanonicalPage, CanonicalStatus, CanonicalTransaction, HistoryCursor, HistoryPosition,
+    HistoryQuery, MovementId, MovementKind, NetworkFee, ObservationDraft, ObservationDraftStatus,
+    ObservedTransaction, TransactionPage, TransactionStatus, Transactions, ValueMovement,
 };
 pub use output::{
-    IndexChanges, IndexUndo, IndexedOutput, OutputChanges, OutputCursor, OutputId, OutputKey,
-    OutputPage, OutputQuery, OutputRequest, OutputSnapshot,
+    IndexedOutput, OutputChanges, OutputCursor, OutputId, OutputKey, OutputPage, OutputRequest,
+    Outputs,
 };
 #[doc(hidden)]
-pub use planning::{
-    addresses as observation_addresses, commit as plan_commit, confirmation as plan_confirmation,
-    observation as plan_observation, validate_draft,
-};
-#[doc(hidden)]
-pub use planning_revert::revert as plan_revert;
-#[doc(hidden)]
-pub use planning_watch::watch as plan_watch;
-pub use service::{SyncPhase, SyncRequest, SyncStatus};
+pub use service::Service;
+pub use service::{AddressFilter, SyncPhase, SyncStatus};
 pub use source::{BlockInterpreter, BlockSource, IndexedBlock};
-pub use store::{
-    BlockOutcome, BlockStore, CanonicalStore, HistoryStore, RevertTip, StatusStore, WatchStore,
-};
-pub use synchronizer::{DEFAULT_CONFIRMATIONS, DEFAULT_REORG_RETENTION, SyncConfig, Synchronizer};
-pub use value::{AssetId, CanonicalAddress, ChainId, TransactionRef};
-pub use watch::{
-    IndexScope, WatchContext, WatchDecision, WatchId, WatchPlan, WatchSnapshot, WatchTarget,
-    WatchVersion,
-};
+pub use synchronizer::SyncConfig;
+pub use value::{AssetId, CanonicalAddress, ChainId, IndexScope, TransactionRef};
 
 use std::{future::Future, pin::Pin};
 

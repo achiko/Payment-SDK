@@ -1,11 +1,12 @@
 use std::str::FromStr;
 
+use base::Decimal;
 use bitcoin::{
     Address, Amount, CompressedPublicKey, OutPoint, PublicKey, ScriptBuf, Sequence, Transaction,
     TxIn, TxOut, Txid, Witness, XOnlyPublicKey, absolute, consensus, hashes::Hash, hex::DisplayHex,
     secp256k1::Secp256k1, transaction::Version,
 };
-use indexing::{BlockHash, BlockHeight, MovementId, MovementKind, WatchSelector};
+use indexing::{BlockHash, BlockHeight, MovementId, MovementKind};
 use serde_json::{Number, Value, json};
 
 use super::*;
@@ -123,7 +124,7 @@ fn block(transactions: Vec<Value>) -> Block {
     }))
     .expect("test block JSON must encode");
     Block::parse(
-        raw_block,
+        &raw_block,
         Some(BlockHeight(10)),
         Some(&BlockHash(native_hash.to_byte_array().to_vec())),
         Network::Regtest,
@@ -145,18 +146,42 @@ fn coinbase(output: TxOut) -> Transaction {
     }
 }
 
-fn address_watch(id: &str, address: &Address) -> WatchTarget<WatchSelector> {
+fn indexed_address(address: &Address) -> CanonicalAddress {
     let address = crate::Address::from_encoded(address.to_string());
-    let selector = address.canonical(&scope());
-    WatchTarget {
-        id: WatchId(id.to_owned()),
-        scope: scope(),
-        selector: selector.clone(),
-        target: selector,
-        idempotency_key: format!("{id}-key"),
-        start_height: BlockHeight(0),
-        registered_at: None,
-    }
+    address.canonical(&scope())
+}
+
+#[test]
+fn ignores_transactions_unrelated_to_the_address_filter() {
+    let destination = p2wpkh_address(0x02);
+    let unrelated = p2tr_address();
+    let transaction = coinbase(TxOut {
+        value: Amount::from_sat(10_000),
+        script_pubkey: destination.script_pubkey(),
+    });
+    let block = block(vec![transaction_json(&transaction, &[None])]);
+
+    let interpreted = BlockInterpreter::new(scope(), Network::Regtest)
+        .expect("scope must be valid")
+        .inspect(&block, &[indexed_address(&unrelated)])
+        .expect("unrelated transaction must still interpret");
+
+    assert!(interpreted.transactions.is_empty());
+    assert!(interpreted.outputs.created.is_empty());
+}
+
+#[test]
+fn rejects_an_address_filter_from_another_scope() {
+    let address = p2wpkh_address(0x02);
+    let mut foreign = indexed_address(&address);
+    foreign.scope.network = "other".to_owned();
+
+    let error = BlockInterpreter::new(scope(), Network::Regtest)
+        .expect("scope must be valid")
+        .inspect(&block(Vec::new()), &[foreign])
+        .expect_err("foreign scope must be rejected");
+
+    assert_eq!(error.kind, IndexErrorKind::InvalidRequest);
 }
 
 #[test]
@@ -202,15 +227,12 @@ fn same_block_spend_nets_utxo_state_while_emitting_movements() {
         .expect("scope must be valid")
         .inspect(
             &block,
-            &[
-                address_watch("watch-source", &source),
-                address_watch("watch-destination", &destination),
-            ],
+            &[indexed_address(&source), indexed_address(&destination)],
         )
-        .expect("valid watched block must interpret");
+        .expect("valid relevant block must interpret");
 
-    assert_eq!(interpreted.drafts.len(), 2);
-    let spend = &interpreted.drafts[1];
+    assert_eq!(interpreted.transactions.len(), 2);
+    let spend = &interpreted.transactions[1];
     assert_eq!(spend.movements.len(), 2);
     assert_eq!(spend.movements[0].kind(), MovementKind::Input);
     assert_eq!(spend.movements[1].kind(), MovementKind::Output);
@@ -235,15 +257,13 @@ fn same_block_spend_nets_utxo_state_while_emitting_movements() {
             .scale(),
         0
     );
-    assert_eq!(interpreted.effect.outputs.created.len(), 1);
-    assert!(interpreted.effect.outputs.spent.is_empty());
-    assert!(interpreted.effect.outputs.tracked_spends.is_empty());
-    assert_eq!(interpreted.undo.created.len(), 1);
-    assert_eq!(interpreted.undo.spent.len(), 0);
+    assert_eq!(interpreted.outputs.created.len(), 1);
+    assert!(interpreted.outputs.spent.is_empty());
+    assert!(interpreted.outputs.tracked_spends.is_empty());
 }
 
 #[test]
-fn active_address_spend_is_recorded_directly() {
+fn indexed_address_spend_is_recorded_directly() {
     let source = p2wpkh_address(0x02);
     let destination = p2tr_address();
     let transaction = Transaction {
@@ -272,15 +292,13 @@ fn active_address_spend_is_recorded_directly() {
 
     let interpreted = BlockInterpreter::new(scope(), Network::Regtest)
         .expect("scope must be valid")
-        .inspect(&block, &[address_watch("active-source", &source)])
-        .expect("active watch spend must interpret");
+        .inspect(&block, &[indexed_address(&source)])
+        .expect("indexed address spend must interpret");
 
-    assert_eq!(interpreted.drafts.len(), 1);
-    assert_eq!(interpreted.effect.outputs.spent.len(), 1);
-    assert!(interpreted.effect.outputs.created.is_empty());
-    assert!(interpreted.effect.outputs.tracked_spends.is_empty());
-    assert!(interpreted.undo.created.is_empty());
-    assert_eq!(interpreted.undo.spent.len(), 1);
+    assert_eq!(interpreted.transactions.len(), 1);
+    assert_eq!(interpreted.outputs.spent.len(), 1);
+    assert!(interpreted.outputs.created.is_empty());
+    assert!(interpreted.outputs.tracked_spends.is_empty());
 }
 
 #[test]
@@ -326,7 +344,7 @@ fn missing_resolved_prevout_fails_before_commit() {
     .expect("test block JSON must encode");
 
     let error = Block::parse(
-        raw,
+        &raw,
         Some(BlockHeight(10)),
         Some(&BlockHash(native_hash.to_byte_array().to_vec())),
         Network::Regtest,

@@ -14,7 +14,7 @@ exist in the current workspace.
 | Ethereum addresses, RPC, EIP-1559 transactions, signing, indexing translation | `sdk/chains/ethereum` | chain unit tests and deterministic stack test |
 | Provider-selected wallet generation/import | `sdk/wallets` | provider/registry tests |
 | Exact wallet history mapping | `sdk/wallets` | history tests |
-| Reorg-safe watched indexing contracts and synchronizer | `sdk/indexing` | synchronizer and planning tests |
+| Reorg-safe filtered indexing contracts and synchronizer | `sdk/indexing` | synchronizer and contract tests |
 | Atomic indexing persistence | `sdk/indexing/rocksdb` | repository tests |
 | Generic JSON-RPC/HTTP/crypto/storage mechanics | `packages/*` | package tests |
 
@@ -30,16 +30,16 @@ doubles and temporary RocksDB databases:
 
 | Behavior | Current evidence |
 |---|---|
-| Wallet generation/watch | authenticated BTC and ETH API creation with a durable watch |
+| Wallet generation/index selection | authenticated BTC and ETH API creation with caller-owned address selection |
 | Balance and transaction reads | incoming node transaction indexed and returned through each generated wallet |
 | Single transfer | BTC and ETH partial sends, node inclusion/confirmation, outgoing history, and reduced balance |
 | Bitcoin batch | two compatible transfers become one broadcast transaction and one ID, then appear in indexed history |
 | Ethereum batch | two transfers submit as two IDs in request order, both become indexed, and balance reduces |
 | Lifecycle | indexes become ready before serving and both runtimes shut down cleanly |
-| Race regression | the previous watch/sync compare-and-swap race did not recur in ten repeated runs |
+| Address selection | caller registry snapshots are supplied to each synchronization run |
 | No internal transport | dependency/source audit shows no indexing HTTP adapter or second application |
 | Restart | configured BTC and ETH wallets reopen the same databases and retain indexed history |
-| Reorg | same-height replacement branches mark BTC and ETH history revisions as reorged |
+| Reorg | same-height replacement branches remove orphan history and expose only replacement canonical history |
 | Multi-source Bitcoin batch | two wallets fund one transaction; each input witness carries its owner's public key |
 | Ethereum accepted prefix | a rejected second submission returns the first transaction ID and `failed_index = 1` |
 | Mixed-chain preflight | BTC/ETH batch is rejected before either RPC double observes a broadcast |

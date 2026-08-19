@@ -1,7 +1,8 @@
 use super::*;
+use crate::{Satoshi, indexer::model::PreviousOutput};
 
 #[test]
-fn numbered_block_fetch_retains_enriched_result_and_rechecks_canonical_hash() {
+fn numbered_block_fetch_parses_transactions_and_rechecks_canonical_hash() {
     let mut replies = connect_replies();
     replies.extend([
         reply("getblockhash", Value::String(hash(2))),
@@ -19,14 +20,18 @@ fn numbered_block_fetch_retains_enriched_result_and_rechecks_canonical_hash() {
         parse_bitcoin_block_hash(&hash(2)).expect("test hash must parse"),
         block.reference.hash
     );
-    assert_eq!(
-        serde_json::from_slice::<Value>(block.raw()).expect("retained block must be exact JSON"),
-        block_result()
-    );
+    let transactions = block.transactions();
+    assert_eq!(transactions.len(), 1);
+    assert!(transactions[0].coinbase);
+    assert_eq!(transactions[0].inputs.len(), 1);
+    assert!(transactions[0].inputs[0].previous_output.is_none());
+    assert_eq!(transactions[0].outputs.len(), 1);
+    assert_eq!(transactions[0].outputs[0].value, Satoshi(5_000_000_000));
+    assert!(transactions[0].outputs[0].script_pubkey.is_empty());
 }
 
 #[test]
-fn external_prevouts_are_resolved_once_from_narrow_bounded_calls() {
+fn external_prevouts_are_resolved_once_into_bounded_parsed_facts() {
     let (block_result, previous, spending, child) = external_prevout_block();
     let previous_id = previous.compute_txid().to_string();
     let mut replies = connect_replies();
@@ -53,56 +58,75 @@ fn external_prevouts_are_resolved_once_from_narrow_bounded_calls() {
         .expect("external previous outputs must be enriched");
     calls.assert_exhausted();
 
-    let raw: Value = serde_json::from_slice(block.raw()).expect("enriched block JSON must decode");
-    let inputs = raw["tx"][0]["vin"]
-        .as_array()
-        .expect("spending inputs must be retained");
+    let transactions = block.transactions();
+    assert_eq!(transactions.len(), 2);
     assert_eq!(
-        inputs[0]["prevout"],
-        json!({
-            "value_satoshis": 123_456_789_u64,
-            "address": address_for_script(
-                &previous.output[0].script_pubkey,
-                Network::Regtest,
-            )
-            .expect("test P2WPKH script must have an address")
-            .encoded(),
-        })
+        transactions
+            .iter()
+            .map(|transaction| transaction.id)
+            .collect::<Vec<_>>(),
+        vec![
+            TransactionId::from(spending.compute_txid()),
+            TransactionId::from(child.compute_txid()),
+        ]
     );
-    assert_eq!(inputs[1]["prevout"]["value_satoshis"], json!(50_000_u64));
+    let historical_id = TransactionId::from(previous.compute_txid());
     assert_eq!(
-        inputs[2]["prevout"],
-        json!({"value_satoshis": 25_000_u64, "address": null})
+        transactions[0]
+            .inputs
+            .iter()
+            .map(|input| input.previous_output.clone())
+            .collect::<Vec<_>>(),
+        previous
+            .output
+            .iter()
+            .enumerate()
+            .map(|(index, output)| {
+                Some(PreviousOutput {
+                    outpoint: Outpoint {
+                        transaction_id: historical_id,
+                        output_index: u32::try_from(index).expect("test index must fit u32"),
+                    },
+                    value: Satoshi(output.value.to_sat()),
+                    address: address_for_script(&output.script_pubkey, Network::Regtest),
+                })
+            })
+            .collect::<Vec<_>>()
     );
-    for input in inputs {
-        let prevout = input
-            .get("prevout")
-            .expect("external input must retain compact data");
-        assert!(prevout.get("scriptPubKey").is_none());
-        assert!(prevout.get("height").is_none());
-        assert!(prevout.get("generated").is_none());
+    assert!(previous.output[2].script_pubkey.len() > MAX_COMPACT_PREVOUT_JSON_BYTES);
+
+    for output in &previous.output {
+        let compact = ResolvedOutput {
+            value_satoshis: output.value.to_sat(),
+            address: address_for_script(&output.script_pubkey, Network::Regtest),
+        }
+        .compact_json()
+        .expect("resolved output must fit its compact boundary");
+        assert_eq!(
+            compact
+                .as_object()
+                .expect("compact previous output must be an object")
+                .len(),
+            2
+        );
         assert!(
-            serde_json::to_vec(prevout)
+            serde_json::to_vec(&compact)
                 .expect("compact data must encode")
                 .len()
                 <= MAX_COMPACT_PREVOUT_JSON_BYTES
         );
     }
-    assert!(
-        block.raw().len() < previous.output[2].script_pubkey.len(),
-        "historical script bytes must not survive retained enrichment"
-    );
+
     assert_eq!(
-        raw["tx"][0]["txid"],
-        Value::String(spending.compute_txid().to_string())
-    );
-    assert!(
-        raw["tx"][1]["vin"][0].get("prevout").is_none(),
-        "same-block previous outputs must remain locally resolved"
-    );
-    assert_eq!(
-        raw["tx"][1]["txid"],
-        Value::String(child.compute_txid().to_string())
+        transactions[1].inputs[0].previous_output,
+        Some(PreviousOutput {
+            outpoint: Outpoint {
+                transaction_id: TransactionId::from(spending.compute_txid()),
+                output_index: 0,
+            },
+            value: Satoshi(123_521_789),
+            address: None,
+        })
     );
 }
 

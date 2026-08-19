@@ -62,7 +62,7 @@ impl Config {
 /// The source fetches the block at verbosity 2, then resolves only external
 /// previous transactions through at most four concurrent, transport-bounded calls.
 /// Full historical scripts are validated and discarded at the source boundary;
-/// retained replay data contains only bounded value/address facts.
+/// parsed blocks contain only the value/address facts interpretation needs.
 pub struct Blocks<C> {
     client: RpcClient<C>,
     config: Config,
@@ -362,8 +362,8 @@ where
                     source_error("Bitcoin transaction input must be an object", true)
                 })?;
                 // Verbosity 2 does not include this field. Removing any
-                // unexpected value ensures only the compact, source-owned
-                // shape can enter retained raw block data.
+                // unexpected value ensures parsing sees only the compact,
+                // source-owned previous-output shape.
                 input.remove("prevout");
                 let previous_id = TransactionId::from(native_input.previous_output.txid);
                 let outpoint = Outpoint {
@@ -410,7 +410,7 @@ where
             return Ok(None);
         };
         let raw_block = self.enrich_prevouts(raw_block).await?;
-        Block::parse(raw_block, expected_height, Some(hash), self.config.network)
+        Block::parse(&raw_block, expected_height, Some(hash), self.config.network)
             .map(Some)
             .map_err(|error| source_error(error.to_string(), true))
     }

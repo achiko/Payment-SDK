@@ -91,7 +91,7 @@ impl BitcoinNode {
         transaction_id
     }
 
-    /// Makes the deterministic funding block visible after watches exist.
+    /// Makes the deterministic funding block visible after the address is registered.
     pub fn mine(&self) {
         self.phase.store(1, Ordering::Release);
     }

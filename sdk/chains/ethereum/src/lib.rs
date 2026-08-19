@@ -11,7 +11,7 @@ mod wallet;
 pub use address::Address as EthereumAddress;
 pub use address::{Address, AddressParseError};
 pub use error::{ChainError, ChainErrorKind};
-pub use indexer::{Block, BlockClient, BlockInterpreter, Source, SourceConfig};
+pub use indexer::{Block, BlockClient, BlockInterpreter, Indexer, Source, SourceConfig};
 pub use rpc::{
     AccountClient, Accounts, BuildError, BuildErrorKind, Client as RpcClient, HttpAccounts,
     HttpConfig, HttpTransactions, Limits, TransactionClient, Transactions,
