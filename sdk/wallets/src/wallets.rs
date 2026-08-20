@@ -102,6 +102,31 @@ where
         })
     }
 
+    /// Registers a wallet from caller-held secret material while running.
+    ///
+    /// Unlike [`Wallets::import`] this takes `&self`, so it stays available
+    /// after synchronization has started. That is safe because the address is
+    /// anchored at the current checkpoint exactly like a generated one: no
+    /// historical selection is introduced, so no rescan is implied.
+    ///
+    /// Use it when the application generates and durably stores its own key
+    /// material — a deposit address whose custody belongs in the application's
+    /// database rather than in this in-memory registry.
+    pub fn adopt<'a>(
+        &'a self,
+        id: I,
+        family: &F,
+        secret: SecretBytes,
+    ) -> FutureResult<'a, WalletInfo<I, F>> {
+        let family_key = family.clone();
+        let configured = self.family(family);
+        Box::pin(async move {
+            let configured = configured?;
+            let wallet = configured.provider.create(secret).await?;
+            self.store(id, family_key, configured, wallet, None).await
+        })
+    }
+
     /// Imports secret material and indexes from its explicit birthday.
     ///
     /// This startup-only operation requires exclusive access so historical

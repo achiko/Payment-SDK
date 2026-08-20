@@ -23,6 +23,10 @@ name = "indexing-adapter"
 may_depend_on = ["package", "base", "indexing"]
 
 [[dependency.layers]]
+name = "indexing-runtime"
+may_depend_on = ["package", "base", "indexing"]
+
+[[dependency.layers]]
 name = "bitcoin-chain"
 may_depend_on = ["package", "base", "indexing", "wallets"]
 
@@ -38,12 +42,12 @@ may_depend_on = []
 [[dependency.layers]]
 name = "application"
 directory = "apps"
-may_depend_on = ["package", "base", "indexing", "wallets", "indexing-adapter", "bitcoin-chain", "ethereum-chain"]
+may_depend_on = ["package", "base", "indexing", "wallets", "indexing-adapter", "indexing-runtime", "bitcoin-chain", "ethereum-chain"]
 
 [[dependency.layers]]
 name = "acceptance"
 directory = "tests"
-may_depend_on = ["package", "base", "indexing", "wallets", "indexing-adapter", "bitcoin-chain", "ethereum-chain", "application"]
+may_depend_on = ["package", "base", "indexing", "wallets", "indexing-adapter", "indexing-runtime", "bitcoin-chain", "ethereum-chain", "application"]
 
 [[dependency.package_layers]]
 package = "base"
@@ -60,6 +64,10 @@ layer = "wallets"
 [[dependency.package_layers]]
 package = "indexing-rocksdb"
 layer = "indexing-adapter"
+
+[[dependency.package_layers]]
+package = "indexing-runtime"
+layer = "indexing-runtime"
 
 [[dependency.package_layers]]
 package = "chain-bitcoin"

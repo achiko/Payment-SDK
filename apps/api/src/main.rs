@@ -1,12 +1,9 @@
-mod sync_task;
-
 use std::{
     collections::BTreeSet,
     env,
     error::Error,
     future::IntoFuture,
     net::SocketAddr,
-    num::NonZeroU32,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -14,8 +11,7 @@ use std::{
 
 use chain_bitcoin::{AddressType, FeeRate, IndexUtxos, Network};
 use chain_ethereum::AssetKind;
-use indexing::{BlockHash, BlockHeight, ChainId, IndexScope};
-use json_rpc::{Config as TransportConfig, Http, Retry};
+use indexing::{BlockHash, BlockHeight};
 use payment_api::{Chain, State};
 use serde::Deserialize;
 use tokio::sync::watch;
@@ -127,6 +123,29 @@ struct BitcoinConfig {
     sync: SyncConfig,
 }
 impl BitcoinConfig {
+    fn settings(&self) -> Result<chain_bitcoin::IndexerSettings, AnyError> {
+        let endpoint = self
+            .rpc
+            .endpoints
+            .first()
+            .ok_or("RPC endpoints must not be empty")?;
+        let mut settings = chain_bitcoin::IndexerSettings::new(
+            endpoint.clone(),
+            self.network,
+            self.genesis_hash.as_str(),
+        );
+        self.rpc.apply_to(
+            &mut settings.endpoints,
+            &mut settings.headers,
+            &mut settings.request_timeout,
+            &mut settings.max_response_bytes,
+        );
+        settings.confirmations = self.sync.confirmation_depth;
+        settings.reorg_retention = self.sync.reorg_retention;
+        settings.batch_size = self.sync.batch_size;
+        Ok(settings)
+    }
+
     fn validate(&self) -> Result<(), AnyError> {
         self.rpc.validate(&self.database)?;
         self.sync.validate()?;
@@ -151,6 +170,29 @@ struct EthereumConfig {
     sync: SyncConfig,
 }
 impl EthereumConfig {
+    fn settings(&self) -> Result<chain_ethereum::IndexerSettings, AnyError> {
+        let endpoint = self
+            .rpc
+            .endpoints
+            .first()
+            .ok_or("RPC endpoints must not be empty")?;
+        let mut settings = chain_ethereum::IndexerSettings::new(
+            endpoint.clone(),
+            chain_ethereum::Network::new(self.chain_id, self.network.as_str()),
+            self.genesis_hash.as_str(),
+        );
+        self.rpc.apply_to(
+            &mut settings.endpoints,
+            &mut settings.headers,
+            &mut settings.request_timeout,
+            &mut settings.max_response_bytes,
+        );
+        settings.confirmations = self.sync.confirmation_depth;
+        settings.reorg_retention = self.sync.reorg_retention;
+        settings.batch_size = self.sync.batch_size;
+        Ok(settings)
+    }
+
     fn validate(&self) -> Result<(), AnyError> {
         self.rpc.validate(&self.database)?;
         self.sync.validate()?;
@@ -198,15 +240,6 @@ impl SyncConfig {
         Ok(())
     }
 
-    fn build(&self, scope: IndexScope) -> Result<indexing::SyncConfig, AnyError> {
-        Ok(indexing::SyncConfig::new(
-            scope,
-            self.confirmation_depth,
-            self.reorg_retention,
-            self.batch_size,
-        )?)
-    }
-
     const fn default_poll_millis() -> u64 {
         1_000
     }
@@ -240,21 +273,18 @@ impl RpcConfig {
         Ok(())
     }
 
-    fn client(&self) -> Result<Http, AnyError> {
-        let endpoint = self
-            .endpoints
-            .first()
-            .ok_or("RPC endpoints must not be empty")?;
-        let mut config = TransportConfig::new(endpoint, Duration::from_secs(self.timeout_seconds));
-        config.endpoints.clone_from(&self.endpoints);
-        config.max_response_bytes = self.max_response_bytes;
-        config.retry = Retry::new(
-            NonZeroU32::try_from(3_u32)?,
-            Duration::from_millis(250),
-            Duration::from_secs(2),
-        )?;
-        config.headers.clone_from(&self.headers);
-        Ok(Http::new(config)?)
+    /// Copies the configured transport tuning onto a chain's indexer settings.
+    fn apply_to(
+        &self,
+        endpoints: &mut Vec<String>,
+        headers: &mut Vec<(String, String)>,
+        request_timeout: &mut Duration,
+        max_response_bytes: &mut usize,
+    ) {
+        endpoints.clone_from(&self.endpoints);
+        headers.clone_from(&self.headers);
+        *request_timeout = Duration::from_secs(self.timeout_seconds);
+        *max_response_bytes = self.max_response_bytes;
     }
 
     const fn default_timeout_seconds() -> u64 {
@@ -311,75 +341,44 @@ async fn main() -> Result<(), AnyError> {
     let mut indexers = Vec::<Arc<dyn indexing::Indexer>>::new();
 
     let bitcoin = if let Some(config) = config.indexes.bitcoin {
-        let scope = IndexScope {
-            chain: ChainId(chain_bitcoin::CHAIN.to_owned()),
-            network: config.network.canonical_name().to_owned(),
-        };
-        let genesis = chain_bitcoin::parse_bitcoin_block_hash(&config.genesis_hash)?;
-        let rpc = chain_bitcoin::RpcClient::connect(
-            config.rpc.client()?,
-            chain_bitcoin::CoreConfig {
-                expected_network: config.network,
-                expected_genesis_hash: genesis.clone(),
-            },
-        )
-        .await?;
-        let source = chain_bitcoin::Source::from_client(
-            rpc.clone(),
-            chain_bitcoin::SourceConfig {
-                scope: scope.clone(),
-                network: config.network,
-                expected_genesis_hash: genesis,
-            },
-        )?;
+        let settings = config.settings()?;
+        let scope = settings.scope();
+        // One long-lived client per chain: the indexer gets a clone, the wallet
+        // provider below keeps the original.
+        let client = settings.client().await?;
         let repository = Arc::new(indexing_rocksdb::Repository::new(
             storage_rocksdb::RocksDb::open(&config.database)?,
             scope.clone(),
         )?);
-        let service = Arc::new(chain_bitcoin::Indexer::new(
-            source,
-            chain_bitcoin::BlockInterpreter::new(scope.clone(), config.network)?,
+        indexers.push(Arc::new(settings.build(
+            client.clone(),
             repository.as_ref().clone(),
-            config.sync.build(scope.clone())?,
-        ));
-        indexers.push(service);
-        Some((scope, config.network, repository, rpc))
+            None,
+        )?));
+        Some((scope, config.network, repository, client))
     } else {
         None
     };
     let ethereum = if let Some(config) = config.indexes.ethereum {
-        let genesis = config.genesis()?;
-        let scope = IndexScope {
-            chain: ChainId(chain_ethereum::CHAIN.to_owned()),
-            network: config.network,
-        };
-        let rpc = chain_ethereum::RpcClient::new(config.rpc.client()?);
-        let source = chain_ethereum::Source::from_rpc(
-            rpc.clone(),
-            chain_ethereum::SourceConfig {
-                scope: scope.clone(),
-                expected_chain_id: config.chain_id,
-                expected_genesis_hash: genesis,
-            },
-        )
-        .await?;
+        let settings = config.settings()?;
+        let scope = settings.scope();
+        let client = settings.client()?;
         let repository = indexing_rocksdb::Repository::new(
             storage_rocksdb::RocksDb::open(&config.database)?,
             scope.clone(),
         )?;
-        let service = Arc::new(chain_ethereum::Indexer::new(
-            source,
-            chain_ethereum::BlockInterpreter::new(scope.clone())?,
-            repository,
-            config.sync.build(scope.clone())?,
+        indexers.push(Arc::new(
+            settings.build(client.clone(), repository, None).await?,
         ));
-        indexers.push(service);
         let accounts: Arc<dyn chain_ethereum::Accounts> = Arc::new(
-            chain_ethereum::AccountClient::new(rpc.clone(), config.chain_id)?,
+            chain_ethereum::AccountClient::new(client.clone(), config.chain_id)?,
         );
-        let transactions: Arc<dyn chain_ethereum::Transactions> = Arc::new(
-            chain_ethereum::TransactionClient::new(rpc, config.chain_id, config.limits.build()?)?,
-        );
+        let transactions: Arc<dyn chain_ethereum::Transactions> =
+            Arc::new(chain_ethereum::TransactionClient::new(
+                client,
+                config.chain_id,
+                config.limits.build()?,
+            )?);
         Some((scope, accounts, transactions))
     } else {
         None
@@ -442,7 +441,7 @@ async fn main() -> Result<(), AnyError> {
     let (shutdown, shutdown_rx) = watch::channel(false);
     let (readiness, mut readiness_rx) = watch::channel(false);
     let filters = wallets.clone();
-    let mut synchronization = tokio::spawn(sync_task::run(
+    let mut synchronization = tokio::spawn(indexing_runtime::run(
         indexer,
         move || filters.filters(),
         interval,
