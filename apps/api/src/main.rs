@@ -1,3 +1,5 @@
+mod readiness;
+
 use std::{
     collections::BTreeSet,
     env,
@@ -379,7 +381,7 @@ async fn main() -> Result<(), AnyError> {
                 config.chain_id,
                 config.limits.build()?,
             )?);
-        Some((scope, accounts, transactions))
+        Some((scope, config.chain_id, accounts, transactions))
     } else {
         None
     };
@@ -406,12 +408,13 @@ async fn main() -> Result<(), AnyError> {
             history.clone(),
         );
         let sender = provider.transactions();
-        wallets.register(Chain::Bitcoin, scope, provider, sender)?;
+        wallets.register(Chain::Bitcoin, scope, provider, sender, None)?;
     }
-    if let Some((scope, accounts, transactions)) = ethereum {
+    if let Some((scope, chain_id, accounts, transactions)) = ethereum {
         let provider = chain_ethereum::WalletProvider::new(
             chain_ethereum::WalletConfig {
                 scope: scope.clone(),
+                chain_id,
                 asset: AssetKind::Native,
                 decimals: chain_ethereum::ETH.decimals,
             },
@@ -420,7 +423,7 @@ async fn main() -> Result<(), AnyError> {
             history,
         );
         let sender = provider.transactions();
-        wallets.register(Chain::Ethereum, scope, provider, sender)?;
+        wallets.register(Chain::Ethereum, scope, provider, sender, None)?;
     }
     for configured in config.wallets {
         let encoded = env::var(configured.secret_env)?;
@@ -439,6 +442,7 @@ async fn main() -> Result<(), AnyError> {
     }
     let wallets = Arc::new(wallets);
     let (shutdown, shutdown_rx) = watch::channel(false);
+    let (sync_state, sync_state_rx) = watch::channel(indexing_runtime::SyncState::CatchingUp);
     let (readiness, mut readiness_rx) = watch::channel(false);
     let filters = wallets.clone();
     let mut synchronization = tokio::spawn(indexing_runtime::run(
@@ -446,8 +450,10 @@ async fn main() -> Result<(), AnyError> {
         move || filters.filters(),
         interval,
         shutdown_rx,
-        readiness,
+        sync_state,
     ));
+
+    readiness::publish(sync_state_rx, readiness);
 
     while !*readiness_rx.borrow() {
         tokio::select! {

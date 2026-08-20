@@ -122,13 +122,20 @@ Deleting one chain must leave the other chain and every generic crate coherent.
 - canonical transaction, movement, and live-output facts;
 - block-source/interpreter contracts;
 - `Blocks`, `Transactions`, and `Outputs` persistence collections;
+- the `Registry` collection holding the durable address selection;
 - confirmation derivation and checkpoint-bound pagination;
 - one-scope synchronization; and
 - the multi-scope `Composer`.
 
 One-chain `Service` and `Composer` implement the same `Indexer` trait. The sync
-caller supplies a complete filter snapshot on every invocation. Indexing does
-not own or persist the selected address lifecycle.
+caller supplies a complete filter snapshot on every invocation; synchronization
+itself holds no selection state.
+
+`Registry` persists that selection so it survives a restart. It is a separate
+collection, not an input to synchronization: a caller reloads the registry and
+supplies the snapshot as before. Indexing stores each entry's opaque caller
+material verbatim and never interprets it, so custody remains the embedding
+application's decision.
 
 `Blocks::add` atomically commits canonical history, live output changes, a
 storage-derived bounded journal entry, and checkpoint movement. `Blocks::remove`
@@ -140,9 +147,9 @@ compare-and-swap conditions, atomic batches, and journal encoding. Those types
 never appear in a chain interpreter or generic consumer.
 
 The durable set is deliberately limited to checkpoint, address-primary
-canonical history, live outputs, and a bounded rollback journal. Confirmation,
-readiness, status, filters, watches, revisions, raw blocks, and event feeds are
-not persisted.
+canonical history, live outputs, a bounded rollback journal, and the registered
+address selection. Confirmation, readiness, status, watches, revisions, raw
+blocks, and event feeds are not persisted.
 
 ### Wallets
 
@@ -199,8 +206,13 @@ next height.
 
 The persisted checkpoint is valid for the authoritative historical address set
 that produced it. A changed set below the checkpoint requires recreating and
-rescanning the scope. Indexing cannot infer that change across restarts because
-it deliberately stores no filter registry.
+rescanning the scope, because synchronization resumes from the checkpoint and
+never revisits blocks behind it.
+
+`Registry` records the selection that produced a checkpoint, so a restart
+restores the same set rather than inferring one. It does not make a birthday
+below the checkpoint safe: registering such an address still requires a rescan,
+and callers are expected to reject or rescan rather than register silently.
 
 A retained reorg removes orphan blocks until the common ancestor, then indexes
 the replacement branch normally. When the ancestor is outside retention,

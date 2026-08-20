@@ -261,6 +261,7 @@ fn fixture(initially_ready: bool) -> Fixture {
             Arc::new(FixtureSender {
                 calls: Arc::clone(&calls),
             }),
+            None,
         )
         .expect("fixture family must register");
     let (ready, receiver) = watch::channel(initially_ready);

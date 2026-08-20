@@ -12,13 +12,28 @@ use tokio::sync::watch;
 
 pub type TaskError = Box<dyn Error + Send + Sync>;
 
+/// What synchronization is currently doing.
+///
+/// Published on every pass. `Retrying` carries the reason: a transient source
+/// or store failure is retried indefinitely, and without the message a wedged
+/// indexer is indistinguishable from an idle one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SyncState {
+    /// Behind the source tip and still applying blocks.
+    CatchingUp,
+    /// Every configured scope has reached the source tip.
+    Ready,
+    /// The last pass failed with a retryable error and will be attempted again.
+    Retrying { error: String },
+}
+
 /// Keeps the composed index current until shutdown or a terminal failure.
 pub async fn run<F, E>(
     indexer: Arc<dyn Indexer>,
     filters: F,
     interval: Duration,
     mut shutdown: watch::Receiver<bool>,
-    ready: watch::Sender<bool>,
+    state: watch::Sender<SyncState>,
 ) -> Result<(), TaskError>
 where
     F: Fn() -> Result<Vec<AddressFilter>, E> + Send + Sync + 'static,
@@ -32,7 +47,9 @@ where
         let filters = match filters() {
             Ok(filters) => filters,
             Err(error) => {
-                ready.send_replace(false);
+                state.send_replace(SyncState::Retrying {
+                    error: error.to_string(),
+                });
                 return Err(TaskError::from(error));
             }
         };
@@ -62,7 +79,9 @@ where
                         status.phase == SyncPhase::Ready && status.checkpoint.is_none()
                     })
                 {
-                    ready.send_replace(false);
+                    state.send_replace(SyncState::Retrying {
+                        error: "incomplete synchronization status".to_owned(),
+                    });
                     return Err(io::Error::other(
                         "indexer returned incomplete or inconsistent synchronization status",
                     )
@@ -71,23 +90,35 @@ where
                 let caught_up = statuses
                     .iter()
                     .all(|status| status.phase == SyncPhase::Ready);
-                ready.send_if_modified(|current| {
-                    let changed = *current != caught_up;
-                    *current = caught_up;
+                let next = if caught_up {
+                    SyncState::Ready
+                } else {
+                    SyncState::CatchingUp
+                };
+                state.send_if_modified(|current| {
+                    let changed = *current != next;
+                    *current = next;
                     changed
                 });
                 caught_up
             }
             Err(error) if error.retryable => {
-                ready.send_if_modified(|current| {
-                    let changed = *current;
-                    *current = false;
+                // The reason must reach the caller: this loop will keep going
+                // forever, and silence here is indistinguishable from health.
+                let next = SyncState::Retrying {
+                    error: error.message.clone(),
+                };
+                state.send_if_modified(|current| {
+                    let changed = *current != next;
+                    *current = next;
                     changed
                 });
                 true
             }
             Err(error) => {
-                ready.send_replace(false);
+                state.send_replace(SyncState::Retrying {
+                    error: error.message.clone(),
+                });
                 return Err(error.into());
             }
         };

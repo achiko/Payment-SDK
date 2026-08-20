@@ -62,6 +62,10 @@ package = "wallets"
 layer = "wallets"
 
 [[dependency.package_layers]]
+package = "indexing-postgres"
+layer = "indexing-adapter"
+
+[[dependency.package_layers]]
 package = "indexing-rocksdb"
 layer = "indexing-adapter"
 

@@ -28,6 +28,14 @@ mod snapshot;
 #[derive(Clone, Debug)]
 pub struct WalletConfig {
     pub scope: IndexScope,
+    /// The EVM chain this wallet signs for, verified against the node before
+    /// broadcast.
+    ///
+    /// Configured rather than derived from the network slug: EVM chains are an
+    /// open set, and a fixed slug table would reject every devnet, rollup, and
+    /// fork while silently accepting a slug that names a different chain than
+    /// the node actually serves.
+    pub chain_id: u64,
     pub asset: AssetKind,
     pub decimals: u32,
 }
@@ -35,7 +43,8 @@ pub struct WalletConfig {
 impl WalletConfig {
     fn validate(&self) -> Result<(), WalletError> {
         if self.scope.chain.0 != "ethereum"
-            || configured_chain_id(&self.scope).is_err()
+            || self.scope.network.trim().is_empty()
+            || self.chain_id == 0
             || matches!(self.asset, AssetKind::Native) && self.decimals != crate::ETH.decimals
             || self.decimals > u8::MAX.into()
         {
@@ -177,6 +186,7 @@ impl TransactionFactory for Wallet {
     fn transaction(&self) -> Box<dyn BaseBuilder> {
         Box::new(Builder::new(
             self.config.scope.clone(),
+            self.config.chain_id,
             self.address.clone(),
             self.config.asset.clone(),
             self.config.decimals,
@@ -199,6 +209,7 @@ impl TransactionFactory for Wallet {
 
 struct Builder {
     scope: IndexScope,
+    chain_id: u64,
     from: Address,
     asset: AssetKind,
     decimals: u32,
@@ -214,6 +225,7 @@ impl Builder {
 
     fn new(
         scope: IndexScope,
+        chain_id: u64,
         from: Address,
         asset: AssetKind,
         decimals: u32,
@@ -222,6 +234,7 @@ impl Builder {
     ) -> Self {
         Self {
             scope,
+            chain_id,
             from,
             asset,
             decimals,
@@ -255,7 +268,8 @@ impl Builder {
 
     fn validate(&self) -> Result<(), TransactionError> {
         if self.scope.chain.0 != "ethereum"
-            || configured_chain_id(&self.scope).is_err()
+            || self.scope.network.trim().is_empty()
+            || self.chain_id == 0
             || matches!(self.asset, AssetKind::Native) && self.decimals != crate::ETH.decimals
             || self.decimals > u8::MAX.into()
         {
@@ -326,7 +340,7 @@ impl BaseBuilder for Builder {
                 .build_context(&request)
                 .await
                 .map_err(|error| transaction_error(TransactionErrorKind::Unavailable, error))?;
-            if context.chain_id != configured_chain_id(&self.scope)? {
+            if context.chain_id != self.chain_id {
                 return Err(transaction_error(
                     TransactionErrorKind::Divergent,
                     "Ethereum RPC chain ID does not match the wallet network",
@@ -342,17 +356,6 @@ impl BaseBuilder for Builder {
                 TransactionEnvelope::new(signed.envelope),
             ))
         })
-    }
-}
-
-fn configured_chain_id(scope: &IndexScope) -> Result<u64, TransactionError> {
-    match scope.network.as_str() {
-        "mainnet" => Ok(1),
-        "sepolia" => Ok(11_155_111),
-        _ => Err(transaction_error(
-            TransactionErrorKind::InvalidSnapshot,
-            "Ethereum wallet uses an unsupported network",
-        )),
     }
 }
 

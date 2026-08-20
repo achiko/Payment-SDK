@@ -76,6 +76,7 @@ mod tests {
                 chain: ChainId(crate::CHAIN.to_owned()),
                 network: "mainnet".to_owned(),
             },
+            chain_id: 1,
             asset,
             decimals,
         }
