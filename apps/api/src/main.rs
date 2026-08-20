@@ -350,9 +350,11 @@ async fn main() -> Result<(), AnyError> {
             storage_rocksdb::RocksDb::open(&config.database)?,
             scope.clone(),
         )?);
-        indexers.push(Arc::new(
-            settings.build(client.clone(), repository.as_ref().clone(), None)?,
-        ));
+        indexers.push(Arc::new(settings.build(
+            client.clone(),
+            repository.as_ref().clone(),
+            None,
+        )?));
         Some((scope, config.network, repository, client))
     } else {
         None
@@ -365,7 +367,9 @@ async fn main() -> Result<(), AnyError> {
             storage_rocksdb::RocksDb::open(&config.database)?,
             scope.clone(),
         )?;
-        indexers.push(Arc::new(settings.build(client.clone(), repository, None).await?));
+        indexers.push(Arc::new(
+            settings.build(client.clone(), repository, None).await?,
+        ));
         let accounts: Arc<dyn chain_ethereum::Accounts> = Arc::new(
             chain_ethereum::AccountClient::new(client.clone(), config.chain_id)?,
         );

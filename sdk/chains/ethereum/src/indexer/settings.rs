@@ -12,9 +12,7 @@
 
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
-use indexing::{
-    BlockHash, ChainId, IndexError, IndexErrorKind, IndexScope, Observer, SyncConfig,
-};
+use indexing::{BlockHash, ChainId, IndexError, IndexErrorKind, IndexScope, Observer, SyncConfig};
 use json_rpc::{Config as TransportConfig, Http, Retry};
 
 use crate::{BlockInterpreter, Indexer, RpcClient, Source, SourceConfig};
