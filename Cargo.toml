@@ -5,6 +5,7 @@ members = [
     "sdk/chains/bitcoin",
     "sdk/chains/ethereum",
     "sdk/indexing",
+    "sdk/indexing/postgres",
     "sdk/indexing/rocksdb",
     "sdk/indexing/runtime",
     "sdk/wallets",

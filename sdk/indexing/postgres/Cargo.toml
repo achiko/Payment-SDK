@@ -1,0 +1,16 @@
+[package]
+name = "indexing-postgres"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+indexing = { path = ".." }
+deadpool-postgres = "0.14"
+tokio-postgres = "0.7"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -7,6 +7,7 @@ mod indexer;
 mod observation;
 mod observer;
 mod output;
+mod registry;
 mod service;
 mod source;
 mod synchronizer;
@@ -29,6 +30,7 @@ pub use output::{
     IndexedOutput, OutputChanges, OutputCursor, OutputId, OutputKey, OutputPage, OutputRequest,
     Outputs,
 };
+pub use registry::{RegisteredAddress, Registry};
 #[doc(hidden)]
 pub use service::Service;
 pub use service::{AddressFilter, SyncPhase, SyncStatus};

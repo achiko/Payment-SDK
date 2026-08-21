@@ -1,11 +1,14 @@
 use std::{
     borrow::Borrow,
     collections::BTreeMap,
+    fmt,
     sync::{Arc, RwLock},
 };
 
 use base::{BlockHeight, Decimal, TransactionId};
-use indexing::{AddressFilter, CanonicalAddress, Checkpoint, IndexScope};
+use indexing::{
+    AddressFilter, CanonicalAddress, Checkpoint, IndexScope, RegisteredAddress, Registry,
+};
 
 use crate::{
     AddressText, Balance, Error, ErrorKind, FutureResult, History, HistoryRequest, Provider,
@@ -34,6 +37,10 @@ struct Family {
     scope: IndexScope,
     provider: Arc<dyn Provider>,
     sender: Arc<dyn Sender>,
+    /// Durable address selection for this family's scope. A registry is bound
+    /// to one scope, so it belongs beside the scope rather than on the whole
+    /// collection, which spans every chain.
+    registry: Option<Arc<dyn Registry>>,
 }
 
 #[derive(Clone)]
@@ -72,6 +79,7 @@ where
         scope: IndexScope,
         provider: impl Provider + 'static,
         sender: Arc<dyn Sender>,
+        registry: Option<Arc<dyn Registry>>,
     ) -> Result<(), Error> {
         if self.families.contains_key(&family) {
             return Err(Error::new(
@@ -85,6 +93,7 @@ where
                 scope,
                 provider: Arc::new(provider),
                 sender,
+                registry,
             },
         );
         Ok(())
@@ -98,7 +107,8 @@ where
         Box::pin(async move {
             let configured = configured?;
             let wallet = configured.provider.generate().await?;
-            self.store(id, family_key, configured, wallet, None).await
+            let (info, _) = self.store(id, family_key, configured, wallet, None).await?;
+            Ok(info)
         })
     }
 
@@ -117,13 +127,79 @@ where
         id: I,
         family: &F,
         secret: SecretBytes,
-    ) -> FutureResult<'a, WalletInfo<I, F>> {
+    ) -> FutureResult<'a, WalletInfo<I, F>>
+    where
+        I: fmt::Display,
+    {
         let family_key = family.clone();
         let configured = self.family(family);
         Box::pin(async move {
             let configured = configured?;
+            // Copy the material before the provider consumes the secret: a
+            // registry has to store what the caller supplied, not a derivation.
+            let material = secret.as_bytes().to_vec();
+            let registry = configured.registry.clone();
             let wallet = configured.provider.create(secret).await?;
-            self.store(id, family_key, configured, wallet, None).await
+            let (info, filter) = self
+                .store(id.clone(), family_key, configured, wallet, None)
+                .await?;
+            if let Some(registry) = &registry
+                && let Err(error) = registry
+                    .register(RegisteredAddress {
+                        id: id.to_string(),
+                        filter,
+                        material,
+                    })
+                    .await
+            {
+                // A wallet observed in memory but absent from the registry
+                // would vanish on restart while appearing registered now.
+                self.forget(&id);
+                return Err(error.into());
+            }
+            Ok(info)
+        })
+    }
+
+    /// Re-registers every address this family previously adopted.
+    ///
+    /// Startup-only, for the same reason as [`Wallets::import`]: a stored
+    /// birthday is usually below the current checkpoint, which is historical
+    /// selection and must not be introduced once synchronization is running.
+    /// Taking `&mut self` makes that impossible after the collection is shared.
+    ///
+    /// Returns how many addresses were restored. A family with no registry
+    /// restores nothing and is not an error — that collection is simply
+    /// memory-only.
+    pub fn restore<'a>(&'a mut self, family: &F) -> FutureResult<'a, usize>
+    where
+        I: From<String>,
+    {
+        let family_key = family.clone();
+        let configured = self.family(family);
+        Box::pin(async move {
+            let configured = configured?;
+            let Some(registry) = configured.registry.clone() else {
+                return Ok(0);
+            };
+            let entries = registry.registered(&configured.scope).await?;
+            let mut restored = 0;
+            for entry in entries {
+                let wallet = configured
+                    .provider
+                    .create(SecretBytes::new(entry.material))
+                    .await?;
+                self.store(
+                    I::from(entry.id),
+                    family_key.clone(),
+                    configured.clone(),
+                    wallet,
+                    Some(entry.filter.start_height),
+                )
+                .await?;
+                restored += 1;
+            }
+            Ok(restored)
         })
     }
 
@@ -143,8 +219,10 @@ where
         Box::pin(async move {
             let configured = configured?;
             let wallet = configured.provider.create(secret).await?;
-            self.store(id, family_key, configured, wallet, Some(start_height))
-                .await
+            let (info, _) = self
+                .store(id, family_key, configured, wallet, Some(start_height))
+                .await?;
+            Ok(info)
         })
     }
 
@@ -236,11 +314,12 @@ where
         family: Family,
         wallet: Arc<dyn Wallet>,
         start_height: Option<BlockHeight>,
-    ) -> Result<WalletInfo<I, F>, Error> {
+    ) -> Result<(WalletInfo<I, F>, AddressFilter), Error> {
         let entry = self
             .activate(id.clone(), family_key, family, wallet, start_height)
             .await?;
         let info = entry.info.clone();
+        let filter = entry.filter.clone();
         let mut values = self.values.write().map_err(|_| lock_error())?;
         if values.contains_key(&id) {
             return Err(Error::new(
@@ -249,7 +328,15 @@ where
             ));
         }
         values.insert(id, entry);
-        Ok(info)
+        Ok((info, filter))
+    }
+
+    /// Drops an in-memory wallet again after a durable write failed, so the two
+    /// never disagree about which addresses are registered.
+    fn forget(&self, id: &I) {
+        if let Ok(mut values) = self.values.write() {
+            values.remove(id);
+        }
     }
 
     async fn activate(
@@ -592,6 +679,7 @@ mod tests {
                 scope("mainnet"),
                 FixtureProvider::Value,
                 sender,
+                None,
             )
             .expect("family registration");
 
@@ -638,6 +726,7 @@ mod tests {
                 scope("mainnet"),
                 FixtureProvider::Value,
                 sender,
+                None,
             )
             .expect("family registration");
         futures_executor::block_on(wallets.import(
@@ -671,6 +760,7 @@ mod tests {
                 scope("firstnet"),
                 FixtureProvider::Value,
                 first_sender,
+                None,
             )
             .expect("first family");
         wallets
@@ -679,6 +769,7 @@ mod tests {
                 scope("secondnet"),
                 FixtureProvider::Value,
                 second_sender,
+                None,
             )
             .expect("second family");
         futures_executor::block_on(wallets.import(

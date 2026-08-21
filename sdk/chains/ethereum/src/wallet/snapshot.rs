@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use super::{Builder, SNAPSHOT_KIND, Wallet, WalletConfig, configured_chain_id, transaction_error};
+use super::{Builder, SNAPSHOT_KIND, Wallet, WalletConfig, transaction_error};
 use crate::{Address, AssetKind};
 use base::{Decimal, TransactionError, TransactionErrorKind, TransactionSnapshot};
 
@@ -35,6 +35,7 @@ pub(super) fn restore(
     let (destination, amount) = decode(&wallet.config, &wallet.address, snapshot)?;
     let mut builder = Builder::new(
         wallet.config.scope.clone(),
+        wallet.config.chain_id,
         wallet.address.clone(),
         wallet.config.asset.clone(),
         wallet.config.decimals,
@@ -59,7 +60,7 @@ fn decode(
     if data.scope.chain != config.scope.chain.0
         || data.scope.network != config.scope.network
         || data.scope.chain != "ethereum"
-        || configured_chain_id(&config.scope).is_err()
+        || config.chain_id == 0
         || data.source != wallet_address.to_string()
         || !asset_matches(&data.asset, &config.asset, config.decimals)
     {
@@ -111,6 +112,7 @@ mod tests {
                 chain: ChainId("ethereum".to_owned()),
                 network: "sepolia".to_owned(),
             },
+            chain_id: 11_155_111,
             asset: AssetKind::Native,
             decimals: 18,
         }
