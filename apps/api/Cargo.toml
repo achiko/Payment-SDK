@@ -18,9 +18,9 @@ chain-ethereum = { path = "../../sdk/chains/ethereum" }
 http-support = { package = "http", path = "../../packages/http" }
 hex.workspace = true
 indexing = { path = "../../sdk/indexing" }
-indexing-rocksdb = { path = "../../sdk/indexing/rocksdb" }
+indexing-redb = { path = "../../sdk/indexing/redb" }
 indexing-runtime = { path = "../../sdk/indexing/runtime" }
-storage-rocksdb = { path = "../../packages/storage/rocksdb" }
+storage-redb = { path = "../../packages/storage/redb" }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["fs", "net", "process", "rt", "signal", "sync", "time"] }

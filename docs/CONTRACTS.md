@@ -195,9 +195,9 @@ the entire inverse from that private journal. No caller can author commit or
 rollback state.
 
 `Transactions` and `Outputs` are read projections over that atomic block
-lifecycle. A persistence implementation may use RocksDB, PostgreSQL, or
+lifecycle. A persistence implementation may use redb, PostgreSQL, or
 another transactional backend, but backend records never cross these
-contracts. Only RocksDB is implemented now.
+contracts. redb is the active embedded implementation.
 
 ## History model
 
@@ -242,7 +242,7 @@ The process is assembled directly in `apps/api/src/main.rs`:
 
 1. read and validate configuration;
 2. construct one long-lived RPC client per configured chain;
-3. construct chain sources, interpreters, RocksDB repositories, and services;
+3. construct chain sources, interpreters, redb repositories, and services;
 4. combine the services in one concrete `Arc<Composer>`;
 5. clone that object into narrow `Indexer`, `Checkpoint`, and `History` views;
 6. expose the Bitcoin repository separately as `Outputs`, construct `Wallets`,

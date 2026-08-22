@@ -1,7 +1,7 @@
 # API
 
 `payment-api` is the only process. It starts configured Bitcoin/Ethereum
-indexing workers, opens their RocksDB databases, composes concrete wallet
+indexing workers, opens their redb files, composes concrete wallet
 providers, and serves one authenticated wallet API.
 
 ## Run
@@ -23,7 +23,7 @@ Minimal shape with both chains:
   "tls_terminated_upstream": false,
   "indexes": {
     "bitcoin": {
-      "database": "./data/bitcoin",
+      "database": "/var/lib/payment-sdk/bitcoin.redb",
       "network": "Regtest",
       "genesis_hash": "<canonical-bitcoin-genesis-hash>",
       "rpc": {
@@ -38,7 +38,7 @@ Minimal shape with both chains:
       "batch_size": 256
     },
     "ethereum": {
-      "database": "./data/ethereum",
+      "database": "/var/lib/payment-sdk/ethereum.redb",
       "network": "local",
       "chain_id": 31337,
       "genesis_hash": "0x<64-hex-digits>",
@@ -57,9 +57,31 @@ Minimal shape with both chains:
 }
 ```
 
-At least one chain is required. Each database path must have one process owner.
+At least one chain is required. Each `database` value is an absolute path to
+one redb file. Its parent directory must already exist, the path must not be an
+existing directory, and each file must have one process owner. A RocksDB
+directory is not a valid redb file and is rejected rather than converted.
 When `tls_terminated_upstream` is false, the server accepts only a loopback
 bind. Otherwise TLS must be terminated by trusted upstream infrastructure.
+
+The embedded database uses immediate durable commits and a bounded 128 MiB
+cache per file. Backups are cold copies: stop the process, wait for shutdown to
+close the database, copy the single `.redb` file, and verify that the copy opens
+before relying on it. Do not copy an open file.
+
+Replacing an earlier RocksDB deployment requires fresh redb files and a rescan
+from the configured wallet birthdays. Keep the old binary, configuration, and
+RocksDB directories untouched until checkpoints, balances, history, and live
+Bitcoin outputs have been compared. The configured RPC providers must retain
+historical blocks and receipts back to every birthday; a pruned provider can
+make that rescan incomplete.
+
+For the cutover, record each chain's ready checkpoint, catch-up throughput,
+commit latency, crash-reopen time, resident memory, cache setting, and database
+file size. Compare complete paginated history—not only the first page—and all
+live Bitcoin outputs before switching traffic. Rollback means stopping the new
+process and restarting the old binary with its unchanged configuration and
+RocksDB directories; there is no in-place conversion or dual-write mode.
 
 RPC endpoints are ordered. Generic transport retries retryable failures and
 may advance to the next endpoint. Headers are configuration data and must not
@@ -80,7 +102,7 @@ Authorization: Bearer <value from PAYMENT_API_TOKEN>
 public. Liveness means the process is running. Before binding the listener, the
 composition root waits until every configured synchronizer reports that it has
 caught up with its node. Readiness is runtime state; it is not persisted in
-RocksDB. This guarantees a newly created wallet can derive an address birthday
+redb. This guarantees a newly created wallet can derive an address birthday
 immediately. A synchronizer exit fails startup; a fatal error
 after startup terminates the runtime rather than leave a silently stale API.
 
@@ -117,7 +139,7 @@ checkpoint exists.
 
 The current key and wallet catalog are intentionally in memory. Restarting the
 process loses generated private keys, wallet IDs, and their indexing filters.
-Canonical checkpoints and indexed history remain in RocksDB. This is
+Canonical checkpoints and indexed history remain in redb. This is
 development behavior, not production custody or durable wallet management.
 
 ## Read wallet metadata

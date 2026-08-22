@@ -3,7 +3,7 @@
 //!
 //! Scope is a column rather than a key prefix, so one schema serves every
 //! configured chain. A repository still binds to exactly one scope and refuses
-//! requests for another, matching the RocksDB implementation.
+//! requests for another, matching the embedded redb implementation.
 
 mod read;
 mod registry;
@@ -95,7 +95,7 @@ impl Repository {
         let client = self.pool.get().await.map_err(unavailable)?;
 
         // Tip comes from the checkpoint; a specific height comes from the
-        // retained journal, exactly as the RocksDB repository resolves them.
+        // retained journal, exactly as the redb repository resolves them.
         let row = match height {
             None => client
                 .query_opt(

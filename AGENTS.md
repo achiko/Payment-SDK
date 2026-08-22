@@ -59,7 +59,7 @@ change or claim development in-process custody is production custody.
 | `sdk/chains/ethereum` | Ethereum addresses, RPC, blocks, gas/nonces, typed transactions, receipts/logs, wallets, indexing translation |
 | `sdk/wallets` | Chain-neutral capabilities, providers, wallet registry, history presentation, batch orchestration |
 | `sdk/indexing` | Storage-independent synchronization, address filters, canonical history, checkpoints, reorg handling, repository contracts |
-| `sdk/indexing/rocksdb` | Indexing repository implementation and all indexing record/key encoding |
+| `sdk/indexing/redb` | Indexing repository implementation and all indexing record/key encoding |
 | `packages/*` | Generic crypto, HTTP, JSON-RPC, and storage mechanics usable outside blockchain projects |
 | `packages/design-lint` | Architecture and Rust API checks configured by `lint.toml` |
 
@@ -68,12 +68,12 @@ Dependency rules:
 - Packages do not import SDK or application crates.
 - `sdk/chains/base` does not import concrete chains, RPC, indexing, or wallets.
   It is not a universal transaction or RPC abstraction.
-- `sdk/indexing` knows no native block, RocksDB key, wallet registry, Axum
+- `sdk/indexing` knows no native block, redb key, wallet registry, Axum
   route, or business label.
 - Concrete chains retain chain-native semantics while implementing wallet and
   indexing contracts. Removing one chain leaves the other generic crates and
   other chain usable.
-- `sdk/indexing/rocksdb` implements persistence only; it owns no synchronizer
+- `sdk/indexing/redb` implements persistence only; it owns no synchronizer
   runtime or public handle.
 - `apps/api` constructs long-lived RPC clients, repositories, synchronizers,
   and providers once. Handlers receive abstractions and do not open storage or
@@ -324,7 +324,7 @@ indexes, event feeds, or raw-block archives.
   only when ownership requires it. Use `Arc`, locks, channels, and atomics for
   their semantics, not by habit.
 - Introduce concurrency only for real parallelism/latency. Do not block async
-  executors or hold locks across `.await`; move blocking RocksDB/CPU work off
+  executors or hold locks across `.await`; move blocking redb/CPU work off
   executors and bound spawned work.
 - The `apps/api` composition root owns cancellation, fatal-task handling,
   readiness, and graceful shutdown. Do not hide unresolved chain composition
@@ -338,7 +338,7 @@ indexes, event feeds, or raw-block archives.
 - Write a failing behavioral test for a defect or testable behavior. Test exact
   outcomes, edges, errors, and invariants.
 - Unit tests stay beside their owner. System tests compose the public facade,
-  RPC doubles, synchronizer, and temporary RocksDB in one process. Tests are
+  RPC doubles, synchronizer, and temporary redb files in one process. Tests are
   deterministic, own their resources, and never contact public networks.
 - Indexing coverage includes birthdays, catch-up, checkpoint/hash restart,
   duplicate commit, retained reorgs, `ReorgTooDeep`, orphan removal, Bitcoin

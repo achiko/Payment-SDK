@@ -2,7 +2,7 @@
 //!
 //! Both run inside one database transaction. The checkpoint row is locked
 //! `FOR UPDATE` first, which serialises concurrent writers on the same scope and
-//! gives the compare-and-swap the RocksDB implementation gets from conditional
+//! gives the compare-and-swap the redb implementation gets from conditional
 //! batch writes.
 
 use indexing::{

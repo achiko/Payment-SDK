@@ -5,7 +5,7 @@ use storage::{Error, ErrorKind};
 /// The marker describes the complete physical layout. A database with any
 /// other marker belongs to a different format and is rejected rather than
 /// interpreted speculatively.
-pub(crate) const DATABASE_FORMAT: &[u8] = b"w3-storage-rocksdb";
+pub(crate) const DATABASE_FORMAT: &[u8] = b"w3-storage-redb";
 
 pub(crate) fn validate_database_format(bytes: &[u8]) -> Result<(), Error> {
     if bytes == DATABASE_FORMAT {

@@ -1,5 +1,5 @@
 [package]
-name = "storage-rocksdb"
+name = "storage-redb"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ workspace = true
 
 [dependencies]
 bincode = { version = "=2.0.1", default-features = false, features = ["derive", "std"] }
-rocksdb = { version = "=0.24.0", default-features = false, features = ["bindgen-runtime", "lz4"] }
+redb = { version = "=4.2.0", default-features = false, features = ["std"] }
 storage = { path = ".." }
 tokio = { version = "=1.49.0", features = ["sync"] }
 

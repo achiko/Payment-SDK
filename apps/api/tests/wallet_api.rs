@@ -49,7 +49,7 @@ impl RunningApi {
 impl Drop for RunningApi {
     fn drop(&mut self) {
         // A failed assertion must not leave the composed API running in the
-        // background and holding its temporary RocksDB directories open.
+        // background and holding its temporary redb files open.
         let _ = self.child.start_kill();
     }
 }
@@ -60,7 +60,7 @@ async fn bitcoin_wallet_is_generated_and_indexed() -> Result<(), Box<dyn std::er
     let node = BitcoinNode::start().await;
     let api = start_api(json!({
         "bitcoin": {
-            "database": files.path().join("bitcoin"),
+            "database": files.path().join("bitcoin.redb"),
             "network": "regtest",
             "genesis_hash": node.fixture.genesis_hash,
             "rpc": rpc_config(&node.rpc_url, true),
@@ -137,7 +137,7 @@ async fn ethereum_wallet_is_generated_and_indexed() -> Result<(), Box<dyn std::e
     let node = EthereumNode::start().await;
     let api = start_api(json!({
         "ethereum": {
-            "database": files.path().join("ethereum"),
+            "database": files.path().join("ethereum.redb"),
             "network": "mainnet",
             "chain_id": 1,
             "genesis_hash": ethereum_node::GENESIS_HASH,

@@ -8,7 +8,7 @@ use indexing::{
     InterpretedBlock, MovementId, ObservationDraft, ObservationDraftStatus, OutputChanges,
     OutputId, OutputKey, OutputRequest, Outputs, TransactionRef, Transactions, ValueMovement,
 };
-use indexing_rocksdb::Repository;
+use indexing_redb::Repository;
 use tempfile::TempDir;
 
 fn scope() -> IndexScope {
@@ -19,7 +19,7 @@ fn scope() -> IndexScope {
 }
 
 fn open(path: &Path) -> Repository {
-    let storage = storage_rocksdb::RocksDb::open(path).expect("temporary RocksDB");
+    let storage = storage_redb::Redb::open(path).expect("temporary redb database");
     Repository::new(storage, scope()).expect("repository")
 }
 
@@ -140,7 +140,8 @@ fn outputs(repository: &Repository) -> Vec<IndexedOutput> {
 #[test]
 fn restart_and_reorg_preserve_atomic_canonical_state() {
     let directory = TempDir::new().expect("temporary directory");
-    let repository = open(directory.path());
+    let database = directory.path().join("index.redb");
+    let repository = open(&database);
     let first = block(1, 1, 0);
     let funding = output("funding");
     assert_eq!(
@@ -212,7 +213,7 @@ fn restart_and_reorg_preserve_atomic_canonical_state() {
     assert!(outputs(&repository).is_empty());
 
     drop(repository);
-    let repository = open(directory.path());
+    let repository = open(&database);
     assert_eq!(tip(&repository), Some(second.clone()));
     assert_eq!(history(&repository), vec!["funding", "spend"]);
     assert!(outputs(&repository).is_empty());
@@ -226,7 +227,7 @@ fn restart_and_reorg_preserve_atomic_canonical_state() {
     assert_eq!(outputs(&repository), vec![funding.clone()]);
 
     drop(repository);
-    let repository = open(directory.path());
+    let repository = open(&database);
     assert_eq!(history(&repository), vec!["funding"]);
     assert_eq!(outputs(&repository), vec![funding]);
 }

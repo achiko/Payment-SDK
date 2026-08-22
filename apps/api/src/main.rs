@@ -348,8 +348,8 @@ async fn main() -> Result<(), AnyError> {
         // One long-lived client per chain: the indexer gets a clone, the wallet
         // provider below keeps the original.
         let client = settings.client().await?;
-        let repository = Arc::new(indexing_rocksdb::Repository::new(
-            storage_rocksdb::RocksDb::open(&config.database)?,
+        let repository = Arc::new(indexing_redb::Repository::new(
+            storage_redb::Redb::open(&config.database)?,
             scope.clone(),
         )?);
         indexers.push(Arc::new(settings.build(
@@ -365,8 +365,8 @@ async fn main() -> Result<(), AnyError> {
         let settings = config.settings()?;
         let scope = settings.scope();
         let client = settings.client()?;
-        let repository = indexing_rocksdb::Repository::new(
-            storage_rocksdb::RocksDb::open(&config.database)?,
+        let repository = indexing_redb::Repository::new(
+            storage_redb::Redb::open(&config.database)?,
             scope.clone(),
         )?;
         indexers.push(Arc::new(

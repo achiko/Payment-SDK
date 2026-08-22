@@ -8,15 +8,15 @@ mod repository_test;
 
 use indexing::*;
 
-/// RocksDB storage for canonical history, live outputs, a checkpoint, and the
+/// redb storage for canonical history, live outputs, a checkpoint, and the
 /// bounded rollback journal required to reverse recent blocks.
 pub struct Repository {
-    storage: storage_rocksdb::RocksDb,
+    storage: storage_redb::Redb,
     scope: IndexScope,
 }
 
 impl Repository {
-    pub fn new(storage: storage_rocksdb::RocksDb, scope: IndexScope) -> Result<Self, IndexError> {
+    pub fn new(storage: storage_redb::Redb, scope: IndexScope) -> Result<Self, IndexError> {
         if scope.chain.0.trim().is_empty() || scope.network.trim().is_empty() {
             return Err(IndexError::new(
                 IndexErrorKind::InvalidRequest,
