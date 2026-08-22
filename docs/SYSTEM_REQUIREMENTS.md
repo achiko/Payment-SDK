@@ -39,7 +39,7 @@ compatibility contracts.
   bounded transport, retry, and ordered endpoint failover.
 - Crypto MUST contain no chain names, addresses, transactions, assets, or
   wallet policy.
-- Generic RocksDB mechanics MUST remain separate from indexing records.
+- Generic redb mechanics MUST remain separate from indexing records.
 
 ### `sdk/chains/base`
 
@@ -64,7 +64,7 @@ compatibility contracts.
 - MUST define storage-independent block synchronization, scoped address
   filters, canonical history, checkpoints, output projections, and persistence
   collections.
-- MUST NOT know RocksDB keys/records, HTTP routes, wallets, or business labels.
+- MUST NOT know redb keys/records, HTTP routes, wallets, or business labels.
 - A checkpoint MUST contain height and hash.
 - `Service` for one scope and `Composer` for several scopes MUST implement the
   same `Indexer` contract.
@@ -103,7 +103,7 @@ compatibility contracts.
 - MUST NOT expose a public event feed, raw-block archive, backfill/rebuild
   command, watch lifecycle, or migration surface.
 
-### `sdk/indexing/rocksdb`
+### `sdk/indexing/redb`
 
 - MUST implement indexing persistence collections only.
 - MUST own all indexing keys, records, codecs, ordered scans,
@@ -245,7 +245,7 @@ git diff --check
 ```
 
 System tests MUST compose the public router, wallet families, one composed
-indexer, chain RPC doubles, synchronizer, and temporary RocksDB in one process.
+indexer, chain RPC doubles, synchronizer, and temporary redb files in one process.
 They MUST cover birthdays, restart, retained reorg, orphan removal, output
 restoration, one and batch sends, readiness, and shutdown without contacting a
 public network.

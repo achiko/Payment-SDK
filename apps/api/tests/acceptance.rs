@@ -37,8 +37,8 @@ async fn configured_wallet_history_survives_restart() -> Result<(), Box<dyn std:
         .collect::<Vec<_>>();
     let indexes = || {
         json!({
-            "bitcoin": bitcoin_index(files.path().join("bitcoin"), &bitcoin),
-            "ethereum": ethereum_index(files.path().join("ethereum"), &ethereum)
+            "bitcoin": bitcoin_index(files.path().join("bitcoin.redb"), &bitcoin),
+            "ethereum": ethereum_index(files.path().join("ethereum.redb"), &ethereum)
         })
     };
 
@@ -84,8 +84,8 @@ async fn bitcoin_and_ethereum_history_follow_canonical_reorgs()
     let bitcoin = BitcoinNode::start().await;
     let ethereum = EthereumNode::start().await;
     let api = start_api(json!({
-        "bitcoin": bitcoin_index(files.path().join("bitcoin"), &bitcoin),
-        "ethereum": ethereum_index(files.path().join("ethereum"), &ethereum)
+        "bitcoin": bitcoin_index(files.path().join("bitcoin.redb"), &bitcoin),
+        "ethereum": ethereum_index(files.path().join("ethereum.redb"), &ethereum)
     }))
     .await?;
     let btc = create_wallet(&api.root, "bitcoin").await?;
@@ -148,8 +148,8 @@ async fn mixed_chain_batch_is_rejected_before_broadcast() -> Result<(), Box<dyn 
     let bitcoin = BitcoinNode::start().await;
     let ethereum = EthereumNode::start().await;
     let api = start_api(json!({
-        "bitcoin": bitcoin_index(files.path().join("bitcoin"), &bitcoin),
-        "ethereum": ethereum_index(files.path().join("ethereum"), &ethereum)
+        "bitcoin": bitcoin_index(files.path().join("bitcoin.redb"), &bitcoin),
+        "ethereum": ethereum_index(files.path().join("ethereum.redb"), &ethereum)
     }))
     .await?;
     let btc_wallet = create_wallet(&api.root, "bitcoin").await?;
@@ -191,7 +191,7 @@ async fn ethereum_batch_reports_the_accepted_prefix() -> Result<(), Box<dyn std:
     let files = TempDir::new()?;
     let node = EthereumNode::start().await;
     let api = start_api(json!({
-        "ethereum": ethereum_index(files.path().join("ethereum"), &node)
+        "ethereum": ethereum_index(files.path().join("ethereum.redb"), &node)
     }))
     .await?;
     let wallet = create_wallet(&api.root, "ethereum").await?;
@@ -230,7 +230,7 @@ async fn bitcoin_batch_uses_each_source_wallet() -> Result<(), Box<dyn std::erro
     let files = TempDir::new()?;
     let node = BitcoinNode::start().await;
     let api = start_api(json!({
-        "bitcoin": bitcoin_index(files.path().join("bitcoin"), &node)
+        "bitcoin": bitcoin_index(files.path().join("bitcoin.redb"), &node)
     }))
     .await?;
     let first = create_wallet(&api.root, "bitcoin").await?;

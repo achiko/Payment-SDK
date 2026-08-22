@@ -17,7 +17,7 @@ After startup, application and endpoint code use two abstractions:
 - `indexing::Indexer` synchronizes and queries one or several chain scopes.
 
 Concrete chain types occur only while `main` wires the process. HTTP handlers
-do not select a chain implementation, build a transaction, call RocksDB, or
+do not select a chain implementation, build a transaction, call redb, or
 manage synchronization. There is no process facade, app-local service facade,
 indexer service, wallet service, or second internal transport.
 
@@ -37,7 +37,7 @@ sdk/chains/base
 sdk/indexing
     blocks, transactions, outputs, synchronization, reorgs, and queries
 
-sdk/indexing/rocksdb
+sdk/indexing/redb
     physical indexing records, keys, atomic writes, and scans
 
 sdk/wallets
@@ -51,7 +51,7 @@ apps/api
 ```
 
 Dependencies point toward generic contracts. `packages/*` imports no SDK or
-application crate. `sdk/indexing` imports no concrete chain, RocksDB record,
+application crate. `sdk/indexing` imports no concrete chain, redb record,
 wallet type, or HTTP type. A chain interpreter emits domain facts and never a
 database key. `apps/api` may import every crate because it is the composition
 root; no crate imports it.
@@ -134,7 +134,7 @@ into an `InterpretedBlock` containing its canonical block reference, complete
 transaction drafts, and live-output changes. Bitcoin keeps each input and
 output as a separate movement. Ethereum keeps native transfers and token-log
 transfers as distinct assets. Neither implementation knows how facts are
-encoded in RocksDB.
+encoded in redb.
 
 ### Persistence collections
 
@@ -553,7 +553,7 @@ The architecture needs deterministic proof for:
 - birthday anchoring without a genesis scan, startup-only imports, and the
   required scope recreation when the historical startup set changes;
 - restart from a height-and-hash checkpoint;
-- atomic add and retained remove in RocksDB;
+- atomic add and retained remove in redb;
 - duplicate add, checkpoint conflict, one- and multi-block reorg, and
   `ReorgTooDeep`;
 - orphan history deletion and Bitcoin live-output restoration;
@@ -564,6 +564,6 @@ The architecture needs deterministic proof for:
   send through abstract wallets;
 - endpoint-local JSON/OpenAPI DTOs and thin handlers; and
 - one-process startup, readiness, restart, fatal-task handling, and graceful
-  shutdown using loopback RPC doubles and temporary RocksDB.
+  shutdown using loopback RPC doubles and temporary redb files.
 
 No public-network RPC or funded key belongs in these tests.

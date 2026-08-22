@@ -34,7 +34,8 @@ fn scope() -> IndexScope {
 
 fn repository() -> TestRepository {
     let directory = TempDir::new().expect("temporary database directory");
-    let storage = storage_rocksdb::RocksDb::open(directory.path()).expect("temporary database");
+    let database = directory.path().join("index.redb");
+    let storage = storage_redb::Redb::open(&database).expect("temporary database");
     TestRepository {
         repository: Repository::new(storage, scope()).expect("repository scope"),
         _directory: directory,

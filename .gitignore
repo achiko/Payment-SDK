@@ -23,6 +23,7 @@
 # Logs/runtime files
 *.log
 logs/
+*.redb
 *.db
 *.sqlite
 *.sqlite3

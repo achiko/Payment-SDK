@@ -2,8 +2,8 @@
 
 Payment-SDK is a design-stage Rust workspace for one Bitcoin/Ethereum wallet
 API process. It composes native chain clients, wallet implementations, embedded
-indexers, and RocksDB persistence in memory. There are no internal HTTP hops or
-separately deployed wallet/indexer services.
+indexers, and redb persistence in one process. There are no internal HTTP hops
+or separately deployed wallet/indexer services.
 
 The current scope is deliberately small:
 
@@ -27,7 +27,7 @@ sdk/chains/bitcoin       Bitcoin RPC, transactions, wallets, and interpretation
 sdk/chains/ethereum      Ethereum RPC, transactions, wallets, and interpretation
 sdk/wallets              wallet families, instances, birthdays, and sending
 sdk/indexing             Indexer, Composer, synchronization, and collections
-sdk/indexing/rocksdb     indexing Blocks/Transactions/Outputs persistence
+sdk/indexing/redb        indexing Blocks/Transactions/Outputs persistence
 packages/*               generic HTTP, JSON-RPC, crypto, and storage mechanics
 ```
 
@@ -45,7 +45,7 @@ canonical history, live outputs, and a bounded rollback journal. Address
 filters remain caller-owned.
 
 Dependencies point toward generic contracts. Packages import no SDK/application
-crate; indexing imports no concrete chain or RocksDB record; chain-native
+crate; indexing imports no concrete chain or redb record; chain-native
 transaction and RPC semantics stay in each chain crate. After composition,
 business and endpoint code do not branch on Bitcoin or Ethereum.
 

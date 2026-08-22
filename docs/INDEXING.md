@@ -26,7 +26,7 @@ chain RPC client
     -> InterpretedBlock
     -> chain Service implementing Indexer
     -> Blocks / Transactions / Outputs
-    -> indexing RocksDB Repository
+    -> indexing redb Repository
 
 Bitcoin Service ----\
                      -> Composer implementing the same Indexer contract

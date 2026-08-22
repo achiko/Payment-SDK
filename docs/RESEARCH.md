@@ -147,7 +147,7 @@ The current Bitcoin/Ethereum implementation applies those principles with:
 - standard Ethereum blocks/receipts/logs with missing trace completeness made
   explicit;
 - chain-owned parsing and semantic projection effects; and
-- one embedded RocksDB adapter owning physical records and atomic batches.
+- one embedded redb adapter owning physical records and atomic batches.
 
 See [`INDEXING.md`](INDEXING.md) for the concrete indexing design and
 [`CHAIN_RESEARCH.md`](CHAIN_RESEARCH.md) for additional-chain constraints.

@@ -66,7 +66,7 @@ package = "indexing-postgres"
 layer = "indexing-adapter"
 
 [[dependency.package_layers]]
-package = "indexing-rocksdb"
+package = "indexing-redb"
 layer = "indexing-adapter"
 
 [[dependency.package_layers]]

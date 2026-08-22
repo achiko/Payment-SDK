@@ -15,7 +15,7 @@ exist in the current workspace.
 | Provider-selected wallet generation/import | `sdk/wallets` | provider/registry tests |
 | Exact wallet history mapping | `sdk/wallets` | history tests |
 | Reorg-safe filtered indexing contracts and synchronizer | `sdk/indexing` | synchronizer and contract tests |
-| Atomic indexing persistence | `sdk/indexing/rocksdb` | repository tests |
+| Atomic indexing persistence | `sdk/indexing/redb` | repository tests |
 | Generic JSON-RPC/HTTP/crypto/storage mechanics | `packages/*` | package tests |
 
 ## Current application validation
@@ -26,7 +26,7 @@ been removed.
 
 The deterministic one-process TCP acceptance suite contains seven tests. It
 starts the real application binary against loopback Bitcoin and Ethereum RPC
-doubles and temporary RocksDB databases:
+doubles and temporary redb files:
 
 | Behavior | Current evidence |
 |---|---|

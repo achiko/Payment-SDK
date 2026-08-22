@@ -1,4 +1,4 @@
-use std::task::Poll;
+use std::{path::PathBuf, task::Poll};
 
 use super::*;
 use storage::{Condition, ErrorKind, Operation, Version};
@@ -16,6 +16,10 @@ fn value(value: &str) -> storage::Value {
     storage::Value(value.as_bytes().to_vec())
 }
 
+fn database_path(directory: &TempDir) -> PathBuf {
+    directory.path().join("database.redb")
+}
+
 fn put(namespace: &Namespace, key: &Key, value: &str) -> Operation {
     Operation::Put {
         namespace: namespace.clone(),
@@ -27,7 +31,7 @@ fn put(namespace: &Namespace, key: &Key, value: &str) -> Operation {
 #[tokio::test]
 async fn cancellation_after_enqueue_does_not_cancel_the_accepted_commit() -> Result<(), Error> {
     let directory = TempDir::new().map_err(|error| other(error.to_string()))?;
-    let storage = RocksDb::open(directory.path())?;
+    let storage = Redb::open(database_path(&directory))?;
     let records = namespace("cancelled-request");
     let record_key = key("accepted-write");
     let release = storage.hold_owner_for_test().await?;
@@ -44,7 +48,7 @@ async fn cancellation_after_enqueue_does_not_cancel_the_accepted_commit() -> Res
     drop(commit);
     release
         .send(())
-        .map_err(|_| other("failed to release RocksDB owner test hold"))?;
+        .map_err(|_| other("failed to release redb owner test hold"))?;
 
     let stored = storage.get(&records, &record_key).await?;
     assert_eq!(stored.map(|stored| stored.value), Some(value("durable")));
@@ -52,9 +56,87 @@ async fn cancellation_after_enqueue_does_not_cancel_the_accepted_commit() -> Res
 }
 
 #[tokio::test]
+async fn ambiguous_commit_successful_reopen_does_not_replay() -> Result<(), Error> {
+    let directory = TempDir::new().map_err(|error| other(error.to_string()))?;
+    let storage = Redb::open(database_path(&directory))?;
+    let records = namespace("records");
+    let primary = key("primary");
+    storage.fail_after_next_commit_for_test().await?;
+
+    let error = storage
+        .commit(WriteBatch {
+            conditions: vec![],
+            operations: vec![put(&records, &primary, "persisted-once")],
+        })
+        .await
+        .expect_err("the injected post-persistence result must be ambiguous");
+
+    assert_eq!(error.kind, ErrorKind::Unavailable);
+    assert_eq!(storage.reopen_count_for_test().await?, 1);
+    assert_eq!(
+        storage.get(&records, &primary).await?,
+        Some(StoredValue {
+            value: value("persisted-once"),
+            version: Version(1),
+        })
+    );
+    assert_eq!(storage.reopen_count_for_test().await?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_recovers_after_ambiguous_commit_reopen_failure() -> Result<(), Error> {
+    let directory = TempDir::new().map_err(|error| other(error.to_string()))?;
+    let storage = Redb::open(database_path(&directory))?;
+    let records = namespace("records");
+    let primary = key("primary");
+    storage.fail_after_next_commit_for_test().await?;
+    storage.fail_next_reopen_for_test().await?;
+
+    let error = storage
+        .commit(WriteBatch {
+            conditions: vec![],
+            operations: vec![put(&records, &primary, "persisted-once")],
+        })
+        .await
+        .expect_err("the injected post-persistence result must be ambiguous");
+
+    assert_eq!(error.kind, ErrorKind::Unavailable);
+    assert_eq!(storage.reopen_count_for_test().await?, 0);
+    assert_eq!(
+        storage.get(&records, &primary).await?,
+        Some(StoredValue {
+            value: value("persisted-once"),
+            version: Version(1),
+        })
+    );
+    assert_eq!(storage.reopen_count_for_test().await?, 1);
+    let page = storage
+        .scan(ScanRequest {
+            namespace: records.clone(),
+            prefix: b"primary".to_vec(),
+            after: None,
+            limit: 1,
+        })
+        .await?;
+    assert_eq!(
+        page.entries,
+        vec![(
+            primary.clone(),
+            StoredValue {
+                value: value("persisted-once"),
+                version: Version(1),
+            }
+        )]
+    );
+    assert_eq!(page.next, None);
+    Ok(())
+}
+
+#[tokio::test]
 async fn put_get_and_paginated_scan_are_ordered() -> Result<(), Error> {
     let directory = TempDir::new().map_err(|error| other(error.to_string()))?;
-    let storage = RocksDb::open(directory.path())?;
+    let storage = Redb::open(database_path(&directory))?;
     let observations = namespace("observations");
     let other_namespace = namespace("other");
 
@@ -119,7 +201,7 @@ async fn put_get_and_paginated_scan_are_ordered() -> Result<(), Error> {
 #[tokio::test]
 async fn stale_condition_rejects_the_complete_batch() -> Result<(), Error> {
     let directory = TempDir::new().map_err(|error| other(error.to_string()))?;
-    let storage = RocksDb::open(directory.path())?;
+    let storage = Redb::open(database_path(&directory))?;
     let records = namespace("records");
     let primary = key("primary");
     let side_effect = key("side-effect");
@@ -184,7 +266,7 @@ async fn stale_condition_rejects_the_complete_batch() -> Result<(), Error> {
 #[tokio::test]
 async fn concurrent_compare_and_swap_has_one_winner() -> Result<(), Error> {
     let directory = TempDir::new().map_err(|error| other(error.to_string()))?;
-    let storage = RocksDb::open(directory.path())?;
+    let storage = Redb::open(database_path(&directory))?;
     let records = namespace("records");
     let primary = key("primary");
     storage
@@ -237,7 +319,7 @@ async fn concurrent_compare_and_swap_has_one_winner() -> Result<(), Error> {
 #[tokio::test]
 async fn delete_removes_the_value() -> Result<(), Error> {
     let directory = TempDir::new().map_err(|error| other(error.to_string()))?;
-    let storage = RocksDb::open(directory.path())?;
+    let storage = Redb::open(database_path(&directory))?;
     let records = namespace("records");
     let primary = key("primary");
     storage
@@ -269,10 +351,11 @@ async fn delete_removes_the_value() -> Result<(), Error> {
 #[tokio::test]
 async fn persisted_values_and_global_version_survive_reopen() -> Result<(), Error> {
     let directory = TempDir::new().map_err(|error| other(error.to_string()))?;
+    let database = database_path(&directory);
     let records = namespace("records");
     let primary = key("primary");
     {
-        let storage = RocksDb::open(directory.path())?;
+        let storage = Redb::open(&database)?;
         storage
             .commit(WriteBatch {
                 conditions: vec![],
@@ -281,7 +364,7 @@ async fn persisted_values_and_global_version_survive_reopen() -> Result<(), Erro
             .await?;
     }
 
-    let reopened = RocksDb::open(directory.path())?;
+    let reopened = Redb::open(&database)?;
     assert_eq!(
         reopened.get(&records, &primary).await?,
         Some(StoredValue {

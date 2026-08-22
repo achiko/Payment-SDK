@@ -44,7 +44,7 @@ apps/api
   -> sdk/chains/{bitcoin,ethereum}
   -> sdk/wallets
   -> sdk/indexing
-  -> sdk/indexing/rocksdb
+  -> sdk/indexing/redb
 
 sdk/chains/{bitcoin,ethereum}
   -> sdk/chains/base
@@ -53,18 +53,18 @@ sdk/chains/{bitcoin,ethereum}
   -> packages/{crypto,json-rpc}
 
 sdk/wallets -> sdk/chains/base, sdk/indexing, packages/crypto
-sdk/indexing/rocksdb -> sdk/indexing, packages/storage/rocksdb
+sdk/indexing/redb -> sdk/indexing, packages/storage/redb
 sdk/indexing -> sdk/chains/base
 sdk/chains/base -> packages/crypto
 ```
 
 - A package may depend on external crates or another package, never SDK/apps.
 - `sdk/chains/base` imports no concrete chain, RPC, indexing, or wallets.
-- `sdk/indexing` imports no chain-native block, RocksDB record, wallet, or HTTP
+- `sdk/indexing` imports no chain-native block, redb record, wallet, or HTTP
   type.
 - Concrete chain crates implement generic wallet/indexing contracts while
   retaining their native protocol semantics.
-- `sdk/indexing/rocksdb` implements persistence collections only and owns no
+- `sdk/indexing/redb` implements persistence collections only and owns no
   synchronizer runtime.
 - No crate depends on `apps/api`.
 
@@ -79,7 +79,7 @@ sdk/chains/base -> packages/crypto
 - `json-rpc` wraps `jsonrpsee` with bounded transport, retry, and endpoint
   failover;
 - `storage` owns backend-neutral atomic key/value mechanics;
-- `storage/rocksdb` owns the generic RocksDB engine; and
+- `storage/redb` owns the generic redb engine; and
 - `design-lint` enforces repository architecture and API rules.
 
 Packages contain no wallet, chain, indexing, asset, or transaction policy.
@@ -142,7 +142,7 @@ storage-derived bounded journal entry, and checkpoint movement. `Blocks::remove`
 uses only that private journal to remove an orphan tip and restore live outputs.
 `Transactions` and `Outputs` are read projections over this lifecycle.
 
-`sdk/indexing/rocksdb` owns all indexing key encoding, records, scans,
+`sdk/indexing/redb` owns all indexing key encoding, records, scans,
 compare-and-swap conditions, atomic batches, and journal encoding. Those types
 never appear in a chain interpreter or generic consumer.
 
@@ -251,7 +251,7 @@ later transaction fails.
 Startup order is part of correctness:
 
 1. validate configuration and server security;
-2. open chain clients and RocksDB repositories;
+2. open chain clients and redb repositories;
 3. construct chain services and `Composer`;
 4. construct `Wallets`, register families, and import startup wallets;
 5. start one sync loop with `Wallets::filters()`;

@@ -8,7 +8,7 @@ the complete address/birthday snapshot and supplies it to every sync.
 
 Use `Blocks`, `Transactions`, and `Outputs` as the persistence contracts.
 `Blocks::add` and `Blocks::remove` own the atomic canonical block lifecycle;
-transaction history and live outputs are read projections. The RocksDB adapter
+transaction history and live outputs are read projections. The redb adapter
 owns all physical records, keys, journals, compare-and-swap checks, and atomic
 batches.
 
