@@ -73,6 +73,11 @@ let ids = wallets.send_all(transfers).await?;
 let filters = wallets.filters()?;
 ```
 
+`Wallets::send_all` is also the compatibility boundary for a chain `Sender`:
+it resolves every wallet from one registered family and then selects that
+family's sender. Directly pairing a public `Transfer` with a sender from a
+different provider or family is outside the reusable contract.
+
 Business and HTTP code use these methods without matching on the concrete
 chain. The current registry is in memory. An embedding product that needs
 durable custody loads encrypted secrets, identities, family keys, and
@@ -106,15 +111,23 @@ A non-empty ordered batch belongs to the registered family's `Sender`:
 - Bitcoin may fund one transaction from several abstract wallets, creates the
   requested outputs and per-source change, signs every input with its owner,
   and returns one submitted ID; and
-- Ethereum currently prepares and broadcasts each transaction in input order,
-  stops on the first failure, and returns the accepted prefix with the failed
-  index.
+- Ethereum reserves consecutive nonces per sender, prepares and signs the
+  entire batch, broadcasts exact envelopes in input order, stops on the first
+  failure, and returns the accepted prefix with the failed index.
 
 Request shape and mixed-family compatibility validate before the first external
-effect. Bitcoin completes its chain-level batch preparation before broadcast.
-Ethereum-wide nonce reservation, whole-batch preparation, and ambiguous-send
-reconciliation remain explicitly pending. RPC acceptance means submitted;
-indexed history establishes canonical inclusion and confirmation.
+effect. Both concrete chains complete chain-level batch preparation before
+broadcast. Ethereum uses one coordinator shared by native and ERC-20 providers,
+keyed by sender address rather than wallet family. It checks cumulative native
+value, maximum fees, and token amounts before signing, and retains an exact
+envelope when a retryable submission outcome is ambiguous. That sender remains
+blocked until exact-hash lookup or exact-envelope replay resolves acceptance.
+RPC acceptance means submitted; indexed history establishes canonical
+inclusion and confirmation.
+
+The coordinator is process-local and is not a durable payment-operation store.
+It assumes one active application writer per managed EOA and does not claim
+crash-safe recovery of an in-flight submission.
 
 An Ethereum provider is configured for exactly one `AssetKind`. Native and
 ERC-20 providers may share account, transaction, and indexing handles, but each

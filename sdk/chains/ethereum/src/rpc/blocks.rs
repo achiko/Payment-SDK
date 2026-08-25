@@ -172,6 +172,14 @@ where
         self.client.call(method, params).await
     }
 
+    pub(super) async fn request_result_detailed_once(
+        &self,
+        method: &'static str,
+        params: Value,
+    ) -> Result<RawJson, CallError> {
+        self.client.call_once(method, params).await
+    }
+
     pub(super) async fn confirm_known_transaction(
         &self,
         expected: &TransactionId,

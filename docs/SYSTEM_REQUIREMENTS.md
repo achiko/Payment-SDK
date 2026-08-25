@@ -37,6 +37,9 @@ compatibility contracts.
 - HTTP helpers MUST remain transport mechanics, not wallet/indexing DTOs.
 - JSON-RPC MUST delegate framing/correlation to `jsonrpsee` and own only
   bounded transport, retry, and ordered endpoint failover.
+- A state-changing Ethereum submission MUST use one transport attempt rather
+  than hidden endpoint failover; retry and reconciliation MUST preserve the
+  exact envelope at the Ethereum coordinator boundary.
 - Crypto MUST contain no chain names, addresses, transactions, assets, or
   wallet policy.
 - Generic redb mechanics MUST remain separate from indexing records.
@@ -204,6 +207,9 @@ compatibility contracts.
 - Ethereum history presentation MUST retain only the wallet's selected-asset
   movements plus attributable native fee metadata. Unrelated token or native
   movements MUST NOT make the selected-asset page fail.
+- One process-wide Ethereum coordinator MUST assign nonces by sender address,
+  so native and token providers using the same EOA cannot reserve the same
+  nonce. This coordination is independent of the selected wallet asset.
 
 ## Sending requirements
 
@@ -223,11 +229,21 @@ successful batch returns one submitted ID; a pre-submit failure returns none.
 Ethereum MUST build one native transaction per transfer and broadcast in input
 order with consecutive nonces per source. On failure it MUST report the
 accepted prefix and first failed input and MUST NOT imply later inputs were
-attempted.
+attempted. Every Ethereum batch item MUST be simulated, checked against
+cumulative per-sender native/token requirements, and signed before its first
+broadcast.
 
 The sender MUST preserve exact signed bytes across retryable ambiguous outcomes
-and verify the returned ID against those bytes. Submission MUST NOT be called
-confirmation; indexing provides canonical confirmation.
+and verify the returned ID against those bytes. An unresolved ambiguous
+Ethereum submission MUST block later nonce use for that sender until the exact
+local transaction ID is observed or the same envelope is accepted on replay.
+Submission MUST NOT be called confirmation; indexing provides canonical
+confirmation.
+
+Ethereum nonce and ambiguous-envelope coordination is process-local. One
+running API process MUST be the only transaction writer for a managed EOA;
+restart-safe outgoing-operation recovery and active-active writers require a
+separately approved durable submission boundary.
 
 ## HTTP requirements
 

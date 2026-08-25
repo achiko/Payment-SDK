@@ -44,15 +44,30 @@ impl<C> TransactionClient<C> {
 
 /// Transaction preparation and submission.
 pub trait Transactions: Send + Sync {
+    /// Preflights a transfer using the nonce reserved by the caller.
     fn build_context<'a>(
         &'a self,
         request: &'a TransferRequest,
+        nonce: u64,
     ) -> BoxFuture<'a, Result<BuildContext, ChainError>>;
 
+    /// Submits one exact signed envelope and verifies the returned hash.
+    ///
+    /// Implementations must use one visible submission attempt. They may
+    /// return `retryable = false` only for a definitive pre-acceptance
+    /// rejection. Transport failures and malformed, missing, or mismatched
+    /// responses after attempting the envelope must remain retryable because
+    /// acceptance is ambiguous.
     fn broadcast<'a>(
         &'a self,
         transaction: SignedTransaction,
     ) -> BoxFuture<'a, Result<TransactionId, SourceError>>;
+
+    /// Reports whether the node exposes the exact requested transaction hash.
+    fn known<'a>(
+        &'a self,
+        transaction: &'a TransactionId,
+    ) -> BoxFuture<'a, Result<bool, SourceError>>;
 }
 
 impl<C> Transactions for Methods<C>
@@ -62,6 +77,7 @@ where
     fn build_context<'a>(
         &'a self,
         request: &'a TransferRequest,
+        nonce: u64,
     ) -> BoxFuture<'a, Result<BuildContext, ChainError>> {
         Box::pin(async move {
             let input = request.input();
@@ -74,10 +90,6 @@ where
             }
 
             self.verify_transaction_chain_id().await?;
-            let nonce = self
-                .nonce(request.from().clone())
-                .await
-                .map_err(rpc_error)?;
             let mut transaction = Map::new();
             transaction.insert("from".to_owned(), json!(address_hex(request.from())));
             transaction.insert("to".to_owned(), json!(address_hex(request.to())));
@@ -247,7 +259,7 @@ where
                 ));
             }
             let result = self
-                .request_result_detailed(
+                .request_result_detailed_once(
                     "eth_sendRawTransaction",
                     json!([data_hex(&transaction.envelope)]),
                 )
@@ -255,26 +267,44 @@ where
             let raw = match result {
                 Ok(raw) => raw,
                 Err(CallError::Remote(failure)) if is_already_known(&failure) => {
-                    if self.confirm_known_transaction(&computed).await? {
-                        return Ok(computed);
+                    match self.confirm_known_transaction(&computed).await {
+                        Ok(true) => return Ok(computed),
+                        Ok(false) => {}
+                        Err(error) => return Err(ambiguous_submission(error)),
                     }
                     return Err(source_error(
                         "Ethereum RPC reported an already-known transaction but did not expose the matching hash",
                         true,
                     ));
                 }
-                Err(error) => return Err(error.into_source("eth_sendRawTransaction")),
+                Err(CallError::Remote(failure)) => {
+                    return Err(ambiguous_submission(
+                        CallError::Remote(failure).into_source("eth_sendRawTransaction"),
+                    ));
+                }
+                Err(CallError::Local(error)) => return Err(ambiguous_submission(error)),
             };
-            let returned: String = raw.deserialize().map_err(map_json_rpc_error)?;
-            let returned = parse_transaction_id(&returned, "eth_sendRawTransaction")?;
+            let returned: String = raw
+                .deserialize()
+                .map_err(map_json_rpc_error)
+                .map_err(ambiguous_submission)?;
+            let returned = parse_transaction_id(&returned, "eth_sendRawTransaction")
+                .map_err(ambiguous_submission)?;
             if returned != computed {
-                return Err(invalid_rpc_response(
-                    "eth_sendRawTransaction",
-                    "node hash differs from the locally computed transaction hash",
+                return Err(source_error(
+                    "Ethereum submission response hash differs from the exact signed envelope; outcome is ambiguous",
+                    true,
                 ));
             }
             Ok(returned)
         })
+    }
+
+    fn known<'a>(
+        &'a self,
+        transaction: &'a TransactionId,
+    ) -> BoxFuture<'a, Result<bool, SourceError>> {
+        Box::pin(async move { self.confirm_known_transaction(transaction).await })
     }
 }
 
@@ -391,8 +421,9 @@ where
     fn build_context<'a>(
         &'a self,
         request: &'a TransferRequest,
+        nonce: u64,
     ) -> BoxFuture<'a, Result<BuildContext, ChainError>> {
-        self.methods.build_context(request)
+        self.methods.build_context(request, nonce)
     }
 
     fn broadcast<'a>(
@@ -400,6 +431,13 @@ where
         transaction: SignedTransaction,
     ) -> BoxFuture<'a, Result<TransactionId, SourceError>> {
         self.methods.broadcast(transaction)
+    }
+
+    fn known<'a>(
+        &'a self,
+        transaction: &'a TransactionId,
+    ) -> BoxFuture<'a, Result<bool, SourceError>> {
+        self.methods.known(transaction)
     }
 }
 
@@ -412,4 +450,11 @@ fn chain_error(kind: ChainErrorKind, message: impl Into<String>) -> ChainError {
 
 fn rpc_error(error: SourceError) -> ChainError {
     chain_error(ChainErrorKind::RpcUnavailable, error.message)
+}
+
+fn ambiguous_submission(error: impl std::fmt::Display) -> SourceError {
+    source_error(
+        format!("Ethereum submission outcome is ambiguous: {error}"),
+        true,
+    )
 }

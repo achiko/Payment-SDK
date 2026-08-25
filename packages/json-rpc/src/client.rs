@@ -14,6 +14,14 @@ pub trait Client: Send + Sync {
         params: Value,
     ) -> BoxFuture<'a, std::result::Result<CallResult, Error>>;
 
+    /// Executes one request without transport retry or endpoint failover.
+    ///
+    fn request_once<'a>(
+        &'a self,
+        method: &'a str,
+        params: Value,
+    ) -> BoxFuture<'a, std::result::Result<CallResult, Error>>;
+
     fn batch<'a>(
         &'a self,
         calls: Vec<Call>,

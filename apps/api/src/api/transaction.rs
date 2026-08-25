@@ -334,7 +334,7 @@ pub struct Submission {
         (status = 400, body = ErrorBody),
         (status = 404, body = ErrorBody),
         (status = 422, body = ErrorBody),
-        (status = 503, body = ErrorBody)
+        (status = 503, description = "Transaction unavailable or submission outcome ambiguous", body = ErrorBody)
     ),
     tag = "transactions"
 )]
@@ -400,14 +400,14 @@ pub struct TransferResponse {
 #[utoipa::path(
     post,
     path = "/v1/transactions",
-    description = "Submits one exact-asset batch. Requests mixing BTC, ETH, or USDC wallet families are rejected before any transaction is submitted. Bitcoin may group transfers into one transaction; Ethereum submits transfers in request order. A failure response preserves accepted transaction IDs and the failed request index.",
+    description = "Submits one exact-asset batch. Requests mixing BTC, ETH, or USDC wallet families are rejected before any transaction is submitted. Bitcoin may group transfers into one transaction. Ethereum reserves nonces per sender and prepares the whole batch before submitting exact envelopes in request order. A failure response preserves accepted transaction IDs and the failed request index.",
     request_body = TransferRequest,
     responses(
         (status = 202, description = "Asset batch submitted", body = TransferResponse),
         (status = 400, body = ErrorBody),
         (status = 404, body = ErrorBody),
         (status = 422, description = "Batch failed; accepted transaction IDs identify partial submission", body = ErrorBody),
-        (status = 503, body = ErrorBody)
+        (status = 503, description = "Batch unavailable or submission outcome ambiguous; accepted transaction IDs identify any partial submission", body = ErrorBody)
     ),
     tag = "transactions"
 )]

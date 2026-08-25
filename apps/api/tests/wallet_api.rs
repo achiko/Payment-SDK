@@ -215,6 +215,11 @@ async fn ethereum_wallet_is_generated_and_indexed() -> Result<(), Box<dyn std::e
         node.submitted_ids(),
         "Ethereum IDs must keep request order"
     );
+    assert_eq!(
+        node.submitted_nonces(),
+        vec![1, 2],
+        "Ethereum batch must reserve consecutive nonces after the earlier send"
+    );
     node.confirm();
     for transaction in &batch {
         wait_history(&api.root, wallet_id(&wallet), transaction).await;

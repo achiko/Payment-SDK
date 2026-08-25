@@ -10,7 +10,7 @@ use utoipa::ToSchema;
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, ToSchema)]
 pub struct ErrorBody {
     pub message: String,
-    /// Transactions accepted before a sequential batch failed.
+    /// Transactions accepted before an ordered batch failed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[schema(required = false)]
     pub transaction_ids: Vec<String>,

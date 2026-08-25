@@ -82,6 +82,14 @@ mod tests {
                 .requests
                 .clone()
         }
+
+        fn push_replies(&self, replies: impl IntoIterator<Item = ExpectedReply>) {
+            self.state
+                .lock()
+                .expect("script lock must be healthy")
+                .replies
+                .extend(replies);
+        }
     }
 
     impl JsonClient for ScriptedClient {
@@ -101,6 +109,14 @@ mod tests {
                 expected.result
             };
             Box::pin(async move { Ok(response) })
+        }
+
+        fn request_once<'a>(
+            &'a self,
+            method: &'a str,
+            params: Value,
+        ) -> crate::BoxFuture<'a, Result<Result<RawJson, Failure>, Error>> {
+            self.request(method, params)
         }
 
         fn batch<'a>(
@@ -163,6 +179,18 @@ mod tests {
             Address([0x22; 20]),
             Wei::from_u128(7),
         )
+    }
+
+    fn signer(seed: u8) -> base::KeyPair<Address> {
+        let secret = vec![seed; 32];
+        let key = crypto::SecretKey::new(secret.clone()).expect("test key must be valid");
+        let public = key
+            .public_key(crypto::PublicKeyFormat::Raw)
+            .expect("test public key must derive");
+        let hash = keccak256(&public.bytes);
+        let mut bytes = [0_u8; 20];
+        bytes.copy_from_slice(&hash[12..]);
+        base::KeyPair::new(Address(bytes), secret).expect("test signer must construct")
     }
 
     fn abi_word(value: u8) -> Value {
@@ -323,7 +351,6 @@ mod tests {
     fn builds_checked_eip1559_context_for_native_transfer() {
         let client = ScriptedClient::new(vec![
             success("eth_chainId", json!("0x7a69")),
-            success("eth_getTransactionCount", json!("0x4")),
             success("eth_estimateGas", json!("0x5208")),
             success("eth_maxPriorityFeePerGas", json!("0x3b9aca00")),
             success(
@@ -334,7 +361,7 @@ mod tests {
         ]);
         let rpc = rpc(client.clone());
 
-        let context = block_on(rpc.build_context(&native_transfer()))
+        let context = block_on(rpc.build_context(&native_transfer(), 4))
             .expect("bounded build context must succeed");
 
         assert_eq!(context.chain_id, 31_337);
@@ -346,15 +373,14 @@ mod tests {
         );
         assert_eq!(context.max_fee_per_gas, Wei::from_u128(5_000_000_000));
         let requests = client.requests();
-        assert_eq!(requests[2].1[0]["data"], json!("0x"));
-        assert_eq!(requests[2].1[0]["value"], json!("0x7"));
+        assert_eq!(requests[1].1[0]["data"], json!("0x"));
+        assert_eq!(requests[1].1[0]["value"], json!("0x7"));
     }
 
     #[test]
     fn simulates_typed_erc20_transfer_and_checks_both_balances() {
         let client = ScriptedClient::new(vec![
             success("eth_chainId", json!("0x7a69")),
-            success("eth_getTransactionCount", json!("0x4")),
             success("eth_call", abi_word(8)),
             success("eth_call", abi_word(1)),
             success("eth_estimateGas", json!("0x5208")),
@@ -367,7 +393,7 @@ mod tests {
         ]);
         let rpc = rpc(client.clone());
 
-        block_on(rpc.build_context(&token_transfer()))
+        block_on(rpc.build_context(&token_transfer(), 4))
             .expect("simulated funded ERC-20 transfer must build");
 
         let requests = client.requests();
@@ -378,15 +404,15 @@ mod tests {
             "00".repeat(31)
         );
         assert_eq!(
-            requests[3].1[0]["to"],
+            requests[2].1[0]["to"],
             json!(Address([0x33; 20]).to_string())
         );
-        assert_eq!(requests[3].1[0]["value"], json!("0x0"));
-        assert_eq!(requests[3].1[0]["data"], json!(expected_data));
-        assert_eq!(requests[3].1[1], json!("pending"));
-        assert_eq!(requests[4].1[0], requests[3].1[0]);
+        assert_eq!(requests[2].1[0]["value"], json!("0x0"));
+        assert_eq!(requests[2].1[0]["data"], json!(expected_data));
+        assert_eq!(requests[2].1[1], json!("pending"));
+        assert_eq!(requests[3].1[0], requests[2].1[0]);
         assert_eq!(
-            requests[2].1[0]["data"],
+            requests[1].1[0]["data"],
             json!(format!("0x70a08231{}{}", "00".repeat(12), "11".repeat(20)))
         );
     }
@@ -400,17 +426,16 @@ mod tests {
         ] {
             let client = ScriptedClient::new(vec![
                 success("eth_chainId", json!("0x7a69")),
-                success("eth_getTransactionCount", json!("0x0")),
                 success("eth_call", abi_word(8)),
                 success("eth_call", result),
             ]);
 
-            let error = block_on(rpc(client.clone()).build_context(&token_transfer()))
+            let error = block_on(rpc(client.clone()).build_context(&token_transfer(), 0))
                 .expect_err("non-canonical ERC-20 transfer success must fail closed");
 
             assert_eq!(error.kind, kind);
             assert!(error.message.contains(expected), "{}", error.message);
-            assert_eq!(client.requests().len(), 4);
+            assert_eq!(client.requests().len(), 3);
         }
     }
 
@@ -418,7 +443,6 @@ mod tests {
     fn erc20_simulation_remote_revert_is_rejected_without_provider_details() {
         let client = ScriptedClient::new(vec![
             success("eth_chainId", json!("0x7a69")),
-            success("eth_getTransactionCount", json!("0x0")),
             success("eth_call", abi_word(8)),
             failure(
                 "eth_call",
@@ -427,7 +451,7 @@ mod tests {
             ),
         ]);
 
-        let error = block_on(rpc(client).build_context(&token_transfer()))
+        let error = block_on(rpc(client).build_context(&token_transfer(), 0))
             .expect_err("a deterministic ERC-20 simulation revert must fail");
 
         assert_eq!(error.kind, ChainErrorKind::Rejected);
@@ -441,7 +465,6 @@ mod tests {
     fn erc20_preflight_rejects_insufficient_native_gas_and_token_balance() {
         let no_gas = ScriptedClient::new(vec![
             success("eth_chainId", json!("0x7a69")),
-            success("eth_getTransactionCount", json!("0x0")),
             success("eth_call", abi_word(8)),
             success("eth_call", abi_word(1)),
             success("eth_estimateGas", json!("0x5208")),
@@ -452,28 +475,26 @@ mod tests {
             ),
             success("eth_getBalance", json!("0x0")),
         ]);
-        let error = block_on(rpc(no_gas).build_context(&token_transfer()))
+        let error = block_on(rpc(no_gas).build_context(&token_transfer(), 0))
             .expect_err("token transfer without native gas must fail");
         assert_eq!(error.kind, ChainErrorKind::InsufficientFunds);
         assert!(error.message.contains("ERC-20 maximum fee"));
 
         let no_tokens = ScriptedClient::new(vec![
             success("eth_chainId", json!("0x7a69")),
-            success("eth_getTransactionCount", json!("0x0")),
             success("eth_call", abi_word(0)),
         ]);
-        let error = block_on(rpc(no_tokens.clone()).build_context(&token_transfer()))
+        let error = block_on(rpc(no_tokens.clone()).build_context(&token_transfer(), 0))
             .expect_err("token transfer above balance must fail");
         assert_eq!(error.kind, ChainErrorKind::InsufficientFunds);
         assert!(error.message.contains("ERC-20 balance is insufficient"));
-        assert_eq!(no_tokens.requests().len(), 3);
+        assert_eq!(no_tokens.requests().len(), 2);
     }
 
     #[test]
     fn native_preflight_checks_value_plus_worst_case_fee() {
         let client = ScriptedClient::new(vec![
             success("eth_chainId", json!("0x7a69")),
-            success("eth_getTransactionCount", json!("0x0")),
             success("eth_estimateGas", json!("0x5208")),
             success("eth_maxPriorityFeePerGas", json!("0x3b9aca00")),
             success(
@@ -483,7 +504,7 @@ mod tests {
             success("eth_getBalance", json!("0x7")),
         ]);
 
-        let error = block_on(rpc(client).build_context(&native_transfer()))
+        let error = block_on(rpc(client).build_context(&native_transfer(), 0))
             .expect_err("native value without fee balance must fail");
 
         assert_eq!(error.kind, ChainErrorKind::InsufficientFunds);
@@ -495,7 +516,7 @@ mod tests {
         let client = ScriptedClient::new(vec![success("eth_chainId", json!("0x1"))]);
         let rpc = rpc(client.clone());
 
-        let error = block_on(rpc.build_context(&native_transfer()))
+        let error = block_on(rpc.build_context(&native_transfer(), 9))
             .expect_err("wrong chain identity must fail closed");
 
         assert_eq!(error.kind, ChainErrorKind::Divergent);
@@ -528,7 +549,6 @@ mod tests {
     fn estimate_gas_revert_is_terminal_and_provider_message_is_not_exposed() {
         let client = ScriptedClient::new(vec![
             success("eth_chainId", json!("0x7a69")),
-            success("eth_getTransactionCount", json!("0x0")),
             failure(
                 "eth_estimateGas",
                 -32_000,
@@ -537,7 +557,7 @@ mod tests {
         ]);
         let rpc = rpc(client);
 
-        let error = block_on(rpc.build_context(&native_transfer()))
+        let error = block_on(rpc.build_context(&native_transfer(), 0))
             .expect_err("a deterministic revert must fail");
 
         assert_eq!(error.kind, ChainErrorKind::Rejected);
@@ -563,8 +583,94 @@ mod tests {
         }))
         .expect_err("provider hash mismatch must fail");
 
-        assert!(!error.retryable);
+        assert!(error.retryable);
         assert_eq!(client.requests()[0].1, json!([data_hex(&envelope)]));
+    }
+
+    #[test]
+    fn unknown_remote_submission_failure_remains_ambiguous() {
+        let envelope = vec![0x02, 0x04, 0x05, 0x06];
+        let id = TransactionId(keccak256(&envelope).0);
+        let client = ScriptedClient::new(vec![failure(
+            "eth_sendRawTransaction",
+            -32_000,
+            "backend failed after upstream acceptance: Bearer secret",
+        )]);
+
+        let error = block_on(rpc(client).broadcast(SignedTransaction { id, envelope }))
+            .expect_err("an unclassified post-attempt remote failure must stay ambiguous");
+
+        assert!(error.retryable);
+        assert!(error.message.contains("outcome is ambiguous"));
+        assert!(!error.message.contains("Bearer secret"));
+    }
+
+    #[tokio::test]
+    async fn coordinator_retains_unknown_remote_failure_for_exact_replay() {
+        let signer = signer(10);
+        let request = TransferRequest::native_atomic(
+            signer.address.clone(),
+            Address([0x44; 20]),
+            Wei::from_u128(7),
+        );
+        let client = ScriptedClient::new(vec![
+            success("eth_getTransactionCount", json!("0x5")),
+            success("eth_chainId", json!("0x7a69")),
+            success("eth_estimateGas", json!("0x5208")),
+            success("eth_maxPriorityFeePerGas", json!("0x1")),
+            success("eth_getBlockByNumber", json!({"baseFeePerGas": "0x1"})),
+            success("eth_getBalance", json!("0xde0b6b3a7640000")),
+            success("eth_getBalance", json!("0xde0b6b3a7640000")),
+            failure(
+                "eth_sendRawTransaction",
+                -32_000,
+                "backend failed after upstream acceptance",
+            ),
+        ]);
+        let methods = Arc::new(rpc(client.clone()));
+        let coordinator = crate::TransactionCoordinator::new(methods.clone(), methods);
+        let signed = coordinator
+            .prepare_one(crate::transaction::Preparation::signer(
+                request, 31_337, &signer,
+            ))
+            .await
+            .expect("transaction must prepare");
+
+        assert!(
+            coordinator
+                .broadcast(signed.clone())
+                .await
+                .expect_err("unclassified remote failure must be ambiguous")
+                .retryable
+        );
+        client.push_replies([
+            success("eth_getTransactionByHash", Value::Null),
+            success(
+                "eth_sendRawTransaction",
+                json!(transaction_id_hex(&signed.id)),
+            ),
+        ]);
+
+        assert_eq!(
+            coordinator
+                .broadcast(signed.clone())
+                .await
+                .expect("reserved exact envelope must replay"),
+            signed.id
+        );
+        let submissions = client
+            .requests()
+            .into_iter()
+            .filter(|(method, _)| method == "eth_sendRawTransaction")
+            .map(|(_, params)| params)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            submissions,
+            [
+                json!([data_hex(&signed.envelope)]),
+                json!([data_hex(&signed.envelope)])
+            ]
+        );
     }
 
     #[test]
@@ -599,7 +705,29 @@ mod tests {
         let mismatched_rpc = rpc(mismatched);
         let error = block_on(mismatched_rpc.broadcast(SignedTransaction { id, envelope }))
             .expect_err("different known hash must not be accepted");
+        assert!(error.retryable);
+    }
+
+    #[test]
+    fn known_requires_the_exact_transaction_hash() {
+        let id = TransactionId([0xaa; 32]);
+        let absent = ScriptedClient::new(vec![success("eth_getTransactionByHash", Value::Null)]);
+        assert!(!block_on(rpc(absent).known(&id)).expect("null lookup must mean not known"));
+
+        let matching = ScriptedClient::new(vec![success(
+            "eth_getTransactionByHash",
+            json!({"hash": transaction_id_hex(&id)}),
+        )]);
+        assert!(block_on(rpc(matching).known(&id)).expect("matching hash must be known"));
+
+        let mismatched = ScriptedClient::new(vec![success(
+            "eth_getTransactionByHash",
+            json!({"hash": format!("0x{}", "bb".repeat(32))}),
+        )]);
+        let error = block_on(rpc(mismatched).known(&id))
+            .expect_err("mismatched transaction object must fail closed");
         assert!(!error.retryable);
+        assert!(error.message.contains("does not match"));
     }
 
     #[test]
@@ -616,14 +744,13 @@ mod tests {
         .expect("test RPC limits must be valid");
         let bounded_rpc = Methods::with_client(no_calls.clone(), 31_337, small_input)
             .expect("test RPC configuration must be valid");
-        let error = block_on(bounded_rpc.build_context(&token_transfer()))
+        let error = block_on(bounded_rpc.build_context(&token_transfer(), 0))
             .expect_err("oversized input must fail before RPC");
         assert_eq!(error.kind, ChainErrorKind::InvalidTransaction);
         assert!(no_calls.requests().is_empty());
 
         let high_fee = ScriptedClient::new(vec![
             success("eth_chainId", json!("0x7a69")),
-            success("eth_getTransactionCount", json!("0x0")),
             success("eth_estimateGas", json!("0x5208")),
             success("eth_maxPriorityFeePerGas", json!("0x1")),
             success(
@@ -631,7 +758,7 @@ mod tests {
                 json!({"baseFeePerGas": "0x100000000000"}),
             ),
         ]);
-        let error = block_on(rpc(high_fee).build_context(&native_transfer()))
+        let error = block_on(rpc(high_fee).build_context(&native_transfer(), 0))
             .expect_err("fee above the configured ceiling must fail");
         assert_eq!(error.kind, ChainErrorKind::FeeUnavailable);
         assert!(error.message.contains("configured ceiling"));

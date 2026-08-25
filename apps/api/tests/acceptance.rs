@@ -187,7 +187,8 @@ async fn mixed_chain_batch_is_rejected_before_broadcast() -> Result<(), Box<dyn 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ethereum_batch_reports_the_accepted_prefix() -> Result<(), Box<dyn std::error::Error>> {
+async fn ethereum_batch_reports_the_accepted_prefix_for_an_ambiguous_failure()
+-> Result<(), Box<dyn std::error::Error>> {
     let files = TempDir::new()?;
     let node = EthereumNode::start().await;
     let api = start_api(json!({
@@ -203,7 +204,7 @@ async fn ethereum_batch_reports_the_accepted_prefix() -> Result<(), Box<dyn std:
     let second = format!("0x{}", "88".repeat(20));
     node.expect_send(from.clone(), first.clone(), 1_000_000_000_000_000_000);
     node.expect_send(from, second.clone(), 2_000_000_000_000_000_000);
-    node.reject_after(1);
+    node.fail_submission_after(1);
 
     let response = batch_response(
         &api.root,
@@ -213,12 +214,112 @@ async fn ethereum_batch_reports_the_accepted_prefix() -> Result<(), Box<dyn std:
         ],
     )
     .await?;
-    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     let body: Value = response.json().await?;
     let accepted = node.submitted_ids();
     assert_eq!(accepted.len(), 1);
+    assert_eq!(node.submitted_nonces(), vec![0]);
     assert_eq!(body["transaction_ids"], json!(accepted));
     assert_eq!(body["failed_index"], 1);
+
+    api.stop().await;
+    node.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ethereum_batch_reserves_nonces_per_source_in_request_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let files = TempDir::new()?;
+    let node = EthereumNode::start().await;
+    let api = start_api(json!({
+        "ethereum": ethereum_index(files.path().join("ethereum.redb"), &node)
+    }))
+    .await?;
+    let first = create_wallet(&api.root, "eth").await?;
+    let second = create_wallet(&api.root, "eth").await?;
+    let first_address = first["address"].as_str().expect("first address").to_owned();
+    let second_address = second["address"]
+        .as_str()
+        .expect("second address")
+        .to_owned();
+    let destinations = [
+        format!("0x{}", "31".repeat(20)),
+        format!("0x{}", "32".repeat(20)),
+        format!("0x{}", "33".repeat(20)),
+    ];
+    node.expect_send(first_address.clone(), destinations[0].clone(), 1);
+    node.expect_send(second_address, destinations[1].clone(), 2);
+    node.expect_send(first_address, destinations[2].clone(), 3);
+
+    let ids = send_batch(
+        &api.root,
+        &[
+            (
+                wallet_id(&first),
+                "hex",
+                destinations[0].clone(),
+                "0.000000000000000001",
+            ),
+            (
+                wallet_id(&second),
+                "hex",
+                destinations[1].clone(),
+                "0.000000000000000002",
+            ),
+            (
+                wallet_id(&first),
+                "hex",
+                destinations[2].clone(),
+                "0.000000000000000003",
+            ),
+        ],
+    )
+    .await?;
+
+    assert_eq!(ids, node.submitted_ids());
+    assert_eq!(node.submitted_nonces(), vec![0, 0, 1]);
+
+    api.stop().await;
+    node.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ethereum_batch_rejects_cumulative_overspend_before_broadcast()
+-> Result<(), Box<dyn std::error::Error>> {
+    let files = TempDir::new()?;
+    let node = EthereumNode::start().await;
+    let api = start_api(json!({
+        "ethereum": ethereum_index(files.path().join("ethereum.redb"), &node)
+    }))
+    .await?;
+    let wallet = create_wallet(&api.root, "eth").await?;
+
+    let response = batch_response(
+        &api.root,
+        &[
+            (
+                wallet_id(&wallet),
+                "hex",
+                format!("0x{}", "41".repeat(20)),
+                "6",
+            ),
+            (
+                wallet_id(&wallet),
+                "hex",
+                format!("0x{}", "42".repeat(20)),
+                "6",
+            ),
+        ],
+    )
+    .await?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body: Value = response.json().await?;
+    assert_eq!(body["failed_index"], 1);
+    assert!(body["transaction_ids"].as_array().is_none_or(Vec::is_empty));
+    assert!(node.submitted_ids().is_empty());
 
     api.stop().await;
     node.stop().await;

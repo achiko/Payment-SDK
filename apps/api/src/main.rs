@@ -65,7 +65,11 @@ async fn main() -> Result<(), AnyError> {
         let transactions: Arc<dyn chain_ethereum::Transactions> = Arc::new(
             chain_ethereum::TransactionClient::new(client, config.chain_id, config.limits()?)?,
         );
-        Some((scope, config.chain_id, usdc, accounts, transactions))
+        let coordinator = Arc::new(chain_ethereum::TransactionCoordinator::new(
+            accounts.clone(),
+            transactions,
+        ));
+        Some((scope, config.chain_id, usdc, accounts, coordinator))
     } else {
         None
     };
@@ -94,7 +98,7 @@ async fn main() -> Result<(), AnyError> {
         let sender = provider.transactions();
         wallets.register(WalletAsset::Btc, scope, provider, sender, None)?;
     }
-    if let Some((scope, chain_id, usdc, accounts, transactions)) = ethereum {
+    if let Some((scope, chain_id, usdc, accounts, coordinator)) = ethereum {
         let eth_provider = chain_ethereum::WalletProvider::new(
             chain_ethereum::WalletConfig {
                 scope: scope.clone(),
@@ -103,7 +107,7 @@ async fn main() -> Result<(), AnyError> {
                 decimals: chain_ethereum::ETH.decimals,
             },
             accounts.clone(),
-            transactions.clone(),
+            coordinator.clone(),
             history.clone(),
         );
         let eth_sender = eth_provider.transactions();
@@ -124,7 +128,7 @@ async fn main() -> Result<(), AnyError> {
                     decimals: u32::from(USDC_DECIMALS),
                 },
                 accounts,
-                transactions,
+                coordinator,
                 history,
             );
             let usdc_sender = usdc_provider.transactions();

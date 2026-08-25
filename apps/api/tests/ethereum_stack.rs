@@ -20,6 +20,7 @@ pub struct Transaction {
     pub from: String,
     pub to: String,
     pub value: String,
+    nonce: Option<u64>,
     token_transfer: Option<TokenTransfer>,
 }
 
@@ -37,6 +38,7 @@ impl Transaction {
             from,
             to,
             value: format!("0x{value:x}"),
+            nonce: None,
             token_transfer: None,
         }
     }
@@ -53,6 +55,7 @@ impl Transaction {
             from,
             to: contract.clone(),
             value: "0x0".to_owned(),
+            nonce: None,
             token_transfer: Some(TokenTransfer {
                 contract,
                 recipient,
@@ -136,8 +139,8 @@ impl EthereumNode {
             .push_back(Transaction::erc20(0, contract, from, recipient, amount));
     }
 
-    /// Rejects the next submission after `accepted` further transactions.
-    pub fn reject_after(&self, accepted: usize) {
+    /// Returns an outcome-ambiguous RPC error after `accepted` submissions.
+    pub fn fail_submission_after(&self, accepted: usize) {
         self.state
             .0
             .lock()
@@ -185,6 +188,22 @@ impl EthereumNode {
             .collect()
     }
 
+    #[must_use]
+    pub fn submitted_nonces(&self) -> Vec<u64> {
+        self.state
+            .0
+            .lock()
+            .expect("Ethereum node lock must be healthy")
+            .submitted
+            .iter()
+            .map(|transaction| {
+                transaction
+                    .nonce
+                    .expect("submitted transaction must retain its nonce")
+            })
+            .collect()
+    }
+
     pub async fn stop(self) {
         let node = self
             .node
@@ -206,6 +225,7 @@ struct Node {
     submitted: Vec<Transaction>,
     balance: u128,
     token_balances: BTreeMap<String, u128>,
+    nonces: BTreeMap<String, u64>,
     reject_after: Option<usize>,
 }
 
@@ -217,6 +237,7 @@ impl Default for Node {
             submitted: Vec::new(),
             balance: 10_000_000_000_000_000_000,
             token_balances: BTreeMap::new(),
+            nonces: BTreeMap::new(),
             reject_after: None,
         }
     }
@@ -334,7 +355,17 @@ fn result(state: &StateHandle, method: &str, params: &Value) -> Value {
             let node = state.0.lock().expect("Ethereum node lock must be healthy");
             json!(format!("0x{:x}", node.blocks.len()))
         }
-        "eth_getTransactionCount" => json!("0x0"),
+        "eth_getTransactionCount" => {
+            let address = params[0]
+                .as_str()
+                .expect("nonce address must be text")
+                .to_ascii_lowercase();
+            let node = state.0.lock().expect("Ethereum node lock must be healthy");
+            json!(format!(
+                "0x{:x}",
+                node.nonces.get(&address).copied().unwrap_or(0)
+            ))
+        }
         "eth_estimateGas" => json!("0x5208"),
         "eth_maxPriorityFeePerGas" => json!("0x1"),
         "eth_getCode" => json!("0x6000"),
@@ -408,13 +439,22 @@ fn submit(state: &StateHandle, params: &Value) -> Result<Value, Value> {
         .expected
         .pop_front()
         .expect("test must describe the expected Ethereum transaction");
-    assert_envelope(&envelope, &transaction);
+    let nonce = assert_envelope(&envelope, &transaction);
+    let expected_nonce = node
+        .nonces
+        .entry(transaction.from.to_ascii_lowercase())
+        .or_default();
+    assert_eq!(nonce, *expected_nonce, "submitted sender nonce");
+    *expected_nonce = expected_nonce
+        .checked_add(1)
+        .expect("fixture sender nonce must not overflow");
     transaction.hash = hash.clone();
+    transaction.nonce = Some(nonce);
     node.submitted.push(transaction);
     Ok(json!(hash))
 }
 
-fn assert_envelope(envelope: &[u8], expected: &Transaction) {
+fn assert_envelope(envelope: &[u8], expected: &Transaction) -> u64 {
     let envelope = TxEnvelope::decode_2718_exact(envelope)
         .expect("submitted transaction must be an exact EIP-2718 envelope");
     let signed = envelope
@@ -454,6 +494,7 @@ fn assert_envelope(envelope: &[u8], expected: &Transaction) {
         expected_input.as_slice(),
         "submitted calldata"
     );
+    transaction.nonce
 }
 
 fn token_input(transfer: &TokenTransfer) -> Vec<u8> {

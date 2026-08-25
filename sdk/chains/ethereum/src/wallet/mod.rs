@@ -7,16 +7,17 @@ use base::{
     TransactionError, TransactionErrorKind, TransactionFuture, TransactionId, TransactionSnapshot,
 };
 use crypto::{PublicKeyFormat, SecretKey};
-use indexing::{History as IndexHistory, IndexScope};
+use indexing::{History as IndexHistory, IndexScope, SourceError};
 use wallets::{
     AddressEncoding, AddressFormat, AddressText, Balance, BalanceReader, Error as WalletError,
     ErrorKind as WalletErrorKind, FutureResult, Provider, SecretBytes, TransactionFactory,
     Wallet as WalletContract,
 };
 
+use crate::transaction::Preparation;
 use crate::{
     Accounts, Address, AssetKind, ChainError, ChainErrorKind, SignedTransaction,
-    TransactionBuilder, Transactions, TransferRequest, Wei,
+    TransactionCoordinator, TransferRequest, Wei,
 };
 
 const SNAPSHOT_KIND: &str = "ethereum.transfer";
@@ -56,12 +57,38 @@ impl WalletConfig {
         }
         Ok(())
     }
+
+    pub(crate) fn transfer_request(
+        &self,
+        from: Address,
+        destination: Address,
+        amount: &Decimal,
+    ) -> Result<TransferRequest, TransactionError> {
+        self.validate()
+            .map_err(|error| transaction_error(TransactionErrorKind::InvalidSnapshot, error))?;
+        if amount <= &Decimal::zero() {
+            return Err(transaction_error(
+                TransactionErrorKind::InvalidAmount,
+                "amount must be positive",
+            ));
+        }
+        let value = amount
+            .to_atomic_be_bytes(self.decimals)
+            .map(Wei)
+            .map_err(|error| transaction_error(TransactionErrorKind::InvalidAmount, error))?;
+        Ok(match &self.asset {
+            AssetKind::Native => TransferRequest::native_atomic(from, destination, value),
+            AssetKind::Erc20(token) => {
+                TransferRequest::erc20(from, token.clone(), destination, value)
+            }
+        })
+    }
 }
 
 pub struct WalletProvider {
     config: WalletConfig,
     accounts: Arc<dyn Accounts>,
-    transactions: Arc<dyn Transactions>,
+    coordinator: Arc<TransactionCoordinator>,
     history: Arc<dyn IndexHistory>,
 }
 
@@ -70,20 +97,23 @@ impl WalletProvider {
     pub fn new(
         config: WalletConfig,
         accounts: Arc<dyn Accounts>,
-        transactions: Arc<dyn Transactions>,
+        coordinator: Arc<TransactionCoordinator>,
         history: Arc<dyn IndexHistory>,
     ) -> Self {
         Self {
             config,
             accounts,
-            transactions,
+            coordinator,
             history,
         }
     }
 
     #[must_use]
     pub fn transactions(&self) -> Arc<dyn wallets::Sender> {
-        Arc::new(crate::batch::Batch::Sequential)
+        Arc::new(crate::batch::Batch::new(
+            self.config.clone(),
+            self.coordinator.clone(),
+        ))
     }
 }
 
@@ -107,7 +137,7 @@ impl Provider for WalletProvider {
                 address,
                 signer: Arc::new(signer),
                 accounts: self.accounts.clone(),
-                transactions: self.transactions.clone(),
+                coordinator: self.coordinator.clone(),
                 history: self.history.clone(),
             }) as Arc<dyn WalletContract>)
         })
@@ -119,7 +149,7 @@ struct Wallet {
     address: Address,
     signer: Arc<KeyPair<Address>>,
     accounts: Arc<dyn Accounts>,
-    transactions: Arc<dyn Transactions>,
+    coordinator: Arc<TransactionCoordinator>,
     history: Arc<dyn IndexHistory>,
 }
 
@@ -186,13 +216,10 @@ impl BalanceReader for Wallet {
 impl TransactionFactory for Wallet {
     fn transaction(&self) -> Box<dyn BaseBuilder> {
         Box::new(Builder::new(
-            self.config.scope.clone(),
-            self.config.chain_id,
+            self.config.clone(),
             self.address.clone(),
-            self.config.asset.clone(),
-            self.config.decimals,
             self.signer.clone(),
-            self.transactions.clone(),
+            self.coordinator.clone(),
         ))
     }
 
@@ -209,13 +236,10 @@ impl TransactionFactory for Wallet {
 }
 
 struct Builder {
-    scope: IndexScope,
-    chain_id: u64,
+    config: WalletConfig,
     from: Address,
-    asset: AssetKind,
-    decimals: u32,
     signer: Arc<KeyPair<Address>>,
-    transactions: Arc<dyn Transactions>,
+    coordinator: Arc<TransactionCoordinator>,
     transfer: Option<(Address, Decimal)>,
 }
 
@@ -225,22 +249,16 @@ impl Builder {
     }
 
     fn new(
-        scope: IndexScope,
-        chain_id: u64,
+        config: WalletConfig,
         from: Address,
-        asset: AssetKind,
-        decimals: u32,
         signer: Arc<KeyPair<Address>>,
-        transactions: Arc<dyn Transactions>,
+        coordinator: Arc<TransactionCoordinator>,
     ) -> Self {
         Self {
-            scope,
-            chain_id,
+            config,
             from,
-            asset,
-            decimals,
             signer,
-            transactions,
+            coordinator,
             transfer: None,
         }
     }
@@ -253,34 +271,14 @@ impl Builder {
                 "transfer is not configured",
             )
         })?;
-        let value = amount
-            .to_atomic_be_bytes(self.decimals)
-            .map(Wei)
-            .map_err(|error| transaction_error(TransactionErrorKind::InvalidAmount, error))?;
-        Ok(match &self.asset {
-            AssetKind::Native => {
-                TransferRequest::native_atomic(self.from.clone(), destination, value)
-            }
-            AssetKind::Erc20(token) => {
-                TransferRequest::erc20(self.from.clone(), token.clone(), destination, value)
-            }
-        })
+        self.config
+            .transfer_request(self.from.clone(), destination, &amount)
     }
 
     fn validate(&self) -> Result<(), TransactionError> {
-        if self.scope.chain.0 != "ethereum"
-            || self.scope.network.trim().is_empty()
-            || self.chain_id == 0
-            || matches!(self.asset, AssetKind::Native) && self.decimals != crate::ETH.decimals
-            || matches!(&self.asset, AssetKind::Erc20(token) if token.is_zero())
-            || self.decimals > u8::MAX.into()
-        {
-            return Err(transaction_error(
-                TransactionErrorKind::InvalidSnapshot,
-                "Ethereum transaction identity, network, asset, and decimals do not agree",
-            ));
-        }
-        Ok(())
+        self.config
+            .validate()
+            .map_err(|error| transaction_error(TransactionErrorKind::InvalidSnapshot, error))
     }
 }
 
@@ -303,7 +301,7 @@ impl BaseBuilder for Builder {
             )
         })?;
         amount
-            .to_atomic_be_bytes::<32>(self.decimals)
+            .to_atomic_be_bytes::<32>(self.config.decimals)
             .map_err(|error| transaction_error(TransactionErrorKind::InvalidAmount, error))?;
         self.transfer = Some((Address(bytes), amount));
         Ok(())
@@ -321,13 +319,13 @@ impl BaseBuilder for Builder {
             SNAPSHOT_KIND,
             serde_json::json!({
                 "scope": {
-                    "chain": self.scope.chain.0.as_str(),
-                    "network": self.scope.network.as_str(),
+                    "chain": self.config.scope.chain.0.as_str(),
+                    "network": self.config.scope.network.as_str(),
                 },
                 "source": self.from.to_string(),
                 "destination": destination.to_string(),
                 "amount": amount.to_string(),
-                "asset": asset_snapshot(&self.asset, self.decimals),
+                "asset": asset_snapshot(&self.config.asset, self.config.decimals),
             }),
         ))
     }
@@ -337,21 +335,15 @@ impl BaseBuilder for Builder {
     ) -> TransactionFuture<'a, Result<base::SignedTransaction, TransactionError>> {
         Box::pin(async move {
             let request = self.request()?;
-            let context = self
-                .transactions
-                .build_context(&request)
+            let signed = self
+                .coordinator
+                .prepare_one(Preparation::signer(
+                    request,
+                    self.config.chain_id,
+                    self.signer.as_ref(),
+                ))
                 .await
                 .map_err(preparation_error)?;
-            if context.chain_id != self.chain_id {
-                return Err(transaction_error(
-                    TransactionErrorKind::Divergent,
-                    "Ethereum RPC chain ID does not match the wallet network",
-                ));
-            }
-            let signed = TransactionBuilder::new(request, context)
-                .sign(self.signer.as_ref())
-                .await
-                .map_err(|error| transaction_error(TransactionErrorKind::Signing, error))?;
             Ok(base::SignedTransaction::new(
                 PREPARED_KIND,
                 TransactionId::new(signed.id.to_string()),
@@ -399,10 +391,10 @@ impl Broadcaster for Wallet {
                         transaction_error(TransactionErrorKind::InvalidTransaction, error)
                     })?;
             let id = self
-                .transactions
+                .coordinator
                 .broadcast(signed)
                 .await
-                .map_err(|error| transaction_error(TransactionErrorKind::Unavailable, error))?;
+                .map_err(submission_error)?;
             Ok(BroadcastReceipt {
                 id: TransactionId::new(id.to_string()),
             })
@@ -417,7 +409,7 @@ fn transaction_error(
     TransactionError::new(kind, error.to_string())
 }
 
-fn preparation_error(error: ChainError) -> TransactionError {
+pub(crate) fn preparation_error(error: ChainError) -> TransactionError {
     let kind = match error.kind {
         ChainErrorKind::InvalidAddress => TransactionErrorKind::InvalidAddress,
         ChainErrorKind::InvalidTransaction => TransactionErrorKind::InvalidTransaction,
@@ -433,13 +425,36 @@ fn preparation_error(error: ChainError) -> TransactionError {
     transaction_error(kind, error)
 }
 
+fn submission_error(error: SourceError) -> TransactionError {
+    let kind = if error.retryable {
+        TransactionErrorKind::Unavailable
+    } else {
+        TransactionErrorKind::Rejected
+    };
+    transaction_error(kind, error)
+}
+
 fn wallet_error(kind: WalletErrorKind, error: impl std::fmt::Display) -> WalletError {
     WalletError::new(kind, error.to_string())
 }
 
 #[cfg(test)]
-mod preparation_error_test {
+mod tests {
     use super::*;
+    use crate::TransferIntent;
+    use indexing::ChainId;
+
+    fn config(asset: AssetKind, decimals: u32) -> WalletConfig {
+        WalletConfig {
+            scope: IndexScope {
+                chain: ChainId("ethereum".to_owned()),
+                network: "sepolia".to_owned(),
+            },
+            chain_id: 11_155_111,
+            asset,
+            decimals,
+        }
+    }
 
     #[test]
     fn deterministic_preparation_kinds_remain_terminal_wallet_errors() {
@@ -467,5 +482,69 @@ mod preparation_error_test {
             message: "RPC failed".to_owned(),
         });
         assert_eq!(mapped.kind, TransactionErrorKind::Unavailable);
+    }
+
+    #[test]
+    fn submission_failures_preserve_retryability() {
+        let unavailable = submission_error(SourceError {
+            message: "submission outcome is ambiguous".to_owned(),
+            retryable: true,
+        });
+        let rejected = submission_error(SourceError {
+            message: "node rejected the transaction".to_owned(),
+            retryable: false,
+        });
+
+        assert_eq!(unavailable.kind, TransactionErrorKind::Unavailable);
+        assert_eq!(rejected.kind, TransactionErrorKind::Rejected);
+    }
+
+    #[test]
+    fn wallet_config_builds_native_and_token_requests_with_asset_precision() {
+        let from = Address([0x11; 20]);
+        let destination = Address([0x22; 20]);
+        let native_amount = "0.000000000000000007"
+            .parse::<Decimal>()
+            .expect("native amount must parse");
+        let token_amount = "0.000009"
+            .parse::<Decimal>()
+            .expect("token amount must parse");
+        let token = Address([0x33; 20]);
+        let seven_wei = Wei::from_u128(7);
+        let nine_units = Wei::from_u128(9);
+
+        let native = config(AssetKind::Native, 18)
+            .transfer_request(from.clone(), destination.clone(), &native_amount)
+            .expect("native request must use ETH precision");
+        let erc20 = config(AssetKind::Erc20(token.clone()), 6)
+            .transfer_request(from.clone(), destination.clone(), &token_amount)
+            .expect("token request must use configured precision");
+
+        assert_eq!(
+            native.intent(),
+            TransferIntent::Native {
+                from: &from,
+                to: &destination,
+                value: &seven_wei,
+            }
+        );
+        assert_eq!(
+            erc20.intent(),
+            TransferIntent::Erc20 {
+                from: &from,
+                token: &token,
+                recipient: &destination,
+                amount: &nine_units,
+            }
+        );
+    }
+
+    #[test]
+    fn wallet_config_rejects_non_positive_transfer_amounts() {
+        let error = config(AssetKind::Native, 18)
+            .transfer_request(Address([0x11; 20]), Address([0x22; 20]), &Decimal::zero())
+            .expect_err("zero-value transfers must fail before RPC");
+
+        assert_eq!(error.kind, TransactionErrorKind::InvalidAmount);
     }
 }

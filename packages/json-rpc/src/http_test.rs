@@ -71,6 +71,33 @@ async fn failover_advances_after_transport_failure() {
     assert_eq!(result.deserialize::<u64>().expect("number must decode"), 42);
 }
 
+#[tokio::test]
+async fn one_attempt_does_not_hide_submission_provenance_with_failover() {
+    let unavailable = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("ephemeral address must bind")
+        .local_addr()
+        .expect("address must exist");
+    let endpoint =
+        serve_once(|request| json!({"jsonrpc":"2.0", "id":request["id"], "result":"accepted"}));
+    let mut config = Config::new(format!("http://{unavailable}"), Duration::from_millis(100));
+    config.endpoints.push(endpoint);
+    let client = Http::new(config).expect("failover client must build");
+
+    client
+        .request_once("eth_sendRawTransaction", json!(["0x02"]))
+        .await
+        .expect_err("one attempt must expose the first endpoint transport failure");
+    let result = client
+        .request("eth_sendRawTransaction", json!(["0x02"]))
+        .await
+        .expect("ordinary request may fail over")
+        .expect("second endpoint must accept");
+    assert_eq!(
+        result.deserialize::<String>().expect("string must decode"),
+        "accepted"
+    );
+}
+
 fn serve_once(response: impl FnOnce(Value) -> Value + Send + 'static) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback server must bind");
     let address = listener.local_addr().expect("loopback address must exist");

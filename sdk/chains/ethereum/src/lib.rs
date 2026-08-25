@@ -21,7 +21,8 @@ pub use rpc::{
 };
 pub use transaction::{
     BuildContext, FeeInspection, IdError, InspectionError, SignedError, SignedTransaction,
-    TransactionBuilder, TransactionId, TransferIntent, TransferRequest, UnsignedTransaction,
+    TransactionBuilder, TransactionCoordinator, TransactionId, TransferIntent, TransferRequest,
+    UnsignedTransaction,
 };
 pub use wallet::{WalletConfig, WalletProvider};
 

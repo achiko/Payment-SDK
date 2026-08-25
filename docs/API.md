@@ -100,6 +100,13 @@ be logged. Each chain shares one connected client between its indexing source
 and wallet fee/account/transaction capabilities. Ethereum also accepts an
 optional `limits` object for maximum input bytes, gas margin/limit, per-gas
 fees, priority fee, and total fee; omitting it uses validated SDK defaults.
+
+Ethereum `eth_sendRawTransaction` is the exception to generic failover: it is
+attempted once against the first configured endpoint. A retryable failure is
+retained as an ambiguous exact envelope, and the Ethereum coordinator performs
+explicit exact-hash reconciliation or byte-identical replay. Native-only
+multi-endpoint operators should therefore keep endpoint 0 submission-ready.
+
 The optional `usdc` object allowlists one exact contract for that Ethereum
 network. Startup requires nonempty contract code and verifies the expected six
 decimals. Until RPC endpoint identity is admitted and validated independently,
@@ -259,7 +266,7 @@ ambiguous transport outcome as proof that no broadcast occurred.
 
 ## Send several transfers
 
-The in-progress batch surface is:
+The batch surface is:
 
 ```http
 POST /v1/transactions
@@ -292,15 +299,23 @@ Required semantics are:
   each input with its owner, and creating one requested output per transfer;
   and
 - Ethereum builds separate transactions and broadcasts them in input order,
-  reporting any accepted prefix if a later broadcast fails.
+  reserving consecutive nonces per sender and reporting any accepted prefix if
+  a later broadcast fails. Every Ethereum item is simulated, cumulatively
+  balance-checked, and signed before the first envelope is submitted.
 
 The one-process acceptance suite proves a two-transfer Bitcoin batch produces
 one transaction/ID and a two-transfer Ethereum batch produces two IDs in input
 order, with both results later visible through indexing. It also proves
 multi-source Bitcoin signatures, an Ethereum failure after a submitted prefix,
 and zero-broadcast rejection for mixed ETH/USDC families. Consecutive nonce
-reservation, whole-batch Ethereum preflight, and ambiguous-submission
-reconciliation remain the next transaction-safety phase.
+reservation and whole-batch Ethereum preflight are enforced by the coordinator
+shared by the ETH and USDC providers. A retryable ambiguous submission retains
+the exact envelope and blocks later sends from that address until exact-hash
+reconciliation or byte-identical replay succeeds.
+
+That safety state lives only in the running API process. Operators must use one
+active transaction writer per managed EOA; an unclean restart can require
+manual reconciliation because this API does not persist outgoing operations.
 
 If a sequential batch fails after a prefix was accepted, the error body keeps
 the ordinary `message` and adds the accepted `transaction_ids` plus the
@@ -308,7 +323,7 @@ zero-based `failed_index` from the original request:
 
 ```json
 {
-  "message": "node rejected transaction",
+  "message": "Ethereum submission outcome is ambiguous",
   "transaction_ids": ["<accepted transaction id>"],
   "failed_index": 1
 }
@@ -323,11 +338,13 @@ Errors return JSON with one `message` field. Current mappings are:
 | `400` | malformed request or cursor |
 | `404` | asset is not configured or wallet ID is unknown |
 | `409` | duplicate/conflicting composition state |
-| `503` | wallet or indexing operation unavailable |
+| `422` | deterministic transaction preparation or submission rejection |
+| `503` | wallet/indexing unavailable or a submission outcome is ambiguous |
 | `500` | an internal result could not be encoded |
 
-Batch transaction failures use `422`; their body may also include accepted
-transaction IDs and the failed input index as shown above.
+Batch transaction failures use `422` for deterministic terminal failures and
+`503` for retryable or ambiguous failures. Either body may also include
+accepted transaction IDs and the failed input index as shown above.
 
 ## Current scope
 

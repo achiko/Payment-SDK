@@ -34,13 +34,10 @@ pub(super) fn restore(
 ) -> Result<Builder, TransactionError> {
     let (destination, amount) = decode(&wallet.config, &wallet.address, snapshot)?;
     let mut builder = Builder::new(
-        wallet.config.scope.clone(),
-        wallet.config.chain_id,
+        wallet.config.clone(),
         wallet.address.clone(),
-        wallet.config.asset.clone(),
-        wallet.config.decimals,
         wallet.signer.clone(),
-        wallet.transactions.clone(),
+        wallet.coordinator.clone(),
     );
     builder.transfer = Some((destination, amount));
     builder.validate()?;

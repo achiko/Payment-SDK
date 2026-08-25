@@ -28,8 +28,11 @@ HTTP: State { Wallets, readiness }
 
 Each configured chain has one long-lived JSON-RPC client shared by its indexing
 source and wallet-side capabilities. Retry and ordered endpoint failover are
-configured once; the architecture does not invent a universal chain RPC
-interface.
+configured once for reads and deterministic preflight; the architecture does
+not invent a universal chain RPC interface. Ethereum raw submission is one
+attempt against the first configured endpoint, so failover cannot hide whether
+an earlier endpoint accepted the envelope. The coordinator owns any exact-byte
+replay and reconciliation.
 
 `apps/api` chooses an application-owned asset key for the existing generic
 wallet-family parameter. Native ETH and an allowlisted ERC-20 such as USDC are
@@ -261,8 +264,17 @@ fee metadata. The shared wallet surface does not replace those native models.
 
 For batches, validate every request and the one-family constraint before the
 first external effect. Bitcoin may produce one multi-source native transaction.
-Ethereum broadcasts an ordered sequence and reports its accepted prefix if a
-later transaction fails.
+One Ethereum-owned coordinator is shared by native and token providers. It
+reserves consecutive nonces by sender address, completes whole-batch
+simulation, cumulative balance checks, and signing, then broadcasts the exact
+envelopes in request order. A retryable ambiguous submission retains its exact
+envelope and blocks that sender until exact-hash reconciliation; a later
+failure reports only the accepted prefix.
+
+Coordinator state is intentionally in-process because indexing owns no
+pending-transaction records and the product has no durable outgoing-operation
+store. Application composition therefore requires one active transaction
+writer per managed EOA; process-crash recovery is not claimed.
 
 ## Runtime lifecycle
 

@@ -169,6 +169,24 @@ impl Client for Http {
         })
     }
 
+    fn request_once<'a>(
+        &'a self,
+        method: &'a str,
+        params: Value,
+    ) -> BoxFuture<'a, std::result::Result<CallResult, Error>> {
+        Box::pin(async move {
+            let params = Params::new(params)?;
+            let client = self.clients.first().ok_or_else(|| {
+                Error::new(ErrorKind::Unavailable, "JSON-RPC endpoint is unavailable")
+            })?;
+            match client.request::<Box<RawValue>, _>(method, params).await {
+                Ok(value) => Ok(Ok(RawJson(value.get().as_bytes().to_vec()))),
+                Err(RpcError::Call(error)) => Ok(Err(failure(error))),
+                Err(source) => Err(map_error(source)),
+            }
+        })
+    }
+
     fn batch<'a>(
         &'a self,
         calls: Vec<Call>,
