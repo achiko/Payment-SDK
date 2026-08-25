@@ -143,6 +143,11 @@ Copying a transaction beneath each affected address makes history a primary
 ordered scan. It intentionally avoids a second address index. Journal records
 are physical storage details and never cross the repository boundary.
 
+Ethereum address history retains every canonical native and Transfer-shaped
+token fact for the watched address. Asset-specific wallet presentation is a
+concrete Ethereum-wallet projection over that checkpoint-bound page; it does
+not add an asset index, token catalog, or alternate persistence record.
+
 The repository does not store address filters, watch IDs, synchronizer phase,
 confirmations, observation revisions, pending-confirmation records, spent
 markers, an event log, or raw blocks.

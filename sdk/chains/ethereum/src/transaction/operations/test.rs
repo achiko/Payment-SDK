@@ -2,12 +2,7 @@ use super::*;
 use crate::{Address, Wei};
 
 fn request() -> TransferRequest {
-    TransferRequest {
-        from: Address([0x11; 20]),
-        to: Some(Address([0x22; 20])),
-        value: Wei::from_u128(7),
-        data: vec![0xaa],
-    }
+    TransferRequest::native_atomic(Address([0x11; 20]), Address([0x22; 20]), Wei::from_u128(7))
 }
 
 fn context() -> BuildContext {
@@ -28,10 +23,10 @@ fn build_preserves_chain_native_fields() {
 
     assert_eq!(transaction.chain_id, context.chain_id);
     assert_eq!(transaction.nonce, context.nonce);
-    assert_eq!(transaction.from, request.from);
-    assert_eq!(transaction.to, request.to);
-    assert_eq!(transaction.value, request.value);
-    assert_eq!(transaction.input, request.data);
+    assert_eq!(transaction.from, request.from().clone());
+    assert_eq!(transaction.to, Some(request.to().clone()));
+    assert_eq!(transaction.value, request.value());
+    assert_eq!(transaction.input, request.input());
     assert_eq!(transaction.gas_limit, context.gas_limit);
     assert_eq!(transaction.max_fee_per_gas, context.max_fee_per_gas);
     assert_eq!(
@@ -41,22 +36,12 @@ fn build_preserves_chain_native_fields() {
 }
 
 #[test]
-fn build_rejects_invalid_fee_and_creation_constraints() {
+fn build_rejects_invalid_fee_constraints() {
     let mut invalid_fee = context();
     invalid_fee.max_fee_per_gas = Wei::from_u128(2);
     assert_eq!(
         build(request(), invalid_fee)
             .expect_err("priority fee above maximum must fail")
-            .kind,
-        ChainErrorKind::InvalidTransaction
-    );
-
-    let mut creation = request();
-    creation.to = None;
-    creation.data.clear();
-    assert_eq!(
-        build(creation, context())
-            .expect_err("empty contract creation must fail")
             .kind,
         ChainErrorKind::InvalidTransaction
     );

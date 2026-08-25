@@ -145,6 +145,15 @@ mod tests {
     }
 
     #[test]
+    fn wallet_config_rejects_a_zero_token_contract() {
+        let mut config = config();
+        config.asset = AssetKind::Erc20(Address([0; 20]));
+        config.decimals = 6;
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn rejects_kind_version_network_chain_and_wallet_mismatches() {
         let wallet = Address([0x11; 20]);
         assert!(

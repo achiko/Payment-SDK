@@ -10,7 +10,8 @@ The current scope is deliberately small:
 - generate or import wallets through one chain-neutral `Wallets` collection;
 - index the authoritative wallet address/birthday set with one reusable
   `Indexer` contract;
-- read exact balances and complete checkpoint-bound transaction history;
+- read exact selected-asset balances and complete checkpoint-bound history for
+  each wallet's configured payment asset;
 - submit one transfer or a non-empty ordered batch; and
 - survive restarts and retained reorgs without serving orphan history.
 

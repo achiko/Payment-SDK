@@ -1,336 +1,17 @@
+mod config;
 mod readiness;
 
-use std::{
-    collections::BTreeSet,
-    env,
-    error::Error,
-    future::IntoFuture,
-    net::SocketAddr,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, env, future::IntoFuture, sync::Arc};
 
-use chain_bitcoin::{AddressType, FeeRate, IndexUtxos, Network};
+use chain_bitcoin::{AddressType, FeeRate, IndexUtxos};
 use chain_ethereum::AssetKind;
-use indexing::{BlockHash, BlockHeight};
-use payment_api::{Chain, State};
-use serde::Deserialize;
+use config::{AnyError, Config};
+use indexing::BlockHeight;
+use payment_api::{State, WalletAsset};
 use tokio::sync::watch;
 
-type AnyError = Box<dyn Error + Send + Sync>;
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Config {
-    bind: SocketAddr,
-    bearer_token_env: String,
-    #[serde(default)]
-    tls_terminated_upstream: bool,
-    indexes: IndexConfig,
-    #[serde(default)]
-    wallets: Vec<ConfiguredWallet>,
-}
-impl Config {
-    async fn read(path: impl AsRef<Path>) -> Result<Self, AnyError> {
-        let config: Self = serde_json::from_slice(&tokio::fs::read(path).await?)?;
-        config.validate()?;
-        Ok(config)
-    }
+const USDC_DECIMALS: u8 = 6;
 
-    fn validate(&self) -> Result<(), AnyError> {
-        if self.bearer_token_env.trim().is_empty() {
-            return Err("bearer-token environment name must not be empty".into());
-        }
-        if self.indexes.bitcoin.is_none() && self.indexes.ethereum.is_none() {
-            return Err("at least one chain must be configured".into());
-        }
-        if let Some(config) = &self.indexes.bitcoin {
-            config.validate()?;
-        }
-        if let Some(config) = &self.indexes.ethereum {
-            config.validate()?;
-        }
-        let mut ids = BTreeSet::new();
-        for wallet in &self.wallets {
-            if wallet.id.trim().is_empty() || wallet.secret_env.trim().is_empty() {
-                return Err("wallet ID and secret environment name must not be empty".into());
-            }
-            if !ids.insert(&wallet.id) {
-                return Err("configured wallet IDs must be unique".into());
-            }
-            let configured = match wallet.chain {
-                Chain::Bitcoin => self.indexes.bitcoin.is_some(),
-                Chain::Ethereum => self.indexes.ethereum.is_some(),
-            };
-            if !configured {
-                return Err("configured wallet references a disabled chain".into());
-            }
-        }
-        Ok(())
-    }
-
-    fn server(&self) -> Result<http_support::server::Config, AnyError> {
-        let token = http_support::server::BearerToken::new(env::var(&self.bearer_token_env)?)?;
-        let security = if self.tls_terminated_upstream {
-            http_support::server::TransportSecurity::TlsTerminatedUpstream
-        } else {
-            http_support::server::TransportSecurity::PlaintextLoopback
-        };
-        let config = http_support::server::Config::new(
-            self.bind,
-            security,
-            Some(token),
-            http_support::server::RequestLimits::default(),
-        );
-        config.validate()?;
-        Ok(config)
-    }
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ConfiguredWallet {
-    id: String,
-    chain: Chain,
-    secret_env: String,
-    start_height: u64,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct IndexConfig {
-    #[serde(default)]
-    bitcoin: Option<BitcoinConfig>,
-    #[serde(default)]
-    ethereum: Option<EthereumConfig>,
-}
-impl IndexConfig {
-    fn interval(&self) -> Duration {
-        let millis = self
-            .bitcoin
-            .iter()
-            .map(|config| config.sync.poll_millis)
-            .chain(self.ethereum.iter().map(|config| config.sync.poll_millis))
-            .min()
-            .unwrap_or(1_000);
-        Duration::from_millis(millis)
-    }
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BitcoinConfig {
-    database: PathBuf,
-    network: Network,
-    genesis_hash: String,
-    rpc: RpcConfig,
-    #[serde(flatten)]
-    sync: SyncConfig,
-}
-impl BitcoinConfig {
-    fn settings(&self) -> Result<chain_bitcoin::IndexerSettings, AnyError> {
-        let endpoint = self
-            .rpc
-            .endpoints
-            .first()
-            .ok_or("RPC endpoints must not be empty")?;
-        let mut settings = chain_bitcoin::IndexerSettings::new(
-            endpoint.clone(),
-            self.network,
-            self.genesis_hash.as_str(),
-        );
-        self.rpc.apply_to(
-            &mut settings.endpoints,
-            &mut settings.headers,
-            &mut settings.request_timeout,
-            &mut settings.max_response_bytes,
-        );
-        settings.confirmations = self.sync.confirmation_depth;
-        settings.reorg_retention = self.sync.reorg_retention;
-        settings.batch_size = self.sync.batch_size;
-        Ok(settings)
-    }
-
-    fn validate(&self) -> Result<(), AnyError> {
-        self.rpc.validate(&self.database)?;
-        self.sync.validate()?;
-        let hash = chain_bitcoin::parse_bitcoin_block_hash(&self.genesis_hash)?;
-        if chain_bitcoin::format_bitcoin_block_hash(&hash)? != self.genesis_hash {
-            return Err("Bitcoin genesis hash must use canonical lowercase encoding".into());
-        }
-        Ok(())
-    }
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EthereumConfig {
-    database: PathBuf,
-    network: String,
-    chain_id: u64,
-    genesis_hash: String,
-    rpc: RpcConfig,
-    #[serde(default)]
-    limits: EthereumLimits,
-    #[serde(flatten)]
-    sync: SyncConfig,
-}
-impl EthereumConfig {
-    fn settings(&self) -> Result<chain_ethereum::IndexerSettings, AnyError> {
-        let endpoint = self
-            .rpc
-            .endpoints
-            .first()
-            .ok_or("RPC endpoints must not be empty")?;
-        let mut settings = chain_ethereum::IndexerSettings::new(
-            endpoint.clone(),
-            chain_ethereum::Network::new(self.chain_id, self.network.as_str()),
-            self.genesis_hash.as_str(),
-        );
-        self.rpc.apply_to(
-            &mut settings.endpoints,
-            &mut settings.headers,
-            &mut settings.request_timeout,
-            &mut settings.max_response_bytes,
-        );
-        settings.confirmations = self.sync.confirmation_depth;
-        settings.reorg_retention = self.sync.reorg_retention;
-        settings.batch_size = self.sync.batch_size;
-        Ok(settings)
-    }
-
-    fn validate(&self) -> Result<(), AnyError> {
-        self.rpc.validate(&self.database)?;
-        self.sync.validate()?;
-        if self.network.trim().is_empty() || self.chain_id == 0 {
-            return Err("Ethereum network and chain ID must be configured".into());
-        }
-        self.genesis()?;
-        self.limits.build()?;
-        Ok(())
-    }
-
-    fn genesis(&self) -> Result<BlockHash, AnyError> {
-        let value = self
-            .genesis_hash
-            .strip_prefix("0x")
-            .ok_or("Ethereum genesis hash must start with 0x")?;
-        let bytes = hex::decode(value)?;
-        if bytes.len() != 32 {
-            return Err("Ethereum genesis hash must contain exactly 32 bytes".into());
-        }
-        Ok(BlockHash(bytes))
-    }
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SyncConfig {
-    confirmation_depth: u64,
-    reorg_retention: u64,
-    #[serde(default = "SyncConfig::default_poll_millis")]
-    poll_millis: u64,
-    #[serde(default = "SyncConfig::default_batch_size")]
-    batch_size: usize,
-}
-impl SyncConfig {
-    fn validate(&self) -> Result<(), AnyError> {
-        if self.confirmation_depth == 0
-            || self.reorg_retention == 0
-            || self.poll_millis == 0
-            || self.batch_size == 0
-        {
-            return Err(
-                "index confirmation, retention, polling, and batch values must be positive".into(),
-            );
-        }
-        Ok(())
-    }
-
-    const fn default_poll_millis() -> u64 {
-        1_000
-    }
-
-    const fn default_batch_size() -> usize {
-        100
-    }
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RpcConfig {
-    endpoints: Vec<String>,
-    #[serde(default)]
-    headers: Vec<(String, String)>,
-    #[serde(default = "RpcConfig::default_timeout_seconds")]
-    timeout_seconds: u64,
-    #[serde(default = "RpcConfig::default_response_bytes")]
-    max_response_bytes: usize,
-}
-impl RpcConfig {
-    fn validate(&self, database: &Path) -> Result<(), AnyError> {
-        if database.as_os_str().is_empty()
-            || self.endpoints.is_empty()
-            || self.endpoints.iter().any(|value| value.trim().is_empty())
-            || self.timeout_seconds == 0
-            || self.max_response_bytes == 0
-            || self.headers.iter().any(|(name, _)| name.trim().is_empty())
-        {
-            return Err("invalid database or RPC configuration".into());
-        }
-        Ok(())
-    }
-
-    /// Copies the configured transport tuning onto a chain's indexer settings.
-    fn apply_to(
-        &self,
-        endpoints: &mut Vec<String>,
-        headers: &mut Vec<(String, String)>,
-        request_timeout: &mut Duration,
-        max_response_bytes: &mut usize,
-    ) {
-        endpoints.clone_from(&self.endpoints);
-        headers.clone_from(&self.headers);
-        *request_timeout = Duration::from_secs(self.timeout_seconds);
-        *max_response_bytes = self.max_response_bytes;
-    }
-
-    const fn default_timeout_seconds() -> u64 {
-        15
-    }
-
-    const fn default_response_bytes() -> usize {
-        64 * 1024 * 1024
-    }
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EthereumLimits {
-    max_input_bytes: usize,
-    gas_margin_basis_points: u32,
-    max_gas_limit: u64,
-    max_fee_per_gas: u128,
-    max_priority_fee_per_gas: u128,
-    max_total_fee: u128,
-}
-impl EthereumLimits {
-    fn build(&self) -> Result<chain_ethereum::Limits, AnyError> {
-        Ok(chain_ethereum::Limits::new(
-            self.max_input_bytes,
-            self.gas_margin_basis_points,
-            self.max_gas_limit,
-            chain_ethereum::Wei::from_u128(self.max_fee_per_gas),
-            chain_ethereum::Wei::from_u128(self.max_priority_fee_per_gas),
-            chain_ethereum::Wei::from_u128(self.max_total_fee),
-        )?)
-    }
-}
-impl Default for EthereumLimits {
-    fn default() -> Self {
-        Self {
-            max_input_bytes: 128 * 1024,
-            gas_margin_basis_points: 2_000,
-            max_gas_limit: 30_000_000,
-            max_fee_per_gas: 1_000_000_000_000,
-            max_priority_fee_per_gas: 100_000_000_000,
-            max_total_fee: 10_000_000_000_000_000_000,
-        }
-    }
-}
 #[tokio::main]
 async fn main() -> Result<(), AnyError> {
     let path = env::args_os()
@@ -362,6 +43,7 @@ async fn main() -> Result<(), AnyError> {
         None
     };
     let ethereum = if let Some(config) = config.indexes.ethereum {
+        let usdc = config.usdc.as_ref().map(config::UsdcConfig::contract);
         let settings = config.settings()?;
         let scope = settings.scope();
         let client = settings.client()?;
@@ -372,16 +54,18 @@ async fn main() -> Result<(), AnyError> {
         indexers.push(Arc::new(
             settings.build(client.clone(), repository, None).await?,
         ));
-        let accounts: Arc<dyn chain_ethereum::Accounts> = Arc::new(
-            chain_ethereum::AccountClient::new(client.clone(), config.chain_id)?,
+        let accounts = Arc::new(chain_ethereum::AccountClient::new(
+            client.clone(),
+            config.chain_id,
+        )?);
+        if let Some(contract) = &usdc {
+            accounts.validate_token(contract, USDC_DECIMALS).await?;
+        }
+        let accounts: Arc<dyn chain_ethereum::Accounts> = accounts;
+        let transactions: Arc<dyn chain_ethereum::Transactions> = Arc::new(
+            chain_ethereum::TransactionClient::new(client, config.chain_id, config.limits()?)?,
         );
-        let transactions: Arc<dyn chain_ethereum::Transactions> =
-            Arc::new(chain_ethereum::TransactionClient::new(
-                client,
-                config.chain_id,
-                config.limits.build()?,
-            )?);
-        Some((scope, config.chain_id, accounts, transactions))
+        Some((scope, config.chain_id, usdc, accounts, transactions))
     } else {
         None
     };
@@ -408,37 +92,68 @@ async fn main() -> Result<(), AnyError> {
             history.clone(),
         );
         let sender = provider.transactions();
-        wallets.register(Chain::Bitcoin, scope, provider, sender, None)?;
+        wallets.register(WalletAsset::Btc, scope, provider, sender, None)?;
     }
-    if let Some((scope, chain_id, accounts, transactions)) = ethereum {
-        let provider = chain_ethereum::WalletProvider::new(
+    if let Some((scope, chain_id, usdc, accounts, transactions)) = ethereum {
+        let eth_provider = chain_ethereum::WalletProvider::new(
             chain_ethereum::WalletConfig {
                 scope: scope.clone(),
                 chain_id,
                 asset: AssetKind::Native,
                 decimals: chain_ethereum::ETH.decimals,
             },
-            accounts,
-            transactions,
-            history,
+            accounts.clone(),
+            transactions.clone(),
+            history.clone(),
         );
-        let sender = provider.transactions();
-        wallets.register(Chain::Ethereum, scope, provider, sender, None)?;
+        let eth_sender = eth_provider.transactions();
+        wallets.register(
+            WalletAsset::Eth,
+            scope.clone(),
+            eth_provider,
+            eth_sender,
+            None,
+        )?;
+
+        if let Some(contract) = usdc {
+            let usdc_provider = chain_ethereum::WalletProvider::new(
+                chain_ethereum::WalletConfig {
+                    scope: scope.clone(),
+                    chain_id,
+                    asset: AssetKind::Erc20(contract),
+                    decimals: u32::from(USDC_DECIMALS),
+                },
+                accounts,
+                transactions,
+                history,
+            );
+            let usdc_sender = usdc_provider.transactions();
+            wallets.register(WalletAsset::Usdc, scope, usdc_provider, usdc_sender, None)?;
+        }
     }
+    let mut imported_ethereum_assets = BTreeMap::new();
     for configured in config.wallets {
         let encoded = env::var(configured.secret_env)?;
         let secret = hex::decode(encoded).map_err(|_| "wallet secret must be hexadecimal")?;
         if secret.len() != 32 {
             return Err("wallet secret must contain exactly 32 bytes".into());
         }
-        wallets
+        let asset = configured.asset;
+        let wallet = wallets
             .import(
                 configured.id,
-                &configured.chain,
+                &asset,
                 wallets::SecretBytes::new(secret),
                 BlockHeight(configured.start_height),
             )
             .await?;
+        if matches!(asset, WalletAsset::Eth | WalletAsset::Usdc) {
+            remember_imported_ethereum_asset(
+                &mut imported_ethereum_assets,
+                wallet.address.text,
+                asset,
+            )?;
+        }
     }
     let wallets = Arc::new(wallets);
     let (shutdown, shutdown_rx) = watch::channel(false);
@@ -494,4 +209,53 @@ async fn main() -> Result<(), AnyError> {
     let _ = shutdown.send(true);
     synchronization.await??;
     result
+}
+
+fn remember_imported_ethereum_asset(
+    addresses: &mut BTreeMap<String, WalletAsset>,
+    address: String,
+    asset: WalletAsset,
+) -> Result<(), AnyError> {
+    if let Some(existing) = addresses.get(&address) {
+        if *existing != asset {
+            return Err(
+                "one imported Ethereum address cannot be registered for multiple assets".into(),
+            );
+        }
+    } else {
+        addresses.insert(address, asset);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn imported_ethereum_address_has_one_asset() {
+        let mut addresses = BTreeMap::new();
+        remember_imported_ethereum_asset(
+            &mut addresses,
+            "0x1111111111111111111111111111111111111111".to_owned(),
+            WalletAsset::Eth,
+        )
+        .expect("first asset");
+        remember_imported_ethereum_asset(
+            &mut addresses,
+            "0x1111111111111111111111111111111111111111".to_owned(),
+            WalletAsset::Eth,
+        )
+        .expect("same asset may share an imported address");
+        let error = remember_imported_ethereum_asset(
+            &mut addresses,
+            "0x1111111111111111111111111111111111111111".to_owned(),
+            WalletAsset::Usdc,
+        )
+        .expect_err("one imported address cannot represent two assets");
+        assert_eq!(
+            error.to_string(),
+            "one imported Ethereum address cannot be registered for multiple assets"
+        );
+    }
 }

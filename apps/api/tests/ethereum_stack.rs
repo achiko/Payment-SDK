@@ -1,15 +1,18 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     net::{Ipv4Addr, SocketAddr},
     sync::{Arc, Mutex},
 };
 
-use alloy_primitives::keccak256;
+use alloy_consensus::TxEnvelope;
+use alloy_eips::Decodable2718;
+use alloy_primitives::{Address as AlloyAddress, U256, keccak256};
 use axum::{Json, Router, extract::State, routing::post};
 use serde_json::{Value, json};
 use tokio::{sync::oneshot, task::JoinHandle};
 
 pub const GENESIS_HASH: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
 #[derive(Clone, Debug)]
 pub struct Transaction {
@@ -17,6 +20,14 @@ pub struct Transaction {
     pub from: String,
     pub to: String,
     pub value: String,
+    token_transfer: Option<TokenTransfer>,
+}
+
+#[derive(Clone, Debug)]
+struct TokenTransfer {
+    contract: String,
+    recipient: String,
+    amount: u128,
 }
 
 impl Transaction {
@@ -26,6 +37,27 @@ impl Transaction {
             from,
             to,
             value: format!("0x{value:x}"),
+            token_transfer: None,
+        }
+    }
+
+    pub fn erc20(
+        hash_byte: u8,
+        contract: String,
+        from: String,
+        recipient: String,
+        amount: u128,
+    ) -> Self {
+        Self {
+            hash: format!("0x{}", hex::encode([hash_byte; 32])),
+            from,
+            to: contract.clone(),
+            value: "0x0".to_owned(),
+            token_transfer: Some(TokenTransfer {
+                contract,
+                recipient,
+                amount,
+            }),
         }
     }
 }
@@ -86,6 +118,22 @@ impl EthereumNode {
             .expect("Ethereum node lock must be healthy")
             .expected
             .push_back(Transaction::native(0, from, to, value));
+    }
+
+    /// Describes the ERC-20 transfer that the wallet API is expected to submit.
+    pub fn expect_token_send(
+        &self,
+        contract: String,
+        from: String,
+        recipient: String,
+        amount: u128,
+    ) {
+        self.state
+            .0
+            .lock()
+            .expect("Ethereum node lock must be healthy")
+            .expected
+            .push_back(Transaction::erc20(0, contract, from, recipient, amount));
     }
 
     /// Rejects the next submission after `accepted` further transactions.
@@ -157,6 +205,7 @@ struct Node {
     expected: VecDeque<Transaction>,
     submitted: Vec<Transaction>,
     balance: u128,
+    token_balances: BTreeMap<String, u128>,
     reject_after: Option<usize>,
 }
 
@@ -167,6 +216,7 @@ impl Default for Node {
             expected: VecDeque::new(),
             submitted: Vec::new(),
             balance: 10_000_000_000_000_000_000,
+            token_balances: BTreeMap::new(),
             reject_after: None,
         }
     }
@@ -181,6 +231,22 @@ struct Block {
 
 impl Node {
     fn append(&mut self, transactions: Vec<Transaction>) {
+        for transaction in &transactions {
+            let Some(transfer) = &transaction.token_transfer else {
+                continue;
+            };
+            let sender = transaction.from.to_ascii_lowercase();
+            if let Some(balance) = self.token_balances.get_mut(&sender) {
+                *balance = balance
+                    .checked_sub(transfer.amount)
+                    .expect("fixture ERC-20 sender must have enough tokens");
+            }
+            let recipient = transfer.recipient.to_ascii_lowercase();
+            let balance = self.token_balances.entry(recipient).or_default();
+            *balance = balance
+                .checked_add(transfer.amount)
+                .expect("fixture ERC-20 balance must fit");
+        }
         let height = self.blocks.len() as u64 + 1;
         let parent = self
             .blocks
@@ -271,6 +337,8 @@ fn result(state: &StateHandle, method: &str, params: &Value) -> Value {
         "eth_getTransactionCount" => json!("0x0"),
         "eth_estimateGas" => json!("0x5208"),
         "eth_maxPriorityFeePerGas" => json!("0x1"),
+        "eth_getCode" => json!("0x6000"),
+        "eth_call" => eth_call(state, params),
         "eth_getBlockByNumber" => block_by_number(state, params),
         "eth_getBlockReceipts" => block_receipts(state, params),
         "eth_getTransactionReceipt" => transaction_receipt(state, params),
@@ -278,17 +346,56 @@ fn result(state: &StateHandle, method: &str, params: &Value) -> Value {
     }
 }
 
+fn eth_call(state: &StateHandle, params: &Value) -> Value {
+    let data = params[0]["data"]
+        .as_str()
+        .and_then(|value| value.strip_prefix("0x"))
+        .expect("Ethereum eth_call data must be hexadecimal");
+    match data.get(..8) {
+        Some("313ce567") => json!(word(6)),
+        Some("70a08231") => {
+            let address = data
+                .get(8 + 24..8 + 64)
+                .expect("balanceOf call must contain one address");
+            let address = format!("0x{address}").to_ascii_lowercase();
+            let node = state.0.lock().expect("Ethereum node lock must be healthy");
+            json!(word(*node.token_balances.get(&address).unwrap_or(&0)))
+        }
+        Some("a9059cbb") => {
+            let node = state.0.lock().expect("Ethereum node lock must be healthy");
+            let expected = node
+                .expected
+                .front()
+                .expect("test must describe the simulated ERC-20 transfer");
+            let transfer = expected
+                .token_transfer
+                .as_ref()
+                .expect("simulated transfer must be ERC-20");
+            assert_eq!(params[0]["from"], expected.from.to_ascii_lowercase());
+            assert_eq!(params[0]["to"], transfer.contract.to_ascii_lowercase());
+            assert_eq!(params[0]["value"], "0x0");
+            assert_eq!(
+                params[0]["data"],
+                format!("0x{}", hex::encode(token_input(transfer)))
+            );
+            assert_eq!(params[1], "pending");
+            json!(word(1))
+        }
+        selector => panic!("unexpected Ethereum eth_call selector {selector:?}"),
+    }
+}
+
+fn word(value: u128) -> String {
+    format!("0x{value:064x}")
+}
+
 fn submit(state: &StateHandle, params: &Value) -> Result<Value, Value> {
     let envelope = params[0]
         .as_str()
         .and_then(|value| value.strip_prefix("0x"))
         .expect("raw transaction must have a hexadecimal prefix");
-    let hash = format!(
-        "0x{}",
-        hex::encode(keccak256(
-            hex::decode(envelope).expect("raw transaction must be hexadecimal")
-        ))
-    );
+    let envelope = hex::decode(envelope).expect("raw transaction must be hexadecimal");
+    let hash = format!("0x{}", hex::encode(keccak256(&envelope)));
     let mut node = state.0.lock().expect("Ethereum node lock must be healthy");
     if let Some(remaining) = node.reject_after.as_mut() {
         if *remaining == 0 {
@@ -301,9 +408,76 @@ fn submit(state: &StateHandle, params: &Value) -> Result<Value, Value> {
         .expected
         .pop_front()
         .expect("test must describe the expected Ethereum transaction");
+    assert_envelope(&envelope, &transaction);
     transaction.hash = hash.clone();
     node.submitted.push(transaction);
     Ok(json!(hash))
+}
+
+fn assert_envelope(envelope: &[u8], expected: &Transaction) {
+    let envelope = TxEnvelope::decode_2718_exact(envelope)
+        .expect("submitted transaction must be an exact EIP-2718 envelope");
+    let signed = envelope
+        .as_eip1559()
+        .expect("submitted transaction must use EIP-1559");
+    let transaction = signed.tx();
+    assert_eq!(transaction.chain_id, 1, "submitted chain ID");
+    assert_eq!(
+        address_text(
+            &signed
+                .recover_signer()
+                .expect("submitted signature must recover")
+        ),
+        expected.from.to_ascii_lowercase(),
+        "submitted sender"
+    );
+    assert_eq!(
+        address_text(
+            transaction
+                .to
+                .to()
+                .expect("submitted transfer must call an address")
+        ),
+        expected.to.to_ascii_lowercase(),
+        "submitted target"
+    );
+    let value = u128::from_str_radix(expected.value.trim_start_matches("0x"), 16)
+        .expect("expected transaction value must be hexadecimal");
+    assert_eq!(transaction.value, U256::from(value), "submitted value");
+
+    let expected_input = expected
+        .token_transfer
+        .as_ref()
+        .map_or_else(Vec::new, token_input);
+    assert_eq!(
+        transaction.input.as_ref(),
+        expected_input.as_slice(),
+        "submitted calldata"
+    );
+}
+
+fn token_input(transfer: &TokenTransfer) -> Vec<u8> {
+    let recipient = hex::decode(
+        transfer
+            .recipient
+            .strip_prefix("0x")
+            .expect("fixture recipient must start with 0x"),
+    )
+    .expect("fixture recipient must be hexadecimal");
+    assert_eq!(recipient.len(), 20, "fixture recipient length");
+    let mut amount = [0_u8; 32];
+    amount[16..].copy_from_slice(&transfer.amount.to_be_bytes());
+    [
+        hex::decode("a9059cbb").expect("fixed selector must decode"),
+        vec![0; 12],
+        recipient,
+        amount.to_vec(),
+    ]
+    .concat()
+}
+
+fn address_text(address: &AlloyAddress) -> String {
+    format!("0x{}", hex::encode(address.as_slice()))
 }
 
 fn block_by_number(state: &StateHandle, params: &Value) -> Value {
@@ -450,6 +624,37 @@ fn receipt(
     gas_price: u128,
     gas_used: u64,
 ) -> Value {
+    let logs = transaction
+        .token_transfer
+        .as_ref()
+        .map(|transfer| {
+            let topic_address = |address: &str| {
+                format!(
+                    "0x{}{}",
+                    "00".repeat(12),
+                    address
+                        .strip_prefix("0x")
+                        .expect("fixture address must start with 0x")
+                )
+            };
+            json!({
+                "address": transfer.contract,
+                "topics": [
+                    TRANSFER_TOPIC,
+                    topic_address(&transaction.from),
+                    topic_address(&transfer.recipient)
+                ],
+                "data": word(transfer.amount),
+                "blockHash": block_hash,
+                "blockNumber": format!("0x{height:x}"),
+                "transactionHash": transaction.hash,
+                "transactionIndex": format!("0x{index:x}"),
+                "logIndex": "0x0",
+                "removed": false
+            })
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
     json!({
         "transactionHash": transaction.hash,
         "transactionIndex": format!("0x{index:x}"),
@@ -461,6 +666,6 @@ fn receipt(
         "status": "0x1",
         "gasUsed": format!("0x{gas_used:x}"),
         "effectiveGasPrice": format!("0x{gas_price:x}"),
-        "logs": []
+        "logs": logs
     })
 }

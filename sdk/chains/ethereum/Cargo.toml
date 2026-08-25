@@ -11,6 +11,7 @@ wallets = { path = "../../wallets" }
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
 alloy-rpc-types-eth = { version = "1.8", default-features = false, features = ["serde", "std"] }
 futures-util = { version = "=0.3.33", default-features = false, features = ["std"] }
 indexing = { path = "../../indexing" }

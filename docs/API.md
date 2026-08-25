@@ -48,12 +48,23 @@ Minimal shape with both chains:
         "timeout_seconds": 15,
         "max_response_bytes": 67108864
       },
+      "usdc": {
+        "contract": "0x<40-hex-digits>"
+      },
       "confirmation_depth": 1,
       "reorg_retention": 100,
       "poll_millis": 1000,
       "batch_size": 256
     }
-  }
+  },
+  "wallets": [
+    {
+      "id": "treasury-usdc",
+      "asset": "usdc",
+      "secret_env": "TREASURY_USDC_SECRET",
+      "start_height": 1
+    }
+  ]
 }
 ```
 
@@ -89,6 +100,14 @@ be logged. Each chain shares one connected client between its indexing source
 and wallet fee/account/transaction capabilities. Ethereum also accepts an
 optional `limits` object for maximum input bytes, gas margin/limit, per-gas
 fees, priority fee, and total fee; omitting it uses validated SDK defaults.
+The optional `usdc` object allowlists one exact contract for that Ethereum
+network. Startup requires nonempty contract code and verifies the expected six
+decimals. Until RPC endpoint identity is admitted and validated independently,
+enabling `usdc` requires exactly one Ethereum RPC endpoint so chain identity,
+canonical block selection, and contract probes cannot span different nodes.
+Native-only Ethereum configuration may still use ordered endpoint failover.
+HTTP callers never choose a token contract or decimals. Omitting `usdc` leaves
+native ETH enabled without a USDC wallet family.
 
 ## Authentication
 
@@ -117,7 +136,7 @@ avoiding a manually duplicated route specification.
 POST /v1/wallets
 Content-Type: application/json
 
-{"chain":"bitcoin"}
+{"asset":"btc"}
 ```
 
 Response (`201 Created`):
@@ -125,17 +144,26 @@ Response (`201 Created`):
 ```json
 {
   "id": "019...",
+  "asset": "btc",
   "chain": "bitcoin",
   "network": "regtest",
   "address": "bcrt1..."
 }
 ```
 
-The chain must have been configured at startup. Network is selected by that
-configuration, not accepted from the request. Before returning `201`, the API
-adds the address to the synchronizer's in-memory filters. Its birthday is
-immediately after the current checkpoint, or the configured beginning when no
-checkpoint exists.
+The asset must have been configured at startup. Accepted values are `btc`,
+`eth`, and `usdc`; `usdc` is available only when its contract is configured.
+Network and token contract are selected by startup configuration, not accepted
+from the request. Each generation selects exactly one payment asset, and ETH
+and USDC generations create independent keys and addresses. Before returning
+`201`, the API adds the address to the synchronizer's in-memory filters. Its
+birthday is immediately after the current checkpoint, or the configured
+beginning when no checkpoint exists.
+
+Startup imports also enforce one asset per Ethereum address. The same imported
+EOA cannot be registered once as `eth` and again as `usdc`; a USDC address may
+still receive native ETH externally for gas, but that ETH is not exposed as a
+second wallet asset.
 
 The current key and wallet catalog are intentionally in memory. Restarting the
 process loses generated private keys, wallet IDs, and their indexing filters.
@@ -165,6 +193,8 @@ GET /v1/wallets/{id}/balance
 
 The amount is an exact decimal string in the wallet asset's display units.
 `observed_height` is null before a canonical checkpoint is available.
+For a USDC wallet this is only its USDC balance. Native ETH required for gas is
+validated internally when sending and is not exposed as a second wallet asset.
 
 ## Read indexed transactions
 
@@ -192,6 +222,12 @@ response checkpoint; if canonical history changes, the API returns a conflict
 and the caller restarts from the first page. Transactions contain scoped
 identity, canonical inclusion/confirmation status, all movements, and an
 optional fee. Bitcoin inputs and outputs remain separate movements.
+
+Ethereum pages contain movements for the wallet's selected asset. A USDC page
+keeps the transaction's attributable ETH network fee but omits unrelated ETH
+or token movements. Filtering preserves the underlying checkpoint and cursor,
+so a page may contain fewer than `limit` items, or be empty while still
+returning `next_cursor`.
 
 ## Send one transfer
 
@@ -248,21 +284,23 @@ Its success response is `202 Accepted` with the submitted chain-native IDs:
 
 Required semantics are:
 
-- one request targets one chain; mixed-chain wallet IDs are rejected before an
-  external effect;
+- one request targets one exact wallet asset; mixed-family wallet IDs,
+  including ETH and USDC on the same chain, are rejected before an external
+  effect;
 - Bitcoin may combine several source wallets into one transaction, reading all
   sources at one checkpoint, preserving distinct per-source change, signing
   each input with its owner, and creating one requested output per transfer;
   and
 - Ethereum builds separate transactions and broadcasts them in input order,
-  using consecutive nonces for repeated transfers from the same wallet and
   reporting any accepted prefix if a later broadcast fails.
 
 The one-process acceptance suite proves a two-transfer Bitcoin batch produces
 one transaction/ID and a two-transfer Ethereum batch produces two IDs in input
-order, with both results later visible through indexing. Focused public-API
-evidence is still required for multi-source Bitcoin change/signatures and an
-Ethereum failure after a submitted prefix.
+order, with both results later visible through indexing. It also proves
+multi-source Bitcoin signatures, an Ethereum failure after a submitted prefix,
+and zero-broadcast rejection for mixed ETH/USDC families. Consecutive nonce
+reservation, whole-batch Ethereum preflight, and ambiguous-submission
+reconciliation remain the next transaction-safety phase.
 
 If a sequential batch fails after a prefix was accepted, the error body keeps
 the ordinary `message` and adds the accepted `transaction_ids` plus the
@@ -283,7 +321,7 @@ Errors return JSON with one `message` field. Current mappings are:
 | Status | Meaning |
 |---|---|
 | `400` | malformed request or cursor |
-| `404` | chain is not configured or wallet ID is unknown |
+| `404` | asset is not configured or wallet ID is unknown |
 | `409` | duplicate/conflicting composition state |
 | `503` | wallet or indexing operation unavailable |
 | `500` | an internal result could not be encoded |

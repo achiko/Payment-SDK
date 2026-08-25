@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use crate::{Address, TransactionId, Wei};
 
 use super::{
-    BASIS_POINTS_DENOMINATOR, ERC20_BALANCE_OF_SELECTOR,
+    BASIS_POINTS_DENOMINATOR,
     transport::{Error, Failure},
 };
 
@@ -53,6 +53,11 @@ pub(super) fn is_already_known(failure: &Failure) -> bool {
     message.contains("already known") || message.contains("known transaction")
 }
 
+pub(super) fn is_execution_revert(failure: &Failure) -> bool {
+    let message = failure.message.to_ascii_lowercase();
+    message.contains("execution reverted") || message.contains("execution revert")
+}
+
 pub(super) fn block_parameter(at: Option<BlockRef>) -> Result<Value, SourceError> {
     let Some(block) = at else {
         return Ok(Value::String("pending".to_owned()));
@@ -67,13 +72,6 @@ pub(super) fn block_parameter(at: Option<BlockRef>) -> Result<Value, SourceError
         "blockHash": data_hex(&block.hash.0),
         "requireCanonical": true,
     }))
-}
-
-pub(super) fn erc20_balance_of_call(address: &Address) -> String {
-    let mut call = [0_u8; 36];
-    call[..4].copy_from_slice(&ERC20_BALANCE_OF_SELECTOR);
-    call[16..].copy_from_slice(&address.0);
-    data_hex(&call)
 }
 
 pub(super) fn parse_quantity_u64(value: &str) -> Result<u64, &'static str> {
@@ -105,10 +103,6 @@ pub(super) fn quantity_digits(value: &str) -> Result<&str, &'static str> {
     Ok(digits)
 }
 
-pub(super) fn parse_abi_word(value: &str) -> Result<[u8; 32], &'static str> {
-    parse_fixed_data(value, "ERC-20 balance result")
-}
-
 pub(super) fn parse_fixed_data<const N: usize>(
     value: &str,
     _field: &'static str,
@@ -120,6 +114,24 @@ pub(super) fn parse_fixed_data<const N: usize>(
         return Err("hex data has an invalid length");
     }
     decode_hex_right_aligned(digits)
+}
+
+pub(super) fn parse_data(value: &str) -> Result<Vec<u8>, &'static str> {
+    let digits = value
+        .strip_prefix("0x")
+        .ok_or("hex data has no 0x prefix")?;
+    if digits.len() % 2 != 0 {
+        return Err("hex data has an invalid length");
+    }
+    digits
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = hex_nibble(pair[0]).ok_or("hex data contains invalid data")?;
+            let low = hex_nibble(pair[1]).ok_or("hex data contains invalid data")?;
+            Ok((high << 4) | low)
+        })
+        .collect()
 }
 
 pub(super) fn decode_hex_right_aligned<const N: usize>(

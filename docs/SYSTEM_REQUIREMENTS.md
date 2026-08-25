@@ -127,8 +127,9 @@ compatibility contracts.
 - Import MUST require exclusive startup access and an explicit birthday.
   Runtime generation MUST start after the current checkpoint, or at zero when
   no checkpoint exists.
-- MUST expose get, exact balance, full history, one send, and ordered batch
-  send without leaking concrete chain transaction types.
+- MUST expose get, exact selected-asset balance, complete checkpoint-bound
+  selected-asset history, one send, and ordered batch send without leaking
+  concrete chain transaction types.
 - One-wallet build/prepare/broadcast/ID verification MUST live on the wallet
   abstraction, not in HTTP.
 - MUST NOT own indexing persistence, a background runtime, or durable custody.
@@ -187,14 +188,31 @@ compatibility contracts.
   is accepted.
 - Native and token movements MUST use distinct assets.
 - Receipts/logs and reorg correction MUST preserve exact `U256` values.
+- One Ethereum wallet provider MUST select exactly one native or allowlisted
+  token asset. Balance and send behavior MUST remain fixed to that selection.
+- Generated Ethereum asset families MUST use independent keys. Startup imports
+  MUST reject registering one EOA under both native ETH and an ERC-20 asset.
+- Token startup validation MUST verify chain identity, deployed code, decimals,
+  and a strict balance response against one canonical block through one
+  endpoint-affine RPC context.
+- ERC-20 transfer preparation MUST target only the configured contract, use
+  zero native value, simulate the exact call, and accept only canonical ABI
+  `bool true` output before signing.
+- An ERC-20 send MUST verify both selected-token funds and native ETH for the
+  worst-case configured gas fee. Native gas is fee state, not a second public
+  wallet balance.
+- Ethereum history presentation MUST retain only the wallet's selected-asset
+  movements plus attributable native fee metadata. Unrelated token or native
+  movements MUST NOT make the selected-asset page fail.
 
 ## Sending requirements
 
 The public send input MUST be one non-empty ordered list of wallet,
 destination, and exact amount. Destination syntax, positive amounts, fee
 bounds, wallet/family compatibility, and chain invariants MUST validate before
-the first broadcast. A request MUST target one family; mixed-chain batches are
-rejected rather than split.
+the first broadcast. A request MUST target one exact family; mixed-asset
+batches, including ETH plus an ERC-20 on the same chain, are rejected rather
+than split.
 
 Bitcoin MUST build one native transaction for a compatible batch. It MAY
 consume UTXOs from several source wallets, MUST read them at one output

@@ -52,6 +52,7 @@ fn openapi_contains_every_route_method_and_schema() {
         "TransferRequest",
         "TransferResponse",
         "Wallet",
+        "WalletAsset",
         "WalletTransfer",
     ] {
         assert_pointer(&document, &format!("/components/schemas/{schema}"));

@@ -24,8 +24,8 @@ async fn configured_wallet_history_survives_restart() -> Result<(), Box<dyn std:
     let bitcoin = BitcoinNode::start().await;
     let ethereum = EthereumNode::start().await;
     let wallets = json!([
-        {"id": "btc-restart", "chain": "bitcoin", "secret_env": "BTC_TEST_SECRET", "start_height": 1},
-        {"id": "eth-restart", "chain": "ethereum", "secret_env": "ETH_TEST_SECRET", "start_height": 1}
+        {"id": "btc-restart", "asset": "btc", "secret_env": "BTC_TEST_SECRET", "start_height": 1},
+        {"id": "eth-restart", "asset": "eth", "secret_env": "ETH_TEST_SECRET", "start_height": 1}
     ]);
     let secrets = [
         ("BTC_TEST_SECRET", hex::encode([3_u8; 32])),
@@ -88,8 +88,8 @@ async fn bitcoin_and_ethereum_history_follow_canonical_reorgs()
         "ethereum": ethereum_index(files.path().join("ethereum.redb"), &ethereum)
     }))
     .await?;
-    let btc = create_wallet(&api.root, "bitcoin").await?;
-    let eth = create_wallet(&api.root, "ethereum").await?;
+    let btc = create_wallet(&api.root, "btc").await?;
+    let eth = create_wallet(&api.root, "eth").await?;
     let btc_id = bitcoin.fund(vec![FundingOutput::new(
         btc["address"].as_str().expect("Bitcoin wallet address"),
         60_000,
@@ -152,8 +152,8 @@ async fn mixed_chain_batch_is_rejected_before_broadcast() -> Result<(), Box<dyn 
         "ethereum": ethereum_index(files.path().join("ethereum.redb"), &ethereum)
     }))
     .await?;
-    let btc_wallet = create_wallet(&api.root, "bitcoin").await?;
-    let eth_wallet = create_wallet(&api.root, "ethereum").await?;
+    let btc_wallet = create_wallet(&api.root, "btc").await?;
+    let eth_wallet = create_wallet(&api.root, "eth").await?;
 
     let response = batch_response(
         &api.root,
@@ -194,7 +194,7 @@ async fn ethereum_batch_reports_the_accepted_prefix() -> Result<(), Box<dyn std:
         "ethereum": ethereum_index(files.path().join("ethereum.redb"), &node)
     }))
     .await?;
-    let wallet = create_wallet(&api.root, "ethereum").await?;
+    let wallet = create_wallet(&api.root, "eth").await?;
     let from = wallet["address"]
         .as_str()
         .expect("wallet address")
@@ -233,8 +233,8 @@ async fn bitcoin_batch_uses_each_source_wallet() -> Result<(), Box<dyn std::erro
         "bitcoin": bitcoin_index(files.path().join("bitcoin.redb"), &node)
     }))
     .await?;
-    let first = create_wallet(&api.root, "bitcoin").await?;
-    let second = create_wallet(&api.root, "bitcoin").await?;
+    let first = create_wallet(&api.root, "btc").await?;
+    let second = create_wallet(&api.root, "btc").await?;
     let first_address = first["address"].as_str().expect("first address").to_owned();
     let second_address = second["address"]
         .as_str()

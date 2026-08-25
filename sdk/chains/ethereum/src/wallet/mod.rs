@@ -15,8 +15,8 @@ use wallets::{
 };
 
 use crate::{
-    Accounts, Address, AssetKind, SignedTransaction, TransactionBuilder, Transactions,
-    TransferRequest, Wei,
+    Accounts, Address, AssetKind, ChainError, ChainErrorKind, SignedTransaction,
+    TransactionBuilder, Transactions, TransferRequest, Wei,
 };
 
 const SNAPSHOT_KIND: &str = "ethereum.transfer";
@@ -46,6 +46,7 @@ impl WalletConfig {
             || self.scope.network.trim().is_empty()
             || self.chain_id == 0
             || matches!(self.asset, AssetKind::Native) && self.decimals != crate::ETH.decimals
+            || matches!(&self.asset, AssetKind::Erc20(token) if token.is_zero())
             || self.decimals > u8::MAX.into()
         {
             return Err(WalletError::new(
@@ -271,6 +272,7 @@ impl Builder {
             || self.scope.network.trim().is_empty()
             || self.chain_id == 0
             || matches!(self.asset, AssetKind::Native) && self.decimals != crate::ETH.decimals
+            || matches!(&self.asset, AssetKind::Erc20(token) if token.is_zero())
             || self.decimals > u8::MAX.into()
         {
             return Err(transaction_error(
@@ -339,7 +341,7 @@ impl BaseBuilder for Builder {
                 .transactions
                 .build_context(&request)
                 .await
-                .map_err(|error| transaction_error(TransactionErrorKind::Unavailable, error))?;
+                .map_err(preparation_error)?;
             if context.chain_id != self.chain_id {
                 return Err(transaction_error(
                     TransactionErrorKind::Divergent,
@@ -415,6 +417,55 @@ fn transaction_error(
     TransactionError::new(kind, error.to_string())
 }
 
+fn preparation_error(error: ChainError) -> TransactionError {
+    let kind = match error.kind {
+        ChainErrorKind::InvalidAddress => TransactionErrorKind::InvalidAddress,
+        ChainErrorKind::InvalidTransaction => TransactionErrorKind::InvalidTransaction,
+        ChainErrorKind::InsufficientFunds => TransactionErrorKind::InsufficientFunds,
+        ChainErrorKind::FeeUnavailable => TransactionErrorKind::Fee,
+        ChainErrorKind::RpcUnavailable => TransactionErrorKind::Unavailable,
+        ChainErrorKind::Divergent => TransactionErrorKind::Divergent,
+        ChainErrorKind::Signer => TransactionErrorKind::Signing,
+        ChainErrorKind::Rejected => TransactionErrorKind::Rejected,
+        ChainErrorKind::NotFound => TransactionErrorKind::InvalidTransaction,
+        ChainErrorKind::Other => TransactionErrorKind::Unknown,
+    };
+    transaction_error(kind, error)
+}
+
 fn wallet_error(kind: WalletErrorKind, error: impl std::fmt::Display) -> WalletError {
     WalletError::new(kind, error.to_string())
+}
+
+#[cfg(test)]
+mod preparation_error_test {
+    use super::*;
+
+    #[test]
+    fn deterministic_preparation_kinds_remain_terminal_wallet_errors() {
+        for (chain, expected) in [
+            (
+                ChainErrorKind::InsufficientFunds,
+                TransactionErrorKind::InsufficientFunds,
+            ),
+            (ChainErrorKind::FeeUnavailable, TransactionErrorKind::Fee),
+            (ChainErrorKind::Rejected, TransactionErrorKind::Rejected),
+            (ChainErrorKind::Divergent, TransactionErrorKind::Divergent),
+        ] {
+            let mapped = preparation_error(ChainError {
+                kind: chain,
+                message: "terminal preparation failure".to_owned(),
+            });
+            assert_eq!(mapped.kind, expected);
+        }
+    }
+
+    #[test]
+    fn rpc_preparation_failures_remain_unavailable() {
+        let mapped = preparation_error(ChainError {
+            kind: ChainErrorKind::RpcUnavailable,
+            message: "RPC failed".to_owned(),
+        });
+        assert_eq!(mapped.kind, TransactionErrorKind::Unavailable);
+    }
 }

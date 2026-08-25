@@ -15,7 +15,7 @@ use indexing::{
     AssetId, BoxFuture, CanonicalAddress, ChainId, Checkpoint, IndexError, IndexScope, MovementId,
     MovementKind, TransactionRef,
 };
-use payment_api::{Chain, State, router};
+use payment_api::{State, WalletAsset, router};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 use tower::ServiceExt;
@@ -248,12 +248,16 @@ struct Fixture {
 }
 
 fn fixture(initially_ready: bool) -> Fixture {
+    fixture_with_usdc(initially_ready, true)
+}
+
+fn fixture_with_usdc(initially_ready: bool, usdc: bool) -> Fixture {
     let calls = Arc::new(Calls::default());
     let checkpoint: Arc<dyn Checkpoint> = Arc::new(FixtureCheckpoint::Value);
-    let mut wallets = Wallets::<String, Chain>::new(checkpoint);
+    let mut wallets = Wallets::<String, WalletAsset>::new(checkpoint);
     wallets
         .register(
-            Chain::Bitcoin,
+            WalletAsset::Btc,
             scope(),
             FixtureProvider {
                 calls: Arc::clone(&calls),
@@ -264,6 +268,21 @@ fn fixture(initially_ready: bool) -> Fixture {
             None,
         )
         .expect("fixture family must register");
+    if usdc {
+        wallets
+            .register(
+                WalletAsset::Usdc,
+                ethereum_scope(),
+                FixtureProvider {
+                    calls: Arc::clone(&calls),
+                },
+                Arc::new(FixtureSender {
+                    calls: Arc::clone(&calls),
+                }),
+                None,
+            )
+            .expect("USDC fixture family must register");
+    }
     let (ready, receiver) = watch::channel(initially_ready);
     let state = State::new(Arc::new(wallets), receiver);
     let token = http_support::server::BearerToken::new(TOKEN).expect("fixture bearer token");
@@ -278,6 +297,44 @@ fn fixture(initially_ready: bool) -> Fixture {
         ready,
         calls,
     }
+}
+
+#[tokio::test]
+async fn unconfigured_wallet_asset_is_not_found() {
+    let fixture = fixture_with_usdc(true, false);
+    let response = request(
+        &fixture.app,
+        "POST",
+        "/v1/wallets",
+        Some(json!({"asset": "usdc"})),
+        true,
+    )
+    .await;
+
+    assert_eq!(response.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_body(&response)["message"],
+        "wallet asset is not configured"
+    );
+}
+
+#[tokio::test]
+async fn invalid_wallet_asset_uses_the_json_error_contract() {
+    let fixture = fixture(true);
+    let response = request(
+        &fixture.app,
+        "POST",
+        "/v1/wallets",
+        Some(json!({"asset": "usd"})),
+        true,
+    )
+    .await;
+
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(&response)["message"],
+        "request body must match the documented JSON schema"
+    );
 }
 
 #[tokio::test]
@@ -314,7 +371,7 @@ async fn wallet_routes_delegate_to_the_wallet_collection() {
         &fixture.app,
         "POST",
         "/v1/wallets",
-        Some(json!({"chain": "bitcoin"})),
+        Some(json!({"asset": "btc"})),
         false,
     )
     .await;
@@ -324,16 +381,31 @@ async fn wallet_routes_delegate_to_the_wallet_collection() {
         &fixture.app,
         "POST",
         "/v1/wallets",
-        Some(json!({"chain": "bitcoin"})),
+        Some(json!({"asset": "btc"})),
         true,
     )
     .await;
     assert_eq!(created.status, StatusCode::CREATED);
     let wallet: Value = serde_json::from_slice(&created.body).expect("wallet JSON");
     let id = wallet["id"].as_str().expect("wallet ID");
+    assert_eq!(wallet["asset"], "btc");
     assert_eq!(wallet["chain"], "bitcoin");
     assert_eq!(wallet["network"], "regtest");
     assert_eq!(wallet["address"], "fixture-address");
+
+    let usdc = request(
+        &fixture.app,
+        "POST",
+        "/v1/wallets",
+        Some(json!({"asset": "usdc"})),
+        true,
+    )
+    .await;
+    assert_eq!(usdc.status, StatusCode::CREATED);
+    let usdc = json_body(&usdc);
+    assert_eq!(usdc["asset"], "usdc");
+    assert_eq!(usdc["chain"], "ethereum");
+    assert_eq!(usdc["network"], "mainnet");
 
     let read = request(
         &fixture.app,
@@ -445,6 +517,13 @@ fn scope() -> IndexScope {
     IndexScope {
         chain: ChainId("bitcoin".to_owned()),
         network: "regtest".to_owned(),
+    }
+}
+
+fn ethereum_scope() -> IndexScope {
+    IndexScope {
+        chain: ChainId("ethereum".to_owned()),
+        network: "mainnet".to_owned(),
     }
 }
 

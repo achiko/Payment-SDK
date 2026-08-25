@@ -1,5 +1,6 @@
 use axum::{
     Json,
+    extract::rejection::JsonRejection,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -41,6 +42,10 @@ impl ApiError {
         Self::new(ErrorKind::InvalidRequest, message)
     }
 
+    pub fn invalid_json(_error: JsonRejection) -> Self {
+        Self::invalid_request("request body must match the documented JSON schema")
+    }
+
     pub fn invalid_batch(failed_index: usize, message: impl Into<String>) -> Self {
         Self {
             failed_index: Some(failed_index),
@@ -50,6 +55,10 @@ impl ApiError {
 
     pub fn invalid_response(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::InvalidResponse, message)
+    }
+
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::NotFound, message)
     }
 
     fn new(kind: ErrorKind, message: impl Into<String>) -> Self {

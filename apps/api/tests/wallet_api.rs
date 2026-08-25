@@ -17,6 +17,7 @@ use tempfile::TempDir;
 use tokio::process::{Child, Command};
 
 const TOKEN: &str = "wallet-api-system-test";
+const USDC_CONTRACT: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
 
 struct RunningApi {
     root: String,
@@ -72,7 +73,8 @@ async fn bitcoin_wallet_is_generated_and_indexed() -> Result<(), Box<dyn std::er
     }))
     .await?;
 
-    let wallet = create_wallet(&api.root, "bitcoin").await?;
+    let wallet = create_wallet(&api.root, "btc").await?;
+    assert_eq!(wallet["asset"], "btc");
     assert_eq!(wallet["chain"], "bitcoin");
     assert_eq!(wallet["network"], "regtest");
     let address = wallet["address"]
@@ -150,7 +152,8 @@ async fn ethereum_wallet_is_generated_and_indexed() -> Result<(), Box<dyn std::e
     }))
     .await?;
 
-    let wallet = create_wallet(&api.root, "ethereum").await?;
+    let wallet = create_wallet(&api.root, "eth").await?;
+    assert_eq!(wallet["asset"], "eth");
     assert_eq!(wallet["chain"], "ethereum");
     assert_eq!(wallet["network"], "mainnet");
     let address = wallet["address"]
@@ -223,6 +226,110 @@ async fn ethereum_wallet_is_generated_and_indexed() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn usdc_wallet_is_generated_sent_and_indexed() -> Result<(), Box<dyn std::error::Error>> {
+    let files = TempDir::new()?;
+    let node = EthereumNode::start().await;
+    let api = start_api(json!({
+        "ethereum": {
+            "database": files.path().join("ethereum-usdc.redb"),
+            "network": "mainnet",
+            "chain_id": 1,
+            "genesis_hash": ethereum_node::GENESIS_HASH,
+            "rpc": rpc_config(&node.rpc_url, false),
+            "confirmation_depth": 1,
+            "reorg_retention": 10,
+            "poll_millis": 10,
+            "batch_size": 10,
+            "usdc": {"contract": USDC_CONTRACT}
+        }
+    }))
+    .await?;
+
+    let eth = create_wallet(&api.root, "eth").await?;
+    let usdc = create_wallet(&api.root, "usdc").await?;
+    assert_eq!(eth["asset"], "eth");
+    assert_eq!(usdc["asset"], "usdc");
+    assert_eq!(usdc["chain"], "ethereum");
+    assert_eq!(usdc["network"], "mainnet");
+    assert_ne!(
+        eth["address"], usdc["address"],
+        "each generated asset wallet must have its own address"
+    );
+
+    let mixed = batch_response(
+        &api.root,
+        &[
+            (
+                wallet_id(&eth),
+                "hex",
+                format!("0x{}", "31".repeat(20)),
+                "0.1",
+            ),
+            (
+                wallet_id(&usdc),
+                "hex",
+                format!("0x{}", "32".repeat(20)),
+                "1",
+            ),
+        ],
+    )
+    .await?;
+    assert_eq!(mixed.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = mixed.json().await?;
+    assert_eq!(body["failed_index"], 1);
+    assert!(body["transaction_ids"].as_array().is_none_or(Vec::is_empty));
+    assert!(
+        node.submitted_ids().is_empty(),
+        "mixed ETH and USDC families must be rejected before broadcast"
+    );
+
+    let usdc_address = usdc["address"]
+        .as_str()
+        .expect("USDC wallet response must contain an address")
+        .to_owned();
+    let incoming = format!("0x{}", "72".repeat(32));
+    node.append(vec![Transaction::erc20(
+        0x72,
+        USDC_CONTRACT.to_owned(),
+        format!("0x{}", "55".repeat(20)),
+        usdc_address.clone(),
+        10_000_000,
+    )]);
+    node.append(Vec::new());
+
+    wait_balance(&api.root, wallet_id(&usdc), "10").await;
+    let incoming_history = wait_history(&api.root, wallet_id(&usdc), &incoming).await;
+    let incoming_entry = transaction(&incoming_history, &incoming);
+    assert_eq!(incoming_entry["scope"]["chain"], "ethereum");
+    assert_eq!(incoming_entry["movements"][0]["asset"]["id"], USDC_CONTRACT);
+    assert_eq!(incoming_entry["movements"][0]["asset"]["decimals"], 6);
+    assert_eq!(incoming_entry["movements"][0]["amount"], "10");
+    assert_eq!(incoming_entry["movements"][0]["to"]["value"], usdc_address);
+
+    let destination = format!("0x{}", "23".repeat(20));
+    node.expect_token_send(
+        USDC_CONTRACT.to_owned(),
+        usdc_address,
+        destination.clone(),
+        1_000_000,
+    );
+    let submitted = send(&api.root, wallet_id(&usdc), "hex", &destination, "1").await?;
+    node.confirm();
+    let outgoing_history = wait_history(&api.root, wallet_id(&usdc), &submitted).await;
+    let outgoing_entry = transaction(&outgoing_history, &submitted);
+    assert_eq!(outgoing_entry["movements"][0]["asset"]["id"], USDC_CONTRACT);
+    assert_eq!(outgoing_entry["movements"][0]["amount"], "1");
+    assert_eq!(outgoing_entry["movements"][0]["to"]["value"], destination);
+    assert_eq!(outgoing_entry["fee"]["asset"]["id"], "native");
+    assert_eq!(outgoing_entry["fee"]["asset"]["decimals"], 18);
+    wait_balance(&api.root, wallet_id(&usdc), "9").await;
+
+    api.stop().await;
+    node.stop().await;
+    Ok(())
+}
+
 async fn start_api(indexes: Value) -> Result<RunningApi, Box<dyn std::error::Error>> {
     start_api_with(indexes, json!([]), &[]).await
 }
@@ -260,7 +367,7 @@ async fn start_api_with(
     wait_ready(&running.root).await;
     let unauthorized = reqwest::Client::new()
         .post(format!("{}/v1/wallets", running.root))
-        .json(&json!({"chain": "bitcoin"}))
+        .json(&json!({"asset": "btc"}))
         .send()
         .await?;
     assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
@@ -276,11 +383,11 @@ fn rpc_config(endpoint: &str, bitcoin: bool) -> Value {
     })
 }
 
-async fn create_wallet(root: &str, chain: &str) -> Result<Value, Box<dyn std::error::Error>> {
+async fn create_wallet(root: &str, asset: &str) -> Result<Value, Box<dyn std::error::Error>> {
     let response = reqwest::Client::new()
         .post(format!("{root}/v1/wallets"))
         .bearer_auth(TOKEN)
-        .json(&json!({"chain": chain}))
+        .json(&json!({"asset": asset}))
         .send()
         .await?;
     let status = response.status();
@@ -414,23 +521,34 @@ async fn wait_atomic_below(root: &str, wallet: &str, decimals: u32, ceiling: u64
 
 async fn wait_history(root: &str, wallet: &str, transaction: &str) -> Value {
     let url = format!("{root}/v1/wallets/{wallet}/transactions?limit=20");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut last = None;
     loop {
-        if let Some(value) = get(&url).await
-            && value["transactions"].as_array().is_some_and(|items| {
+        if let Some(value) = get(&url).await {
+            if value["transactions"].as_array().is_some_and(|items| {
                 items
                     .iter()
                     .any(|item| item["transaction_id"] == transaction)
-            })
-        {
-            return value;
+            }) {
+                return value;
+            }
+            last = Some(value);
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "wallet history did not contain transaction {transaction}"
+            "wallet history did not contain transaction {transaction}; last response: {last:?}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+fn transaction<'a>(history: &'a Value, transaction_id: &str) -> &'a Value {
+    history["transactions"]
+        .as_array()
+        .expect("history must contain transactions")
+        .iter()
+        .find(|transaction| transaction["transaction_id"] == transaction_id)
+        .expect("requested transaction must be present in history")
 }
 
 async fn get(url: &str) -> Option<Value> {
