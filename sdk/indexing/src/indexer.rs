@@ -137,9 +137,14 @@ pub trait History: Send + Sync {
 pub trait Indexer: Checkpoint + History {
     fn scopes(&self) -> &[IndexScope];
 
+    /// Advances every scope this indexer owns.
+    ///
+    /// The selection is read during the pass rather than passed in, so it is
+    /// never older than the tip the pass indexes towards. See
+    /// [`crate::FilterSource`].
     fn sync<'a>(
         &'a self,
-        filters: Vec<crate::AddressFilter>,
+        selection: &'a dyn crate::FilterSource,
     ) -> BoxFuture<'a, Result<Vec<crate::SyncStatus>, IndexError>>;
 }
 

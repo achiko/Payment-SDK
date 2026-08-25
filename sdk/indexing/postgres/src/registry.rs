@@ -6,17 +6,25 @@ use indexing::{
 };
 use tokio_postgres::Row;
 
-use crate::{Repository, row};
+use crate::{Repository, prepare, row};
+
+const REGISTER: &str = "\
+INSERT INTO payment_wallets (id, chain, network, address, start_height, secret)
+VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING";
+
+const REGISTERED: &str = "\
+SELECT id, address, start_height, secret FROM payment_wallets
+WHERE chain = $1 AND network = $2 ORDER BY created_at, id";
 
 impl Repository {
     async fn write_registration(&self, entry: RegisteredAddress) -> Result<(), IndexError> {
         self.check_scope(&entry.filter.address.scope)?;
         let height = row::as_i64(entry.filter.start_height.0, "start height")?;
-        let client = self.pool.get().await.map_err(crate::unavailable)?;
+        let client = self.client().await?;
+        let statement = prepare(&client, REGISTER).await?;
         let written = client
             .execute(
-                "INSERT INTO payment_wallets (id, chain, network, address, start_height, secret) \
-                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+                &statement,
                 &[
                     &entry.id,
                     &self.scope.chain.0,
@@ -46,13 +54,10 @@ impl Repository {
         scope: &IndexScope,
     ) -> Result<Vec<RegisteredAddress>, IndexError> {
         self.check_scope(scope)?;
-        let client = self.pool.get().await.map_err(crate::unavailable)?;
+        let client = self.client().await?;
+        let statement = prepare(&client, REGISTERED).await?;
         let rows = client
-            .query(
-                "SELECT id, address, start_height, secret FROM payment_wallets \
-                 WHERE chain = $1 AND network = $2 ORDER BY created_at, id",
-                &[&scope.chain.0, &scope.network],
-            )
+            .query(&statement, &[&scope.chain.0, &scope.network])
             .await
             .map_err(crate::store)?;
         rows.iter().map(|entry| registered(scope, entry)).collect()

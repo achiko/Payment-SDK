@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use futures_executor::block_on;
 use indexing::{
     AddressFilter, BlockHash, BlockHeight, BlockRef, BoxFuture, CanonicalAddress, ChainId,
-    Checkpoint, Composer, History, HistoryQuery, IndexError, IndexErrorKind, IndexScope, Indexer,
-    SyncPhase, SyncStatus, TransactionPage,
+    Checkpoint, Composer, FilterSource, History, HistoryQuery, IndexError, IndexErrorKind,
+    IndexScope, Indexer, SyncPhase, SyncStatus, TransactionPage,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,8 +73,12 @@ impl Indexer for Probe {
 
     fn sync<'a>(
         &'a self,
-        filters: Vec<AddressFilter>,
+        selection: &'a dyn FilterSource,
     ) -> BoxFuture<'a, Result<Vec<SyncStatus>, IndexError>> {
+        let filters = match selection.filters() {
+            Ok(filters) => filters,
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
         self.record(Call::Sync(filters));
         let statuses = self
             .scopes
@@ -137,7 +141,7 @@ fn exercise_indexer(indexer: &dyn Indexer, scope: &IndexScope, height: u64) {
     .expect("history through Indexer");
     assert_eq!(page.checkpoint, Some(block(height)));
 
-    let statuses = block_on(indexer.sync(vec![filter])).expect("sync through Indexer");
+    let statuses = block_on(indexer.sync(&vec![filter])).expect("sync through Indexer");
     assert_eq!(statuses.len(), 1);
     assert_eq!(statuses[0].scope, *scope);
 }
@@ -225,7 +229,7 @@ fn rejects_operations_for_an_unconfigured_scope() {
         limit: 1,
     }))
     .expect_err("missing history");
-    let sync_error = block_on(composer.sync(vec![AddressFilter {
+    let sync_error = block_on(composer.sync(&vec![AddressFilter {
         address: address(&missing, "owner"),
         start_height: BlockHeight(0),
     }]))
@@ -259,7 +263,7 @@ fn partitions_filters_and_combines_statuses_from_every_indexer() {
         address: address(&second_scope, "second-owner"),
         start_height: BlockHeight(5),
     };
-    let statuses = block_on(composer.sync(vec![second_filter.clone(), first_filter.clone()]))
+    let statuses = block_on(composer.sync(&vec![second_filter.clone(), first_filter.clone()]))
         .expect("composed sync");
 
     assert_eq!(

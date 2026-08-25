@@ -81,13 +81,13 @@ impl Indexer for Composer {
 
     fn sync<'a>(
         &'a self,
-        filters: Vec<AddressFilter>,
+        selection: &'a dyn crate::FilterSource,
     ) -> BoxFuture<'a, Result<Vec<SyncStatus>, IndexError>> {
         Box::pin(async move {
             let mut addresses = BTreeSet::new();
-            for filter in &filters {
+            for filter in &selection.filters()? {
                 self.indexer(&filter.address.scope)?;
-                if filter.address.value.is_empty() || !addresses.insert(&filter.address) {
+                if filter.address.value.is_empty() || !addresses.insert(filter.address.clone()) {
                     return Err(IndexError::new(
                         IndexErrorKind::InvalidRequest,
                         "address filters must be non-empty and unique",
@@ -97,14 +97,36 @@ impl Indexer for Composer {
             }
             let mut statuses = Vec::with_capacity(self.indexers.len());
             for indexer in &self.indexers {
-                let scoped = filters
-                    .iter()
-                    .filter(|filter| indexer.scopes().contains(&filter.address.scope))
-                    .cloned()
-                    .collect();
-                statuses.extend(indexer.sync(scoped).await?);
+                // Narrowing happens per read rather than once over a snapshot,
+                // so each indexer still reads the selection after it observes
+                // its own tip.
+                let scoped = Scoped {
+                    selection,
+                    scopes: indexer.scopes(),
+                };
+                statuses.extend(indexer.sync(&scoped).await?);
             }
             Ok(statuses)
         })
+    }
+}
+
+/// One indexer's view of the shared selection.
+///
+/// Holds the selection rather than a copy of its addresses so the narrowing is
+/// applied to whatever the inner indexer reads, at the moment it reads it.
+struct Scoped<'a> {
+    selection: &'a dyn crate::FilterSource,
+    scopes: &'a [IndexScope],
+}
+
+impl crate::FilterSource for Scoped<'_> {
+    fn filters(&self) -> Result<Vec<AddressFilter>, IndexError> {
+        Ok(self
+            .selection
+            .filters()?
+            .into_iter()
+            .filter(|filter| self.scopes.contains(&filter.address.scope))
+            .collect())
     }
 }

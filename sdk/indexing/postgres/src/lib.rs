@@ -4,24 +4,55 @@
 //! Scope is a column rather than a key prefix, so one schema serves every
 //! configured chain. A repository still binds to exactly one scope and refuses
 //! requests for another, matching the embedded redb implementation.
+//!
+//! # Round trips
+//!
+//! An embedded store commits a block with one batch write; a database pays a
+//! network round trip per statement, so the count of statements — not the count
+//! of rows — is what this backend has to keep down. Two rules hold everywhere
+//! here:
+//!
+//!   * every statement goes through the connection's statement cache, so a
+//!     repeated query costs one round trip rather than a parse plus a bind; and
+//!   * a set of rows is written by one statement over parameter arrays, never
+//!     by a loop of single-row statements.
+//!
+//! The result is a fixed statement count per block instead of one that grows
+//! with the block's transactions, movements, and outputs.
 
+mod columns;
 mod read;
 mod registry;
 mod revert;
 mod row;
 mod write;
 
-use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
+use deadpool_postgres::{Client, Manager, ManagerConfig, Pool, RecyclingMethod, Transaction};
 use indexing::{
-    BlockAddition, BlockHash, BlockHeight, BlockOutcome, BlockRef, BlockSelector, Blocks,
-    BoxFuture, CanonicalAddress, IndexError, IndexErrorKind, IndexScope,
+    BlockAddition, BlockOutcome, BlockRef, BlockSelector, Blocks, BoxFuture, CanonicalAddress,
+    IndexError, IndexErrorKind, IndexScope,
 };
-use tokio_postgres::{NoTls, Row};
+use tokio_postgres::{NoTls, Statement};
+
+/// The scope's tip. Column aliases match [`row::block`] so every block-shaped
+/// row decodes through one function.
+const CHECKPOINT: &str = "SELECT height, hash, parent_hash AS parent, \
+                          block_timestamp AS timestamp \
+                          FROM checkpoint WHERE chain = $1 AND network = $2";
+
+/// A retained block, which is the only place a non-tip height is recorded.
+const RETAINED_BLOCK: &str = "SELECT height, block_hash AS hash, block_parent AS parent, \
+                              block_timestamp AS timestamp FROM journal \
+                              WHERE chain = $1 AND network = $2 AND height = $3";
 
 /// Builds a connection pool from a libpq-style URL.
 ///
 /// TLS is not configured: this is intended for a database reached over a
 /// trusted local socket or network. Wrap the manager yourself for anything else.
+///
+/// Recycling is [`RecyclingMethod::Fast`] deliberately: a cleaning recycle
+/// discards the session, which would throw away the prepared statements this
+/// backend depends on and put the parse round trip back on every query.
 pub fn pool(url: &str, max_size: usize) -> Result<Pool, IndexError> {
     let config = url
         .parse::<tokio_postgres::Config>()
@@ -68,10 +99,25 @@ impl Repository {
         ))
     }
 
-    /// The scope's current checkpoint, used to keep a page consistent.
-    pub(crate) async fn read_checkpoint(&self) -> Result<Option<BlockRef>, IndexError> {
-        self.read_block(BlockSelector::Tip(self.scope.clone()))
+    pub(crate) async fn client(&self) -> Result<Client, IndexError> {
+        self.pool.get().await.map_err(unavailable)
+    }
+
+    /// The scope's current checkpoint, read on a caller-supplied connection.
+    ///
+    /// A page reads the checkpoint twice to prove it did not move, and both
+    /// reads must share the request's connection: acquiring a second one costs
+    /// a pool round trip and can observe a different session's view.
+    pub(crate) async fn checkpoint_on(
+        &self,
+        client: &Client,
+    ) -> Result<Option<BlockRef>, IndexError> {
+        let statement = prepare(client, CHECKPOINT).await?;
+        let row = client
+            .query_opt(&statement, &[&self.scope.chain.0, &self.scope.network])
             .await
+            .map_err(store)?;
+        row.as_ref().map(|row| row::block(row, "")).transpose()
     }
 
     /// Rejects an address from another chain before it reaches a query.
@@ -92,35 +138,36 @@ impl Repository {
             BlockSelector::Height { scope, height } => (scope, Some(height)),
         };
         self.check_scope(&scope)?;
-        let client = self.pool.get().await.map_err(unavailable)?;
+        let client = self.client().await?;
 
         // Tip comes from the checkpoint; a specific height comes from the
         // retained journal, exactly as the redb repository resolves them.
-        let row = match height {
-            None => client
-                .query_opt(
-                    "SELECT height, hash, parent_hash, block_timestamp \
-                     FROM checkpoint WHERE chain = $1 AND network = $2",
-                    &[&scope.chain.0, &scope.network],
-                )
-                .await
-                .map_err(store)?,
-            Some(height) => {
-                let height = i64::try_from(height.0)
-                    .map_err(|_| invalid("block height exceeds the storage range"))?;
-                client
-                    .query_opt(
-                        "SELECT height, block_hash AS hash, block_parent AS parent_hash, \
-                         block_timestamp FROM journal \
-                         WHERE chain = $1 AND network = $2 AND height = $3",
-                        &[&scope.chain.0, &scope.network, &height],
-                    )
-                    .await
-                    .map_err(store)?
-            }
+        let Some(height) = height else {
+            return self.checkpoint_on(&client).await;
         };
-        row.map(block_ref).transpose()
+        let height = row::as_i64(height.0, "block height")?;
+        let statement = prepare(&client, RETAINED_BLOCK).await?;
+        let row = client
+            .query_opt(&statement, &[&scope.chain.0, &scope.network, &height])
+            .await
+            .map_err(store)?;
+        row.as_ref().map(|row| row::block(row, "")).transpose()
     }
+}
+
+/// Prepares through the connection's cache, so a repeated statement costs one
+/// round trip instead of a parse and a bind.
+pub(crate) async fn prepare(client: &Client, sql: &str) -> Result<Statement, IndexError> {
+    client.prepare_cached(sql).await.map_err(store)
+}
+
+/// The same cache, reached from inside a transaction. The cache belongs to the
+/// connection, so statements survive the transaction that first prepared them.
+pub(crate) async fn prepare_in(
+    transaction: &Transaction<'_>,
+    sql: &str,
+) -> Result<Statement, IndexError> {
+    transaction.prepare_cached(sql).await.map_err(store)
 }
 
 impl Clone for Repository {
@@ -156,28 +203,8 @@ impl Blocks for Repository {
     }
 }
 
-fn block_ref(row: Row) -> Result<BlockRef, IndexError> {
-    let height: i64 = row.try_get("height").map_err(store)?;
-    let hash: Vec<u8> = row.try_get("hash").map_err(store)?;
-    let parent_hash: Option<Vec<u8>> = row.try_get("parent_hash").map_err(store)?;
-    let timestamp: Option<i64> = row.try_get("block_timestamp").map_err(store)?;
-    Ok(BlockRef {
-        height: BlockHeight(u64::try_from(height).map_err(|_| store_message("negative height"))?),
-        hash: BlockHash(hash),
-        parent_hash: parent_hash.map(BlockHash),
-        timestamp: timestamp
-            .map(u64::try_from)
-            .transpose()
-            .map_err(|_| store_message("negative block timestamp"))?,
-    })
-}
-
 fn invalid(message: impl Into<String>) -> IndexError {
     IndexError::new(IndexErrorKind::InvalidRequest, message, false)
-}
-
-fn store_message(message: impl Into<String>) -> IndexError {
-    IndexError::new(IndexErrorKind::Store, message, false)
 }
 
 fn store(error: tokio_postgres::Error) -> IndexError {

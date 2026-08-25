@@ -120,10 +120,22 @@ pub trait History {
 pub trait Indexer: Checkpoint + History {
     fn scopes(&self) -> &[IndexScope];
 
-    fn sync(&self, filters: Vec<AddressFilter>)
+    fn sync(&self, selection: &dyn FilterSource)
         -> BoxFuture<Result<Vec<SyncStatus>, IndexError>>;
 }
+
+pub trait FilterSource: Send + Sync {
+    fn filters(&self) -> Result<Vec<AddressFilter>, IndexError>;
+}
 ```
+
+`sync` reads the selection itself rather than receiving a snapshot, and the
+ordering is part of the contract: it reads once before any source I/O so a
+malformed selection fails without a reachable node, then reads it again after
+observing the tip and indexes against that newer set. A set captured before the
+tip was observed cannot contain an address registered in between, so the blocks
+that tip admits — blocks the new address's birthday already covers — would be
+applied without it, and nothing rescans them once the checkpoint passes.
 
 `Service<S, I, R>` implements `Indexer` for one exact scope. `Composer` requires
 at least one child, rejects duplicate scopes, validates a complete filter
@@ -139,14 +151,16 @@ SyncConfig::new(scope, minimum_confirmations, reorg_retention, batch_size)?;
 The three numeric inputs must be greater than zero. Confirmation depth is the
 `u64` value itself; it does not need a one-field policy wrapper.
 
-`Wallets` owns the filter snapshot and receives the composed `Checkpoint`
+`Wallets` owns the address selection and receives the composed `Checkpoint`
 capability to choose safe runtime birthdays. Indexing owns no address registry
-or watch lifecycle. The sync task repeatedly passes `wallets.filters()` to the
-composed indexer.
+or watch lifecycle. The sync task hands the composed indexer a `FilterSource`
+that reads `wallets.filters()`, rather than a set read in advance, so a wallet
+adopted while a pass is starting is still covered from its birthday.
 
 Filter addresses are non-empty, unique, and scoped to a configured child.
-Composer validates the whole snapshot before any source I/O; `Wallets` keeps
-the earliest birthday when several wallets have the same canonical address.
+Composer validates the whole selection before any source I/O and narrows it per
+child on each read; `Wallets` keeps the earliest birthday when several wallets
+have the same canonical address.
 
 `Outputs` is an independent capability. It is injected only into consumers
 that need live UTXOs; it is not a supertrait of `Indexer`.

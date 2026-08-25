@@ -114,10 +114,10 @@ fn cycle(packages: &[crate::source::Package], ignored: &[String]) -> Option<Vec<
         let package = map.get(name)?;
         active.push(name.to_owned());
         for dependency in &package.dependencies {
-            if map.contains_key(dependency.as_str()) {
-                if let Some(found) = visit(dependency, map, ignored, active, done) {
-                    return Some(found);
-                }
+            if map.contains_key(dependency.as_str())
+                && let Some(found) = visit(dependency, map, ignored, active, done)
+            {
+                return Some(found);
             }
         }
         active.pop();

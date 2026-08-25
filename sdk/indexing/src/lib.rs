@@ -33,7 +33,7 @@ pub use output::{
 pub use registry::{RegisteredAddress, Registry};
 #[doc(hidden)]
 pub use service::Service;
-pub use service::{AddressFilter, SyncPhase, SyncStatus};
+pub use service::{AddressFilter, FilterSource, SyncPhase, SyncStatus};
 pub use source::{BlockInterpreter, BlockSource, IndexedBlock};
 pub use synchronizer::SyncConfig;
 pub use value::{AssetId, CanonicalAddress, ChainId, IndexScope, TransactionRef};

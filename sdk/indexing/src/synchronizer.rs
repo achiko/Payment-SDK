@@ -100,10 +100,26 @@ where
     I: BlockInterpreter,
     R: Blocks,
 {
-    pub(crate) async fn sync(&self, filters: Vec<AddressFilter>) -> Result<SyncStatus, IndexError> {
+    pub(crate) async fn sync(
+        &self,
+        selection: &dyn crate::FilterSource,
+    ) -> Result<SyncStatus, IndexError> {
         let _guard = self.enter()?;
-        self.validate(&filters)?;
+        // A malformed selection is a programming error, so it is rejected
+        // before any source I/O: the caller should not need a reachable node to
+        // find out.
+        self.validate(&selection.filters()?)?;
+
         let observed_tip = self.source.tip().await.map_err(IndexError::from)?;
+
+        // Read the selection again now that the tip is known, and index against
+        // this newer set. An address registered between the two reads has a
+        // birthday of the current checkpoint plus one, which covers the blocks
+        // this pass is about to apply; indexing them against the earlier set
+        // would skip that address for blocks it was registered to cover, and
+        // the checkpoint moves past them for good.
+        let filters = selection.filters()?;
+        self.validate(&filters)?;
         let mut checkpoint = self
             .repository
             .get(BlockSelector::Tip(self.config.scope.clone()))
