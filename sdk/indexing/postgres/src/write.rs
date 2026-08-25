@@ -22,29 +22,30 @@ use crate::{
 /// Locks the scope's checkpoint for the rest of the transaction.
 const LOCK_CHECKPOINT: &str = "SELECT height, hash, parent_hash AS parent, \
                                block_timestamp AS timestamp \
-                               FROM checkpoint WHERE chain = $1 AND network = $2 FOR UPDATE";
+                               FROM payments_checkpoint WHERE chain = $1 AND network = $2 FOR UPDATE";
 
 const JOURNALLED_HASH: &str =
-    "SELECT block_hash FROM journal WHERE chain = $1 AND network = $2 AND height = $3";
+    "SELECT block_hash FROM payments_journal WHERE chain = $1 AND network = $2 AND height = $3";
 
 /// Records the block and drops what has aged out of the retention window in one
 /// statement. The two touch disjoint heights, so folding the prune into the
 /// insert saves a round trip without changing what either does.
 const WRITE_JOURNAL: &str = "\
 WITH pruned AS (
-    DELETE FROM journal WHERE chain = $1 AND network = $2 AND height <= $11
+    DELETE FROM payments_journal WHERE chain = $1 AND network = $2 AND height <= $11
 )
-INSERT INTO journal (chain, network, height, block_hash, block_parent, block_timestamp,
-                     previous_checkpoint_height, previous_checkpoint_hash,
-                     previous_checkpoint_parent, previous_checkpoint_time)
+INSERT INTO payments_journal (chain, network, height, block_hash, block_parent, block_timestamp,
+                              previous_checkpoint_height, previous_checkpoint_hash,
+                              previous_checkpoint_parent, previous_checkpoint_time)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
 
 /// One row per address a transaction touched. Chain, network, height, and the
 /// block are identical for every row in a block, so they bind once as scalars
 /// and only the per-row columns travel as arrays.
 const WRITE_HISTORY: &str = "\
-INSERT INTO history (chain, network, address, height, transaction_id, status, failure_reason,
-                     block_hash, block_parent, block_timestamp, fee_asset, fee_amount, fee_payer)
+INSERT INTO payments_history (chain, network, address, height, transaction_id, status, failure_reason,
+                              block_hash, block_parent, block_timestamp, fee_asset, fee_amount,
+                              fee_payer)
 SELECT $1, $2, entry.address, $3, entry.transaction_id, entry.status, entry.failure_reason,
        $4, $5, $6, entry.fee_asset, entry.fee_amount::numeric, entry.fee_payer
 FROM UNNEST($7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[],
@@ -52,8 +53,8 @@ FROM UNNEST($7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::t
      AS entry(address, transaction_id, status, failure_reason, fee_asset, fee_amount, fee_payer)";
 
 const WRITE_MOVEMENT: &str = "\
-INSERT INTO movement (chain, network, address, height, transaction_id, ordinal, kind, movement_id,
-                      asset_chain, asset, amount, from_address, to_address)
+INSERT INTO payments_movement (chain, network, address, height, transaction_id, ordinal, kind, movement_id,
+                               asset_chain, asset, amount, from_address, to_address)
 SELECT $1, $2, entry.address, $3, entry.transaction_id, entry.ordinal, entry.kind,
        entry.movement_id, entry.asset_chain, entry.asset, entry.amount::numeric,
        entry.from_address, entry.to_address
@@ -65,8 +66,8 @@ FROM UNNEST($4::text[], $5::text[], $6::int4[], $7::text[], $8::text[], $9::text
 /// Every output created by a block shares the block's height, which
 /// `OutputChanges::validate` has already enforced.
 const WRITE_CREATED: &str = "\
-INSERT INTO output (chain, network, transaction_id, output_index, address, asset_chain, asset,
-                    amount, evidence, created_at, coinbase)
+INSERT INTO payments_output (chain, network, transaction_id, output_index, address, asset_chain,
+                             asset, amount, evidence, created_at, coinbase)
 SELECT $1, $2, entry.transaction_id, entry.output_index, entry.address, entry.asset_chain,
        entry.asset, entry.amount::numeric, entry.evidence, $3, entry.coinbase
 FROM UNNEST($4::text[], $5::int4[], $6::text[], $7::text[], $8::text[], $9::text[], $10::bytea[],
@@ -85,20 +86,20 @@ const SPEND_OUTPUTS: &str = "\
 WITH target AS (
     SELECT * FROM UNNEST($3::text[], $4::int4[]) AS t(transaction_id, output_index)
 ), removed AS (
-    DELETE FROM output USING target
+    DELETE FROM payments_output AS output USING target
     WHERE output.chain = $1 AND output.network = $2
       AND output.transaction_id = target.transaction_id
       AND output.output_index = target.output_index
     RETURNING output.*
 )
-INSERT INTO journal_output (chain, network, height, transaction_id, output_index, address,
-                            asset_chain, asset, amount, evidence, created_at, coinbase)
+INSERT INTO payments_journal_output (chain, network, height, transaction_id, output_index, address,
+                                     asset_chain, asset, amount, evidence, created_at, coinbase)
 SELECT chain, network, $5, transaction_id, output_index, address, asset_chain, asset, amount,
        evidence, created_at, coinbase
 FROM removed";
 
 const MOVE_CHECKPOINT: &str = "\
-INSERT INTO checkpoint (chain, network, height, hash, parent_hash, block_timestamp)
+INSERT INTO payments_checkpoint (chain, network, height, hash, parent_hash, block_timestamp)
 VALUES ($1, $2, $3, $4, $5, $6)
 ON CONFLICT (chain, network) DO UPDATE SET height = EXCLUDED.height, hash = EXCLUDED.hash,
     parent_hash = EXCLUDED.parent_hash, block_timestamp = EXCLUDED.block_timestamp";

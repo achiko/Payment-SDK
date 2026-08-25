@@ -12,30 +12,31 @@ SELECT block_hash, previous_checkpoint_height AS previous_height,
        previous_checkpoint_hash AS previous_hash,
        previous_checkpoint_parent AS previous_parent,
        previous_checkpoint_time AS previous_timestamp
-FROM journal WHERE chain = $1 AND network = $2 AND height = $3";
+FROM payments_journal WHERE chain = $1 AND network = $2 AND height = $3";
 
 /// Movements are removed by the same predicate as their history rows rather
 /// than by cascading from them: the foreign key that would cascade costs more
 /// on every insert than the delete saves on the rare reorg.
 const DELETE_MOVEMENT: &str =
-    "DELETE FROM movement WHERE chain = $1 AND network = $2 AND height = $3";
+    "DELETE FROM payments_movement WHERE chain = $1 AND network = $2 AND height = $3";
 
 const DELETE_HISTORY: &str =
-    "DELETE FROM history WHERE chain = $1 AND network = $2 AND height = $3";
+    "DELETE FROM payments_history WHERE chain = $1 AND network = $2 AND height = $3";
 
 const DELETE_CREATED: &str =
-    "DELETE FROM output WHERE chain = $1 AND network = $2 AND created_at = $3";
+    "DELETE FROM payments_output WHERE chain = $1 AND network = $2 AND created_at = $3";
 
 const RESTORE_SPENT: &str = "\
-INSERT INTO output (chain, network, transaction_id, output_index, address, asset_chain, asset,
-                    amount, evidence, created_at, coinbase)
+INSERT INTO payments_output (chain, network, transaction_id, output_index, address, asset_chain,
+                             asset, amount, evidence, created_at, coinbase)
 SELECT chain, network, transaction_id, output_index, address, asset_chain, asset, amount,
        evidence, created_at, coinbase
-FROM journal_output WHERE chain = $1 AND network = $2 AND height = $3";
+FROM payments_journal_output WHERE chain = $1 AND network = $2 AND height = $3";
 
-const DROP_CHECKPOINT: &str = "DELETE FROM checkpoint WHERE chain = $1 AND network = $2";
+const DROP_CHECKPOINT: &str = "DELETE FROM payments_checkpoint WHERE chain = $1 AND network = $2";
 
-const DROP_JOURNAL: &str = "DELETE FROM journal WHERE chain = $1 AND network = $2 AND height = $3";
+const DROP_JOURNAL: &str =
+    "DELETE FROM payments_journal WHERE chain = $1 AND network = $2 AND height = $3";
 
 impl Repository {
     pub(crate) async fn remove_tip(

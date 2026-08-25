@@ -38,11 +38,11 @@ use tokio_postgres::{NoTls, Statement};
 /// row decodes through one function.
 const CHECKPOINT: &str = "SELECT height, hash, parent_hash AS parent, \
                           block_timestamp AS timestamp \
-                          FROM checkpoint WHERE chain = $1 AND network = $2";
+                          FROM payments_checkpoint WHERE chain = $1 AND network = $2";
 
 /// A retained block, which is the only place a non-tip height is recorded.
 const RETAINED_BLOCK: &str = "SELECT height, block_hash AS hash, block_parent AS parent, \
-                              block_timestamp AS timestamp FROM journal \
+                              block_timestamp AS timestamp FROM payments_journal \
                               WHERE chain = $1 AND network = $2 AND height = $3";
 
 /// Builds a connection pool from a libpq-style URL.
