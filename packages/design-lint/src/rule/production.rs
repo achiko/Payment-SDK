@@ -8,7 +8,7 @@ use syn::{
 use crate::source::SourceFile;
 
 pub(super) fn line_count(source: &SourceFile) -> usize {
-    let mut visitor = TestRangeVisitor::default();
+    let mut visitor = RangeVisitor::default();
     visitor.visit_file(&source.syntax);
     let offsets = LineOffsets::new(&source.text);
     let mut test_ranges = visitor
@@ -130,11 +130,11 @@ struct SpanRange {
 }
 
 #[derive(Default)]
-struct TestRangeVisitor {
+struct RangeVisitor {
     ranges: Vec<SpanRange>,
 }
 
-impl TestRangeVisitor {
+impl RangeVisitor {
     fn record<T: Spanned>(&mut self, attributes: &[Attribute], item: &T) {
         let span = item.span();
         let start = attributes
@@ -150,43 +150,43 @@ impl TestRangeVisitor {
     }
 }
 
-impl<'ast> Visit<'ast> for TestRangeVisitor {
+impl<'ast> Visit<'ast> for RangeVisitor {
     fn visit_item(&mut self, item: &'ast Item) {
-        if let Some(attributes) = item_attributes(item) {
-            if test_only(attributes) {
-                self.record(attributes, item);
-                return;
-            }
+        if let Some(attributes) = item_attributes(item)
+            && test_only(attributes)
+        {
+            self.record(attributes, item);
+            return;
         }
         syn::visit::visit_item(self, item);
     }
 
     fn visit_impl_item(&mut self, item: &'ast ImplItem) {
-        if let Some(attributes) = impl_item_attributes(item) {
-            if test_only(attributes) {
-                self.record(attributes, item);
-                return;
-            }
+        if let Some(attributes) = impl_item_attributes(item)
+            && test_only(attributes)
+        {
+            self.record(attributes, item);
+            return;
         }
         syn::visit::visit_impl_item(self, item);
     }
 
     fn visit_trait_item(&mut self, item: &'ast TraitItem) {
-        if let Some(attributes) = trait_item_attributes(item) {
-            if test_only(attributes) {
-                self.record(attributes, item);
-                return;
-            }
+        if let Some(attributes) = trait_item_attributes(item)
+            && test_only(attributes)
+        {
+            self.record(attributes, item);
+            return;
         }
         syn::visit::visit_trait_item(self, item);
     }
 
     fn visit_foreign_item(&mut self, item: &'ast ForeignItem) {
-        if let Some(attributes) = foreign_item_attributes(item) {
-            if test_only(attributes) {
-                self.record(attributes, item);
-                return;
-            }
+        if let Some(attributes) = foreign_item_attributes(item)
+            && test_only(attributes)
+        {
+            self.record(attributes, item);
+            return;
         }
         syn::visit::visit_foreign_item(self, item);
     }
@@ -283,11 +283,11 @@ fn merge(ranges: &mut Vec<Range<usize>>) {
     ranges.sort_by_key(|range| range.start);
     let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
     for range in ranges.drain(..) {
-        if let Some(previous) = merged.last_mut() {
-            if range.start <= previous.end {
-                previous.end = previous.end.max(range.end);
-                continue;
-            }
+        if let Some(previous) = merged.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
+            continue;
         }
         merged.push(range);
     }

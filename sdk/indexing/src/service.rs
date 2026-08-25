@@ -14,6 +14,32 @@ pub struct AddressFilter {
     pub start_height: BlockHeight,
 }
 
+/// The complete address selection, read on demand rather than handed over in
+/// advance.
+///
+/// Synchronization reads this *after* it observes the source tip, and the
+/// ordering is load-bearing. An address is registered with a birthday of the
+/// current checkpoint plus one, which promises that every later block is
+/// inspected for it. A selection captured before the tip was observed cannot
+/// contain an address registered in between, so the blocks that tip admits —
+/// blocks the new address's birthday already covers — would be indexed without
+/// it, and nothing rescans them once the checkpoint moves past.
+///
+/// Implementing this for a fixed `Vec` is correct only when the selection
+/// cannot change during the pass, which is why it is spelled out rather than
+/// taken as a snapshot argument.
+pub trait FilterSource: Send + Sync {
+    fn filters(&self) -> Result<Vec<AddressFilter>, IndexError>;
+}
+
+/// A selection that cannot change while a pass runs, such as a fixed
+/// configuration or a test fixture.
+impl FilterSource for Vec<AddressFilter> {
+    fn filters(&self) -> Result<Vec<AddressFilter>, IndexError> {
+        Ok(self.clone())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncPhase {
     CatchingUp,
@@ -99,10 +125,10 @@ where
 
     fn sync<'a>(
         &'a self,
-        filters: Vec<AddressFilter>,
+        selection: &'a dyn FilterSource,
     ) -> crate::BoxFuture<'a, Result<Vec<SyncStatus>, IndexError>> {
         Box::pin(async move {
-            let status = self.synchronizer.sync(filters).await?;
+            let status = self.synchronizer.sync(selection).await?;
             Ok(vec![status])
         })
     }

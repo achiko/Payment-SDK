@@ -10,8 +10,8 @@ use futures_executor::block_on;
 use indexing::{
     AddressFilter, BlockAddition, BlockHash, BlockHeight, BlockInterpreter, BlockOutcome, BlockRef,
     BlockSelector, BlockSource, Blocks, BoxFuture, CanonicalAddress, CanonicalPage, ChainId,
-    HistoryQuery, IndexError, IndexErrorKind, IndexScope, IndexedBlock, Indexer, InterpretedBlock,
-    OutputChanges, Service, SourceError, SyncConfig, SyncPhase, Transactions,
+    FilterSource, HistoryQuery, IndexError, IndexErrorKind, IndexScope, IndexedBlock, Indexer,
+    InterpretedBlock, OutputChanges, Service, SourceError, SyncConfig, SyncPhase, Transactions,
 };
 
 #[derive(Clone)]
@@ -28,6 +28,9 @@ struct Source {
     tip: BlockHeight,
     tip_calls: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<BlockHeight>>>,
+    /// Runs while the tip is being observed, standing in for anything that can
+    /// happen during that round trip — such as a wallet being created.
+    during_tip: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Source {
@@ -36,7 +39,13 @@ impl Source {
             tip: BlockHeight(tip),
             tip_calls: Arc::new(AtomicUsize::new(0)),
             requests: Arc::new(Mutex::new(Vec::new())),
+            during_tip: None,
         }
+    }
+
+    fn during_tip(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        self.during_tip = Some(Arc::new(hook));
+        self
     }
 
     fn tip_calls(&self) -> usize {
@@ -53,6 +62,9 @@ impl BlockSource for Source {
 
     fn tip<'a>(&'a self) -> BoxFuture<'a, Result<BlockRef, SourceError>> {
         self.tip_calls.fetch_add(1, Ordering::AcqRel);
+        if let Some(hook) = &self.during_tip {
+            hook();
+        }
         let tip = block(self.tip);
         Box::pin(async move { Ok(tip) })
     }
@@ -201,6 +213,23 @@ impl BlockInterpreter for Interpreter {
     }
 }
 
+/// An address selection that can grow while a pass is running, the way a
+/// registry does when a wallet is created.
+#[derive(Clone, Default)]
+struct Selection(Arc<Mutex<Vec<AddressFilter>>>);
+
+impl Selection {
+    fn register(&self, filter: AddressFilter) {
+        self.0.lock().expect("selection").push(filter);
+    }
+}
+
+impl FilterSource for Selection {
+    fn filters(&self) -> Result<Vec<AddressFilter>, IndexError> {
+        Ok(self.0.lock().expect("selection").clone())
+    }
+}
+
 fn scope(chain: &str) -> IndexScope {
     IndexScope {
         chain: ChainId(chain.into()),
@@ -249,7 +278,7 @@ fn fresh_wallet_sync_starts_at_its_earliest_birthday_not_genesis() {
         config(own_scope),
     );
 
-    let statuses = block_on(service.sync(vec![
+    let statuses = block_on(service.sync(&vec![
         AddressFilter {
             address: first.clone(),
             start_height: BlockHeight(3),
@@ -290,7 +319,7 @@ fn fresh_index_without_wallets_anchors_directly_at_the_tip() {
         config(own_scope),
     );
 
-    let statuses = block_on(service.sync(Vec::new())).expect("sync without wallets");
+    let statuses = block_on(service.sync(&Vec::new())).expect("sync without wallets");
 
     assert_eq!(statuses[0].phase, SyncPhase::Ready);
     assert_eq!(statuses[0].checkpoint, Some(block(BlockHeight(500))));
@@ -316,7 +345,7 @@ fn caller_can_restore_the_same_filter_selection_after_restart() {
         address: owner.clone(),
         start_height: BlockHeight(3),
     }];
-    block_on(initial.sync(filters.clone())).expect("initial sync");
+    block_on(initial.sync(&filters)).expect("initial sync");
     drop(initial);
 
     let restarted_source = Source::new(4);
@@ -326,7 +355,7 @@ fn caller_can_restore_the_same_filter_selection_after_restart() {
         repository.clone(),
         config(own_scope.clone()),
     );
-    block_on(restarted.sync(filters)).expect("restart sync");
+    block_on(restarted.sync(&filters)).expect("restart sync");
     assert!(restarted_source.requests().is_empty());
 }
 
@@ -340,7 +369,7 @@ fn sync_rejects_an_address_from_another_scope() {
         config(own_scope),
     );
 
-    let error = block_on(service.sync(vec![AddressFilter {
+    let error = block_on(service.sync(&vec![AddressFilter {
         address: address(&scope("other-chain"), "owner"),
         start_height: BlockHeight(0),
     }]))
@@ -379,10 +408,60 @@ fn sync_rejects_empty_and_duplicate_addresses_before_source_io() {
             config(own_scope.clone()),
         );
 
-        let error = block_on(service.sync(filters)).expect_err("invalid address selection");
+        let error = block_on(service.sync(&filters)).expect_err("invalid address selection");
 
         assert_eq!(error.kind, IndexErrorKind::InvalidRequest);
         assert_eq!(source.tip_calls(), 0);
         assert!(source.requests().is_empty());
+    }
+}
+
+/// An address registered while the tip is being observed is still inspected for
+/// in the blocks its birthday covers.
+///
+/// A wallet is anchored at the checkpoint that was current when it was created,
+/// which promises every later block is inspected for it. If the pass indexed
+/// against a selection read before it observed the tip, the blocks that tip
+/// admits would be applied without the new address — and nothing rescans them
+/// once the checkpoint moves past, so the miss is permanent rather than late.
+#[test]
+fn an_address_registered_while_the_tip_is_read_still_covers_its_birthday() {
+    let own_scope = scope("late-chain");
+    let late = address(&own_scope, "late");
+    let selection = Selection::default();
+    let source = Source::new(2).during_tip({
+        let selection = selection.clone();
+        let late = late.clone();
+        move || {
+            selection.register(AddressFilter {
+                address: late.clone(),
+                start_height: BlockHeight(1),
+            });
+        }
+    });
+    let interpreter = Interpreter::default();
+    let service = Service::new(
+        source,
+        interpreter.clone(),
+        Repository::default(),
+        config(own_scope),
+    );
+
+    block_on(service.sync(&selection)).expect("sync");
+
+    let covered = interpreter
+        .inspections()
+        .into_iter()
+        .filter(|(height, _)| *height >= BlockHeight(1))
+        .collect::<Vec<_>>();
+    assert!(
+        !covered.is_empty(),
+        "blocks at or above the address birthday must be indexed"
+    );
+    for (height, addresses) in covered {
+        assert!(
+            addresses.contains(&late),
+            "block {height:?} was indexed without the address its birthday covers"
+        );
     }
 }

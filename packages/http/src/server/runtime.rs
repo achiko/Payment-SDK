@@ -127,10 +127,10 @@ pub fn protected_router(protected: Router, config: &Config) -> Result<Router, Co
             inject_authentication_mode,
         ))
         .layer(DefaultBodyLimit::max(config.limits.max_body_bytes()));
-    if config.authentication_mode.is_strict() {
-        if let Some(token) = config.bearer_token.clone() {
-            protected = protected.layer(middleware::from_fn_with_state(token, require_bearer));
-        }
+    if config.authentication_mode.is_strict()
+        && let Some(token) = config.bearer_token.clone()
+    {
+        protected = protected.layer(middleware::from_fn_with_state(token, require_bearer));
     }
 
     Ok(protected)
