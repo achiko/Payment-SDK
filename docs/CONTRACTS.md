@@ -7,28 +7,39 @@ authoritative for exact lifetimes, generic bounds, and error types.
 
 `wallets::Wallets<I, F>` is the chain-neutral application surface. `I` is the
 embedding application's wallet identity. `F` is its configured family key,
-such as the public API's `Chain` enum.
+such as the public API's asset selector. The collection does not prescribe
+whether an application keys providers by chain, asset, or another closed
+domain identity.
 
 ```rust,ignore
 let mut wallets = wallets::Wallets::new(checkpoints.clone());
 
 wallets.register(
-    Chain::Bitcoin,
+    WalletAsset::Btc,
     bitcoin_scope,
     bitcoin_provider,
     bitcoin_sender,
+    None,
 )?;
 wallets.register(
-    Chain::Ethereum,
+    WalletAsset::Eth,
     ethereum_scope,
-    ethereum_provider,
-    ethereum_sender,
+    ethereum_native_provider,
+    ethereum_native_sender,
+    None,
+)?;
+wallets.register(
+    WalletAsset::Usdc,
+    ethereum_scope,
+    ethereum_usdc_provider,
+    ethereum_usdc_sender,
+    None,
 )?;
 
 let imported = wallets
-    .import(id, &Chain::Bitcoin, secret, BlockHeight(birthday))
+    .import(id, &WalletAsset::Btc, secret, BlockHeight(birthday))
     .await?;
-let generated = wallets.generate(other_id, &Chain::Ethereum).await?;
+let generated = wallets.generate(other_id, &WalletAsset::Usdc).await?;
 ```
 
 Each family registration contains exactly one `IndexScope`, concrete
@@ -62,6 +73,11 @@ let ids = wallets.send_all(transfers).await?;
 let filters = wallets.filters()?;
 ```
 
+`Wallets::send_all` is also the compatibility boundary for a chain `Sender`:
+it resolves every wallet from one registered family and then selects that
+family's sender. Directly pairing a public `Transfer` with a sender from a
+different provider or family is outside the reusable contract.
+
 Business and HTTP code use these methods without matching on the concrete
 chain. The current registry is in memory. An embedding product that needs
 durable custody loads encrypted secrets, identities, family keys, and
@@ -74,7 +90,8 @@ supports:
 
 - `Addresser` and `AddressFormat` for canonical and external address forms;
 - `BalanceReader` for exact balance at an indexed checkpoint;
-- `HistoryReader` for complete checkpoint-bound history;
+- `HistoryReader` for complete checkpoint-bound history of the wallet's
+  configured payment asset;
 - `TransactionFactory` for a chain-backed transaction builder and broadcaster;
   and
 - `Signer` for the minimal signing request.
@@ -94,13 +111,30 @@ A non-empty ordered batch belongs to the registered family's `Sender`:
 - Bitcoin may fund one transaction from several abstract wallets, creates the
   requested outputs and per-source change, signs every input with its owner,
   and returns one submitted ID; and
-- Ethereum prepares consecutive per-source nonces, broadcasts in input order,
-  stops on the first failure, and returns the accepted prefix with the failed
-  index.
+- Ethereum reserves consecutive nonces per sender, prepares and signs the
+  entire batch, broadcasts exact envelopes in input order, stops on the first
+  failure, and returns the accepted prefix with the failed index.
 
-All preflight validation occurs before the first external effect. Mixed-family
-batches fail rather than being split. RPC acceptance means submitted; indexed
-history establishes canonical inclusion and confirmation.
+Request shape and mixed-family compatibility validate before the first external
+effect. Both concrete chains complete chain-level batch preparation before
+broadcast. Ethereum uses one coordinator shared by native and ERC-20 providers,
+keyed by sender address rather than wallet family. It checks cumulative native
+value, maximum fees, and token amounts before signing, and retains an exact
+envelope when a retryable submission outcome is ambiguous. That sender remains
+blocked until exact-hash lookup or exact-envelope replay resolves acceptance.
+RPC acceptance means submitted; indexed history establishes canonical
+inclusion and confirmation.
+
+The coordinator is process-local and is not a durable payment-operation store.
+It assumes one active application writer per managed EOA and does not claim
+crash-safe recovery of an in-flight submission.
+
+An Ethereum provider is configured for exactly one `AssetKind`. Native and
+ERC-20 providers may share account, transaction, and indexing handles, but each
+generated wallet clones only its provider's fixed asset configuration. A token
+wallet resolves movements from its configured contract, keeps native ETH fees
+as fee metadata, and ignores unrelated assets in presentation without changing
+the canonical address-history store.
 
 ## Indexer
 

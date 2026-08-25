@@ -52,6 +52,11 @@ impl FromStr for Address {
 
 impl Address {
     #[must_use]
+    pub fn is_zero(&self) -> bool {
+        self.0 == [0; 20]
+    }
+
+    #[must_use]
     pub fn canonical(&self, scope: indexing::IndexScope) -> CanonicalAddress {
         CanonicalAddress {
             scope,
@@ -131,5 +136,11 @@ mod tests {
             Address::try_from(&address),
             Err(AddressParseError::WrongChain)
         );
+    }
+
+    #[test]
+    fn detects_only_the_zero_address() {
+        assert!(Address([0; 20]).is_zero());
+        assert!(!Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]).is_zero());
     }
 }

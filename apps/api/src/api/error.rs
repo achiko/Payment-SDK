@@ -1,5 +1,6 @@
 use axum::{
     Json,
+    extract::rejection::JsonRejection,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -9,7 +10,7 @@ use utoipa::ToSchema;
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, ToSchema)]
 pub struct ErrorBody {
     pub message: String,
-    /// Transactions accepted before a sequential batch failed.
+    /// Transactions accepted before an ordered batch failed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[schema(required = false)]
     pub transaction_ids: Vec<String>,
@@ -41,6 +42,10 @@ impl ApiError {
         Self::new(ErrorKind::InvalidRequest, message)
     }
 
+    pub fn invalid_json(_error: JsonRejection) -> Self {
+        Self::invalid_request("request body must match the documented JSON schema")
+    }
+
     pub fn invalid_batch(failed_index: usize, message: impl Into<String>) -> Self {
         Self {
             failed_index: Some(failed_index),
@@ -50,6 +55,10 @@ impl ApiError {
 
     pub fn invalid_response(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::InvalidResponse, message)
+    }
+
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::NotFound, message)
     }
 
     fn new(kind: ErrorKind, message: impl Into<String>) -> Self {

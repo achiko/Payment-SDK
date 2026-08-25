@@ -8,5 +8,6 @@ mod api;
 pub use api::{
     Address, AddressEncoding, AddressInput, Asset, Balance, Block, Chain, CreateWallet, Fee,
     HistoryQuery, Movement, MovementKind, Scope, SendFunds, State, Status, Submission, Transaction,
-    TransactionPage, TransferRequest, TransferResponse, Wallet, WalletTransfer, router,
+    TransactionPage, TransferRequest, TransferResponse, Wallet, WalletAsset, WalletTransfer,
+    router,
 };

@@ -56,6 +56,22 @@ where
         result.map_err(CallError::Remote)
     }
 
+    /// Executes one state-changing RPC attempt without hidden failover.
+    pub(crate) async fn call_once(
+        &self,
+        method: &'static str,
+        params: Value,
+    ) -> Result<RawJson, CallError> {
+        let result = self
+            .inner
+            .transport
+            .request_once(method, params)
+            .await
+            .map_err(map_json_rpc_error)
+            .map_err(CallError::Local)?;
+        result.map_err(CallError::Remote)
+    }
+
     /// Executes calls as one JSON-RPC batch and returns results in input order.
     pub(crate) async fn batch(
         &self,

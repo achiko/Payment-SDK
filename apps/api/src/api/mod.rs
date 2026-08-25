@@ -6,7 +6,7 @@ mod openapi;
 mod transaction;
 mod wallet;
 
-pub use contract::{AddressEncoding, AddressInput, Chain, Wallet};
+pub use contract::{AddressEncoding, AddressInput, Chain, Wallet, WalletAsset};
 pub use transaction::{
     Address, Asset, Block, Fee, HistoryQuery, Movement, MovementKind, Scope, SendFunds, Status,
     Submission, Transaction, TransactionPage, TransferRequest, TransferResponse, WalletTransfer,
@@ -21,14 +21,14 @@ use utoipa_axum::router::OpenApiRouter;
 
 #[derive(Clone)]
 pub struct State {
-    wallets: Arc<wallets::Wallets<String, Chain>>,
+    wallets: Arc<wallets::Wallets<String, WalletAsset>>,
     readiness: watch::Receiver<bool>,
 }
 
 impl State {
     #[must_use]
     pub fn new(
-        wallets: Arc<wallets::Wallets<String, Chain>>,
+        wallets: Arc<wallets::Wallets<String, WalletAsset>>,
         readiness: watch::Receiver<bool>,
     ) -> Self {
         Self { wallets, readiness }

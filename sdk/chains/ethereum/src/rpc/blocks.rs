@@ -138,6 +138,22 @@ where
             .map_err(|message| invalid_rpc_response(method, message))
     }
 
+    pub(super) async fn latest_canonical_parameter(&self) -> Result<Value, SourceError> {
+        let raw = self
+            .request_result("eth_getBlockByNumber", json!(["latest", false]))
+            .await?;
+        let block: Value = raw.deserialize().map_err(map_json_rpc_error)?;
+        let hash = block.get("hash").and_then(Value::as_str).ok_or_else(|| {
+            invalid_rpc_response("eth_getBlockByNumber", "latest block has no hash")
+        })?;
+        let hash = super::wire::parse_fixed_data::<32>(hash, "block hash")
+            .map_err(|message| invalid_rpc_response("eth_getBlockByNumber", message))?;
+        Ok(json!({
+            "blockHash": super::wire::data_hex(&hash),
+            "requireCanonical": true,
+        }))
+    }
+
     pub(super) async fn request_result(
         &self,
         method: &'static str,
@@ -154,6 +170,14 @@ where
         params: Value,
     ) -> Result<RawJson, CallError> {
         self.client.call(method, params).await
+    }
+
+    pub(super) async fn request_result_detailed_once(
+        &self,
+        method: &'static str,
+        params: Value,
+    ) -> Result<RawJson, CallError> {
+        self.client.call_once(method, params).await
     }
 
     pub(super) async fn confirm_known_transaction(

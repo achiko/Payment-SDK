@@ -18,9 +18,9 @@ main
   |                                                       -> Composer
   |- Ethereum RPC/source/interpreter/repository/Service -/
   |
-  |- Bitcoin provider/sender --\
-  |                             -> Wallets(instances, birthdays, Checkpoint)
-  `- Ethereum provider/sender -/
+  |- Bitcoin/BTC provider/sender -------\
+  |- Ethereum/ETH provider/sender -------+-> Wallets(instances, birthdays, Checkpoint)
+  `- Ethereum/allowlisted-token provider /
 
 sync task: Wallets::filters() -> Composer
 HTTP: State { Wallets, readiness }
@@ -28,8 +28,23 @@ HTTP: State { Wallets, readiness }
 
 Each configured chain has one long-lived JSON-RPC client shared by its indexing
 source and wallet-side capabilities. Retry and ordered endpoint failover are
-configured once; the architecture does not invent a universal chain RPC
-interface.
+configured once for reads and deterministic preflight; the architecture does
+not invent a universal chain RPC interface. Ethereum raw submission is one
+attempt against the first configured endpoint, so failover cannot hide whether
+an earlier endpoint accepted the envelope. The coordinator owns any exact-byte
+replay and reconciliation.
+
+`apps/api` chooses an application-owned asset key for the existing generic
+wallet-family parameter. Native ETH and an allowlisted ERC-20 such as USDC are
+separate registrations backed by separate `WalletProvider` configurations,
+while sharing the same Ethereum RPC and indexing objects. One generated wallet
+therefore has one fixed payment asset. This application choice does not add
+asset-family state to `sdk/wallets` or `sdk/chains/base`.
+
+Token admission is a composition concern. The application validates the
+allowlisted contract on one canonical block before erasing the concrete account
+client behind wallet capabilities. Until endpoint identities are validated
+separately, token-enabled composition admits exactly one Ethereum RPC endpoint.
 
 The concrete `Arc<Composer>` is cloned into narrow `Indexer`, `Checkpoint`, and
 `History` trait-object views. Bitcoin separately receives an `Arc<dyn Outputs>`
@@ -169,6 +184,10 @@ get, balance, history, one send, and batch send operations. It delegates native
 behavior to registered wallets and senders. Business and endpoint code do not
 match on Bitcoin or Ethereum.
 
+For `payment-api`, `F` is the closed `WalletAsset` selector (`btc`, `eth`, or
+`usdc`), not merely a chain identifier. The collection remains generic and
+other embedding applications may choose a different key type.
+
 The wallet/key registry is in memory. Durable custody is the embedding
 application's responsibility and is not represented as an indexing concern.
 
@@ -238,13 +257,24 @@ second confirmation system.
 
 Bitcoin preserves outpoints, every input/output, scripts, checked satoshi
 fees, per-input signers, and deterministic change. Ethereum preserves chain ID,
-nonces, EIP-1559 fees, typed envelopes, recovered signer, receipts, and logs.
-The shared wallet surface does not replace those native models.
+nonces, EIP-1559 fees, typed envelopes, recovered signer, receipts, logs, and
+the configured native-or-token asset. An ERC-20 wallet exposes only that token
+for balance, send, and history movements while retaining native ETH as network
+fee metadata. The shared wallet surface does not replace those native models.
 
 For batches, validate every request and the one-family constraint before the
 first external effect. Bitcoin may produce one multi-source native transaction.
-Ethereum broadcasts an ordered sequence and reports its accepted prefix if a
-later transaction fails.
+One Ethereum-owned coordinator is shared by native and token providers. It
+reserves consecutive nonces by sender address, completes whole-batch
+simulation, cumulative balance checks, and signing, then broadcasts the exact
+envelopes in request order. A retryable ambiguous submission retains its exact
+envelope and blocks that sender until exact-hash reconciliation; a later
+failure reports only the accepted prefix.
+
+Coordinator state is intentionally in-process because indexing owns no
+pending-transaction records and the product has no durable outgoing-operation
+store. Application composition therefore requires one active transaction
+writer per managed EOA; process-crash recovery is not claimed.
 
 ## Runtime lifecycle
 
@@ -267,8 +297,11 @@ terminates runtime rather than serving stale data.
 ## Product boundary
 
 The architecture currently supports wallet generation/import, canonical
-address and exact balance, complete paginated history, one or ordered batch
-submission, and continuous filtered indexing.
+address and exact selected-asset balance, complete checkpoint-bound paginated
+history for that selected asset, one or ordered batch submission, and
+continuous filtered indexing. Indexing may retain unrelated canonical facts for
+a watched Ethereum address; the concrete wallet projects only its configured
+asset.
 
 It does not contain deposit accounting, ledgers, payment state machines,
 collection/sweep jobs, reservations, hardware-wallet workflows, remote

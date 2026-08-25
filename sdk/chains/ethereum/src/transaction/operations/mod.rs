@@ -23,19 +23,13 @@ pub(super) fn build(
             "Ethereum max fee per gas is below the priority fee",
         ));
     }
-    if request.to.is_none() && request.data.is_empty() {
-        return Err(invalid_transaction(
-            "Ethereum contract creation requires init code",
-        ));
-    }
-
     Ok(UnsignedTransaction {
         chain_id: context.chain_id,
         nonce: context.nonce,
-        from: request.from,
-        to: request.to,
-        value: request.value,
-        input: request.data,
+        from: request.from().clone(),
+        to: Some(request.to().clone()),
+        value: request.value(),
+        input: request.input(),
         gas_limit: context.gas_limit,
         max_fee_per_gas: context.max_fee_per_gas,
         max_priority_fee_per_gas: context.max_priority_fee_per_gas,
