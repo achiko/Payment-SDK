@@ -13,6 +13,7 @@ pub enum ChainErrorKind {
     InsufficientFunds,
     FeeUnavailable,
     RpcUnavailable,
+    Divergent,
     Signer,
     Rejected,
     NotFound,

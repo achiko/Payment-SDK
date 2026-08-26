@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, State, rejection::JsonRejection},
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
@@ -8,7 +8,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::{
     State as HttpState,
-    contract::{Chain, Wallet, WalletPath},
+    contract::{Wallet, WalletAsset, WalletPath},
     error::{ApiError, ErrorBody},
 };
 
@@ -22,7 +22,7 @@ pub fn routes() -> OpenApiRouter<HttpState> {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateWallet {
-    pub chain: Chain,
+    pub asset: WalletAsset,
 }
 
 #[utoipa::path(
@@ -40,11 +40,23 @@ pub struct CreateWallet {
 )]
 async fn create(
     State(state): State<HttpState>,
-    Json(request): Json<CreateWallet>,
+    request: Result<Json<CreateWallet>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Wallet>), ApiError> {
+    let Json(request) = request.map_err(ApiError::invalid_json)?;
     let id = uuid::Uuid::now_v7().to_string();
-    let wallet = state.wallets.generate(id, &request.chain).await?;
+    let wallet = state
+        .wallets
+        .generate(id, &request.asset)
+        .await
+        .map_err(create_error)?;
     Ok((StatusCode::CREATED, Json(wallet.into())))
+}
+
+fn create_error(error: wallets::Error) -> ApiError {
+    if error.kind == wallets::ErrorKind::Unsupported {
+        return ApiError::not_found("wallet asset is not configured");
+    }
+    error.into()
 }
 
 #[utoipa::path(

@@ -2,6 +2,7 @@
 
 mod address;
 mod batch;
+mod erc20;
 mod error;
 mod indexer;
 mod rpc;
@@ -20,7 +21,8 @@ pub use rpc::{
 };
 pub use transaction::{
     BuildContext, FeeInspection, IdError, InspectionError, SignedError, SignedTransaction,
-    TransactionBuilder, TransactionId, TransferRequest, UnsignedTransaction,
+    TransactionBuilder, TransactionCoordinator, TransactionId, TransferIntent, TransferRequest,
+    UnsignedTransaction,
 };
 pub use wallet::{WalletConfig, WalletProvider};
 

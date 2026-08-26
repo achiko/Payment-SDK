@@ -30,6 +30,8 @@ uuid.workspace = true
 wallets = { path = "../../sdk/wallets" }
 
 [dev-dependencies]
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
 alloy-primitives.workspace = true
 bitcoin.workspace = true
 http-body-util = "=0.1.4"

@@ -34,13 +34,10 @@ pub(super) fn restore(
 ) -> Result<Builder, TransactionError> {
     let (destination, amount) = decode(&wallet.config, &wallet.address, snapshot)?;
     let mut builder = Builder::new(
-        wallet.config.scope.clone(),
-        wallet.config.chain_id,
+        wallet.config.clone(),
         wallet.address.clone(),
-        wallet.config.asset.clone(),
-        wallet.config.decimals,
         wallet.signer.clone(),
-        wallet.transactions.clone(),
+        wallet.coordinator.clone(),
     );
     builder.transfer = Some((destination, amount));
     builder.validate()?;
@@ -142,6 +139,15 @@ mod tests {
         assert_eq!(destination, Address([0x22; 20]));
         assert_eq!(amount.to_string(), "1.25");
         assert!(!encoded.contains("private"));
+    }
+
+    #[test]
+    fn wallet_config_rejects_a_zero_token_contract() {
+        let mut config = config();
+        config.asset = AssetKind::Erc20(Address([0; 20]));
+        config.decimals = 6;
+
+        assert!(config.validate().is_err());
     }
 
     #[test]

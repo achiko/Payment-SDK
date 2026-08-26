@@ -6,7 +6,7 @@ use alloy_primitives::keccak256;
 
 use crate::Wei;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Id(pub [u8; 32]);
 
 impl fmt::Display for Id {

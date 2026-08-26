@@ -7,9 +7,9 @@ features. Exact Rust signatures remain authoritative in source.
 ## Outcome
 
 Payment-SDK runs one process. `apps/api/src/main.rs` explicitly constructs the
-Bitcoin and Ethereum stacks, combines their indexers, registers their wallet
-families, imports configured wallets, starts synchronization, and exposes one
-thin HTTP API.
+Bitcoin and Ethereum stacks, combines their indexers, registers the BTC, ETH,
+and optional USDC asset families, imports configured wallets, starts
+synchronization, and exposes one thin HTTP API.
 
 After startup, application and endpoint code use two abstractions:
 
@@ -237,7 +237,8 @@ partial recovery.
 
 `Wallets<I, F>` is the application-facing collection. `I` is the
 application-owned wallet identity and `F` is a small configured family key such
-as the API's `Chain` enum. It owns:
+as the API's `WalletAsset` enum. In `payment-api`, a family identifies one exact
+asset (`btc`, `eth`, or `usdc`), not merely its underlying chain. It owns:
 
 - the family-to-`(IndexScope, Provider, Sender)` registrations;
 - constructed abstract wallet instances and their public metadata;
@@ -251,7 +252,7 @@ The intended call surface is:
 
 ```rust,ignore
 let mut wallets = Wallets::new(checkpoints.clone());
-wallets.register(family, scope, provider, sender)?;
+wallets.register(family, scope, provider, sender, None)?;
 
 let imported = wallets
     .import(id, &family, secret, BlockHeight(birthday))
@@ -360,32 +361,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         history.clone(),
     );
     let bitcoin_sender = bitcoin_provider.transactions();
-    let ethereum_provider = ethereum::WalletProvider::new(
-        ethereum_wallet_config,
-        ethereum_accounts,
-        ethereum_transactions,
-        history,
+    let eth_provider = ethereum::WalletProvider::new(
+        ethereum::WalletConfig {
+            scope: ethereum_scope.clone(),
+            chain_id,
+            asset: ethereum::AssetKind::Native,
+            decimals: ethereum::ETH.decimals,
+        },
+        ethereum_accounts.clone(),
+        ethereum_transactions.clone(),
+        history.clone(),
     );
-    let ethereum_sender = ethereum_provider.transactions();
+    let eth_sender = eth_provider.transactions();
 
     let mut wallets = wallets::Wallets::new(checkpoints);
-    wallets.register(Chain::Bitcoin, bitcoin_scope, bitcoin_provider, bitcoin_sender)?;
-    wallets.register(Chain::Ethereum, ethereum_scope, ethereum_provider, ethereum_sender)?;
+    wallets.register(
+        WalletAsset::Btc,
+        bitcoin_scope,
+        bitcoin_provider,
+        bitcoin_sender,
+        None,
+    )?;
+    wallets.register(
+        WalletAsset::Eth,
+        ethereum_scope.clone(),
+        eth_provider,
+        eth_sender,
+        None,
+    )?;
+    if let Some(contract) = usdc {
+        let usdc_provider = ethereum::WalletProvider::new(
+            ethereum::WalletConfig {
+                scope: ethereum_scope.clone(),
+                chain_id,
+                asset: ethereum::AssetKind::Erc20(contract),
+                decimals: u32::from(USDC_DECIMALS),
+            },
+            ethereum_accounts,
+            ethereum_transactions,
+            history,
+        );
+        let usdc_sender = usdc_provider.transactions();
+        wallets.register(
+            WalletAsset::Usdc,
+            ethereum_scope,
+            usdc_provider,
+            usdc_sender,
+            None,
+        )?;
+    }
 
     // Load/import configured wallets and their birthdays before the first sync.
+    let mut imported_ethereum_assets = BTreeMap::new();
     for configured in config.wallets {
         let bytes = hex::decode(std::env::var(&configured.secret_env)?)?;
         if bytes.len() != 32 {
             return Err("wallet secret must contain exactly 32 bytes".into());
         }
-        wallets
+        let asset = configured.asset;
+        let wallet = wallets
             .import(
                 configured.id,
-                &configured.chain,
+                &asset,
                 wallets::SecretBytes::new(bytes),
                 BlockHeight(configured.start_height),
             )
             .await?;
+        if matches!(asset, WalletAsset::Eth | WalletAsset::Usdc) {
+            remember_imported_ethereum_asset(
+                &mut imported_ethereum_assets,
+                wallet.address.text,
+                asset,
+            )?;
+        }
     }
 
     let wallets = Arc::new(wallets);
@@ -432,6 +480,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+Configuration rejects an imported wallet whose asset family is disabled.
+Startup also rejects assigning the same imported Ethereum address to both the
+ETH and USDC families.
+
 The concrete `Arc<Composer>` is cloned and coerced independently to
 `Arc<dyn Indexer>`, `Arc<dyn Checkpoint>`, and `Arc<dyn History>`. Bitcoin's
 repository separately provides `Arc<dyn Outputs>` to its wallet provider.
@@ -458,7 +510,7 @@ boundary, business code needs no Bitcoin or Ethereum imports:
 
 ```rust,ignore
 async fn pay(
-    wallets: &Wallets<WalletId, Chain>,
+    wallets: &Wallets<WalletId, WalletAsset>,
     wallet_id: &WalletId,
     destination: AddressText,
     amount: Decimal,
@@ -467,16 +519,16 @@ async fn pay(
 }
 
 async fn activity(
-    wallets: &Wallets<WalletId, Chain>,
+    wallets: &Wallets<WalletId, WalletAsset>,
     wallet_id: &WalletId,
 ) -> Result<History, wallets::Error> {
     wallets.history(wallet_id, HistoryRequest::first(100)).await
 }
 ```
 
-The same business functions work for any registered family. Chain selection,
-RPC clients, signing rules, and transaction construction remain inside the
-objects registered in `main`.
+The same business functions work for any registered asset family. Asset and
+chain selection, RPC clients, signing rules, and transaction construction
+remain inside the objects registered in `main`.
 
 ## HTTP boundary
 
@@ -485,13 +537,13 @@ HTTP state is data only:
 ```rust,ignore
 #[derive(Clone)]
 pub struct State {
-    wallets: Arc<Wallets<String, Chain>>,
+    wallets: Arc<Wallets<String, WalletAsset>>,
     readiness: watch::Receiver<bool>,
 }
 
 impl State {
     pub fn new(
-        wallets: Arc<Wallets<String, Chain>>,
+        wallets: Arc<Wallets<String, WalletAsset>>,
         readiness: watch::Receiver<bool>,
     ) -> Self {
         Self { wallets, readiness }
@@ -503,38 +555,47 @@ Liveness always answers for the running process. Readiness reads the current
 watch value and returns success only while all configured index scopes are
 ready; it contains no second status model.
 
-Every endpoint defines its endpoint-specific wire input and output immediately
-above the one handler function:
+Each endpoint-specific wire input stays immediately above its handler. `Wallet`
+is the deliberate shared response contract for both create and read, so it
+lives in `api/contract.rs`:
 
 ```rust,ignore
 #[derive(Deserialize, ToSchema)]
-pub struct CreateWalletInput {
-    pub chain: Chain,
+#[serde(deny_unknown_fields)]
+pub struct CreateWallet {
+    pub asset: WalletAsset,
 }
 
 #[derive(Serialize, ToSchema)]
-pub struct CreateWalletOutput {
+pub struct Wallet {
     pub id: String,
+    pub asset: WalletAsset,
     pub chain: Chain,
     pub network: String,
     pub address: String,
 }
 
-pub async fn create(
-    axum::extract::State(state): axum::extract::State<State>,
-    Json(input): Json<CreateWalletInput>,
-) -> Result<(StatusCode, Json<CreateWalletOutput>), ApiError> {
+async fn create(
+    State(state): State<HttpState>,
+    request: Result<Json<CreateWallet>, JsonRejection>,
+) -> Result<(StatusCode, Json<Wallet>), ApiError> {
+    let Json(request) = request.map_err(ApiError::invalid_json)?;
     let id = uuid::Uuid::now_v7().to_string();
-    let wallet = state.wallets.generate(id, &input.chain).await?;
+    let wallet = state
+        .wallets
+        .generate(id, &request.asset)
+        .await
+        .map_err(create_error)?;
     Ok((StatusCode::CREATED, Json(wallet.into())))
 }
 ```
 
 The handler performs extraction, one domain call, error/status translation,
-and encoding. A resource module may contain several endpoints, but each DTO
-stays directly above the endpoint that owns it. A type is extracted only when
-the exact same wire contract is used by several endpoints. Domain models do
-not move into API DTO modules.
+and encoding. Malformed JSON uses the API's JSON `400` contract, while an
+unregistered asset family maps to `404`. A resource module may contain several
+endpoints, but each endpoint-only DTO stays directly above its owner. A type is
+extracted only when the exact same wire contract is used by several endpoints.
+Domain models do not move into API DTO modules.
 
 ## Current non-goals
 

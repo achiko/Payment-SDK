@@ -77,6 +77,14 @@ impl JsonClient for ScriptedClient {
         Box::pin(async move { Ok(response) })
     }
 
+    fn request_once<'a>(
+        &'a self,
+        method: &'a str,
+        params: Value,
+    ) -> BoxFuture<'a, Result<Result<RawJson, Failure>, Error>> {
+        self.request(method, params)
+    }
+
     fn batch<'a>(
         &'a self,
         requests: Vec<Call>,

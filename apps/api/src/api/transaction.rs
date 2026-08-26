@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::JsonRejection},
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
@@ -334,15 +334,16 @@ pub struct Submission {
         (status = 400, body = ErrorBody),
         (status = 404, body = ErrorBody),
         (status = 422, body = ErrorBody),
-        (status = 503, body = ErrorBody)
+        (status = 503, description = "Transaction unavailable or submission outcome ambiguous", body = ErrorBody)
     ),
     tag = "transactions"
 )]
 async fn send(
     State(state): State<HttpState>,
     Path(path): Path<WalletPath>,
-    Json(request): Json<SendFunds>,
+    request: Result<Json<SendFunds>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Submission>), ApiError> {
+    let Json(request) = request.map_err(ApiError::invalid_json)?;
     let (destination, amount) = request.try_into()?;
     let id = state.wallets.send(&path.id, destination, amount).await?;
     Ok((
@@ -364,7 +365,7 @@ pub struct WalletTransfer {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TransferRequest {
-    /// Transfers for one configured chain and network, in execution order.
+    /// Transfers for one configured asset family, in execution order.
     pub transfers: Vec<WalletTransfer>,
 }
 
@@ -399,21 +400,22 @@ pub struct TransferResponse {
 #[utoipa::path(
     post,
     path = "/v1/transactions",
-    description = "Submits one same-chain batch. Mixed-chain requests are rejected before any transaction is submitted. Bitcoin may group transfers into one transaction; Ethereum submits nonce-ordered transactions. A failure response preserves accepted transaction IDs and the failed request index.",
+    description = "Submits one exact-asset batch. Requests mixing BTC, ETH, or USDC wallet families are rejected before any transaction is submitted. Bitcoin may group transfers into one transaction. Ethereum reserves nonces per sender and prepares the whole batch before submitting exact envelopes in request order. A failure response preserves accepted transaction IDs and the failed request index.",
     request_body = TransferRequest,
     responses(
-        (status = 202, description = "Native batch submitted", body = TransferResponse),
+        (status = 202, description = "Asset batch submitted", body = TransferResponse),
         (status = 400, body = ErrorBody),
         (status = 404, body = ErrorBody),
         (status = 422, description = "Batch failed; accepted transaction IDs identify partial submission", body = ErrorBody),
-        (status = 503, body = ErrorBody)
+        (status = 503, description = "Batch unavailable or submission outcome ambiguous; accepted transaction IDs identify any partial submission", body = ErrorBody)
     ),
     tag = "transactions"
 )]
 async fn send_all(
     State(state): State<HttpState>,
-    Json(request): Json<TransferRequest>,
+    request: Result<Json<TransferRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<TransferResponse>), ApiError> {
+    let Json(request) = request.map_err(ApiError::invalid_json)?;
     let transaction_ids = state
         .wallets
         .send_all(request.try_into()?)

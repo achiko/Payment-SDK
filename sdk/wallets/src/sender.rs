@@ -53,6 +53,10 @@ impl error::Error for SendError {
 ///
 /// UTXO chains may combine compatible transfers into one transaction. Account
 /// chains normally submit one nonce-ordered transaction per transfer.
+/// Callers route batches through [`crate::Wallets::send_all`], which proves
+/// that every wallet belongs to the registered family owning this sender.
+/// Constructing [`Transfer`] values from another provider or family is outside
+/// this capability's contract.
 pub trait Sender: Send + Sync {
     fn send<'a>(&'a self, transfers: Vec<Transfer>) -> SendFuture<'a>;
 }

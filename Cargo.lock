@@ -1068,6 +1068,7 @@ dependencies = [
  "alloy-eips",
  "alloy-primitives",
  "alloy-rpc-types-eth",
+ "alloy-sol-types",
  "base",
  "crypto",
  "futures-executor",
@@ -2833,6 +2834,8 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 name = "payment-api"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
  "alloy-primitives",
  "axum",
  "base",
