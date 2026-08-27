@@ -6,7 +6,7 @@ This file defines the canonical scope for the design-stage workspace.
 
 The system MUST provide one API process that can:
 
-1. initialize Bitcoin and Ethereum RPC clients and embedded indexers;
+1. initialize Bitcoin, Ethereum, and Solana RPC clients and embedded indexers;
 2. generate or import a wallet through a chain-neutral wallet collection;
 3. return a wallet's canonical address, exact balance, and complete paginated
    transaction history;
@@ -24,8 +24,8 @@ wallet/indexer transports.
 
 The project is pre-release. Obsolete internal types and persisted formats MUST
 be replaced directly rather than retained behind compatibility versions or
-migrations. External Bitcoin, Ethereum, HTTP, and JSON-RPC standards remain
-compatibility contracts.
+migrations. External Bitcoin, Ethereum, Solana, HTTP, and JSON-RPC standards
+remain compatibility contracts.
 
 ## Layering
 
@@ -60,7 +60,7 @@ compatibility contracts.
 - MUST keep redundant chain prefixes out of types within the crate namespace.
 - MUST satisfy the common directory skeleton enforced by design lint.
 - MUST be independently deletable without breaking generic crates or the other
-  concrete chain.
+  concrete chains.
 
 ### `sdk/indexing`
 
@@ -211,6 +211,183 @@ compatibility contracts.
   so native and token providers using the same EOA cannot reserve the same
   nonce. This coordination is independent of the selected wallet asset.
 
+## Solana requirements
+
+- Initial Solana support MUST be native SOL only. SPL Token and Token-2022
+  wallet families, balances, history, and sends MUST be rejected as
+  unsupported.
+- Wallet generation and import MUST use Ed25519. Import MUST accept exactly one
+  validated 32-byte secret seed and reject other key encodings.
+- Addresses MUST decode to exactly 32 bytes and round-trip through canonical
+  plain Base58. Solana addresses MUST NOT be labeled or processed as
+  Base58Check.
+- Each configured scope MUST provide a stable network slug and expected genesis
+  hash. Startup MUST verify the hash through the endpoint-affine RPC context
+  used by that scope and fail readiness on mismatch.
+- One coherent identity check, indexing operation, or send operation MUST NOT
+  silently span multiple RPC endpoints.
+- Canonical indexing MUST initially admit only finalized slots. Lower indexing
+  commitment policies MUST be rejected as unsupported.
+- Chain traversal MUST use slots and parent slots. RPC-reported block height is
+  separate metadata, and skipped slots MUST NOT be synthesized as blocks.
+- Outbound native transfers MUST use System Program transfer instructions in
+  legacy transactions. History MUST interpret both legacy and version-0
+  transactions, including loaded addresses and top-level or inner System
+  Program transfers.
+- Destination syntax alone MUST NOT authorize a transfer. Destination account
+  state MUST be validated before signing, and executable, non-System-owned, or
+  otherwise unsupported recipient states MUST be rejected.
+- Priority fees are unsupported initially. Meaningful priority-fee
+  configuration or request input MUST be rejected rather than ignored.
+
+### Native SOL wallet acceptance
+
+- A generated wallet MUST be returned and remain retrievable with native asset
+  `sol`, chain `solana`, the configured network slug, and one canonical Base58
+  address. Responses, metadata, logs, and errors MUST expose no secret
+  material.
+- Importing the same valid seed into the same configured scope MUST derive the
+  same canonical address. A rejected generation or import MUST register neither
+  an active wallet nor an indexing filter.
+- Native SOL values MUST use checked integer lamports and exact base-10 decimal
+  conversion, where one SOL is `1_000_000_000` lamports. Balance responses MUST
+  preserve the exact finalized lamport value without floating-point conversion.
+
+### Native SOL transaction acceptance
+
+- A send MUST reject zero, negative, sub-lamport, or greater-than-`u64`-lamport
+  amounts before signing or broadcast.
+- A supported destination MUST be on-curve and either absent or an existing,
+  non-executable, zero-data account owned by the System Program. Every
+  off-curve destination, executable account, non-zero-data account, and other
+  existing account owner MUST be rejected before signing or broadcast. General
+  address parsing and indexing MUST continue to accept valid off-curve Solana
+  addresses.
+- Every RPC acquisition supplying destination account observations MUST
+  explicitly use `confirmed` commitment. Failure to obtain confirmed state MUST
+  fail destination validation without omitting commitment or substituting
+  `processed` or `finalized`.
+- Every supplied destination account observation, including explicit absence,
+  MUST carry a valid returned Solana context slot. Missing or malformed context
+  MUST fail destination validation, and the context slot MUST NOT be treated as
+  a produced-block height or indexing checkpoint.
+- Before each destination-observation attempt obtains its confirmed `getSlot`
+  base, it MUST issue exactly one endpoint-bound, no-parameter `getHealth`
+  request through the same endpoint-affine RPC context and receive the exact
+  JSON string `"ok"`. The call MUST NOT be transparently retried or failed over.
+  A failed, unsupported, malformed, or non-`"ok"` response MUST close the
+  attempt before any base or account acquisition and produce no eligibility
+  handoff. Health admission MUST be repeated for every attempt, is ephemeral,
+  supplies no slot, and MUST NOT be represented as an SDK-enforced numeric
+  maximum-lag guarantee.
+- Initial native SOL destination validation MUST have no independently trusted
+  numeric cluster-progress reference. Primary-endpoint methods, generic
+  failover endpoints, indexing or readiness state, wall clock, and other
+  transaction-preparation contexts MUST NOT be treated as one. Initial support
+  therefore MUST NOT claim an SDK-enforced numeric maximum lag relative to
+  current cluster progress. If a separately supported future mode requires
+  reference or quorum evidence, missing, malformed, wrong-genesis, timed-out,
+  or insufficient evidence MUST fail closed and MUST NOT fall back to the
+  no-reference path.
+- Initial Solana application configuration MUST expose no maximum-lag,
+  reference-provider, provider-role, quorum, sampling, fallback, or explicit
+  no-reference option. Absence is the only valid initial representation. The
+  root configuration and every relevant nested object MUST enforce exact
+  allowed keys end to end. Any attempted meaningful member MUST fail
+  configuration deserialization before application composition or runtime
+  effects, regardless of whether its value is `null`, zero, false, empty, or
+  apparently disabled. Generic RPC endpoints MUST retain only their ordered
+  primary/failover transport meaning and MUST NOT become independent reference
+  evidence.
+- The shared public destination JSON object used by both transaction POST
+  endpoints MUST remain an exact address-only schema containing `encoding` and
+  `text`. It MUST expose no lag/reference member. Any unrecognized destination
+  member MUST reject the complete authenticated JSON body with the generic
+  `400` schema error, regardless of its name or JSON value, before
+  post-deserialization conversion, `Wallets::send`, or `Wallets::send_all`.
+  Batch rejection at this boundary MUST return no accepted transaction IDs or
+  failed index. OpenAPI MUST publish this object with
+  `additionalProperties: false`.
+- The public single-transfer JSON body for
+  `POST /v1/wallets/{id}/transactions` MUST remain an exact top-level schema
+  containing only the required `destination` and `amount` members.
+  `destination` MUST retain the shared `AddressInput` contract and `amount`
+  MUST remain a JSON string. Any unrecognized top-level member, including a
+  lag/reference control or wrapper, MUST reject the complete authenticated
+  body with the generic `400` schema error before post-deserialization
+  conversion, wallet lookup, or `Wallets::send`, with no transaction-ID or
+  failed-index metadata. OpenAPI MUST publish `SendFunds` with
+  `additionalProperties: false`, exactly those two required properties, the
+  `AddressInput` reference, and string-typed `amount`.
+- Every public `WalletTransfer` item inside `POST /v1/transactions` MUST remain
+  an exact schema containing only the required `wallet_id`, `destination`, and
+  `amount` properties. `wallet_id` and `amount` MUST remain JSON strings, and
+  `destination` MUST retain the shared `AddressInput` contract. Any
+  unrecognized item property, regardless of item position, property order,
+  name, or JSON value, MUST reject the complete authenticated body with the
+  generic `400` schema error before post-deserialization request conversion or
+  `Wallets::send_all`, with no accepted transaction IDs or failed index.
+  OpenAPI MUST publish `WalletTransfer` with `additionalProperties: false`,
+  exactly those three required properties, string-typed `wallet_id` and
+  `amount`, and the `AddressInput` reference.
+- The public `TransferRequest` root for `POST /v1/transactions` MUST remain an
+  exact schema containing only required `transfers`, represented as a JSON
+  array whose items reference `WalletTransfer`. Missing or non-array
+  `transfers`, an invalid root JSON type, or any unrecognized root property
+  MUST reject the complete authenticated body with the generic `400` schema
+  error before post-deserialization request conversion or `Wallets::send_all`,
+  with no accepted transaction IDs or failed index. OpenAPI MUST publish
+  `TransferRequest` with `additionalProperties: false`, exactly that required
+  array property and item reference, and the batch operation MUST reference
+  that component. This structural rule sets no maximum, uniqueness,
+  duplicate-item, or ordering contract.
+- `TransferRequest.transfers` MUST contain at least one item, and OpenAPI MUST
+  publish `minItems: 1` without adding `maxItems`, `uniqueItems`, or a default
+  array. `Wallets::send_all` MUST remain the authoritative non-empty guard for
+  HTTP and direct SDK callers. An authenticated, structurally valid
+  `{"transfers":[]}` MUST reach that guard and return exactly `400` with
+  `{"message":"at least one transfer is required"}`, no transaction-ID or
+  failed-index property, no registered `Sender::send` invocation, and no
+  transaction or chain-side external effect. The SDK source classification
+  MUST be `InvalidBatch`; the collection-level `SendError` and every public
+  projection, including `Display`, MUST represent no failed item index and
+  MUST NOT imply `transaction 0`. The batch operation description MUST make
+  accepted IDs and failed-item metadata conditional on a real-item failure.
+- Before destination account reads, each observation attempt MUST obtain one
+  explicit confirmed `getSlot` result and use that slot as its immutable base
+  `minContextSlot` floor. Every destination account request MUST carry a floor
+  no lower than that base; inability to establish or satisfy it MUST fail
+  destination validation without omitting or lowering the floor.
+- A nominally successful destination account response whose returned context
+  slot is below the exact `minContextSlot` sent on that request MUST be rejected
+  before any account value or absence classification; the complete attempt MUST
+  produce no eligibility handoff.
+- When an attempt requires several contextual destination account responses,
+  requests MUST be issued causally and sequentially. Each request after the
+  first MUST use the greatest predecessor slot accepted by every approved
+  contextual guard as its exact `minContextSlot`, unless another separately
+  approved floor is higher. Accepted response slots MUST be nondecreasing; this
+  ordering guard alone MUST NOT impose a maximum forward spread.
+- If separately approved behavior starts another destination-observation
+  attempt inside the same live native SOL send invocation, the greatest slot
+  accepted by every approved guard in any closed predecessor attempt MUST cross
+  the attempt boundary as the operation's only retained destination slot
+  constraint.
+  The successor MUST reacquire every account observation and establish its own
+  confirmed `getSlot` base using that inherited floor as `minContextSlot`. An
+  inability to satisfy the exact sent floor or a nominal success below it MUST
+  fail before any destination account request without omitting or lowering the
+  floor. Internal preparation reconstruction MUST NOT reset the operation
+  floor; a separate caller invocation or operation restored after process loss
+  MUST start without one.
+- Before a single send broadcasts, it MUST determine the network fee, verify
+  with checked arithmetic that the source can pay the requested lamports plus
+  that fee, sign, and successfully simulate the exact transaction. Any failure
+  during preparation MUST produce zero broadcasts.
+- A successful send MUST return the canonical Base58 first signature derived
+  from the exact signed transaction. A different identifier returned by RPC
+  MUST NOT be reported as success.
+
 ## Sending requirements
 
 The public send input MUST be one non-empty ordered list of wallet,
@@ -232,6 +409,13 @@ accepted prefix and first failed input and MUST NOT imply later inputs were
 attempted. Every Ethereum batch item MUST be simulated, checked against
 cumulative per-sender native/token requirements, and signed before its first
 broadcast.
+
+Solana MUST build one legacy native transaction per transfer. Before any item
+is broadcast, the complete batch MUST validate every amount and destination,
+verify cumulative requested lamports plus network fees per source, and sign and
+successfully simulate every exact transaction. Transactions MUST then broadcast
+in input order. On failure it MUST report the accepted prefix and first failed
+input and MUST NOT imply later inputs were attempted.
 
 The sender MUST preserve exact signed bytes across retryable ambiguous outcomes
 and verify the returned ID against those bytes. An unresolved ambiguous
@@ -282,4 +466,5 @@ System tests MUST compose the public router, wallet families, one composed
 indexer, chain RPC doubles, synchronizer, and temporary redb files in one process.
 They MUST cover birthdays, restart, retained reorg, orphan removal, output
 restoration, one and batch sends, readiness, and shutdown without contacting a
-public network.
+public network. Solana integration tests MUST use owned RPC doubles or a local
+validator and MUST NOT contact a public RPC endpoint.

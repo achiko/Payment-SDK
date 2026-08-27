@@ -236,6 +236,20 @@ or token movements. Filtering preserves the underlying checkpoint and cursor,
 so a page may contain fewer than `limit` items, or be empty while still
 returning `next_cursor`.
 
+## Shared destination input
+
+Both transaction POST endpoints reuse one exact destination object. It contains
+only `encoding` and `text`; address-encoding values and chain-native text rules
+remain chain-specific.
+
+An unrecognized destination member, including a lag, reference-provider,
+provider-role, quorum, sampling, fallback, or explicit no-reference control,
+rejects the complete authenticated JSON body with `400 Bad Request` and the
+generic `request body must match the documented JSON schema` message. This
+happens before post-deserialization conversion or wallet delegation. A rejected
+batch body therefore returns no accepted transaction IDs or failed index.
+OpenAPI publishes `AddressInput` with `additionalProperties: false`.
+
 ## Send one transfer
 
 ```http
@@ -250,6 +264,16 @@ Content-Type: application/json
   "amount": "1.25"
 }
 ```
+
+The top-level `SendFunds` body is exact: `destination` and string-typed
+`amount` are its only properties and both are required. An unrecognized
+top-level member, including a lag/reference control or wrapper, rejects the
+complete authenticated body with `400 Bad Request` and the generic
+`request body must match the documented JSON schema` message. Rejection occurs
+before post-deserialization conversion, wallet lookup, or `Wallets::send`, and
+the error contains no transaction-ID or failed-index metadata. OpenAPI
+publishes `SendFunds` with `additionalProperties: false`, exactly those two
+required properties, and the shared `AddressInput` reference.
 
 After the concrete wallet validates the address and exact positive decimal,
 builds and signs its chain-native transaction, and a node accepts it for
@@ -282,6 +306,44 @@ Content-Type: application/json
   ]
 }
 ```
+
+Each `WalletTransfer` item is exact: required string `wallet_id`, shared
+`AddressInput` `destination`, and required string `amount` are its only
+properties. An unrecognized item property in any array position rejects the
+complete authenticated body with `400 Bad Request` and the generic
+`request body must match the documented JSON schema` message. No item prefix
+is accepted, the error contains no transaction IDs or failed index, and
+rejection occurs before post-deserialization request conversion or
+`Wallets::send_all`. OpenAPI publishes `WalletTransfer` with
+`additionalProperties: false`, exactly those three required properties, the
+string-typed `wallet_id` and `amount`, and the shared `AddressInput` reference.
+
+The enclosing `TransferRequest` root is also exact. Its only property is the
+required `transfers` array, whose items reference `WalletTransfer`. A missing
+or non-array `transfers`, invalid root JSON type, or unrecognized root property
+rejects the complete authenticated body with the same generic `400` message,
+no transaction IDs or failed index, and no post-deserialization conversion or
+`Wallets::send_all` call. OpenAPI publishes the root with
+`additionalProperties: false`, exactly that required array property and item
+reference, and uses it as the batch operation's request body. This root-schema
+rule does not define maximum cardinality, uniqueness, duplicate-item behavior,
+or ordering.
+
+The `transfers` array has a minimum of one item. An authenticated,
+structurally valid `{"transfers":[]}` reaches the authoritative
+`Wallets::send_all` guard and returns exactly `400 Bad Request` with:
+
+```json
+{"message":"at least one transfer is required"}
+```
+
+That collection-level failure has no `transaction_id`, `transaction_ids`, or
+`failed_index`, invokes no registered sender, and produces no transaction or
+chain-side external effect. Its SDK classification is `InvalidBatch`, and its
+public rendering never invents item zero. OpenAPI publishes `minItems: 1`, no
+`maxItems`, `uniqueItems`, or default array, and describes accepted IDs and a
+failed item index as conditional metadata available only when a real item
+fails.
 
 Its success response is `202 Accepted` with the submitted chain-native IDs:
 
