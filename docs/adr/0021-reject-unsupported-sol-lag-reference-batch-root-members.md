@@ -20,8 +20,8 @@ following records:
    structural rejection boundary;
 2. ADR-0022 later decided minimum cardinality and the empty-list HTTP/OpenAPI
    contract; and
-3. Public Transaction Semantics proposes request-order and
-   original-item-index preservation up to the chain-specific handoff.
+3. Public Transaction Semantics accepts request-order and original-item-index
+   preservation up to the chain-specific handoff.
 
 S1.6.3.5.3.2.2.2.2.4.2 is only a collection-semantics grouping label, not an
 approval step. This ADR now addresses only S1.6.3.5.3.2.2.2.2.4.1.
@@ -184,11 +184,10 @@ decide:
 - implementation, dependency, migration, compatibility, or test execution.
 
 ADR-0022 now decides minimum cardinality and the empty-list HTTP/OpenAPI
-contract. If accepted, the named Public Transaction Semantics and Destination
-Account Acquisition proposals would consolidate request order, original
-indices, maximum and duplicate behavior, non-body inputs, slot plausibility,
-acquisition, and mapping. The former nested future labels become historical
-only upon that acceptance.
+contract. The accepted Public Transaction Semantics and Destination Account
+Acquisition decisions consolidate request order, original indices, maximum and
+duplicate behavior, non-body inputs, slot plausibility, acquisition, and
+mapping. The former nested future labels are historical.
 
 ## Alternatives considered
 
@@ -297,8 +296,8 @@ Decision `S1.6.3.5.3.2.2.2.2.4.1` was explicitly approved on 2026-08-27.
 Acceptance records only the batch-root schema rejection policy, matching
 canonical and API documentation, and narrow ADR-0014 through ADR-0020 pointer
 clarifications. It does not authorize Solana source, wallet, transaction, RPC,
-configuration, dependency, API, or test implementation. ADR-0022 and the five
-named consolidation proposals retain their own approval boundaries.
+configuration, dependency, API, or test implementation. ADR-0022 and the named
+consolidation ADRs retain their recorded statuses and approval boundaries.
 
 ## References
 

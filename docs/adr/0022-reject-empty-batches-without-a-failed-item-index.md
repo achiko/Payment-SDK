@@ -136,8 +136,8 @@ Acceptance adds the exact empty-batch outcome to
 metadata, and `minItems: 1` in `docs/API.md`, including the operation
 description's conditional metadata wording. Acceptance also narrows ADR-0014
 through ADR-0021 planning pointers to identify this accepted cardinality leaf.
-Public Transaction Semantics would own request-order and original-item-index
-preservation upon acceptance.
+The accepted Public Transaction Semantics decision owns request-order and
+original-item-index preservation.
 
 ## Scope boundary
 
@@ -153,7 +153,7 @@ boundary, and ownership. It does not decide:
 - maximum cardinality, body-size limits, uniqueness, duplicate-wallet policy,
   defaulting, or coercion;
 - request-order or original-item-index preservation for real items, which the
-  Public Transaction Semantics proposal would own upon acceptance;
+  accepted Public Transaction Semantics decision owns;
 - whether the index-free `SendError` representation is an enum, conditional
   field, constructor set, or another equally precise pre-release replacement;
 - amount parsing, positivity for real items, wallet lookup, family or asset
@@ -171,11 +171,10 @@ boundary, and ownership. It does not decide:
   test execution. The pre-release direct replacement and absence of
   compatibility shims are decided, but their code is not.
 
-If accepted, the named Public Transaction Semantics and Destination Account
-Acquisition proposals would consolidate request order, original indices,
-maximum and duplicate behavior, non-body inputs, slot plausibility,
-acquisition, and mapping. The former nested future labels become historical
-only upon that acceptance.
+The accepted Public Transaction Semantics and Destination Account Acquisition
+decisions consolidate request order, original indices, maximum and duplicate
+behavior, non-body inputs, slot plausibility, acquisition, and mapping. The
+former nested future labels are historical.
 
 ## Alternatives considered
 
@@ -293,7 +292,8 @@ conditional route description, and `minItems: 1`, plus matching canonical/API
 documentation and narrow ADR-0014 through ADR-0021 pointer clarifications
 only. It does not authorize Solana source, wallet, transaction, RPC,
 configuration, dependency, API, SDK, error-type, or test implementation. The
-five named consolidation proposals retain their own approval boundaries.
+named consolidation ADRs retain their recorded statuses and approval
+boundaries.
 
 ## References
 

@@ -4,6 +4,20 @@
 indexing workers, opens their redb files, composes concrete wallet
 providers, and serves one authenticated wallet API.
 
+The Public Transaction Semantics, Destination Account Acquisition, and Native
+SOL Submission sections below describe accepted target contracts that are not
+yet implemented. In particular, the current Rust source does not yet enforce
+the shared 50-item maximum, reject transaction queries, project locally derived
+ambiguous transaction IDs, or contain native SOL acquisition or submission.
+`docs/FEATURE_VALIDATION.md` records those gaps; unmarked existing-runtime
+descriptions remain current.
+
+Native SOL Submission is Accepted and selects blockhash, fee, signing,
+simulation, broadcast, exact-byte replay, and ambiguity behavior below. Solana
+Runtime Composition is also Accepted and fixes the target dependencies,
+configuration, task supervision, readiness, and shutdown, but those application
+changes are not implemented.
+
 ## Run
 
 ```bash
@@ -14,7 +28,8 @@ cargo run --locked -p payment-api -- ./config.json
 The configuration file names the environment variable containing the inbound
 bearer token. The token itself must not be stored in JSON.
 
-Minimal shape with both chains:
+The following is the current implemented Bitcoin/Ethereum redb configuration,
+not the accepted PostgreSQL/Solana target. Its minimal two-chain shape is:
 
 ```json
 {
@@ -116,6 +131,63 @@ Native-only Ethereum configuration may still use ordered endpoint failover.
 HTTP callers never choose a token contract or decimals. Omitting `usdc` leaves
 native ETH enabled without a USDC wallet family.
 
+## Accepted PostgreSQL/Solana configuration target
+
+The accepted-but-unimplemented root replaces per-chain database paths with one
+PostgreSQL object and adds one optional Solana index with a singular endpoint:
+
+```json
+{
+  "bind": "127.0.0.1:8080",
+  "bearer_token_env": "PAYMENT_API_TOKEN",
+  "tls_terminated_upstream": false,
+  "postgres": {
+    "url_env": "PAYMENT_POSTGRES_URL",
+    "schema": "payment",
+    "max_connections": 16
+  },
+  "indexes": {
+    "solana": {
+      "network": "local",
+      "genesis_hash": "<canonical-Base58-genesis-hash>",
+      "rpc": {
+        "endpoint": "http://127.0.0.1:8899",
+        "headers": [],
+        "timeout_seconds": 15,
+        "max_response_bytes": 67108864
+      },
+      "sync": {
+        "confirmation_depth": 1,
+        "reorg_retention": 100,
+        "poll_millis": 1000,
+        "batch_size": 256
+      }
+    }
+  },
+  "wallets": [
+    {
+      "id": "treasury-sol",
+      "asset": "sol",
+      "secret_env": "TREASURY_SOL_SEED",
+      "start_position": 0
+    }
+  ]
+}
+```
+
+The accepted objects are exact closed schemas. `postgres.schema` is a validated
+lowercase identifier, and each connection pins that schema plus `pg_catalog`;
+the URL's search path cannot override it. Startup validates the already-applied
+schema without DDL. Database credentials, endpoint text, header values, and seed
+contents are redacted from ordinary diagnostics.
+
+Solana has exactly one endpoint and no transparent retry or failover. The target
+rejects aliases, per-chain database fields, `start_height`, commitment, priority
+fee, lag/reference/quorum, retry, and Memo-program controls rather than ignoring
+them. Every configured import reads exactly one lowercase 64-character
+hexadecimal Ed25519 seed from its named environment variable; generated SOL
+wallets are process-lifetime only and are not restart-recoverable.
+
 ## Authentication
 
 Every wallet route requires:
@@ -130,7 +202,18 @@ composition root waits until every configured synchronizer reports that it has
 caught up with its node. Readiness is runtime state; it is not persisted in
 redb. This guarantees a newly created wallet can derive an address birthday
 immediately. A synchronizer exit fails startup; a fatal error
-after startup terminates the runtime rather than leave a silently stale API.
+after startup terminates the current runtime rather than leave a silently stale
+API.
+
+Under the accepted-but-unimplemented Solana target, startup first verifies every
+chain identity and the exact executable Memo-v3 account, then validates
+PostgreSQL and imports configured wallets before synchronization and HTTP. A
+runtime-fatal Solana indexer exit publishes not-ready and closes new admission.
+With no guarded envelope the process exits; with a submitted or ambiguous
+envelope, supervised shutdown waits without an automatic deadline while status
+and indexing evidence remain available. After a fatal indexer exit, only
+positive historical status can clear the guard in-process; force-kill explicitly
+accepts the documented duplicate-payment risk.
 
 `GET /openapi.json` is also public and returns the generated OpenAPI 3 contract.
 The wallet and transaction resources are bearer-protected. Utoipa annotations
@@ -158,8 +241,9 @@ Response (`201 Created`):
 }
 ```
 
-The asset must have been configured at startup. Accepted values are `btc`,
-`eth`, and `usdc`; `usdc` is available only when its contract is configured.
+The asset must have been configured at startup. The current implementation
+accepts `btc`, `eth`, and `usdc`; `usdc` is available only when its contract is
+configured. The accepted target adds `sol`, but that value is not implemented.
 Network and token contract are selected by startup configuration, not accepted
 from the request. Each generation selects exactly one payment asset, and ETH
 and USDC generations create independent keys and addresses. Before returning
@@ -250,6 +334,131 @@ happens before post-deserialization conversion or wallet delegation. A rejected
 batch body therefore returns no accepted transaction IDs or failed index.
 OpenAPI publishes `AddressInput` with `additionalProperties: false`.
 
+## Native SOL account acquisition target
+
+One native SOL single or batch send performs one endpoint-affine account
+acquisition with no automatic retry, transparent transport retry, failover, or
+chunking:
+
+```text
+getHealth()
+  -> getSlot(confirmed) = F
+  -> getMultipleAccounts(confirmed, base64, minContextSlot = F) = (C, values)
+  -> getSlot(confirmed, minContextSlot = C) = U
+  -> atomic eligibility and balance handoff at operation floor P = U
+```
+
+Source and destination addresses are deduplicated stably by their canonical
+32-byte value in first-occurrence order. Each original transfer contributes its
+source and then destination when that address has not appeared already. The
+50-transfer public limit therefore produces at most 100 addresses and exactly
+one `getMultipleAccounts` call. Results map by request position only after exact
+cardinality validation and then map back to every original occurrence.
+
+The request asks for full Base64 data without `dataSlice`. Explicit JSON `null`
+alone represents absence. Existing accounts must contain valid lamports, owner,
+executable, data, and total-space values. Data uses the exact
+`[string, "base64"]` tuple and strict Base64 decoding; owner text is canonical
+Base58 for exactly 32 bytes; and decoded data length equals the reported space.
+The response context and complete payload structure validate before the
+closing request. `C` must satisfy `C >= F`; the closing witness must return
+`U >= C`. `F`, `C`, and `U` remain provisional until eligibility and source-
+balance classification succeed; only then does `U` leave acquisition as `P`
+atomically with the complete handoff.
+
+An absent destination is eligible. An existing destination is eligible only
+when it is non-executable, System-owned, and zero-data. Existing sources require
+the same account shape; an absent source contributes zero lamports and fails
+later balance sufficiency. A structurally valid but unsupported account is an
+item-scoped error assigned to the earliest original occurrence using it. It
+prevents the handoff and publishes no floor.
+
+Timeout or cancellation at any await, oversized response, transport/HTTP/RPC
+failure, malformed JSON/Base64/owner or account fields, cardinality mismatch,
+data/space disagreement, below-floor context, or closing-witness failure aborts
+the complete acquisition. It is index-free, publishes no slot floor, releases
+every pre-envelope lexical source lease already held, leaves no background
+acquisition, returns no transaction ID, accepted IDs, failed index, or
+ambiguous ID, and performs no fee call, construction, signing, simulation, or
+broadcast. It cannot release a coordinator-owned submitted or ambiguous
+envelope guard. A new caller invocation starts without retained account facts
+or a floor.
+
+## Native SOL submission target
+
+One process-local Solana coordinator admits a source at a time. A busy or
+ambiguously guarded source rejects the complete new invocation as `503` before
+account RPC or transaction work. A batch identifies the earliest original
+occurrence using that source; a single send has no failed index.
+
+Every non-self payment becomes one legacy transaction containing one System
+Program native transfer followed by one Memo-v3 instruction with a fresh opaque
+random 256-bit Base58 token. That token makes intentional identical occurrences
+produce distinct signatures; it carries no payment/customer facts and is not an
+HTTP idempotency key.
+
+After the account-acquisition handoff, the complete single or batch operation
+obtains a confirmed recent blockhash, constructs every message, obtains every
+exact fee, checks cumulative `amount + fee` per source, signs and verifies every
+distinct transaction, and simulates every exact signed transaction. Any
+preparation failure causes zero broadcasts. The recent-blockhash lifetime uses
+block height, not slot, and is checked before each broadcast.
+
+Prepared transactions broadcast in original order with provider retries
+disabled. The returned signature must equal the locally derived first signature
+and means submitted, not confirmed. After an unknown response, the coordinator
+may make at most two more byte-identical submissions, for three wire calls
+total, only after signature-status and block-height checks. It never rebuilds or
+re-signs an envelope after any item may have reached the network.
+
+Once the first wire call begins, a timeout, disconnect, cancellation, RPC error,
+malformed response, or returned-signature mismatch is ambiguous rather than a
+proved failure. A single send returns `503` with only the locally derived
+`ambiguous_transaction_id`. A batch returns `503` with the definitely
+acknowledged prefix, the ambiguous occurrence's original `failed_index`, and
+that ID; it does not attempt later items.
+
+The accepted native SOL batch target therefore uses this shape:
+
+```json
+{
+  "message": "Solana submission outcome is ambiguous",
+  "transaction_ids": ["<accepted Solana signature>"],
+  "failed_index": 1,
+  "ambiguous_transaction_id": "<locally derived Solana signature>"
+}
+```
+
+An ambiguous source remains blocked until status or canonical finalized history
+proves observation, or blockhash expiry plus complete checkpoint-stable history
+proves absence. Missing evidence may block it indefinitely. This state is not
+durable: operators must run one active writer per source, callers must not
+automatically retry an unknown logical payment, and response loss, restart,
+failover, active-active writers, or a new invocation can double-pay because a
+new invocation creates a new Memo token and exact transaction identity.
+
+## Transaction request controls and precedence
+
+Following any existing transport or authentication rejection, both transaction
+POST routes reject a non-empty URI query string with `400 Bad Request` and:
+
+```json
+{"message":"transaction query parameters are not supported"}
+```
+
+That rejection occurs before JSON shape extraction, request conversion, or
+wallet delegation. An empty query component has no semantic effect. Ordinary
+HTTP, proxy, authentication, content-negotiation, and tracing headers remain
+permitted, but no header controls transaction lag, reference selection,
+commitment, retry, priority fee, or other send behavior.
+
+The remaining public precedence is JSON exact-schema validation; batch
+cardinality; wire-item conversion in original order; itemwise common validation
+in original order; chain-specific complete preparation; then ordered broadcast.
+For each batch occurrence, common validation checks its positive amount,
+resolves its wallet, and checks family compatibility before advancing to the
+next occurrence.
+
 ## Send one transfer
 
 ```http
@@ -326,10 +535,10 @@ no transaction IDs or failed index, and no post-deserialization conversion or
 `Wallets::send_all` call. OpenAPI publishes the root with
 `additionalProperties: false`, exactly that required array property and item
 reference, and uses it as the batch operation's request body. This root-schema
-rule does not define maximum cardinality, uniqueness, duplicate-item behavior,
-or ordering.
+closure is independent from the array policy below and does not imply item
+uniqueness.
 
-The `transfers` array has a minimum of one item. An authenticated,
+The `transfers` array contains from one through 50 items. An authenticated,
 structurally valid `{"transfers":[]}` reaches the authoritative
 `Wallets::send_all` guard and returns exactly `400 Bad Request` with:
 
@@ -341,9 +550,26 @@ That collection-level failure has no `transaction_id`, `transaction_ids`, or
 `failed_index`, invokes no registered sender, and produces no transaction or
 chain-side external effect. Its SDK classification is `InvalidBatch`, and its
 public rendering never invents item zero. OpenAPI publishes `minItems: 1`, no
-`maxItems`, `uniqueItems`, or default array, and describes accepted IDs and a
-failed item index as conditional metadata available only when a real item
-fails.
+`uniqueItems` or default array, and describes accepted IDs and a failed item
+index as conditional metadata available only when a real item fails.
+
+More than 50 items returns the index-free `400 Bad Request` collection error:
+
+```json
+{"message":"at most 50 transfers are allowed"}
+```
+
+That failure has no transaction IDs, failed index, or sender/RPC call. The HTTP
+adapter applies the shared maximum before converting any item, while
+`Wallets::send_all` remains the authoritative minimum-and-maximum guard for HTTP
+and direct SDK callers. OpenAPI publishes `maxItems: 50`.
+
+Every item's identity is its zero-based position in the authored array. The
+entire public-to-sender path preserves exact order and multiplicity. Repeated
+wallet IDs, destinations, amounts, and identical items remain distinct payment
+occurrences; OpenAPI publishes no `uniqueItems` rule. Internal account/RPC reads
+may deduplicate observations only when their results map back to every original
+occurrence.
 
 Its success response is `202 Accepted` with the submitted chain-native IDs:
 
@@ -353,17 +579,22 @@ Its success response is `202 Accepted` with the submitted chain-native IDs:
 
 Required semantics are:
 
+- validation, result mapping, and item-scoped failures preserve each original
+  zero-based occurrence index;
 - one request targets one exact wallet asset; mixed-family wallet IDs,
   including ETH and USDC on the same chain, are rejected before an external
   effect;
 - Bitcoin may combine several source wallets into one transaction, reading all
   sources at one checkpoint, preserving distinct per-source change, signing
   each input with its owner, and creating one requested output per transfer;
-  and
 - Ethereum builds separate transactions and broadcasts them in input order,
   reserving consecutive nonces per sender and reporting any accepted prefix if
   a later broadcast fails. Every Ethereum item is simulated, cumulatively
-  balance-checked, and signed before the first envelope is submitted.
+  balance-checked, and signed before the first envelope is submitted; and
+- Solana builds one distinct transfer-plus-Memo transaction per occurrence,
+  prepares, fee-checks, signs, and simulates the complete batch before its first
+  broadcast, submits in input order, and stops with only the definitely
+  acknowledged prefix at the first failure or ambiguity.
 
 The one-process acceptance suite proves a two-transfer Bitcoin batch produces
 one transaction/ID and a two-transfer Ethereum batch produces two IDs in input
@@ -375,25 +606,48 @@ shared by the ETH and USDC providers. A retryable ambiguous submission retains
 the exact envelope and blocks later sends from that address until exact-hash
 reconciliation or byte-identical replay succeeds.
 
+Those are current Bitcoin and Ethereum implementation claims; the equivalent
+accepted native SOL batch and ambiguity evidence is still missing and is listed
+in `docs/FEATURE_VALIDATION.md`.
+
 That safety state lives only in the running API process. Operators must use one
 active transaction writer per managed EOA; an unclean restart can require
 manual reconciliation because this API does not persist outgoing operations.
 
+The accepted-but-unimplemented Solana target likewise keeps its source guard
+and exact envelope only in the running process. It requires one active writer
+per source and forbids automatic client retry of an unknown logical payment;
+restart or a new invocation can create a new Memo and double-pay.
+
 If a sequential batch fails after a prefix was accepted, the error body keeps
 the ordinary `message` and adds the accepted `transaction_ids` plus the
-zero-based `failed_index` from the original request:
+zero-based `failed_index` from the original request. If exact signed bytes may
+have been submitted without a provable outcome, it also carries the locally
+derived canonical `ambiguous_transaction_id`:
 
 ```json
 {
   "message": "Ethereum submission outcome is ambiguous",
   "transaction_ids": ["<accepted transaction id>"],
-  "failed_index": 1
+  "failed_index": 1,
+  "ambiguous_transaction_id": "<locally derived transaction id>"
 }
 ```
 
+A grouped transaction may represent several public occurrences with one
+chain-native transaction. Its failure or ambiguity has no truthful single item
+index, so the error must omit `failed_index` rather than inventing item zero. A
+grouped ambiguity may still expose its locally derived
+`ambiguous_transaction_id`. A single-send ambiguity likewise returns `503` with
+that ID and without batch IDs or a failed index.
+
 ## Errors
 
-Errors return JSON with one `message` field. Current mappings are:
+Current errors return JSON with required `message` and may add
+`transaction_ids` and `failed_index`. The accepted Public Transaction Semantics
+target also adds optional `ambiguous_transaction_id` and makes failed-index
+presence depend on a truthful item-scoped failure. The current status classes,
+which the target retains, are:
 
 | Status | Meaning |
 |---|---|
@@ -404,13 +658,24 @@ Errors return JSON with one `message` field. Current mappings are:
 | `503` | wallet/indexing unavailable or a submission outcome is ambiguous |
 | `500` | an internal result could not be encoded |
 
-Batch transaction failures use `422` for deterministic terminal failures and
-`503` for retryable or ambiguous failures. Either body may also include
-accepted transaction IDs and the failed input index as shown above.
+Under the accepted target, batch transaction failures use `422` for
+deterministic terminal failures and `503` for retryable or ambiguous failures.
+Accepted IDs contain only the definitely acknowledged prefix. `failed_index`
+is present only when one original occurrence truthfully failed. Presence of
+`ambiguous_transaction_id` always produces `503`; it is reconciliation metadata,
+not proof of submission or an idempotency key.
+
+The chain transaction layer derives that ID from the exact locally signed
+envelope before broadcast. Wallet/common-error conversion preserves it
+unchanged and HTTP only renders it. Provider prose, a provider-supplied
+candidate, or a returned ID that does not match the local envelope cannot
+become reconciliation metadata.
 
 ## Current scope
 
-The public routes cover wallet generation, metadata, balance, history, ordinary
-sending, and chain-native batch sending as described above.
+The currently implemented BTC, ETH, and USDC routes cover wallet generation,
+metadata, balance, history, ordinary sending, and chain-native batch sending.
+Sections explicitly marked as accepted targets do not describe implemented
+routes or fields.
 There are no deposit, payment-state, accounting, collection, indexer-service,
 or wallet-service routes.

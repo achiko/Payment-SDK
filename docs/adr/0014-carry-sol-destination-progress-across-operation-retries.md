@@ -8,6 +8,28 @@ Accepted
 
 2026-08-27
 
+## Subsequent clarification
+
+The accepted **Destination Account Acquisition** decision on 2026-08-28
+supersedes this ADR's original `P = greatest H` promotion formula. For the
+initial native SOL acquisition path, an opening base `F` and account context
+`C` remain provisional. A predecessor may supply a floor to a separately
+approved successor only after its structurally valid complete account response
+is followed by a successful closing `getSlot(minContextSlot = C) = U` with
+`U >= C` and a complete successful eligibility and source-balance handoff; the
+retained floor is that witnessed `U`, not `F`, `C`, or an earlier attempt-local
+`H`.
+
+Timeout, cancellation at any await, oversized or malformed response,
+below-floor context, failed closing witness, or semantic classification failure
+creates no new `P` and releases every pre-envelope lexical source lease. A
+failed first attempt leaves no predecessor floor; a failed future successor
+does not alter a `P` already retained from an earlier complete handoff. Initial
+support still authorizes no automatic successor attempt. If one is approved
+later, it must reacquire every account and use the last fully witnessed `U` as
+its exact opening `minContextSlot`; the operation lifetime, non-persistence,
+and reset boundaries below remain unchanged.
+
 ## Context
 
 ADR-0008 makes one native SOL destination acquisition an all-or-nothing
@@ -92,20 +114,23 @@ Under the rules approved through S1.6.3.5.3.1, no prior operation floor or
 other approved opening floor exists for the first attempt, so that opening
 `getSlot` carries no `minContextSlot`.
 
-Whenever an attempt that established `H` closes while its containing public
-invocation remains live, the operation must retain exactly one derived
-lower-bound constraint:
+Whenever an attempt completes ADR-0024's closing witness and atomic account,
+eligibility, and source-balance handoff while its containing public invocation
+remains live, the operation may retain exactly one derived lower-bound
+constraint for a separately approved successor:
 
 ```text
-P = greatest H reached by any closed predecessor attempt in this operation
+P = greatest witnessed U from any complete predecessor handoff
 ```
 
-Every account value, explicit absence, eligibility classification, mapping,
-and partial result is still discarded under ADR-0008. The predecessor's `F`,
-`H`, request-local `M` values, and response objects also end with that attempt;
-only the derived scalar constraint represented by `P` crosses into the
-successor. An earlier successful eligibility handoff supplies no account fact
-to a later reacquisition; that reacquisition still starts as a fresh attempt.
+If later behavior starts a successor, every account value, explicit absence,
+eligibility classification, mapping, and partial result is discarded under
+ADR-0008. The predecessor's `F`, `H`, `C`, request-local `M` values, and
+response objects also end with that attempt; only the scalar witnessed `U`
+represented by `P` crosses into the successor. An earlier successful handoff
+supplies no account fact to a later reacquisition; that reacquisition still
+starts as a fresh attempt. A failed or cancelled acquisition and a semantic
+classification failure publish no new `P`.
 
 A successor attempt must establish its own base `F_new`. Under the rules
 approved through S1.6.3.5.3.1, its exact opening request floor is:
@@ -141,8 +166,8 @@ implementation must not use addition or subtraction.
 
 ```mermaid
 flowchart LR
-    A1["Predecessor reaches H1"] --> X["Attempt closes; discard account facts"]
-    X --> P["Retain operation floor P = H1"]
+    A1["Predecessor completes handoff at U1"] --> X["Successor starts; discard account facts"]
+    X --> P["Retain operation floor P = U1"]
     P --> K["Successor getHealth: exact ok"]
     K --> G["Successor getSlot: confirmed + exact M_open"]
     K -->|"failure"| D["No base, account requests, or handoff"]
@@ -150,34 +175,34 @@ flowchart LR
     G -->|"any guard fails"| D
 ```
 
-When another attempt closes after reaching `H_new` while the containing
-invocation remains live, the operation updates:
+When another attempt completes its closing witness and atomic handoff at
+`U_new` while the containing invocation remains live, the operation updates:
 
 ```text
-P_new = max(P, H_new)
+P_new = max(P, U_new)
 ```
 
-`H_new` is already no lower than `P`, so assignment to `H_new` is equivalent.
+`U_new` is already no lower than `P`, so assignment to `U_new` is equivalent.
 Direct comparison or assignment must be used. A malformed context,
-below-request-floor nominal success, transport or JSON-RPC error, or error-data
-slot never advances `H` and therefore never advances `P`.
+below-request-floor nominal success, transport or JSON-RPC error, error-data
+slot, failed closing witness, cancellation, or classification error never
+advances `P`.
 
 A context-slot candidate that passes every approved contextual guard may
-advance `H` before later account decoding or destination classification. If
-the attempt later closes and the live operation performs another acquisition,
-its final accepted `H` may therefore become `P`, but none of the account facts
-cross the boundary. A candidate rejected by any applicable guard never raises
-`H` or `P`. A late response from a closed attempt must not advance `P` or
-contribute evidence to its successor.
+advance attempt-local `H` before later account decoding or destination
+classification, but `H` never crosses the boundary. Only the closing `U` of a
+complete successful handoff may become `P`; none of that handoff's account
+facts cross into a future reacquisition. A candidate rejected by any applicable
+guard never raises `H` or `P`. A late response from a closed attempt must not
+advance `P` or contribute evidence to its successor.
 
 The operation floor is a fail-closed safety choice with a bounded liveness
 cost. A lower confirmed view makes the successor unable to establish a base
 until a selected backend reaches `M_open`; the live operation may terminate
 before that occurs. A false extreme value can remain unreachable for the
-operation's entire lifetime. Apparently future-slot handling was unresolved
-when this ADR was accepted. The proposed Destination Account Acquisition ADR
-now supplies an endpoint-local closing witness and delays floor promotion; that
-rule remains unapproved until the named proposal is accepted.
+operation's entire lifetime. The later accepted Destination Account Acquisition
+decision supplies the endpoint-local closing witness and delays floor promotion
+as recorded in the subsequent clarification above.
 
 `P` ends only when the containing public send invocation returns success or a
 terminal error, is cancelled, or is lost with the process. An identical
@@ -252,10 +277,10 @@ and its reset boundary. It does not decide:
   or ambiguous-broadcast coherence.
 
 ADR-0016 through ADR-0022 record the accepted no-reference, exact-input, and
-empty-batch boundaries. If accepted, the named Public Transaction Semantics
-and Destination Account Acquisition proposals would consolidate order/index
-behavior, slot-plausibility, account acquisition, and mapping. The former
-nested future labels become historical only upon that acceptance.
+empty-batch boundaries. The now-accepted Public Transaction Semantics and
+Destination Account Acquisition decisions consolidate order/index behavior,
+slot plausibility, account acquisition, and mapping. The former nested future
+labels are historical.
 
 ## Alternatives considered
 
@@ -325,10 +350,10 @@ object is decided by ADR-0018 and S1.6.3.5.3.2.2.2.2.1. The single-send
 envelope is decided by ADR-0019 and S1.6.3.5.3.2.2.2.2.2. The batch item is
 decided by ADR-0020 and S1.6.3.5.3.2.2.2.2.3. The batch-root schema is decided
 by ADR-0021 and S1.6.3.5.3.2.2.2.2.4.1. Cardinality/empty behavior is decided
-by ADR-0022 and its historical approval label. Order/index behavior is now
-would be owned by the Public Transaction Semantics proposal upon acceptance,
-and future-slot handling would likewise be owned by Destination Account
-Acquisition. Neither follows from the lifetime of `P`.
+by ADR-0022 and its historical approval label. The accepted Public Transaction
+Semantics decision owns order/index behavior, and the accepted Destination
+Account Acquisition decision owns future-slot handling. Neither follows from
+the lifetime of `P`.
 
 ## Consequences
 
@@ -349,8 +374,8 @@ Acquisition. Neither follows from the lifetime of `P`.
   change makes the live operation unavailable until a selected backend reaches
   the floor or the operation terminates.
 - A valid-looking false extreme slot can poison the remainder of that one
-  operation under this ADR alone. The proposed Destination Account Acquisition
-  closing witness narrows that risk but remains separately approvable.
+  operation under this ADR alone. The accepted Destination Account Acquisition
+  closing witness narrows that risk as recorded in the subsequent clarification.
 - Every successor repeats health admission, its opening `getSlot`, and all
   destination reads.
 
@@ -371,9 +396,9 @@ Focused tests must prove:
   first passes ADR-0015 health admission and then issues confirmed `getSlot`
   without `minContextSlot`; only a candidate that passes every applicable guard
   establishes `F` and initializes `H = F`;
-- after an attempt reaches `F1 = 100`, advances to `H1 = 120`, and fails, a
-  separately authorized successor sends confirmed `getSlot` with exact
-  `M_open = minContextSlot = 120`;
+- after an attempt reaches `F1 = 100`, observes `C1 = 115`, closes at `U1 =
+  120`, and completes its atomic handoff, a separately authorized successor
+  sends confirmed `getSlot` with exact `M_open = minContextSlot = 120`;
 - successor candidates `F2 = 120` and `F2 > 120` that pass every other
   applicable guard establish the new base and initialize `H2 = F2`;
 - a nominal candidate `F2 = 119`, malformed result, transport or JSON-RPC
@@ -382,16 +407,19 @@ Focused tests must prove:
 - if another separately approved opening floor is higher than `P`, the exact
   `M_open` sent and defensively checked is that higher approved floor;
 - an error's reported current slot cannot replace, lower, or raise `P`;
-- failure after establishing `F1 = 100` but before an account response retains
-  `P = 100`, while failure before establishing any first base creates no `P`;
-- a context accepted by every applicable guard can advance `H` and later `P`
-  even if account decoding or classification subsequently fails, while none of
-  its account facts survive;
+- failure after establishing `F1 = 100` but before the complete atomic handoff
+  creates no new `P`; when no earlier handoff exists there is no `P`, and a
+  future successor failure leaves an earlier `P` unchanged;
+- a context accepted by every applicable guard may advance attempt-local `H`,
+  but account decoding, closing-witness, classification, or cancellation
+  failure prevents `U` from becoming a new `P` and releases every pre-envelope
+  lexical source lease;
 - malformed context, below-request-floor nominal success, transport or RPC
   failure, and late responses from closed attempts never raise `P`;
 - a base or account-context candidate rejected by any later applicable lag or
   future-slot guard never becomes `F` or raises `H` or `P`;
-- several failed successor attempts keep `P` numerically nondecreasing;
+- several failed successor attempts leave an existing `P` unchanged and create
+  none when the operation has no completed predecessor handoff;
 - `P = u64::MAX` is sent and compared without overflow, and can fail only the
   current live operation rather than another operation;
 - each successor reacquires every destination and never receives account

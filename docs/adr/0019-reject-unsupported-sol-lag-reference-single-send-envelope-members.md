@@ -154,11 +154,11 @@ not decide:
 - implementation, dependency, migration, compatibility, or test execution.
 
 ADR-0020 decides `WalletTransfer`-specific members, ADR-0021 decides the
-`TransferRequest` root, and ADR-0022 decides minimum cardinality. If accepted,
-the named Public Transaction Semantics and Destination Account Acquisition
-proposals would consolidate the remaining collection, non-body input,
-slot-plausibility, acquisition, and mapping questions; the former nested future
-labels become historical only upon that acceptance.
+`TransferRequest` root, and ADR-0022 decides minimum cardinality. The accepted
+Public Transaction Semantics and Destination Account Acquisition decisions
+consolidate the remaining collection, non-body input, slot-plausibility,
+acquisition, and mapping questions; the former nested future labels are
+historical.
 
 ## Alternatives considered
 

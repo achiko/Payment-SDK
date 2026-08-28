@@ -8,6 +8,26 @@ Accepted
 
 2026-08-27
 
+## Subsequent clarification
+
+The accepted **Destination Account Acquisition** decision on 2026-08-28
+partially supersedes this method-neutral publication model for the initial
+native SOL path. Initial acquisition now issues one `getMultipleAccounts`
+request: its valid context `C` may advance the attempt-local causal floor only
+for the closing `getSlot(minContextSlot = C)` request. `C` is provisional and
+never becomes the operation floor merely because its account response arrived.
+
+The account response must first pass cardinality, context, and complete payload
+structure/encoding checks. A successful closing witness returns `U >= C`; only
+that witnessed `U` may become operation floor `P`, and only atomically with the
+complete successful eligibility and source-balance handoff. Timeout,
+cancellation, oversized or malformed response, below-floor context, failed
+closing witness, or semantic classification failure discards all account facts
+and publishes no floor. It also releases every pre-envelope lexical source
+lease already held by the invocation. The causal non-regression rules below
+remain applicable if a future accepted design introduces several account
+requests, but initial acquisition neither chunks nor issues them concurrently.
+
 ## Context
 
 ADR-0008 permits one native SOL destination-observation attempt to use one or

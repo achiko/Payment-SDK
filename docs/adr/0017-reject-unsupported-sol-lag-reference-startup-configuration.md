@@ -170,10 +170,10 @@ does not decide:
   confirmation, or ambiguous-broadcast coherence.
 
 ADR-0018 through ADR-0022 record the accepted exact-input and empty-batch
-boundaries. If accepted, the named Public Transaction Semantics and Destination
-Account Acquisition proposals would consolidate order/index behavior,
-slot-plausibility, account acquisition, and mapping. The former nested future
-labels become historical only upon that acceptance.
+boundaries. The accepted Public Transaction Semantics and Destination Account
+Acquisition decisions consolidate order/index behavior, slot plausibility,
+account acquisition, and mapping. The former nested future labels are
+historical.
 
 ## Alternatives considered
 
@@ -272,8 +272,8 @@ Focused future tests must prove:
   schemas unchanged. ADR-0018 later accepts their shared destination closure,
   ADR-0019 later accepts the single-send envelope, ADR-0020 later accepts the
   batch item, ADR-0021 later accepts the batch-root schema, ADR-0022 later
-  accepts cardinality/empty behavior, and the Public Transaction Semantics
-  proposal would own order/index behavior upon acceptance; and
+  accepts cardinality/empty behavior, and the accepted Public Transaction
+  Semantics decision owns order/index behavior; and
 - Bitcoin and Ethereum configuration behavior remains unchanged.
 
 ## Approval boundary

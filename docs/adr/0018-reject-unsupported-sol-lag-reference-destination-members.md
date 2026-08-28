@@ -156,11 +156,10 @@ OpenAPI closure, and ownership. It does not decide:
 
 ADR-0019 decides the single-send `SendFunds` envelope, ADR-0020 decides the
 `WalletTransfer`-specific members, ADR-0021 decides the `TransferRequest` root,
-and ADR-0022 decides minimum cardinality. If accepted, the named Public
-Transaction Semantics and Destination Account Acquisition proposals would
-consolidate the remaining collection, non-body input, slot-plausibility,
-acquisition, and mapping questions; the former nested future labels become
-historical only upon that acceptance.
+and ADR-0022 decides minimum cardinality. The accepted Public Transaction
+Semantics and Destination Account Acquisition decisions consolidate the
+remaining collection, non-body input, slot-plausibility, acquisition, and
+mapping questions; the former nested future labels are historical.
 
 ## Alternatives considered
 

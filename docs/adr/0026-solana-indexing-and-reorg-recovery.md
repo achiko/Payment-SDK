@@ -1,12 +1,18 @@
-# ADR-0026: Solana Indexing and Reorg Recovery
+# ADR-0026: Indexing & Central Database
 
 ## Status
 
-Proposed
+Accepted
 
 ## Date
 
 2026-08-27
+
+## Accepted
+
+Accepted by the user on 2026-08-28 under the simplified decision name
+**Indexing & Central Database**. The historical file name is retained to avoid
+churn in existing references.
 
 ## Context
 
@@ -26,11 +32,23 @@ Solana-specific synchronizer.
 
 Remove the out-of-contract `indexing::Registry` and `RegisteredAddress`
 surface, the PostgreSQL registry module/queries, and the optional registry
-parameter plus `Wallets::adopt`/`restore` coupling. Indexing persists no watch,
-address selection, wallet identity, or secret bytes. Runtime-generated wallets
-remain process-local; configured historical imports remain startup-only. Any
-future durable wallet registry belongs to the wallet/application boundary and
-requires a separately approved encrypted-custody design.
+parameter plus `Wallets::adopt`/`restore` coupling. This removes indexing's
+source-level ownership of wallet identity, selection, and custody; it does not
+authorize dropping, truncating, or rewriting the application-owned
+`payment_wallets` table. Existing application rows must be preserved.
+
+Indexing persists no watch, address selection, wallet identity, or secret
+bytes. Runtime-generated wallets remain process-local; configured historical
+imports remain startup-only. Any application-side wallet-schema or custody
+transition requires a separately approved encrypted-custody design and an
+explicit owner outside indexing.
+
+The ownership transfer is ordered: application-owned code must first gain and
+verify a read path for every existing `payment_wallets` row needed at restart;
+only then may indexing registry queries and wallet coupling be removed. Until
+that handoff is implemented and tested, the existing read path remains despite
+its incorrect ownership so preserved rows do not become stranded. The handoff
+must not reinterpret, rewrite, log, or expose stored secret bytes.
 
 `sdk/indexing` owns one concrete checkpoint/revision coordinator and its commit
 and publication permits because the protected commit occurs in the generic
@@ -120,7 +138,7 @@ BigTable branch can return before enforcing `minContextSlot`, while finalized
 `getBlocks` enforces that floor before selecting local blockstore or BigTable.
 The singular URL may still hide a load balancer, so canonical agreement among
 its physical backends remains the explicit operator trust assumption recorded
-by the runtime-composition proposal.
+by the accepted Runtime Composition decision.
 
 Every selected slot is then fetched with the exact full `getBlock` configuration
 above. The response is explicitly paired with its requested slot and must
@@ -179,8 +197,10 @@ value must not be raised without decoder and fixture coverage.
 Produced block height continues to own confirmations, journal keys, history
 ordering, and retention. Slot owns RPC traversal, birthdays, canonical lookup,
 and restart. Redb and PostgreSQL records store both coordinates and atomic
-parent position/hash; old pre-release records and cursors are rejected and
-rescanned without compatibility readers.
+parent position/hash. Redb records and old cursors may be replaced or rejected
+without compatibility readers. Shared PostgreSQL indexing rows instead follow
+ADR-0003's preservation-first, indexing-only backfill; there is no runtime
+compatibility reader or inferred `position = height` fallback.
 
 ### Dynamic wallet correctness
 
@@ -209,6 +229,10 @@ revision. A sync plan therefore either includes the new filter or commits first
 and forces the wallet to start after that commit. Startup-only historical import
 remains exclusive and publishes its explicit position before sync begins;
 lowering a birthday after progress requires scope recreation and rescan.
+
+Here scope recreation means deleting and rebuilding only indexing-owned rows
+for one explicitly approved `(chain, network)` scope. It never means recreating
+the central database, changing another scope, or deleting `payment_wallets`.
 
 ## Consequences
 
@@ -244,10 +268,14 @@ Generic tests must cover sparse positions, actual parent jumps, produced-height
 continuity, skipped-slot birthdays, the checkpoint-read/commit/filter-publish
 race in both possible orders, commit cancellation recovery, startup import,
 restart, retained reorgs, deep reorg failure, confirmations, both repository
-round trips, removal of the indexing registry/secret persistence surface, and
-old record/cursor rejection. The missing
-`sdk/indexing/postgres/migrations/0001_init.sql` fixture must be restored or
-replaced before PostgreSQL can satisfy this gate. Solana tests must cover
+round trips, removal of the indexing registry/secret query surface, and old
+record/cursor rejection. PostgreSQL validation must migrate the current sibling
+integration baseline into the canonical ordered history under
+`sdk/indexing/postgres/migrations/`; preserve
+existing Bitcoin and Ethereum checkpoints, history, and journals; leave
+sentinel `payment_wallets` rows byte-for-byte unchanged; and prove Bitcoin,
+Ethereum, and Solana scopes plus native and token assets coexist in one schema.
+Solana tests must cover
 backward tip windows, count-bounded forward windows, the 500,000-position
 boundary, empty and short skipped-slot windows, prefix resume, strict in-range
 slot mapping, known-tip omission, false-high `T`, a huge empty gap, enumeration
@@ -258,16 +286,19 @@ completeness, unsupported versions, no partial commit, same-slot canonical
 mismatch, replacement-fork omission of a stored slot, and rejection of a
 `getBlocksWithLimit` implementation shortcut.
 
-## Approval boundary
+## Implementation boundary
 
-This proposal consolidates finalized traversal, pruning, checkpoint,
-persistence, restart, reorg, transaction-version, and dynamic-filter rules. It
-does not authorize implementation. Acceptance requires reconciling the current
-height-only and stale registry descriptions in `ARCHITECTURE.md`,
-`docs/CONTRACTS.md`, `docs/INDEXING.md`, and `docs/SYSTEM_REQUIREMENTS.md` with
-accepted ADR-0003 and this coordination contract before source changes begin.
-The source-level registry removal and PostgreSQL schema repair are explicit
-prerequisites, not documentation-only cleanup.
+This decision consolidates finalized traversal, pruning, checkpoint,
+persistence, restart, reorg, transaction-version, dynamic-filter, and central
+PostgreSQL rules. Acceptance authorizes the architecture record and a detailed
+implementation plan. It does not authorize Rust changes, SQL execution,
+dependency changes, database mutation, or runtime rollout.
+
+Source-level registry ownership transfer and the PostgreSQL schema transition
+remain explicit implementation prerequisites. The transition must be
+indexing-only with application-table preservation; it is never permission to
+recreate the database. Each implementation slice remains separately reviewable
+and requires the user's approval before editing production code or SQL.
 
 ## References
 
@@ -281,6 +312,7 @@ prerequisites, not documentation-only cleanup.
 - [Pinned Agave `getBlocksWithLimit` BigTable early return](https://github.com/anza-xyz/agave/blob/3134055b562e95902233be308453fffa1c4a8902/rpc/src/rpc.rs#L1498-L1545)
 - `docs/adr/0003-separate-native-block-position-from-produced-block-height.md`
 - `docs/adr/0004-derive-native-sol-history-from-system-transfers.md`
+- `docs/INDEXING_CENTRAL_DATABASE_PLAN.md`
 - `sdk/indexing/src/synchronizer.rs`
 - `sdk/indexing/redb/src/record.rs`
 - `sdk/indexing/postgres/src/row.rs`

@@ -1,7 +1,20 @@
 # Public contracts
 
-This document describes the reusable Rust boundaries. Current source is
-authoritative for exact lifetimes, generic bounds, and error types.
+This document describes the target reusable Rust boundaries. Current source is
+authoritative for exact lifetimes, generic bounds, and error types that are
+already implemented. The accepted Public Transaction Semantics, Destination
+Account Acquisition, block-coordinate, and shared-PostgreSQL target changes
+below are not fully implemented: the current batch path has no 50-item guard or
+locally derived ambiguous-ID projection, no Solana crate or account-acquisition
+path exists, `apps/api` still composes per-chain redb repositories, and both the
+current `BlockRef` and PostgreSQL adapter remain height-only. The existing
+PostgreSQL adapter does already provide scope-bound persistence collections;
+the production shared-pool composition, dual-coordinate model, and preservation
+evidence are missing. Provider-owned native generation and canonical plain
+Base58 are also accepted but unimplemented. Native SOL Submission is Accepted
+but unimplemented. Solana Runtime Composition is Accepted and fixes the target
+dependency, application supervision, readiness, and shutdown contract, but none
+of that runtime composition is implemented.
 
 ## Wallet collection
 
@@ -19,25 +32,28 @@ wallets.register(
     bitcoin_scope,
     bitcoin_provider,
     bitcoin_sender,
-    None,
 )?;
 wallets.register(
     WalletAsset::Eth,
     ethereum_scope,
     ethereum_native_provider,
     ethereum_native_sender,
-    None,
 )?;
 wallets.register(
     WalletAsset::Usdc,
     ethereum_scope,
     ethereum_usdc_provider,
     ethereum_usdc_sender,
-    None,
+)?;
+wallets.register(
+    WalletAsset::Sol,
+    solana_scope,
+    solana_provider,
+    solana_sender,
 )?;
 
 let imported = wallets
-    .import(id, &WalletAsset::Btc, secret, BlockHeight(birthday))
+    .import(id, &WalletAsset::Btc, secret, BlockPosition(birthday))
     .await?;
 let generated = wallets.generate(other_id, &WalletAsset::Usdc).await?;
 ```
@@ -47,12 +63,26 @@ Each family registration contains exactly one `IndexScope`, concrete
 composition. A separate provider registry would duplicate that same family map
 and is not part of the target API.
 
-`Provider::create` imports secret bytes. Its default `Provider::generate` uses
-the operating-system RNG before delegating to `create`. Both return an abstract
-wallet and never return secret material.
+`Provider::create` and `Provider::generate` are both mandatory target methods.
+Each concrete provider owns its native secret generation and validation policy,
+then reuses its own `create` path. Bitcoin and Ethereum explicitly generate
+secp256k1 material; Solana generates one Ed25519 seed. Both operations return an
+abstract wallet and never return secret material. The current source still has
+a generic secp256k1 `generate` default; removing that default is accepted
+prerequisite work, not implemented evidence.
 
-Import requires a birthday. Generation assigns the next block after the
-current checkpoint, or block zero when the scope has no checkpoint. `Wallets`
+A generated Solana wallet exists only for the current process and is not
+restart-recoverable. A configured Solana import is reconstructed from exactly
+one lowercase 64-character hexadecimal seed held in its named environment
+variable and is registered before synchronization. Secret strings, decoded
+temporaries, and private wrappers are zeroized and never ordinarily formatted,
+serialized, or cloned. This contract adds no Solana row to `payment_wallets` and
+does not claim durable production custody.
+
+Import requires a native-position birthday. Generation assigns the checked
+successor of the current checkpoint position, or position zero when the scope
+has no checkpoint. If the successor is not a produced block, the address
+becomes active at the first produced block after it. `Wallets`
 stores the abstract instance, public identity/scope/address metadata, and the
 deduplicated `AddressFilter` used for synchronization.
 
@@ -79,9 +109,14 @@ family's sender. Directly pairing a public `Transfer` with a sender from a
 different provider or family is outside the reusable contract.
 
 Business and HTTP code use these methods without matching on the concrete
-chain. The current registry is in memory. An embedding product that needs
-durable custody loads encrypted secrets, identities, family keys, and
-birthdays from its own trusted store before synchronization.
+chain. Wallet/custody persistence belongs to the embedding application. An
+application-owned `payment_wallets` table may share the physical PostgreSQL
+database, but indexing must not query or mutate it. The application loads
+encrypted secrets, identities, family keys, and birthdays from its trusted
+store before synchronization. Preserving the current table does not certify its
+opaque secret bytes as encrypted custody; that application design requires a
+separate decision. Application-owned restart reads must be verified before the
+current indexing-owned query path is removed.
 
 ## Wallet capabilities
 
@@ -89,7 +124,8 @@ birthdays from its own trusted store before synchronization.
 supports:
 
 - `Addresser` and `AddressFormat` for canonical and external address forms;
-- `BalanceReader` for exact balance at an indexed checkpoint;
+- `BalanceReader` for an exact selected-asset balance, with an optional
+  canonical observation `BlockRef` when the concrete source supplies one;
 - `HistoryReader` for complete checkpoint-bound history of the wallet's
   configured payment asset;
 - `TransactionFactory` for a chain-backed transaction builder and broadcaster;
@@ -100,24 +136,143 @@ Code needing one capability accepts that capability rather than `dyn Wallet`.
 `Provider` is construction and does not become a post-construction wallet
 capability.
 
+`AddressEncoding::Base58` is distinct from `Base58Check`. The accepted Solana
+address boundary decodes exactly 32 bytes and requires canonical plain-Base58
+round trips; Bitcoin encodings keep their existing network and checksum rules.
+
+A native SOL balance is an exact finalized `u64` lamport value converted to a
+nine-decimal `Decimal` without floating point. Its `observed_at` remains
+optional under the shared contract; a concrete implementation must not invent a
+checkpoint when its balance source did not supply one.
+
 One-wallet sending belongs to the wallet abstraction. It validates the
 destination and exact positive amount, constructs the chain-native-backed
 builder, prepares/signs, broadcasts the exact signed bytes, and verifies the
 returned transaction ID. `Wallets::send` owns lookup and delegates this
 operation.
 
-A non-empty ordered batch belongs to the registered family's `Sender`:
+A batch contains from one through 50 ordered occurrences and belongs to the
+registered family's `Sender`. `Wallets::send_all` is the authoritative
+minimum-and-maximum guard for HTTP and direct SDK callers; a concrete sender
+also rejects an out-of-contract count before chain I/O. Each occurrence keeps
+the identity of its zero-based input position. Conversion, wallet lookup,
+common validation, sender handoff, and result mapping preserve exact length,
+order, and multiplicity; duplicate items remain distinct requested payments.
+
+The chain behaviors are:
 
 - Bitcoin may fund one transaction from several abstract wallets, creates the
   requested outputs and per-source change, signs every input with its owner,
   and returns one submitted ID; and
 - Ethereum reserves consecutive nonces per sender, prepares and signs the
   entire batch, broadcasts exact envelopes in input order, stops on the first
-  failure, and returns the accepted prefix with the failed index.
+  failure, and returns the accepted prefix with the failed index; and
+- Solana builds one distinct legacy System-transfer-plus-Memo transaction per
+  occurrence, prepares and simulates the complete batch, broadcasts exact
+  signed bytes in input order, and returns only the definitely acknowledged
+  prefix before the first failed or ambiguous occurrence.
+
+### Native SOL account acquisition ownership
+
+The concrete Solana chain owns one private acquisition per public single or
+batch invocation. After syntax and on-curve validation, it walks original
+occurrences in order and stably deduplicates canonical 32-byte source-then-
+destination addresses. At most 100 unique addresses enter one unchunked
+`getMultipleAccounts` request. The same endpoint executes health admission,
+opening confirmed slot `F`, the full Base64 account observation at context `C`,
+and closing confirmed witness `U`, with `C >= F` and `U >= C`.
+
+The acquisition has one complete-or-empty handoff. Exact cardinality,
+positional mapping, strict account decoding, decoded-data/space agreement, and
+every source and destination classification complete before the snapshot and
+source balances leave the chain. Only then is witnessed `U` published
+atomically as operation floor `P`. No chain-neutral RPC or transaction trait
+gains Solana account DTOs, slot variables, or partial-acquisition state;
+`packages/json-rpc` retains only generic framing, correlation, bounded
+transport, and response execution.
+
+Timeout, cancellation, response-size rejection, malformed response, below-
+floor context, or failed closing witness is operation-wide and index-free. It
+discards all account facts and floor candidates, releases every pre-envelope
+lexical source lease already held by the containing send operation, and has no
+transaction ID, accepted IDs, failed index, ambiguous ID, or downstream
+transaction effect. It never releases a coordinator-owned submitted or
+ambiguous envelope guard. A structurally coherent but unsupported account
+shape instead identifies the earliest original occurrence using that account;
+because it prevents the complete handoff, it still publishes no floor and
+releases the containing operation's lexical leases.
+
+### Native SOL submission ownership
+
+The concrete Solana chain owns a process-local coordinator keyed by resolved
+source public key. It acquires all involved sources in canonical byte order
+before account RPC. A busy or ambiguously guarded source rejects the complete
+new invocation as `SourceBusy`, releases its provisional leases, and performs no
+new RPC, construction, signing, simulation, or broadcast.
+
+`Wallets::send` and the chain-neutral `Sender` batch path reach that same
+private coordinator; they do not create independent source guards. Solana
+message, account, blockhash-lifetime, Memo, exact-envelope, and source-lease
+types remain private to `sdk/chains/solana`. They do not add a universal RPC,
+transaction, retry, or coordinator trait to `sdk/chains/base` or
+`packages/json-rpc`.
+
+The Solana crate owns one narrow submission-task registration capability;
+`apps/api` implements it with its application-owned queue and tracked task set.
+Registration succeeds only after the supervisor inserts the task. A closed
+registrar or acknowledgement loss before insertion fails before dispatch, so no
+handler or SDK object can detach an untracked send. Complete destination account
+acquisition precedes registration; once a registered task crosses dispatch, its
+submitted or ambiguous guard is coordinator-owned.
+
+After the acquisition handoff publishes operation floor `P`, the coordinator
+obtains one confirmed recent-blockhash lifetime; constructs one exact System
+transfer plus opaque random Memo-v3 token per occurrence; obtains exact fees;
+checks cumulative source `amount + fee`; signs, verifies, and serializes each
+distinct message; and simulates every exact signed transaction. Any preparation
+failure produces zero broadcasts. The Memo makes intentional identical
+occurrences distinct but is not a request-idempotency key.
+
+Broadcast is sequential and requires the provider result to match the locally
+derived first signature. An unknown result may cause at most two additional
+byte-identical submissions, for three wire calls total, after signature-status
+and block-height checks. Once the first wire call begins, every transport,
+provider, malformed-response, returned-signature, or cancellation outcome that
+does not prove observation remains ambiguous and exposes only that locally
+derived signature as reconciliation identity.
+
+The guarded source remains unavailable until signature status or canonical
+finalized indexed history proves observation, or blockhash expiry plus one
+complete checkpoint-stable history traversal proves absence. Missing evidence
+may block it indefinitely. State is not durable: one process must be the only
+writer per source, callers must not automatically retry an unknown logical
+payment, and response loss, restart, failover, active-active writers, or a new
+invocation can double-pay.
+
+Reconciliation reuses only the same scope's narrow chain-neutral `Checkpoint`
+and `History` capabilities plus an application-published checkpoint-advance
+notification. Indexing does not learn about source leases or exact envelopes
+and stores no outgoing-operation state for the coordinator.
+
+`SendError` carries the definitely acknowledged IDs, an optional original
+`failed_index`, the source error, and an optional canonical
+`ambiguous_transaction_id`. An item-scoped failure has its original index. An
+empty/oversized collection, operation-wide preparation/resource failure, or
+grouped-transaction broadcast failure has no synthetic index. A grouped
+ambiguity may still carry its locally derived transaction ID.
+
+The concrete chain transaction error is the sole origin of an ambiguous ID: it
+derives the canonical, chain-validated value from the exact locally signed
+envelope. Wallet and send-error conversion preserve that value unchanged; the
+HTTP layer only projects it. Provider prose or a returned identifier that does
+not match the local envelope has no authority. The ID is reconciliation
+metadata, not proof of submission or an idempotency key.
 
 Request shape and mixed-family compatibility validate before the first external
-effect. Both concrete chains complete chain-level batch preparation before
-broadcast. Ethereum uses one coordinator shared by native and ERC-20 providers,
+effect. All three concrete chains complete their accepted chain-level batch
+preparation before broadcast. Solana account acquisition and submission are
+Accepted in ADR-0024 and ADR-0025 but unimplemented. Ethereum uses one
+coordinator shared by native and ERC-20 providers,
 keyed by sender address rather than wallet family. It checks cumulative native
 value, maximum fees, and token amounts before signing, and retains an exact
 envelope when a retryable submission outcome is ambiguous. That sender remains
@@ -125,9 +280,9 @@ blocked until exact-hash lookup or exact-envelope replay resolves acceptance.
 RPC acceptance means submitted; indexed history establishes canonical
 inclusion and confirmation.
 
-The coordinator is process-local and is not a durable payment-operation store.
-It assumes one active application writer per managed EOA and does not claim
-crash-safe recovery of an in-flight submission.
+The Ethereum coordinator is process-local and is not a durable payment-operation
+store. It assumes one active application writer per managed EOA and does not
+claim crash-safe recovery of an in-flight submission.
 
 An Ethereum provider is configured for exactly one `AssetKind`. Native and
 ERC-20 providers may share account, transaction, and indexing handles, but each
@@ -163,6 +318,13 @@ pub trait FilterSource: Send + Sync {
 }
 ```
 
+The `BlockRef` returned by `Checkpoint` contains a native `BlockPosition`, a
+produced `BlockHeight`, the block hash, and an atomic optional parent pairing
+parent position with parent hash. `BlockPosition` drives RPC traversal,
+canonical lookup, restart, readiness, and birthdays. `BlockHeight` drives
+confirmation arithmetic, history/output ordering, journal keys, and retained-
+block counts. Only genesis may omit the parent pair.
+
 `sync` reads the selection itself rather than receiving a snapshot, and the
 ordering is part of the contract: it reads once before any source I/O so a
 malformed selection fails without a reachable node, then reads it again after
@@ -186,10 +348,11 @@ The three numeric inputs must be greater than zero. Confirmation depth is the
 `u64` value itself; it does not need a one-field policy wrapper.
 
 `Wallets` owns the address selection and receives the composed `Checkpoint`
-capability to choose safe runtime birthdays. Indexing owns no address registry
-or watch lifecycle. The sync task hands the composed indexer a `FilterSource`
-that reads `wallets.filters()`, rather than a set read in advance, so a wallet
-adopted while a pass is starting is still covered from its birthday.
+capability to choose safe runtime birthdays. Indexing owns no address registry,
+wallet identity, secret, or watch lifecycle. The sync task hands the composed
+indexer a `FilterSource` that reads `wallets.filters()`, rather than a set read
+in advance, so a wallet admitted while a pass is starting is still covered from
+its birthday.
 
 Filter addresses are non-empty, unique, and scoped to a configured child.
 Composer validates the whole selection before any source I/O and narrows it per
@@ -203,15 +366,27 @@ that need live UTXOs; it is not a supertrait of `Indexer`.
 
 Each chain implements:
 
-- `BlockSource`, wrapping native RPC tip, block-at-height, and canonical hash
-  reads; and
+- `BlockSource`, wrapping native RPC produced-tip, bounded produced-block range,
+  and canonical reference-at-position reads; and
 - `BlockInterpreter`, converting one native block and the active canonical
   addresses into `InterpretedBlock`.
 
-`InterpretedBlock` contains a `BlockRef`, complete transaction drafts, and
+The source range is ordered by native position and omits coordinates where no
+block was produced. Its bound counts returned blocks, not numeric position
+distance. Bitcoin and Ethereum positions are dense; Solana slots may be sparse.
+
+`InterpretedBlock` contains a complete `BlockRef`, transaction drafts, and
 `OutputChanges`. It contains no storage key, record, journal, or backend type.
-Bitcoin and Ethereum remain free to use different native RPC and transaction
-models.
+Bitcoin, Ethereum, and Solana remain free to use different native RPC and
+transaction models.
+
+The accepted Solana interpreter admits finalized legacy and version-0
+transactions, resolves loaded addresses, and decodes supported top-level and
+inner System Program `Transfer` and `TransferWithSeed` instructions. It retains
+the first signature as transaction identity, authoritative execution status and
+fee, emits no movements for failed transactions, and emits no UTXO output
+changes. Missing or inconsistent meaningful metadata invalidates the complete
+source block rather than advancing a checkpoint with partial history.
 
 ## Persistence collections
 
@@ -243,9 +418,34 @@ the entire inverse from that private journal. No caller can author commit or
 rollback state.
 
 `Transactions` and `Outputs` are read projections over that atomic block
-lifecycle. A persistence implementation may use redb, PostgreSQL, or
-another transactional backend, but backend records never cross these
-contracts. redb is the active embedded implementation.
+lifecycle. A persistence implementation may use redb, PostgreSQL, or another
+transactional backend, but backend records never cross these contracts.
+
+The target application composition opens one PostgreSQL database/schema and
+one process-wide pool. It clones that pool into one
+`indexing_postgres::Repository` handle per exact `(chain, network)` scope. A
+handle refuses another scope. An asset is a history fact, so native and token
+assets on the same chain share the same repository rather than acquiring an
+asset repository or schema.
+
+The PostgreSQL adapter owns only checkpoint, canonical history/movement, live-
+output, and bounded-journal tables. Application-owned tables, including
+`payment_wallets`, remain outside these collections even when physically
+colocated. redb remains an embedded implementation and test backend; current
+`apps/api` still uses it pending the target composition change.
+
+Shared PostgreSQL evolution is preservation-first. Generic columns and
+constraints are added and validated without destroying existing scopes. A
+scope-local rescan may replace only indexing-owned rows for its explicitly
+approved `(chain, network)` and must preserve every other scope and
+application-owned row. No legacy runtime reader, inferred coordinate fallback,
+compatibility alias, or versioned storage DTO is part of the contract.
+
+The deployment-owned canonical creation and ordered migration scripts live
+physically under `sdk/indexing/postgres/migrations/`. This one history may
+describe the central schema, but a change to an application-owned table still
+requires its owner's approval; the indexing runtime repository contract
+remains limited to indexing tables and issues no application-table DDL.
 
 ## History model
 
@@ -257,9 +457,10 @@ contracts. redb is the active embedded implementation.
 - optional exact network fee.
 
 The `History` implementation reads canonical transactions and derives
-`ObservedTransaction` confirmation from inclusion height and the page
-checkpoint. `Confirmed` carries the observed depth. The current API neither
-stores confirmation transitions nor claims chain-finality proof.
+`ObservedTransaction` confirmation from inclusion produced height and the page
+checkpoint's produced height. `Confirmed` carries the observed depth. The
+current API neither stores confirmation transitions nor claims chain-finality
+proof.
 
 Bitcoin inputs and outputs are separate movements, so multi-input and
 multi-output history remains truthful. Transfer, input, output, mint, and burn
@@ -273,41 +474,103 @@ restart.
 
 ## Address coverage contract
 
-All imported wallets and birthdays for an existing scope form one
-authoritative startup set. They are registered before the first sync. A fresh
-scope anchors immediately before the earliest birthday and scans forward; an
-empty scope anchors at the current tip.
+All imported wallets and native-position birthdays for an existing scope form
+one authoritative startup set. They are registered before the first sync. A
+fresh scope locates the first produced block at or after the earliest birthday
+and anchors at that block's actual parent; it never invents `birthday - 1`. An
+empty scope anchors at the actual produced tip.
 
-A wallet created at runtime starts at `checkpoint + 1`. A historical address
+A wallet created at runtime starts at the checked successor of
+`checkpoint.position`; a skipped successor activates at the first later
+produced block. A historical address
 cannot be added after `Wallets` becomes shared because import is startup-only.
 If the authoritative startup set changes below the persisted checkpoint, the
-embedding application recreates and rescans that scope. Indexing stores no
-filter registry and cannot infer selection drift across restarts.
+embedding application may recreate and rescan only that scope's indexing-owned
+rows. It must not drop the shared database, alter another scope, or touch
+application-owned wallet rows. Indexing stores no filter registry and cannot
+infer selection drift across restarts.
 
 ## Composition contract
 
-The process is assembled directly in `apps/api/src/main.rs`:
+The target process is assembled directly in `apps/api/src/main.rs`:
 
-1. read and validate configuration;
-2. construct one long-lived RPC client per configured chain;
-3. construct chain sources, interpreters, redb repositories, and services;
-4. combine the services in one concrete `Arc<Composer>`;
-5. clone that object into narrow `Indexer`, `Checkpoint`, and `History` views;
-6. expose the Bitcoin repository separately as `Outputs`, construct `Wallets`,
-   register chain families, and import configured wallets;
-7. start one sync loop with the current wallet filter snapshots;
-8. wait for persisted ready checkpoints before binding HTTP; and
-9. supervise HTTP, sync, fatal exits, cancellation, and graceful shutdown.
+1. validate the complete closed configuration;
+2. construct one long-lived client per configured chain, using one singular
+   no-retry Solana endpoint and redacted configuration;
+3. verify all chain identities before database mutation, including one-shot
+   Solana genesis and finalized executable Memo-v3 checks;
+4. construct one process-wide PostgreSQL pool and validate the already-applied
+   pinned schema without DDL;
+5. clone the pool into one scope-bound repository per `(chain, network)`, load
+   checkpoints, and initialize filter/commit coordination;
+6. construct services and one `Arc<Composer>`, then expose narrow `Indexer`,
+   `Checkpoint`, `History`, and Bitcoin-only `Outputs` views;
+7. inject the Solana service's checkpoint/history views and checkpoint
+   notification into its coordinator and inject the application task registrar;
+8. construct `Wallets`, register only native SOL for Solana, and import every
+   configured wallet at `start_position` before the first sync snapshot;
+9. start supervised synchronization, readiness, and submission tasks;
+10. wait for persisted ready checkpoints before binding HTTP; and
+11. supervise HTTP, sync, fatal exits, cancellation, ambiguity reconciliation,
+    and graceful shutdown.
+
+No step creates a database, schema, pool, or repository for an asset. The
+current `apps/api` redb composition is an acknowledged implementation gap, not
+evidence that this PostgreSQL contract is already live.
 
 There is no process facade or app-local service facade. HTTP state contains the
 abstract wallet collection and readiness state only. Concrete handles and
 chain selection remain in `main`.
+
+A runtime-fatal Solana indexer error publishes not-ready and closes admission.
+If no exact envelope is guarded, the supervisor joins and returns the error. If
+one is submitted or ambiguous, shutdown waits without an automatic deadline
+while the reconciliation paths required for safety remain active. Registrar
+closure, handler drain, guarded-envelope drain, synchronization cancellation,
+and storage joins occur in that order. After a fatal indexer exit, only positive
+historical status can clear the guard in-process; force-kill accepts the known
+duplicate-payment risk.
+
+## Contract evidence
+
+Repository contract tests must exercise both redb and PostgreSQL with complete
+block references, sparse native positions, dense Bitcoin/Ethereum positions,
+atomic parent presence, scope rejection, commit/rollback atomicity, and
+checkpoint-bound pagination. Shared-schema tests must use one pool to prove
+Bitcoin, Ethereum, and Solana scope isolation, native/token asset coexistence,
+and byte-for-byte preservation of sentinel application-owned wallet rows.
+
+Application system tests must compose the target shared PostgreSQL topology,
+prove restart/readiness from native position while confirmations remain
+produced-height based, and verify that a scope-local rescan leaves unrelated
+scopes and `payment_wallets` unchanged. Solana system evidence must additionally
+prove singular endpoint configuration and redaction, genesis/Memo probes,
+tracked registration before dispatch, shutdown races and indefinite ambiguity,
+the pinned/checksummed owned validator, and the explicit `solana_stack` target.
 
 ## HTTP contract
 
 `apps/api` owns all public wire models, Utoipa schema derivation, extraction,
 authentication, request limits, error/status mapping, and encoding. SDK crates
 know no Axum route or response shape.
+
+Following transport and authentication handling, both transaction POST routes
+reject a non-empty URI query before JSON shape extraction. An empty query
+component has no semantic effect. Ordinary infrastructure headers are allowed
+but are not interpreted as transaction-control inputs. HTTP applies the shared
+50-item maximum before converting a batch item, while the SDK collection still
+owns the authoritative guard.
+
+The fixed transaction precedence is query rejection, JSON schema, collection
+cardinality, wire conversion in original order, then itemwise common
+validation. For each occurrence that itemwise stage checks positive amount,
+wallet resolution, and family compatibility before advancing. Chain-specific
+complete preparation and ordered broadcast follow. HTTP error projection
+includes optional accepted IDs, failed index, and ambiguous ID only when the
+underlying domain error truthfully supplies them; any ambiguous ID maps to
+`503`. A native SOL acquisition-wide failure supplies none of those optional
+fields; a structurally valid unsupported account shape may supply only its
+truthful original item index.
 
 Each endpoint-specific input and output struct is declared immediately above
 its handler. A handler performs extraction, one `Wallets` call, mapping, and

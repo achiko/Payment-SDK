@@ -60,8 +60,8 @@ The historical split kept native health admission separate from a numeric
 freshness claim. ADR-0016 records that initial support has no independent
 reference or SDK-enforced numeric maximum-lag guarantee. ADR-0017 through
 ADR-0022 record the accepted startup, exact-input, and empty-batch boundaries.
-The five named proposals would consolidate the remaining behavior if accepted;
-they do not alter these accepted decisions while Proposed.
+The simplified named ADR set now consolidates this behavior according to each
+ADR's recorded status; it does not alter this accepted health decision.
 
 ## Decision
 
@@ -189,10 +189,10 @@ failure boundary, lifetime, and ownership. It does not decide:
   confirmation, or ambiguous-broadcast coherence.
 
 ADR-0016 through ADR-0022 record the accepted no-reference, exact-input, and
-empty-batch boundaries. If accepted, the named Public Transaction Semantics
-and Destination Account Acquisition proposals would consolidate order/index
-behavior, slot-plausibility, account acquisition, and mapping. The former
-nested future labels become historical only upon that acceptance.
+empty-batch boundaries. The accepted Public Transaction Semantics and
+Destination Account Acquisition decisions consolidate order/index behavior,
+slot plausibility, account acquisition, and mapping. The former nested future
+labels are historical.
 
 ## Alternatives considered
 

@@ -2,11 +2,31 @@
 
 ## Status
 
-Proposed
+Accepted
 
 ## Date
 
 2026-08-27
+
+## Accepted
+
+Accepted by the user on 2026-08-28 under the simplified decision name
+**Native SOL Submission**.
+
+Acceptance explicitly includes the initial process-local, single-writer model:
+there is no durable outgoing-operation or request-idempotency store, callers
+must not automatically retry an unknown result, an ambiguous source may remain
+blocked indefinitely while evidence is unavailable, and restart, failover,
+active-active writers, or a new logical invocation may double-pay. Those are
+accepted initial product limitations, not implementation evidence or production
+custody claims.
+
+This acceptance authorizes the architecture contract and its reconciliation
+into canonical documentation. It does not by itself authorize source changes,
+dependency installation, signing, live submission, or network actions. Exact
+application dependencies, task supervision, readiness, and shutdown are fixed
+by the Accepted Solana Runtime Composition decision, ADR-0027, but remain
+unimplemented.
 
 ## Context
 
@@ -38,6 +58,17 @@ and its reconciliation continue unchanged. A caller may retry this definite
 pre-broadcast failure later, but must not infer anything new about the earlier
 ambiguous transaction.
 
+Accepted Destination Account Acquisition runs while those source guards are
+still lexical and before any envelope-state transition or submission-task
+registration. Its timeout, cancellation, oversized or malformed response,
+below-floor result, failed closing witness, or semantic account rejection
+releases every lexical lease held by this invocation, creates no guarded
+envelope, and reaches no fee, construction, signing, simulation, or broadcast
+step. Acquisition-wide failures remain index-free; a structurally valid but
+unsupported account shape retains the earliest truthful original occurrence.
+Neither case can release or otherwise change a submitted or ambiguous guard
+owned by an earlier invocation.
+
 Every self-transfer is rejected before RPC. Every other item becomes one
 legacy transaction with exactly these top-level instructions:
 
@@ -58,7 +89,8 @@ The Memo supplies transaction uniqueness, not HTTP request idempotency.
 
 ### Full-batch preparation
 
-After the account handoff, preparation is strictly:
+After ADR-0024's complete account and balance handoff atomically establishes
+operation floor `P = U`, preparation is strictly:
 
 1. acquire `getLatestBlockhash` with `confirmed` commitment and the current
    `minContextSlot`; retain blockhash, context slot, and
@@ -145,6 +177,9 @@ uncorrelated response, internal error, provider message, and returned-signature
 mismatch is therefore ambiguous. Agave custom codes and standard JSON-RPC
 codes remain diagnostics only; none releases the source or changes replay
 safety. A definite item failure can occur only before that wire boundary.
+Cancellation during account acquisition is therefore definite and follows
+ADR-0024's no-floor, lexical-lease-release rule. Cancellation becomes ambiguous
+only after the first `sendTransaction` wire call begins.
 
 Every ambiguous or definite broadcast result is still attached to the exact
 original occurrence currently being attempted. In a batch it retains that
@@ -230,9 +265,11 @@ custody, serialization, recovery, and a different batch-preparation model.
 Tests must cover same-blockhash identical items and sequential sends; RNG
 failure; missing Memo program; exact fee and simulation including Memo; checked
 cumulative balances; source locking and aliases; fail-fast `SourceBusy` with
-all provisional leases released; zero broadcasts on every preparation failure;
-block-height expiry; returned-signature mismatch; exact byte replay; three-call
-bound; status mapping; cancellation after dispatch;
+all provisional leases released; cancellation at every pre-wire account await;
+oversized or malformed account responses; no floor, guarded envelope, or task
+registration after a failed acquisition; zero broadcasts on every preparation
+failure; block-height expiry; returned-signature mismatch; exact byte replay;
+three-call bound; status mapping; cancellation after dispatch;
 ambiguous public metadata; no later-item attempt; indexed Memo transactions
 counting only the System transfer; every exact JSON-RPC allowlist branch and
 malformed-data fallback; status context/cardinality/null/error behavior;
@@ -242,14 +279,14 @@ exclusion; checkpoint-triggered/capped reconciliation without a busy loop; and
 the documented restart limitation. Every returned JSON-RPC error code must
 exercise the same ambiguous wire-boundary path.
 
-## Approval boundary
+## Implementation boundary
 
-This proposal consolidates construction, uniqueness, blockhash, fee, balance,
-signing, simulation, broadcast, retry, ambiguity, and confirmation policy. It
-does not authorize implementation or live submission. Acceptance requires
-reconciling the transaction, ambiguity, and error contracts in
-`docs/SYSTEM_REQUIREMENTS.md`, `docs/API.md`, and `docs/CONTRACTS.md` before
-source changes begin.
+This accepted decision consolidates construction, uniqueness, blockhash, fee,
+balance, signing, simulation, broadcast, retry, ambiguity, and confirmation
+policy. It depends on the Accepted Public Transaction Semantics and Destination
+Account Acquisition decisions. Accepted ADR-0027 now satisfies its architectural
+dependency for application task ownership, readiness, and shutdown. Source
+implementation and live submission still require separate authorization.
 
 ## References
 
@@ -261,6 +298,7 @@ source changes begin.
 - [Solana `getBlockHeight`](https://solana.com/docs/rpc/http/getblockheight)
 - [Agave RPC custom error codes](https://github.com/anza-xyz/agave/blob/master/rpc-client-api/src/custom_error.rs)
 - [Solana Memo interface IDs](https://github.com/solana-program/memo/blob/main/interface/src/lib.rs)
+- `docs/adr/0024-destination-account-acquisition.md`
 - `sdk/chains/base/src/transaction.rs`
 - `sdk/chains/base/src/signer.rs`
 - `sdk/wallets/src/sender.rs`

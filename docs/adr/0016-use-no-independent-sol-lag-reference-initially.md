@@ -106,10 +106,9 @@ primary endpoint-bound getHealth
 ```
 
 The apparently-future-slot guard was unresolved when this ADR was accepted.
-The proposed Destination Account Acquisition ADR now supplies an
-endpoint-local closing witness without pretending it is an independent
-reference. This ADR does not authorize bypassing that separately approvable
-guard.
+The accepted Destination Account Acquisition ADR now supplies an endpoint-
+local closing witness without pretending it is an independent reference. This
+ADR does not authorize bypassing that required guard.
 
 No reference state, trait, enum, repository record, transaction snapshot,
 public field, RPC abstraction, or configuration is introduced. In particular,
@@ -146,8 +145,8 @@ destination object. ADR-0019 and S1.6.3.5.3.2.2.2.2.2 decide the single-send
 envelope. ADR-0020 and S1.6.3.5.3.2.2.2.2.3 decide the batch item;
 ADR-0021 and S1.6.3.5.3.2.2.2.2.4.1 decide the batch-root schema.
 ADR-0022 and its historical approval label decide cardinality/empty behavior;
-the Public Transaction Semantics proposal would own order/index and non-body
-input behavior upon acceptance.
+the accepted Public Transaction Semantics decision owns order/index and non-
+body input behavior.
 
 Acceptance adds the matching canonical reference boundary: initial native SOL
 destination validation has no independently trusted numeric cluster-progress
@@ -165,8 +164,8 @@ as S1.6.3.5.3.2.2.2.2.1. ADR-0019 later accepts the single-send envelope as
 S1.6.3.5.3.2.2.2.2.2. ADR-0020 later accepts the batch item as
 S1.6.3.5.3.2.2.2.2.3. ADR-0021 later accepts the batch-root schema as
 S1.6.3.5.3.2.2.2.2.4.1. ADR-0022 later accepts cardinality/empty behavior as
-its historical cardinality label. Public Transaction Semantics would own the
-remaining order/index behavior upon acceptance.
+its historical cardinality label. The accepted Public Transaction Semantics
+decision owns the remaining order/index behavior.
 
 ## Scope boundary
 
@@ -192,10 +191,10 @@ future reference design. It does not decide:
   confirmation, or ambiguous-broadcast coherence.
 
 ADR-0017 through ADR-0022 record the accepted startup, exact-input, and
-empty-batch boundaries. If accepted, the named Public Transaction Semantics
-and Destination Account Acquisition proposals would consolidate order/index
-behavior, slot-plausibility, account acquisition, and mapping. The former
-nested future labels become historical only upon that acceptance.
+empty-batch boundaries. The accepted Public Transaction Semantics and
+Destination Account Acquisition decisions consolidate order/index behavior,
+slot plausibility, account acquisition, and mapping. The former nested future
+labels are historical.
 
 ## Alternatives considered
 
@@ -273,8 +272,8 @@ false-high denial of service or false-low acceptance.
 - No reference request is made, so there is no reference outage or quorum
   failure path in initial destination validation.
 - This decision neither weakens nor strengthens protection against a false-high
-  primary candidate; the Destination Account Acquisition proposal would own
-  that plausibility question upon acceptance.
+  primary candidate; the accepted Destination Account Acquisition decision
+  owns that plausibility question.
 - Bitcoin, Ethereum, generic RPC, and indexing behavior remain unchanged.
 - No implementation or test code is authorized by S1.6.3.5.3.2.2.1.
 

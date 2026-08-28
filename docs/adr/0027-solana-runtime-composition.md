@@ -2,11 +2,32 @@
 
 ## Status
 
-Proposed
+Accepted
 
 ## Date
 
 2026-08-27
+
+## Accepted
+
+Accepted by the user on 2026-08-28 under the simplified decision name
+**Solana Runtime Composition**.
+
+Acceptance includes the complete runtime boundary in this record: the
+independently deletable `chain-solana` crate and modular dependency family; the
+Rust 1.85/Alloy reconciliation prerequisite; zeroizing Ed25519 custody limits;
+one singular no-retry Solana endpoint; one shared PostgreSQL schema and pool;
+closed configuration; startup genesis and executable Memo-v3 checks; explicit
+composition, readiness, submission supervision, and shutdown ordering; and the
+pinned owned-validator test environment.
+
+This acceptance completes the simplified Solana architecture decision set and
+authorizes implementation planning against it. It is not implementation
+evidence and does not by itself authorize Rust, manifest, lockfile, SQL, or
+migration edits; dependency installation; migration execution; signing; or
+live-network actions. Those changes still require explicit implementation-step
+approval and must preserve the stop condition for an unsuccessful Rust 1.85
+dependency reconciliation.
 
 ## Context
 
@@ -31,15 +52,16 @@ The crate owns native address, Ed25519 seed/keypair wrapper, lamports, RPC DTOs,
 legacy messages, transactions, account policy, coordinator, source,
 interpreter, provider, sender, and the one-method submission-task registration
 contract consumed by its coordinator. Generic crates gain only accepted
-Provider-generation, transaction-error, block-position, and filter/commit
-coordination prerequisites. The app implements that registration contract,
-owns its queue and task set, and owns config, enum/OpenAPI additions,
-construction, readiness, and shutdown. Single-wallet and batch paths share the
-same source-keyed coordinator.
+provider-generation, block-position, and filter/commit coordination
+prerequisites. The accepted-but-unimplemented Public Transaction Semantics
+decision owns the transaction-error changes. The app implements that
+registration contract, owns its queue and task set, and owns config,
+enum/OpenAPI additions, construction, readiness, and shutdown. Single-wallet
+and batch paths share the same source-keyed coordinator.
 
 Use maintained modular Anza/SPL interfaces, not `solana-client`, a monolithic
 SDK, hand-written transaction encoding, or copied System discriminants. The
-candidate direct version family is:
+selected direct version family is:
 
 | Dependency | Version/purpose |
 |---|---|
@@ -72,33 +94,61 @@ behavior, implementation stops for a separate MSRV-policy decision; Solana
 does not silently raise it.
 
 Ed25519 secrets stay in a private zeroizing wrapper with no `Clone`, `Debug`,
-`Display`, or Serde. The indexing-registry prerequisite in Solana Indexing
-removes the plain secret-material surface entirely. Configured imports accept
+`Display`, or Serde. The registry-ownership prerequisite in the accepted
+Indexing & Central Database decision
+removes the plain secret-material query surface from indexing. It does not
+delete or rewrite the existing application-owned `payment_wallets` table, and
+this decision adds no Solana row to that table. Configured imports accept
 exactly lowercase ASCII
 `[0-9a-f]{64}` from an environment variable—no `0x` prefix, whitespace, or
 alternate keypair encoding—and decode it into one 32-byte seed.
 The environment `String`, decoded temporary storage, construction failures,
 and final key wrapper are all zeroized and never ordinarily formatted. This
-proposal adds no remote custody, HSM, or plaintext key database.
+decision adds no remote custody, HSM, or plaintext key database.
 
 Generated Solana wallets follow the repository's existing development-custody
 boundary: they are process-lifetime only and are neither returned as secrets
 nor restart-recoverable. Configured imports are reconstructible on restart.
 Funding a generated wallet across restart requires a separately approved
-durable encrypted custody boundary; this proposal does not imply otherwise.
+durable encrypted custody boundary; this decision does not imply otherwise.
 
 ### Configuration and endpoint coherence
 
-Add exactly one optional, non-flattened, `deny_unknown_fields`
-`indexes.solana` object:
+Add exactly one top-level, non-flattened, `deny_unknown_fields` PostgreSQL
+object and one optional Solana index object:
 
 ```text
-database
-network
-genesis_hash
-rpc { endpoint, headers, timeout_seconds, max_response_bytes }
-sync { confirmation_depth, reorg_retention, poll_millis, batch_size }
+postgres { url_env, schema, max_connections }
+
+indexes.solana {
+  network
+  genesis_hash
+  rpc { endpoint, headers, timeout_seconds, max_response_bytes }
+  sync { confirmation_depth, reorg_retention, poll_millis, batch_size }
+}
 ```
+
+`apps/api` constructs exactly one process-wide PostgreSQL pool and uses one
+shared indexing schema. It creates one
+`indexing_postgres::Repository::new(pool.clone(), scope)` handle for each exact
+`(chain, network)` scope. Every asset on that scope uses the same repository and
+indexer because assets are movement facts, not database partitions. Per-chain
+database fields and paths for Bitcoin, Ethereum, or Solana are rejected. The
+URL is loaded through the configured environment-variable name so credentials
+do not enter the configuration document or its debug output.
+
+`schema` is required and accepts one canonical lowercase ASCII identifier
+`[a-z][a-z0-9_]{0,62}` that does not begin with `pg_`. Pool construction pins
+every connection's search path to exactly that schema and `pg_catalog`, and
+startup verifies that the selected schema and required relations match the
+read-only compatibility contract. A URL-supplied search path cannot override
+the explicit field. Deployment tooling applies the scripts to that same named
+schema; application startup performs no DDL.
+
+The current `apps/api` still composes per-chain redb repositories. The shared
+PostgreSQL composition in this ADR is a target implementation requirement, not
+a claim about current runtime behavior. Redb may remain an embedded contract-
+test implementation, but `apps/api` does not select it in the target design.
 
 `endpoint` is singular. Zero or multiple Solana endpoints are not representable
 inside that object, and configuration aliases are rejected. Its RPC type is a
@@ -129,31 +179,37 @@ exposed initially.
 The application performs this order:
 
 1. deserialize and validate the complete closed config before effects;
-2. construct the one no-retry, redacting Solana client;
-3. call one-shot `getGenesisHash` and compare canonical Base58 to the expected
+2. construct every configured chain client, including the one no-retry,
+   redacting Solana client;
+3. verify every configured chain identity before database mutation; for Solana,
+   call one-shot `getGenesisHash` and compare canonical Base58 to the expected
    hash;
 4. call `getSlot(finalized) = S`, then call `getAccountInfo` for exactly
    `MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr` with Base64,
    `finalized`, and `minContextSlot = S`; require response context at least
    `S` and a non-null executable account;
-5. only then open the repository and load its persisted checkpoint;
-6. initialize the per-scope filter/commit coordinator from that checkpoint;
-7. build one source, interpreter, indexing service, provider, submission
+5. only then construct the one PostgreSQL pool and validate the already-applied
+   shared indexing schema; startup performs no implicit or destructive DDL;
+6. construct one scope-bound repository handle per configured
+   `(chain, network)` from cloned pool handles and load every persisted
+   checkpoint;
+7. initialize each per-scope filter/commit coordinator from its checkpoint;
+8. build one source, interpreter, indexing service, provider, submission
    coordinator, and sender; inject the same service's `Checkpoint` and
    `History` views plus its checkpoint notification into the submission
    coordinator, then add the indexer to the shared `Composer`;
-8. register only native `WalletAsset::Sol`, with no durable plaintext wallet
+9. register only native `WalletAsset::Sol`, with no durable plaintext wallet
    registry;
-9. import every configured Solana seed and `start_position` before the first
+10. import every configured Solana seed and `start_position` before the first
    synchronization snapshot; and
-10. bind the HTTP listener only after every configured index reports `Ready`
+11. bind the HTTP listener only after every configured index reports `Ready`
    with a persisted checkpoint.
 
-The accepted Provider Generation and Block Position decisions, plus the
-proposed Public Transaction Semantics, Native SOL Submission, and Solana
-Indexing decisions, are prerequisites. Canonical requirements and contract
-documents must be reconciled with every accepted proposal before the first
-source patch.
+The accepted Provider Generation, Block Position, Public Transaction
+Semantics, Destination Account Acquisition, and Indexing & Central Database
+decisions, plus the accepted Native SOL Submission decision, are prerequisites.
+Canonical requirements and contract documents must remain reconciled with
+those decisions before the first source patch.
 
 Per-send `getHealth` is not reused as startup readiness or freshness evidence.
 A fatal Solana indexer exit fails startup. At runtime it immediately publishes
@@ -173,6 +229,13 @@ coordinator fails before dispatch. A handler or SDK object therefore cannot
 detach an untracked submission task. The existing readiness bridge also moves
 under the application supervisor; no bare `tokio::spawn` remains outside
 tracked application task ownership.
+
+Destination account acquisition completes before submission-task registration.
+Cancellation or failure there publishes no floor, releases every pre-envelope
+lexical source lease, and registers no task. Only after the complete account
+handoff may a task win registration and later cross the dispatch boundary; a
+submitted or ambiguous envelope guard is then coordinator-owned and cannot be
+released by acquisition cleanup.
 
 ### Shutdown
 
@@ -224,6 +287,8 @@ and executes that target.
 - Solana remains independently deletable and does not leak protocol DTOs into
   base, wallets, or indexing.
 - Startup fails before repository mutation on wrong chain or missing Memo.
+- All configured scopes share one pool and schema while each repository rejects
+  cross-scope access; adding an asset does not create another database.
 - A temporary Rust 1.97 dependency probe proves the selected modular APIs can
   construct, sign, and serialize the exact legacy System-plus-Memo transaction;
   it is not an MSRV proof. Full implementation remains blocked until the Alloy
@@ -250,24 +315,34 @@ process-local record of an accepted-but-unknown envelope.
 
 ## Validation requirements
 
-Tests must cover exact configuration keys, rejection of `start_height`, and one
-endpoint; redacted endpoint/header/secret debug output; canonical seed length
-and decoding; wrong genesis before repository open; finalized Memo context and
+Tests must cover exact configuration keys, schema-identifier validation,
+search-path pinning, rejection of `start_height`, one endpoint, and rejection
+of every per-chain database field; redacted database URL, endpoint, header, and
+secret debug output; canonical seed length and decoding; wrong genesis before
+pool creation; incompatible shared schema
+rejection without mutation; one pool shared by Bitcoin, Ethereum, and Solana;
+scope isolation under concurrent writes; native/token asset coexistence;
+byte-for-byte preservation of `payment_wallets`; finalized Memo context and
 executable-account checks; complete wallet import before first sync; readiness
-startup/regression/fatal-exit behavior; task tracking; graceful shutdown during
-preparation, registrar-close races, dispatch, ambiguity, and fatal indexing;
+startup/regression/fatal-exit behavior; configured response-size exhaustion and
+cancellation during account acquisition with no floor publication, no leaked
+lexical lease, and no submission-task registration; task tracking; graceful
+shutdown during preparation, registrar-close races, dispatch, ambiguity, and
+fatal indexing;
 positive-status-only recovery after fatal indexing; tracked readiness; owned validator isolation
 and binary hashes; the explicit application test target; locked dependency
 resolution; the Alloy/MSRV prerequisite; an actual Rust 1.85 build; design
 lint; and full workspace gates.
 
-## Approval boundary
+## Implementation boundary
 
-This proposal consolidates dependencies, crate ownership, configuration,
-composition, endpoint coherence, readiness, shutdown, and test environment. It
-does not authorize source changes, dependency installation, signing, or live
-network actions. While its status is Proposed, the canonical documents and
-manifests remain unchanged.
+This accepted decision consolidates dependencies, crate ownership,
+configuration, composition, endpoint coherence, readiness, shutdown, and test
+environment. Its prerequisites include all earlier accepted Solana decisions,
+and it closes the architecture gate for a small-step implementation plan. It
+does not claim current implementation or authorize source, dependency,
+lockfile, SQL, migration, signing, or live-network changes without the
+corresponding approved implementation step.
 
 ## References
 

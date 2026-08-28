@@ -12,11 +12,29 @@ exist in the current workspace.
 | Small signing and transaction snapshot contracts | `sdk/chains/base` | focused crate tests |
 | Bitcoin addresses, RPC, UTXO transactions, signing, indexing translation | `sdk/chains/bitcoin` | chain unit tests and deterministic stack test |
 | Ethereum native/allowlisted ERC-20 balances, typed transfers, EIP-1559 signing, sender-keyed nonce coordination, and indexing translation | `sdk/chains/ethereum` | 74 chain unit tests, external adapter test, and deterministic ETH/USDC stack tests |
-| Provider-selected wallet generation/import | `sdk/wallets` | provider/registry tests |
 | Exact wallet history mapping | `sdk/wallets` | history tests |
 | Reorg-safe filtered indexing contracts and synchronizer | `sdk/indexing` | synchronizer and contract tests |
 | Atomic indexing persistence | `sdk/indexing/redb` | repository tests |
+| Current height-only PostgreSQL indexing repository | `sdk/indexing/postgres` | scope-bound `Blocks`, `Transactions`, and `Outputs`; database contract tests run when `POSTGRES_TEST_URL` is configured |
 | Generic JSON-RPC/HTTP/crypto/storage mechanics | `packages/*` | package tests |
+
+## Accepted but not implemented
+
+| Decision | Accepted source | Missing implementation evidence |
+|---|---|---|
+| Provider-owned native wallet generation | Provider Generation ADR | current `Provider::generate` still has a generic secp256k1 default; Bitcoin and Ethereum do not yet implement mandatory native `generate`, and no Ed25519 Solana provider exists |
+| Canonical plain Base58 and native SOL wallet values | Canonical Base58 ADR and Solana requirements | public and wallet address-encoding enums have no plain Base58 variant; no Solana crate, Ed25519 seed provider, checked lamport value, or exact finalized SOL balance adapter exists |
+| Native SOL block interpretation and canonical history | Native SOL History and Indexing & Central Database ADRs | no Solana `BlockInterpreter` or tests for legacy/version-0 loaded addresses, top-level/inner System transfers, exact fee/status, failed-transaction movement suppression, completeness shielding, or empty UTXO changes exist |
+| Public batch bounds, occurrence identity, deterministic error precedence, and locally derived ambiguous IDs | Public Transaction Semantics ADR | current code has no `InvalidBatch`, 50-item SDK/OpenAPI/defensive-sender bounds, pre-conversion oversized guard, query-before-JSON rejection, optional domain failed index, or base/wallet/HTTP ambiguous-ID propagation; complete duplicate/alias/original-index evidence is also missing |
+| Native SOL source/destination acquisition and closing-witness floor | Destination Account Acquisition ADR | no Solana crate, client, coordinator, account DTO, stable deduplication, exact one-call mapping, atomic `U` handoff, response-bound, cancellation, malformed-payload, floor-publication, or lexical-lease-release tests exist |
+| Native SOL construction, submission, exact-byte replay, and ambiguity reconciliation | Native SOL Submission ADR | no Solana transaction/message/Memo-v3 builder, executable-Memo readiness probe, recent-blockhash lifetime, fee/simulation RPC, source coordinator, exact-signature broadcaster, three-call replay bound, checkpoint-stable indexed absence proof, background reconciliation, ambiguous-ID projection, or duplicate-risk tests exist |
+| Native block position separated from produced height | Block Position and Indexing & Central Database ADRs | current `BlockRef`, synchronization, birthdays, redb records, PostgreSQL rows, and cursors remain height-only |
+| One central PostgreSQL database/schema/pool with scope-bound repositories | Indexing & Central Database ADR and canonical architecture | the scope-bound height-only adapter exists, but `apps/api` still composes per-chain redb; no production shared-pool, dual-coordinate, or preservation system test exists |
+| Canonical schema history under `sdk/indexing/postgres/migrations/` | Indexing & Central Database ADR | three scripts are present; baseline equivalence, ordered-upgrade behavior, checksums, and table-ownership/preservation evidence remain unverified |
+| Application ownership of `payment_wallets` restart reads | Indexing & Central Database ADR | `Wallets` still accepts an optional indexing `Registry` and couples registration to `adopt`/`restore`; indexing exports that surface and the PostgreSQL adapter still queries the table |
+| Atomic runtime wallet/filter admission against checkpoint movement | Indexing & Central Database ADR | no per-scope admission coordinator prevents a sync pass from advancing beyond a newly generated wallet's birthday before that wallet enters the authoritative filter snapshot |
+| Sparse finalized Solana traversal and retained-reorg evidence | Indexing & Central Database ADR | no Solana source or deterministic sparse-slot test exists; accepted runtime/crate composition is also unimplemented |
+| Solana crate and runtime composition | Solana Runtime Composition ADR | no `chain-solana` crate, selected modular dependencies, Rust 1.85/Alloy reconciliation proof, singular no-retry RPC config/redaction, genesis/Memo startup probes, shared-pool application composition, tracked submission supervisor, readiness regression/fatal behavior, shutdown-race/indefinite-ambiguity evidence, pinned checksummed validator fixture, or explicit `solana_stack` test target exists |
 
 ## Current application validation
 
@@ -55,12 +73,15 @@ RPC doubles and temporary redb files:
 - accounting journals or user credits;
 - collection planners, reservations, jobs, sweeps, gas sponsorship, or automatic token-wallet ETH top-up;
 - outgoing payment state machines;
+- durable native SOL request-idempotency, outgoing-envelope, or cross-process
+  source-guard storage (ADR-0025 accepts an unimplemented process-local model);
 - durable or cross-process outgoing-envelope coordination; the Ethereum
   coordinator is process-local and requires one active writer per EOA;
 - deposit/accounting/collection semantics around ordinary wallet sends;
 - separate wallet or indexer processes;
 - an indexing HTTP client;
-- migration commands or `V1`/`V2` compatibility DTOs;
+- runtime/public migration commands or `V1`/`V2` compatibility DTOs; canonical
+  ordered PostgreSQL migration scripts are deployment inputs, not a runtime API;
 - hardware wallets, remote signers, HSM/KMS integration, or production custody;
 - HA, multi-process database ownership, or production deployment claims.
 

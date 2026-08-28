@@ -8,6 +8,14 @@ Accepted
 
 2026-08-27
 
+## Amendment — 2026-08-28
+
+The accepted coordinate model is unchanged. Its rollout policy is reconciled
+with the central PostgreSQL requirement: a shared multi-chain database is
+preserved and evolved deliberately rather than recreated as a Solana
+prerequisite. This amendment changes deployment consequences, not block
+semantics or this ADR's Accepted status.
+
 ## Context
 
 The indexing model currently uses `BlockHeight` for several different jobs:
@@ -144,12 +152,56 @@ transaction status, and previous checkpoints, will store position and the
 parent position in addition to the existing height and hashes. Existing
 height-based keys and ordering may remain.
 
-The redb record shape and PostgreSQL schema will be replaced directly. Existing
-pre-release index data must be recreated and rescanned; no legacy decoder,
-migration reader, compatibility alias, or inferred `position = height` fallback
-will be added. The PostgreSQL repository tests currently reference a missing
-`migrations/0001_init.sql`; that schema source must be restored or replaced
-before PostgreSQL implementation validation can be complete.
+The minimum PostgreSQL change is limited to rows that persist a complete block
+reference:
+
+- `checkpoint` gains current position and parent position;
+- `history` gains inclusion-block position and parent position; and
+- `journal` gains current block position and parent position plus previous-
+  checkpoint position and parent position.
+
+Parent position and parent hash form one atomic optional value: both are absent
+only for genesis and otherwise both are present. `movement`, `output`, and
+`journal_output` remain unchanged because they use produced height for ordering
+or retention and do not persist a `BlockRef`. Solana writes no UTXO `output`
+rows. Existing generic `asset_chain`, `asset`, and exact `numeric` amount
+columns already represent native SOL without a Solana-only table.
+
+Native positions use the same PostgreSQL `bigint` plus checked `u64`/`i64`
+adapter boundary as produced heights. No position index is added merely because
+the column exists: current database access reads the scoped checkpoint or a
+height-keyed retained journal row, then uses the stored position for remote RPC.
+Any later index requires a demonstrated SQL access path.
+
+PostgreSQL is one central multi-chain database. Its indexing tables coexist
+with application-owned tables and must not be dropped or recreated as a Solana
+prerequisite. Canonical schema creation and ordered migration scripts live
+under `sdk/indexing/postgres/migrations/`; deployment tooling owns applying
+them. Physical script location does not transfer logical ownership of
+application tables to indexing. The three migrations in the sibling integration
+checkout remain baseline evidence until the user places them in that canonical
+folder.
+
+PostgreSQL evolution is preservation-first: add the generic position columns,
+backfill verified dense-coordinate scopes, validate every row, and only then
+enforce final non-null and parent-pair constraints. A one-time
+`position = height` backfill is valid only for explicitly verified Bitcoin and
+Ethereum scopes. It is never a runtime fallback and must not be applied to an
+unknown or Solana scope. A scope rescan may replace only indexing-owned rows for
+that exact `(chain, network)` after explicit operational approval; it must not
+delete another scope, the shared database, or application-owned
+`payment_wallets`. No legacy runtime reader, compatibility alias, versioned DTO,
+or inferred fallback is introduced.
+
+Before cutover, operators must inventory scopes and row counts, verify the
+applied baseline, take a tested restore point, and pause index writers for the
+final backfill and validation. The new reader/writer starts only after every
+required position and parent pair validates. Exact commands and rollback steps
+belong to the separately approved implementation plan, not this ADR.
+
+The application-owned `payment_wallets.start_height` column is outside this
+indexing schema change. Renaming or changing that custody record requires a
+separate application-owned decision; the existing rows are preserved here.
 
 HTTP block representations and opaque checkpoint-bearing cursors will carry
 both position and height, including parent position where a parent exists.
@@ -175,8 +227,9 @@ integration planning.
 
 - The change is coordinated and breaking across base values, source adapters,
   synchronization, wallet birthdays, both repositories, and HTTP block data.
-- Existing pre-release index databases and checkpoint cursors become invalid
-  and require recreation or rejection.
+- Existing redb records and checkpoint cursors require replacement or
+  rejection. Shared PostgreSQL rows require a coordinated indexing-only
+  backfill while unrelated scopes and application tables remain intact.
 - The Solana source must enumerate sparse produced slots and respect provider
   range limits while presenting one bounded generic result.
 - A Solana block whose RPC response omits `blockHeight` cannot be committed
@@ -262,6 +315,12 @@ would weaken ordering and boundary validation.
   confirmation per produced descendant.
 - redb and PostgreSQL contract tests must round-trip both coordinates and
   reject the old storage shape clearly.
+- PostgreSQL validation must start from the current height-only baseline,
+  migrate only indexing-owned tables, preserve existing Bitcoin and Ethereum
+  checkpoint/history/journal facts, and leave sentinel `payment_wallets` rows
+  byte-for-byte unchanged.
+- One shared-schema test must prove Bitcoin, Ethereum, and Solana scope
+  isolation and native/token asset coexistence.
 - HTTP block and cursor tests must round-trip position and height and reject
   old height-only cursors.
 - Bitcoin and Ethereum regression tests must prove `position == height`,
@@ -288,7 +347,6 @@ persistence, schema, cursor, or API implementation changes.
 - `sdk/indexing/redb/src/record.rs`
 - `sdk/indexing/postgres/src/row.rs`
 - `sdk/indexing/postgres/src/write.rs`
-- `sdk/indexing/postgres/src/registry.rs`
 - `sdk/indexing/postgres/tests/repository_contract.rs`
 - `sdk/wallets/src/wallets.rs`
 - `apps/api/src/api/transaction.rs`

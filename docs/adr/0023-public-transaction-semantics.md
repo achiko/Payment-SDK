@@ -2,11 +2,19 @@
 
 ## Status
 
-Proposed
+Accepted
 
 ## Date
 
 2026-08-27
+
+## Accepted
+
+Accepted by the user on 2026-08-28 under the simplified decision name
+**Public Transaction Semantics**. Acceptance includes the clarified grouped-
+broadcast failure, query precedence, itemwise common-validation order, and
+locally derived ambiguous-ID authority recorded below. It records a target
+contract and does not claim that the current Rust implementation satisfies it.
 
 ## Context
 
@@ -56,31 +64,39 @@ list. They must not sort, group, deduplicate, or renumber it.
 
 Repeated wallet IDs, destinations, amounts, and even identical items are
 separate requested payment occurrences. Internal RPC deduplication may reuse
-one observation, but every result and error maps back to the original
-occurrence. Solana must produce distinct signed transaction identities for
-distinct occurrences; the Native SOL Submission ADR owns that mechanism.
+one observation, but every item-scoped result and error maps back to the
+original occurrence. A grouped transaction maps to the complete set of public
+occurrences it represents and must not invent one failed item index. Solana
+must produce distinct signed transaction identities for distinct occurrences;
+the Native SOL Submission ADR owns that mechanism.
 
 ### Error precedence
 
 The fixed precedence is:
 
 1. existing transport and authentication rejection;
-2. JSON shape and exact-schema rejection;
-3. collection cardinality, first minimum and then maximum;
-4. conversion of every wire item in original order, stopping at the first
+2. rejection of a non-empty URI query string;
+3. JSON shape and exact-schema rejection;
+4. collection cardinality, first minimum and then maximum;
+5. conversion of every wire item in original order, stopping at the first
    conversion error;
-5. positive-amount validation, wallet resolution, and family compatibility in
-   original order;
-6. chain-specific full-batch preparation in the stage order defined by that
+6. itemwise common validation in original order: validate the current
+   occurrence's positive amount, resolve its wallet, and validate its family
+   compatibility before advancing to the next occurrence;
+7. chain-specific full-batch preparation in the stage order defined by that
    chain; and
-7. ordered broadcast, stopping at the first failed or ambiguous occurrence.
+8. ordered broadcast, stopping at the first failed or ambiguous occurrence or
+   grouped transaction.
 
 A pre-broadcast item error reports the first original occurrence that fails the
 current deterministic stage and has no accepted prefix. A batch-wide RPC,
 coherence, or resource failure that cannot truthfully be assigned to one item
 has no failed index. Once broadcasting begins, accepted IDs describe only the
-definitely acknowledged prefix, `failed_index` remains the original item
-position, and no later item is attempted.
+definitely acknowledged prefix. A per-occurrence broadcast failure preserves
+the original item position in `failed_index`, and no later item is attempted.
+A grouped transaction that represents several public occurrences has no
+truthful single failed item, so its failure or ambiguity remains index-free.
+It may still carry the locally derived ambiguous transaction ID.
 
 The generic contract does not equate accepted-ID count with `failed_index`
 because a grouped chain may represent several public occurrences with one
@@ -99,13 +115,24 @@ same optional string field. It is present only when exact signed bytes may have
 been submitted but acceptance cannot yet be proved. Definite failures and
 chains without that condition omit it.
 
+The chain transaction layer is the sole origin of this reconciliation ID. It
+derives the canonical, chain-validated ID from the exact locally signed
+envelope before broadcast. Error conversion preserves that same value through
+the wallet and `SendError` layers, and HTTP only projects it; those layers do
+not create independent mutable copies with separate authority. Provider prose,
+a provider-supplied candidate, or a returned ID that does not match the local
+envelope must never become `ambiguous_transaction_id`.
+
 One-wallet and batch errors remain distinct:
 
 - a single-send ambiguity is `503 Service Unavailable` with
   `ambiguous_transaction_id`, no `transaction_ids`, and no `failed_index`;
-- a batch ambiguity is `503` with only the definitely acknowledged
-  `transaction_ids`, the original ambiguous item `failed_index`, and its
-  `ambiguous_transaction_id`; and
+- a per-occurrence batch ambiguity is `503` with only the definitely
+  acknowledged `transaction_ids`, the original ambiguous item `failed_index`,
+  and its `ambiguous_transaction_id`;
+- a grouped-transaction batch ambiguity is `503` with only the definitely
+  acknowledged `transaction_ids` and its `ambiguous_transaction_id`, but no
+  synthetic `failed_index`;
 - a pre-broadcast item failure has no transaction IDs or ambiguous ID; its
   batch form carries only the original `failed_index`, while its single-send
   form has no index; and
@@ -120,7 +147,9 @@ prose.
 
 Both transaction POST routes reject any non-empty URI query string with
 `400 Bad Request` and `transaction query parameters are not supported` before
-request conversion or wallet delegation.
+JSON shape extraction, request conversion, or wallet delegation. An empty query
+component has no semantic effect. Existing transport and authentication
+rejection remains earlier in the public precedence.
 
 There is no transaction-control header contract. Normal HTTP, proxy,
 authentication, content-negotiation, and tracing headers remain permitted and
@@ -131,14 +160,14 @@ header requires an explicit public-contract decision.
 
 ## Consequences
 
-- Callers receive stable original indices even when concrete chains optimize
-  reads internally.
+- Callers receive stable original indices for item-scoped outcomes even when
+  concrete chains optimize reads internally.
 - Intentional duplicate payments remain expressible.
 - The shared bound controls RPC, signing, simulation, and memory fan-out.
 - Unknown query parameters fail closed, while ordinary HTTP infrastructure can
   continue to add headers.
 - `SendError` and the HTTP error body must support both indexed item failures
-  and index-free collection or operation failures.
+  and index-free collection, operation, or grouped-transaction failures.
 
 ## Alternatives considered
 
@@ -166,15 +195,23 @@ rejection; ordinary unknown-header tolerance; and OpenAPI bounds without
 `uniqueItems`. They must also cover a 51-item body with an earlier malformed
 amount, direct-SDK cardinality enforcement, single and batch ambiguity bodies,
 field omission for definite failures, and Solana's one-to-one prefix invariant.
+The suite must distinguish an empty query component from a non-empty query;
+prove that query rejection precedes malformed JSON, empty-batch, and 51-item
+classification; prove itemwise amount, wallet, and family ordering with mixed-
+invalid occurrences; and prove grouped Bitcoin broadcast failure and ambiguity
+without a synthetic item index. Ambiguous-ID tests derive the exposed value
+from the local envelope, reject provider mismatch/injection as authority, and
+prove that its presence always produces `503`.
 
 ## Approval boundary
 
-This proposal consolidates the former order, index, duplicate, maximum-size,
-error-precedence, query, and header questions. Approval records the contract
-but does not authorize Rust implementation. Acceptance also requires replacing
-the current no-maximum language in `docs/API.md` and
-`docs/SYSTEM_REQUIREMENTS.md`; those canonical documents remain unchanged while
-this ADR is Proposed.
+This accepted decision consolidates the former order, index, duplicate,
+maximum-size, error-precedence, query, and header questions. Acceptance records
+the contract but does not authorize Rust implementation. `docs/API.md`,
+`docs/SYSTEM_REQUIREMENTS.md`, `docs/CONTRACTS.md`, and
+`docs/FEATURE_VALIDATION.md` must be reconciled in the same documentation
+change so the target contract and missing implementation evidence remain
+truthful.
 
 ## References
 
@@ -184,4 +221,6 @@ this ADR is Proposed.
 - `sdk/wallets/src/sender.rs`
 - `docs/API.md`
 - `docs/SYSTEM_REQUIREMENTS.md`
+- `docs/CONTRACTS.md`
+- `docs/FEATURE_VALIDATION.md`
 - [Solana `getMultipleAccounts`](https://solana.com/docs/rpc/http/getmultipleaccounts)
