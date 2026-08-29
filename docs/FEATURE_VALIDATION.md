@@ -11,7 +11,7 @@ exist in the current workspace.
 | Exact chain/network/asset metadata and decimal amounts | `sdk/chains/base` | focused crate tests |
 | Small signing, transaction snapshot, and ambiguity-carrier contracts | `sdk/chains/base` | focused crate tests prove ordinary errors remain ID-free, provider prose supplies no ID, and explicit typed ambiguity preserves the canonical ID |
 | Bitcoin addresses, RPC, UTXO transactions, signing, indexing translation | `sdk/chains/bitcoin` | chain unit tests and deterministic stack test |
-| Ethereum native/allowlisted ERC-20 balances, typed transfers, EIP-1559 signing, sender-keyed nonce coordination, and indexing translation | `sdk/chains/ethereum` | 74 chain unit tests, external adapter test, and deterministic ETH/USDC stack tests |
+| Ethereum native/allowlisted ERC-20 balances, typed transfers, EIP-1559 signing, sender-keyed nonce coordination, and indexing translation | `sdk/chains/ethereum` | 77 chain unit tests, external adapter test, and deterministic ETH/USDC stack tests |
 | Exact wallet history mapping, transaction-ambiguity preservation, truthful batch failure metadata, and bounded batch admission | `sdk/wallets` | history and conversion tests, four scoped `SendError` tests, and direct 0/1/50/51 boundary tests proving the exported 50-item maximum runs before lookup or sender invocation |
 | Reorg-safe filtered indexing contracts and synchronizer | `sdk/indexing` | synchronizer and contract tests |
 | Atomic indexing persistence | `sdk/indexing/redb` | repository tests |
