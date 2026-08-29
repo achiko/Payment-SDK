@@ -274,7 +274,7 @@ workspace evidence rather than copy a temporary path.
   multiplicity, aliases, duplicate wallet IDs/destinations/amounts, and original
   indices through common conversion and sender handoff. **Depends on:**
   **Enforce SDK batch bounds**. **Proof:** wallet orchestration tests.
-- [ ] **Fix common precedence** — validate each authored occurrence in order:
+- [x] **Fix common precedence** — validate each authored occurrence in order:
   positive amount, wallet lookup, then family compatibility before advancing.
   **Depends on:** **Preserve authored occurrences**. **Proof:** competing-error
   table tests.
@@ -1095,8 +1095,16 @@ items, distinct wallet-ID aliases resolving to one canonical source, exact
 resolved-wallet identity at sender handoff, and unchanged sender results. A
 separate one-defect case proves a lookup failure keeps authored index 4 and
 never invokes the sender. Wallet tests pass 19/19 plus the compiler doctest;
-focused strict Clippy passes. The next approval boundary is **Fix common
-precedence**.
+focused strict Clippy passes. **Fix common precedence** then proved the existing
+production loop already validates each authored occurrence completely before
+advancing: positive amount, exact wallet lookup, then family compatibility. A
+four-row competing-error table proves amount wins over same-item missing-wallet
+and wrong-family defects, an earlier lookup failure wins over later amount and
+family defects, and an earlier family mismatch wins over later amount and
+lookup defects. Every case keeps original index 1, carries no accepted or
+ambiguous metadata, and invokes neither sender. No production behavior changed;
+wallet tests pass 20/20 plus the compiler doctest and focused strict Clippy
+passes. The next approval boundary is **Defend Bitcoin batches**.
 
 ## Accepted limitations and operational failure policy
 

@@ -1105,6 +1105,100 @@ mod tests {
     }
 
     #[test]
+    fn batch_common_validation_uses_authored_itemwise_precedence() {
+        let (first_sender, first_calls) = sender();
+        let (second_sender, second_calls) = sender();
+        let first_family = "first".to_owned();
+        let second_family = "second".to_owned();
+        let mut wallets = Wallets::<String, String>::new(Arc::new(FixtureIndex(None)));
+        wallets
+            .register(
+                first_family.clone(),
+                scope("firstnet"),
+                FixtureProvider::Value,
+                first_sender,
+                None,
+            )
+            .expect("first family");
+        wallets
+            .register(
+                second_family.clone(),
+                scope("secondnet"),
+                FixtureProvider::Value,
+                second_sender,
+                None,
+            )
+            .expect("second family");
+        futures_executor::block_on(wallets.import(
+            "first".to_owned(),
+            &first_family,
+            SecretBytes::new([1; 32]),
+            BlockHeight(1),
+        ))
+        .expect("first wallet");
+        futures_executor::block_on(wallets.import(
+            "second".to_owned(),
+            &second_family,
+            SecretBytes::new([2; 32]),
+            BlockHeight(1),
+        ))
+        .expect("second wallet");
+
+        let transfer = |wallet: &str, amount: u64| WalletTransfer {
+            wallet: wallet.to_owned(),
+            to: AddressText::new(AddressEncoding::Hex, "destination"),
+            amount: Decimal::from(amount),
+        };
+        let cases = [
+            (
+                "amount before same-item lookup",
+                vec![transfer("first", 1), transfer("missing", 0)],
+                ErrorKind::InvalidAmount,
+                "amount must be positive",
+            ),
+            (
+                "amount before same-item family compatibility",
+                vec![transfer("first", 1), transfer("second", 0)],
+                ErrorKind::InvalidAmount,
+                "amount must be positive",
+            ),
+            (
+                "lookup before later amount and family defects",
+                vec![
+                    transfer("first", 1),
+                    transfer("missing", 1),
+                    transfer("second", 0),
+                ],
+                ErrorKind::NotFound,
+                "wallet does not exist",
+            ),
+            (
+                "family compatibility before later amount and lookup defects",
+                vec![
+                    transfer("first", 1),
+                    transfer("second", 1),
+                    transfer("missing", 0),
+                ],
+                ErrorKind::Unsupported,
+                "all transfers must use the same wallet family",
+            ),
+        ];
+
+        for (name, requests, kind, message) in cases {
+            let failure = futures_executor::block_on(wallets.send_all(requests)).expect_err(name);
+
+            assert!(failure.accepted.is_empty(), "{name}");
+            assert_eq!(failure.failed_index, Some(1), "{name}");
+            assert_eq!(failure.ambiguous_transaction_id, None, "{name}");
+            assert_eq!(failure.source.kind, kind, "{name}");
+            assert_eq!(failure.source.message, message, "{name}");
+            assert_eq!(failure.source.ambiguous_transaction_id, None, "{name}");
+        }
+        assert_eq!(*first_calls.lock().expect("first calls"), 0);
+        assert_eq!(*second_calls.lock().expect("second calls"), 0);
+    }
+
+    #[test]
     fn batch_resolves_wallets_and_rejects_mixed_families_before_sending() {
         let (first_sender, first_calls) = sender();
         let (second_sender, second_calls) = sender();
