@@ -292,6 +292,7 @@ impl Broadcaster for Wallet {
                 prepared.envelope().as_bytes().to_vec(),
             )
             .map_err(|error| transaction_error(TransactionErrorKind::InvalidTransaction, error))?;
+            let native_id = signed.id();
             let preflight = self
                 .transactions
                 .preflight(&signed, self.config.max_fee_rate)
@@ -303,13 +304,18 @@ impl Broadcaster for Wallet {
                     "Bitcoin node rejected transaction preflight",
                 ));
             }
-            let id = self
+            let submitted = self
                 .transactions
                 .broadcast(signed, self.config.max_fee_rate)
-                .await
-                .map_err(|error| transaction_error(TransactionErrorKind::Unavailable, error))?;
+                .await?;
+            if submitted != native_id {
+                return Err(transaction_error(
+                    TransactionErrorKind::Unavailable,
+                    "Bitcoin transaction capability returned a different transaction ID",
+                ));
+            }
             Ok(BroadcastReceipt {
-                id: BaseTransactionId::new(id.to_string()),
+                id: BaseTransactionId::new(native_id.to_string()),
             })
         })
     }
@@ -328,11 +334,16 @@ pub(super) fn map_error(kind: WalletErrorKind, error: impl std::fmt::Display) ->
 #[cfg(test)]
 mod tests {
     use base::{Digest, SignRequest, SignablePayload, SignatureEncoding, SignatureScheme};
+    use bitcoin::{
+        Amount, OutPoint, ScriptBuf, Sequence, Transaction as NativeTransaction, TxIn, TxOut, Txid,
+        Witness, absolute, consensus, hashes::Hash, transaction::Version,
+    };
     use futures_executor::block_on;
     use indexing::{
         BoxFuture, ChainId, HistoryQuery, IndexError, OutputPage, OutputRequest, Outputs,
         SourceError, TransactionPage,
     };
+    use std::sync::Mutex;
 
     use super::*;
 
@@ -369,7 +380,7 @@ mod tests {
             &'a self,
             _transaction: SignedTransaction,
             _max_fee_rate: FeeRate,
-        ) -> BoxFuture<'a, Result<crate::TransactionId, SourceError>> {
+        ) -> BoxFuture<'a, Result<crate::TransactionId, TransactionError>> {
             Box::pin(async { unreachable!("wallet generation must not broadcast a transaction") })
         }
     }
@@ -383,7 +394,77 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    struct TransactionCalls {
+        preflight: Vec<(crate::TransactionId, Vec<u8>)>,
+        broadcast: Vec<(crate::TransactionId, Vec<u8>)>,
+    }
+
+    struct InspectingTransactions {
+        preflight: Result<crate::Preflight, SourceError>,
+        broadcast: Result<crate::TransactionId, TransactionError>,
+        calls: Mutex<TransactionCalls>,
+    }
+
+    impl InspectingTransactions {
+        fn new(
+            preflight: Result<crate::Preflight, SourceError>,
+            broadcast: Result<crate::TransactionId, TransactionError>,
+        ) -> Self {
+            Self {
+                preflight,
+                broadcast,
+                calls: Mutex::new(TransactionCalls::default()),
+            }
+        }
+
+        fn calls(&self) -> TransactionCalls {
+            self.calls
+                .lock()
+                .expect("transaction call lock must be healthy")
+                .clone()
+        }
+    }
+
+    impl Transactions for InspectingTransactions {
+        fn preflight<'a>(
+            &'a self,
+            transaction: &'a SignedTransaction,
+            _max_fee_rate: FeeRate,
+        ) -> BoxFuture<'a, Result<crate::Preflight, SourceError>> {
+            self.calls
+                .lock()
+                .expect("transaction call lock must be healthy")
+                .preflight
+                .push((transaction.id(), transaction.consensus_bytes().to_vec()));
+            let result = self.preflight.clone();
+            Box::pin(async move { result })
+        }
+
+        fn broadcast<'a>(
+            &'a self,
+            transaction: SignedTransaction,
+            _max_fee_rate: FeeRate,
+        ) -> BoxFuture<'a, Result<crate::TransactionId, TransactionError>> {
+            self.calls
+                .lock()
+                .expect("transaction call lock must be healthy")
+                .broadcast
+                .push((transaction.id(), transaction.consensus_bytes().to_vec()));
+            let result = self.broadcast.clone();
+            Box::pin(async move { result })
+        }
+    }
+
     fn factory(address_type: AddressType) -> Factory {
+        let transactions: Arc<dyn Transactions> = Arc::new(InactiveDependencies);
+        factory_with_transactions(address_type, transactions)
+    }
+
+    fn factory_with_transactions(
+        address_type: AddressType,
+        transactions: Arc<dyn Transactions>,
+    ) -> Factory {
         let network = Network::Regtest;
         let scope = IndexScope {
             chain: ChainId(crate::CHAIN.to_owned()),
@@ -392,7 +473,6 @@ mod tests {
         let dependencies = Arc::new(InactiveDependencies);
         let outputs: Arc<dyn Outputs> = dependencies.clone();
         let fees: Arc<dyn Fees> = dependencies.clone();
-        let transactions: Arc<dyn Transactions> = dependencies.clone();
         let history: Arc<dyn IndexHistory> = dependencies;
         let utxos = Arc::new(
             IndexUtxos::new(scope.clone(), network, outputs)
@@ -411,6 +491,171 @@ mod tests {
             transactions,
             history,
         )
+    }
+
+    fn prepared_transaction() -> (base::SignedTransaction, crate::TransactionId) {
+        let transaction = NativeTransaction {
+            version: Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([3; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let id = crate::TransactionId::from(transaction.compute_txid());
+        let envelope = consensus::serialize(&transaction);
+        (
+            base::SignedTransaction::new(
+                PREPARED_KIND,
+                BaseTransactionId::new(id.to_string()),
+                base::TransactionEnvelope::new(envelope),
+            ),
+            id,
+        )
+    }
+
+    fn allowed_preflight() -> crate::Preflight {
+        crate::Preflight {
+            allowed: true,
+            reject_reason: None,
+            virtual_size: None,
+            base_fee: None,
+        }
+    }
+
+    fn wallet_with_transactions(transactions: Arc<dyn Transactions>) -> Arc<dyn WalletContract> {
+        block_on(
+            factory_with_transactions(AddressType::SegwitV0, transactions)
+                .create(SecretBytes::new([1_u8; 32])),
+        )
+        .expect("fixed valid secret must create a Bitcoin wallet")
+    }
+
+    #[test]
+    fn broadcast_preserves_the_transaction_layers_exact_local_id() {
+        let provider_candidate = format!("{:064x}", 9);
+        let (prepared, native_id) = prepared_transaction();
+        let local_id = BaseTransactionId::new(native_id.to_string());
+        let transactions = Arc::new(InspectingTransactions::new(
+            Ok(allowed_preflight()),
+            Err(transaction_error(
+                TransactionErrorKind::Unavailable,
+                format!("provider claimed transaction {provider_candidate}"),
+            )
+            .with_ambiguous_transaction_id(local_id.clone())),
+        ));
+        let wallet = wallet_with_transactions(transactions.clone());
+
+        let error = block_on(wallet.broadcaster().broadcast(&prepared))
+            .expect_err("an unknown Bitcoin broadcast outcome must fail with reconciliation data");
+
+        assert_eq!(error.kind, TransactionErrorKind::Unavailable);
+        assert_eq!(error.ambiguous_transaction_id, Some(local_id));
+        assert_ne!(
+            error
+                .ambiguous_transaction_id
+                .as_ref()
+                .expect("ambiguity must carry the local ID")
+                .as_str(),
+            provider_candidate
+        );
+        let expected = (native_id, prepared.envelope().as_bytes().to_vec());
+        let calls = transactions.calls();
+        assert_eq!(calls.preflight, vec![expected.clone()]);
+        assert_eq!(calls.broadcast, vec![expected]);
+    }
+
+    #[test]
+    fn matching_broadcast_returns_the_validated_local_id() {
+        let (prepared, native_id) = prepared_transaction();
+        let transactions = Arc::new(InspectingTransactions::new(
+            Ok(allowed_preflight()),
+            Ok(native_id),
+        ));
+        let wallet = wallet_with_transactions(transactions);
+
+        let submitted = block_on(wallet.broadcaster().broadcast(&prepared))
+            .expect("a matching Bitcoin broadcast ID must be acknowledged");
+
+        assert_eq!(submitted.id, BaseTransactionId::new(native_id.to_string()));
+    }
+
+    #[test]
+    fn invalid_local_envelope_has_no_ambiguity_or_chain_io() {
+        let transactions = Arc::new(InspectingTransactions::new(
+            Ok(allowed_preflight()),
+            Ok(crate::TransactionId([9; 32])),
+        ));
+        let wallet = wallet_with_transactions(transactions.clone());
+        let (prepared, native_id) = prepared_transaction();
+        let different_id = crate::TransactionId([9; 32]);
+        assert_ne!(native_id, different_id);
+        let invalid = base::SignedTransaction::new(
+            PREPARED_KIND,
+            BaseTransactionId::new(different_id.to_string()),
+            base::TransactionEnvelope::new(prepared.envelope().as_bytes().to_vec()),
+        );
+
+        let error = block_on(wallet.broadcaster().broadcast(&invalid))
+            .expect_err("a declared ID that disagrees with its bytes must fail locally");
+
+        assert_eq!(error.kind, TransactionErrorKind::InvalidTransaction);
+        assert_eq!(error.ambiguous_transaction_id, None);
+        assert_eq!(transactions.calls(), TransactionCalls::default());
+    }
+
+    #[test]
+    fn preflight_failure_has_no_ambiguity_and_never_broadcasts() {
+        let transactions = Arc::new(InspectingTransactions::new(
+            Err(SourceError {
+                message: "Bitcoin preflight is unavailable".to_owned(),
+                retryable: true,
+            }),
+            Ok(crate::TransactionId([9; 32])),
+        ));
+        let wallet = wallet_with_transactions(transactions.clone());
+        let (prepared, native_id) = prepared_transaction();
+
+        let error = block_on(wallet.broadcaster().broadcast(&prepared))
+            .expect_err("preflight failure must stop before broadcast");
+
+        assert_eq!(error.kind, TransactionErrorKind::Unavailable);
+        assert_eq!(error.ambiguous_transaction_id, None);
+        assert_eq!(
+            transactions.calls(),
+            TransactionCalls {
+                preflight: vec![(native_id, prepared.envelope().as_bytes().to_vec(),)],
+                broadcast: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejected_preflight_has_no_ambiguity_and_never_broadcasts() {
+        let transactions = Arc::new(InspectingTransactions::new(
+            Ok(crate::Preflight {
+                allowed: false,
+                reject_reason: Some("missing-inputs".to_owned()),
+                virtual_size: Some(82),
+                base_fee: None,
+            }),
+            Ok(crate::TransactionId([9; 32])),
+        ));
+        let wallet = wallet_with_transactions(transactions.clone());
+        let (prepared, _) = prepared_transaction();
+
+        let error = block_on(wallet.broadcaster().broadcast(&prepared))
+            .expect_err("a rejected Bitcoin preflight must stop before broadcast");
+
+        assert_eq!(error.kind, TransactionErrorKind::Rejected);
+        assert_eq!(error.ambiguous_transaction_id, None);
+        assert!(transactions.calls().broadcast.is_empty());
     }
 
     #[test]

@@ -278,7 +278,7 @@ workspace evidence rather than copy a temporary path.
   positive amount, wallet lookup, then family compatibility before advancing.
   **Depends on:** **Preserve authored occurrences**. **Proof:** competing-error
   table tests.
-- [ ] **Defend Bitcoin batches** — reject impossible zero/51 direct sender
+- [x] **Defend Bitcoin batches** — reject impossible zero/51 direct sender
   calls before chain I/O and make grouped failures index-free. Originate
   ambiguity only from the exact local Bitcoin envelope. **Depends on:**
   **Make batch failures truthful**. **Proof:** Bitcoin batch and ambiguity
@@ -1104,7 +1104,18 @@ family defects, and an earlier family mismatch wins over later amount and
 lookup defects. Every case keeps original index 1, carries no accepted or
 ambiguous metadata, and invokes neither sender. No production behavior changed;
 wallet tests pass 20/20 plus the compiler doctest and focused strict Clippy
-passes. The next approval boundary is **Defend Bitcoin batches**.
+passes. **Defend Bitcoin batches** then made the concrete sender reject zero
+and 51 direct calls with the shared index-free `InvalidBatch` contract before
+parsing or chain I/O. Bitcoin submission now uses one visible transport
+execution; its RPC transaction adapter distinguishes definite pre-wire and
+remote rejection from unknown transport or acknowledgement outcomes and
+attaches only the txid validated from the exact local consensus envelope.
+Wallet and grouped-send conversion preserve that typed authority, returned
+mismatches and provider prose cannot replace it, and grouped failures remain
+index-free. The Bitcoin suite passes 58/58, as do the workspace all-target
+check and complete test suite, strict all-target/all-feature Clippy, no-deps
+documentation, formatting, design-lint, and diff checks. The next approval
+boundary is **Defend Ethereum batches**.
 
 ## Accepted limitations and operational failure policy
 
