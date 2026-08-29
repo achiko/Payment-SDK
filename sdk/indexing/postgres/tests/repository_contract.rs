@@ -1522,6 +1522,107 @@ async fn one_pool_isolates_scopes_and_preserves_native_token_facts() {
     );
 }
 
+#[tokio::test]
+async fn one_pool_keeps_bitcoin_ethereum_and_solana_facts_isolated() {
+    let bitcoin = IndexScope {
+        chain: ChainId("bitcoin".to_owned()),
+        network: "regtest".to_owned(),
+    };
+    let ethereum = IndexScope {
+        chain: ChainId("ethereum".to_owned()),
+        network: "anvil".to_owned(),
+    };
+    let solana = IndexScope {
+        chain: ChainId("solana".to_owned()),
+        network: "localnet".to_owned(),
+    };
+    let database = TestDatabase::start().await;
+    let pool = database.pool();
+    let bitcoin_repository =
+        Repository::new(pool.clone(), bitcoin.clone()).expect("Bitcoin repository");
+    let ethereum_repository =
+        Repository::new(pool.clone(), ethereum.clone()).expect("Ethereum repository");
+    let solana_repository = Repository::new(pool, solana.clone()).expect("Solana repository");
+
+    let bitcoin_block = block(1, 10, 0);
+    let bitcoin_output = output(&bitcoin, "bitcoin", 0, 1);
+    bitcoin_repository
+        .add(addition(
+            &bitcoin,
+            bitcoin_block.clone(),
+            None,
+            one(&bitcoin, "bitcoin-native"),
+            OutputChanges {
+                created: vec![bitcoin_output.clone()],
+                ..OutputChanges::default()
+            },
+        ))
+        .await
+        .expect("Bitcoin block");
+
+    let ethereum_block = block(1, 20, 0);
+    ethereum_repository
+        .add(addition(
+            &ethereum,
+            ethereum_block.clone(),
+            None,
+            vec![
+                draft_with_asset(&ethereum, "ethereum-native", "native"),
+                draft_with_asset(&ethereum, "ethereum-token", "usdc"),
+            ],
+            OutputChanges::default(),
+        ))
+        .await
+        .expect("Ethereum block");
+
+    let solana_block = sparse_block(300, 1, 30, 0, 0);
+    solana_repository
+        .add(addition(
+            &solana,
+            solana_block.clone(),
+            None,
+            vec![draft_with_asset(&solana, "solana-native", "native")],
+            OutputChanges::default(),
+        ))
+        .await
+        .expect("Solana block");
+
+    assert_eq!(
+        tip(&bitcoin_repository, &bitcoin).await,
+        Some(bitcoin_block)
+    );
+    assert_eq!(
+        tip(&ethereum_repository, &ethereum).await,
+        Some(ethereum_block)
+    );
+    assert_eq!(tip(&solana_repository, &solana).await, Some(solana_block));
+    assert_eq!(
+        outputs(&bitcoin_repository, &bitcoin).await,
+        [bitcoin_output]
+    );
+    assert!(outputs(&ethereum_repository, &ethereum).await.is_empty());
+    assert!(outputs(&solana_repository, &solana).await.is_empty());
+
+    let bitcoin_before = scope_signature(&database, &bitcoin).await;
+    let ethereum_before = scope_signature(&database, &ethereum).await;
+    solana_repository
+        .add(addition(
+            &solana,
+            sparse_block(303, 2, 31, 300, 30),
+            Some(sparse_block(300, 1, 30, 0, 0)),
+            vec![draft_with_asset(&solana, "solana-second", "native")],
+            OutputChanges::default(),
+        ))
+        .await
+        .expect("second sparse Solana block");
+    assert_eq!(scope_signature(&database, &bitcoin).await, bitcoin_before);
+    assert_eq!(scope_signature(&database, &ethereum).await, ethereum_before);
+    assert!(
+        database.registry_sentinel_unchanged().await,
+        "three-chain writes must preserve payment_wallets"
+    );
+}
+
 /// History pages behave the same way, and a page boundary must not drop the
 /// movements of the transaction it lands on.
 #[tokio::test]

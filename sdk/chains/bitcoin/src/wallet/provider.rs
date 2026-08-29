@@ -95,6 +95,7 @@ impl Factory {
             self.config.network,
             self.utxos.clone(),
             self.fees.clone(),
+            self.transactions.clone(),
             self.config.fee_target_blocks,
             self.config.max_fee_rate,
         ))
@@ -260,6 +261,16 @@ impl TransactionFactory for Wallet {
     }
 }
 
+impl wallets::SingleSender for Wallet {
+    fn send<'a>(
+        &'a self,
+        destination: wallets::AddressText,
+        amount: base::Decimal,
+    ) -> wallets::FutureResult<'a, base::TransactionId> {
+        wallets::send_with_transaction(self, destination, amount)
+    }
+}
+
 pub(super) const fn network_name(network: Network) -> &'static str {
     match network {
         Network::Mainnet => "mainnet",
@@ -275,50 +286,54 @@ impl Broadcaster for Wallet {
         &'a self,
         prepared: &'a base::SignedTransaction,
     ) -> TransactionFuture<'a, Result<BroadcastReceipt, TransactionError>> {
-        Box::pin(async move {
-            if prepared.version() != base::SignedTransaction::VERSION
-                || prepared.kind() != PREPARED_KIND
-            {
-                return Err(transaction_error(
-                    TransactionErrorKind::InvalidTransaction,
-                    "prepared transaction is not a Bitcoin signed envelope",
-                ));
-            }
-            let id = prepared.id().as_str().parse().map_err(|error| {
-                transaction_error(TransactionErrorKind::InvalidTransaction, error)
-            })?;
-            let signed = SignedTransaction::from_consensus_bytes(
-                id,
-                prepared.envelope().as_bytes().to_vec(),
-            )
-            .map_err(|error| transaction_error(TransactionErrorKind::InvalidTransaction, error))?;
-            let native_id = signed.id();
-            let preflight = self
-                .transactions
-                .preflight(&signed, self.config.max_fee_rate)
-                .await
-                .map_err(|error| transaction_error(TransactionErrorKind::Unavailable, error))?;
-            if !preflight.allowed {
-                return Err(transaction_error(
-                    TransactionErrorKind::Rejected,
-                    "Bitcoin node rejected transaction preflight",
-                ));
-            }
-            let submitted = self
-                .transactions
-                .broadcast(signed, self.config.max_fee_rate)
-                .await?;
-            if submitted != native_id {
-                return Err(transaction_error(
-                    TransactionErrorKind::Unavailable,
-                    "Bitcoin transaction capability returned a different transaction ID",
-                ));
-            }
-            Ok(BroadcastReceipt {
-                id: BaseTransactionId::new(native_id.to_string()),
-            })
-        })
+        Box::pin(broadcast_prepared(
+            self.transactions.as_ref(),
+            self.config.max_fee_rate,
+            prepared,
+        ))
     }
+}
+
+pub(crate) async fn broadcast_prepared(
+    transactions: &dyn Transactions,
+    max_fee_rate: FeeRate,
+    prepared: &base::SignedTransaction,
+) -> Result<BroadcastReceipt, TransactionError> {
+    if prepared.version() != base::SignedTransaction::VERSION || prepared.kind() != PREPARED_KIND {
+        return Err(transaction_error(
+            TransactionErrorKind::InvalidTransaction,
+            "prepared transaction is not a Bitcoin signed envelope",
+        ));
+    }
+    let id = prepared
+        .id()
+        .as_str()
+        .parse()
+        .map_err(|error| transaction_error(TransactionErrorKind::InvalidTransaction, error))?;
+    let signed =
+        SignedTransaction::from_consensus_bytes(id, prepared.envelope().as_bytes().to_vec())
+            .map_err(|error| transaction_error(TransactionErrorKind::InvalidTransaction, error))?;
+    let native_id = signed.id();
+    let preflight = transactions
+        .preflight(&signed, max_fee_rate)
+        .await
+        .map_err(|error| transaction_error(TransactionErrorKind::Unavailable, error))?;
+    if !preflight.allowed {
+        return Err(transaction_error(
+            TransactionErrorKind::Rejected,
+            "Bitcoin node rejected transaction preflight",
+        ));
+    }
+    let submitted = transactions.broadcast(signed, max_fee_rate).await?;
+    if submitted != native_id {
+        return Err(transaction_error(
+            TransactionErrorKind::Unavailable,
+            "Bitcoin transaction capability returned a different transaction ID",
+        ));
+    }
+    Ok(BroadcastReceipt {
+        id: BaseTransactionId::new(native_id.to_string()),
+    })
 }
 pub(super) fn transaction_error(
     kind: TransactionErrorKind,
@@ -529,14 +544,6 @@ mod tests {
         }
     }
 
-    fn wallet_with_transactions(transactions: Arc<dyn Transactions>) -> Arc<dyn WalletContract> {
-        block_on(
-            factory_with_transactions(AddressType::SegwitV0, transactions)
-                .create(SecretBytes::new([1_u8; 32])),
-        )
-        .expect("fixed valid secret must create a Bitcoin wallet")
-    }
-
     #[test]
     fn broadcast_preserves_the_transaction_layers_exact_local_id() {
         let provider_candidate = format!("{:064x}", 9);
@@ -550,10 +557,12 @@ mod tests {
             )
             .with_ambiguous_transaction_id(local_id.clone())),
         ));
-        let wallet = wallet_with_transactions(transactions.clone());
-
-        let error = block_on(wallet.broadcaster().broadcast(&prepared))
-            .expect_err("an unknown Bitcoin broadcast outcome must fail with reconciliation data");
+        let error = block_on(broadcast_prepared(
+            transactions.as_ref(),
+            FeeRate::new(1_000),
+            &prepared,
+        ))
+        .expect_err("an unknown Bitcoin broadcast outcome must fail with reconciliation data");
 
         assert_eq!(error.kind, TransactionErrorKind::Unavailable);
         assert_eq!(error.ambiguous_transaction_id, Some(local_id));
@@ -578,10 +587,12 @@ mod tests {
             Ok(allowed_preflight()),
             Ok(native_id),
         ));
-        let wallet = wallet_with_transactions(transactions);
-
-        let submitted = block_on(wallet.broadcaster().broadcast(&prepared))
-            .expect("a matching Bitcoin broadcast ID must be acknowledged");
+        let submitted = block_on(broadcast_prepared(
+            transactions.as_ref(),
+            FeeRate::new(1_000),
+            &prepared,
+        ))
+        .expect("a matching Bitcoin broadcast ID must be acknowledged");
 
         assert_eq!(submitted.id, BaseTransactionId::new(native_id.to_string()));
     }
@@ -592,7 +603,6 @@ mod tests {
             Ok(allowed_preflight()),
             Ok(crate::TransactionId([9; 32])),
         ));
-        let wallet = wallet_with_transactions(transactions.clone());
         let (prepared, native_id) = prepared_transaction();
         let different_id = crate::TransactionId([9; 32]);
         assert_ne!(native_id, different_id);
@@ -602,8 +612,12 @@ mod tests {
             base::TransactionEnvelope::new(prepared.envelope().as_bytes().to_vec()),
         );
 
-        let error = block_on(wallet.broadcaster().broadcast(&invalid))
-            .expect_err("a declared ID that disagrees with its bytes must fail locally");
+        let error = block_on(broadcast_prepared(
+            transactions.as_ref(),
+            FeeRate::new(1_000),
+            &invalid,
+        ))
+        .expect_err("a declared ID that disagrees with its bytes must fail locally");
 
         assert_eq!(error.kind, TransactionErrorKind::InvalidTransaction);
         assert_eq!(error.ambiguous_transaction_id, None);
@@ -619,11 +633,14 @@ mod tests {
             }),
             Ok(crate::TransactionId([9; 32])),
         ));
-        let wallet = wallet_with_transactions(transactions.clone());
         let (prepared, native_id) = prepared_transaction();
 
-        let error = block_on(wallet.broadcaster().broadcast(&prepared))
-            .expect_err("preflight failure must stop before broadcast");
+        let error = block_on(broadcast_prepared(
+            transactions.as_ref(),
+            FeeRate::new(1_000),
+            &prepared,
+        ))
+        .expect_err("preflight failure must stop before broadcast");
 
         assert_eq!(error.kind, TransactionErrorKind::Unavailable);
         assert_eq!(error.ambiguous_transaction_id, None);
@@ -647,11 +664,14 @@ mod tests {
             }),
             Ok(crate::TransactionId([9; 32])),
         ));
-        let wallet = wallet_with_transactions(transactions.clone());
         let (prepared, _) = prepared_transaction();
 
-        let error = block_on(wallet.broadcaster().broadcast(&prepared))
-            .expect_err("a rejected Bitcoin preflight must stop before broadcast");
+        let error = block_on(broadcast_prepared(
+            transactions.as_ref(),
+            FeeRate::new(1_000),
+            &prepared,
+        ))
+        .expect_err("a rejected Bitcoin preflight must stop before broadcast");
 
         assert_eq!(error.kind, TransactionErrorKind::Rejected);
         assert_eq!(error.ambiguous_transaction_id, None);

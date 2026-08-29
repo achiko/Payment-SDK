@@ -379,91 +379,91 @@ once, under Rust 1.85:
 
 ## Native Submission
 
-- [ ] **Create the submission registrar contract** — define one Solana-owned
+- [x] **Create the submission registrar contract** — define one Solana-owned
   registration capability whose success means the application has inserted
   the task before dispatch; do not depend on Tokio task ownership in generic
   crates.
-- [ ] **Model immutable envelope state** — privately bind source, original
+- [x] **Model immutable envelope state** — privately bind source, original
   occurrence, message, first signature, exact signed bytes, operation floor,
   blockhash, and last valid block height.
-- [ ] **Generate Memo tokens** — generate a fresh opaque 256-bit OS-random value
+- [x] **Generate Memo tokens** — generate a fresh opaque 256-bit OS-random value
   for every occurrence and encode its raw bytes as canonical Base58; expose no
   caller or payment data.
-- [ ] **Build the System instruction** — use the maintained System interface to
+- [x] **Build the System instruction** — use the maintained System interface to
   construct one native transfer with the source as fee payer and only signer.
-- [ ] **Build the Memo-v3 instruction** — use exactly
+- [x] **Build the Memo-v3 instruction** — use exactly
   `MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr`, zero accounts, and the unique
   token; support no program override or memo-less fallback.
-- [ ] **Build one legacy message** — create exactly System transfer then Memo
+- [x] **Build one legacy message** — create exactly System transfer then Memo
   for one occurrence and prove instruction order/account roles.
-- [ ] **Distinguish identical payments** — prove duplicate items and sequential
+- [x] **Distinguish identical payments** — prove duplicate items and sequential
   sends sharing a blockhash receive different messages and first signatures.
-- [ ] **Read the blockhash lifetime** — implement confirmed
+- [x] **Read the blockhash lifetime** — implement confirmed
   `getLatestBlockhash` with current `minContextSlot` and keep blockhash, context,
   and `lastValidBlockHeight` atomic.
-- [ ] **Advance preparation floors** — require each contextual preparation
+- [x] **Advance preparation floors** — require each contextual preparation
   response to meet the sent floor and advance it monotonically; bare block
   height never advances a slot floor.
-- [ ] **Read one exact fee** — implement sequential `getFeeForMessage` using
+- [x] **Read one exact fee** — implement sequential `getFeeForMessage` using
   Base64 of the exact bincode message; reject null as failure, never zero.
-- [ ] **Accumulate source requirements** — checked-sum every amount plus exact
+- [x] **Accumulate source requirements** — checked-sum every amount plus exact
   fee by source without crediting incoming transfers in the same batch.
-- [ ] **Reject insufficient sources** — compare the complete checked totals to
+- [x] **Reject insufficient sources** — compare the complete checked totals to
   the acquired snapshot and report the first original item made impossible by
   the fixed stage order.
-- [ ] **Sign each message once** — sign in original order, verify every local
+- [x] **Sign each message once** — sign in original order, verify every local
   signature, serialize exact bytes, and retain the locally derived first
   signature as sole transaction-ID authority.
-- [ ] **Require distinct envelopes** — reject duplicate messages, signatures,
+- [x] **Require distinct envelopes** — reject duplicate messages, signatures,
   or signed bytes inside one fully prepared batch.
-- [ ] **Simulate one exact envelope** — implement sequential
+- [x] **Simulate one exact envelope** — implement sequential
   `simulateTransaction` with Base64, confirmed, `sigVerify: true`,
   `replaceRecentBlockhash: false`, and the current floor; require `err == null`.
-- [ ] **Prove full preparation atomicity** — every address, RNG, blockhash, fee,
+- [x] **Prove full preparation atomicity** — every address, RNG, blockhash, fee,
   arithmetic, signing, encoding, or simulation failure must yield zero
   broadcasts and release only this invocation's lexical leases. Preserve an
   original index for a truthful item failure and no index for an operation-wide
   RPC, coherence, cancellation, or resource failure.
-- [ ] **Check lifetime equality** — implement confirmed `getBlockHeight` with
+- [x] **Check lifetime equality** — implement confirmed `getBlockHeight` with
   the current floor and allow broadcast while height equals the last valid
   height; expire only when it is greater.
-- [ ] **Register before dispatch** — transition lexical leases into guarded
+- [x] **Register before dispatch** — transition lexical leases into guarded
   immutable envelopes, register the application task, and begin no wire call
   until insertion acknowledgement succeeds.
-- [ ] **Reject closed registration** — if registration closes or acknowledgement
+- [x] **Reject closed registration** — if registration closes or acknowledgement
   is lost before insertion, fail definitely before dispatch and create no
   ambiguous guard.
-- [ ] **Broadcast exact bytes** — implement one-shot `sendTransaction` with
+- [x] **Broadcast exact bytes** — implement one-shot `sendTransaction` with
   Base64, preflight enabled, confirmed preflight commitment, current floor, and
   `maxRetries: 0`.
-- [ ] **Validate the returned signature** — accept only canonical equality with
+- [x] **Validate the returned signature** — accept only canonical equality with
   the locally derived first signature; a mismatch after the wire boundary is
   ambiguous, never a provider-authoritative ID.
-- [ ] **Define the wire boundary** — treat timeout, disconnect, cancellation,
+- [x] **Define the wire boundary** — treat timeout, disconnect, cancellation,
   every JSON-RPC error code, malformed/uncorrelated response, internal error,
   and signature mismatch after the call begins as unknown acceptance.
-- [ ] **Read one historical status** — implement
+- [x] **Read one historical status** — implement
   `getSignatureStatuses([local_id], searchTransactionHistory: true)` with exact
   one-entry cardinality, context at least the operation floor, transaction slot
   inside the inclusive floor-to-response-context range, valid status shape,
   and no floor advancement.
-- [ ] **Map non-null status** — treat any coherent non-null entry, including an
+- [x] **Map non-null status** — treat any coherent non-null entry, including an
   execution error, as submitted while leaving final success/failure to indexing.
-- [ ] **Keep unavailable status unknown** — null, malformed, short, extra,
+- [x] **Keep unavailable status unknown** — null, malformed, short, extra,
   incoherent, or low-context status proves neither landing nor absence and
   permits no unsafe source release.
-- [ ] **Authorize exact replay** — only after a valid null status and confirmed
+- [x] **Authorize exact replay** — only after a valid null status and confirmed
   block height at or below expiry may the coordinator resend the identical
   bytes.
-- [ ] **Bound wire submissions** — permit at most the original call plus two
+- [x] **Bound wire submissions** — permit at most the original call plus two
   identical replays, checking status and height between attempts and once after
   the final unknown response.
-- [ ] **Stop the ordered batch** — submit in original order; expose only the
+- [x] **Stop the ordered batch** — submit in original order; expose only the
   definitely acknowledged prefix, attach the ambiguous original index, and
   attempt no later item after definite/ambiguous broadcast outcome. Release
   sources used only by unattempted later items while retaining the ambiguous
   occurrence's source guard.
-- [ ] **Detach the HTTP waiter safely** — handler cancellation after task
+- [x] **Detach the HTTP waiter safely** — handler cancellation after task
   registration drops only its result waiter; submission and reconciliation
   stay application-supervised.
 
@@ -479,180 +479,180 @@ Solana plan owns the following native source/interpreter work; the central plan
 must link its **Add the Solana source** and **Prove Solana edge cases** evidence
 here rather than implementing a second source.
 
-- [ ] **Add indexing RPC methods** — implement finalized
+- [x] **Add indexing RPC methods** — implement finalized
   `getFirstAvailableBlock`, closed-range `getBlocks`, and full/json/version-0/
   no-rewards `getBlock` with strict bounds and response shapes.
-- [ ] **Create the tip request fixture** — model `getSlot`, both lower-bound
+- [x] **Create the tip request fixture** — model `getSlot`, both lower-bound
   samples, exact closed windows, and complete selected block responses.
-- [ ] **Traverse backward tip windows** — search descending 10,000-position
+- [x] **Traverse backward tip windows** — search descending 10,000-position
   windows from finalized `T`, sending `minContextSlot = T` on every
   `getBlocks` call, without fabricating `T` as a produced block.
-- [ ] **Validate tip enumeration** — reject unordered, duplicate, out-of-range,
+- [x] **Validate tip enumeration** — reject unordered, duplicate, out-of-range,
   empty-retained-range, `A0 > T`, and unavailable selected-candidate results.
-- [ ] **Validate the tip block** — require hash, previous hash, actual parent
+- [x] **Validate the tip block** — require hash, previous hash, actual parent
   slot, non-null produced block height, and the exact requested slot pairing.
-- [ ] **Create the sparse range fixture** — cover positions `100, 103, 107`,
+- [x] **Create the sparse range fixture** — cover positions `100, 103, 107`,
   produced heights `50, 51, 52`, skipped positions, and returned-block limits.
-- [ ] **Open the range pruning bound** — sample
+- [x] **Open the range pruning bound** — sample
   `A0 = getFirstAvailableBlock()` before every range enumeration and reject an
   attempt whose required start, anchor, or checkpoint is already below it.
-- [ ] **Return empty past-tip ranges** — when `start > tip.position`, return an
+- [x] **Return empty past-tip ranges** — when `start > tip.position`, return an
   empty generic range without issuing an enumeration or block RPC.
-- [ ] **Traverse forward sparse windows** — use checked inclusive numeric
+- [x] **Traverse forward sparse windows** — use checked inclusive numeric
   windows sized as `min(max(remaining, 10_000), 500_000)`, append only earliest
   remaining produced slots, send `minContextSlot = tip.position`, and never
   synthesize skipped slots.
-- [ ] **Validate range enumeration** — require strict increasing uniqueness and
+- [x] **Validate range enumeration** — require strict increasing uniqueness and
   exact range membership while validating but deferring a response suffix;
   prove the implementation does not substitute `getBlocksWithLimit`.
-- [ ] **Fetch every selected block** — request each selected slot with the exact
+- [x] **Fetch every selected block** — request each selected slot with the exact
   finalized/full/json/version-0/no-rewards configuration, pair the response to
   its requested slot, and make an unavailable/incomplete selected block a
   retryable result with no checkpoint advance.
-- [ ] **Enforce known-tip consistency** — reject a final covered window that
+- [x] **Enforce known-tip consistency** — reject a final covered window that
   omits the independently proved produced tip.
-- [ ] **Enforce enumeration bounds** — cap one window at 500,000 numeric
+- [x] **Enforce enumeration bounds** — cap one window at 500,000 numeric
   positions and one attempt at 64 enumeration calls.
-- [ ] **Enforce the source deadline** — apply one 30-second monotonic deadline
+- [x] **Enforce the source deadline** — apply one 30-second monotonic deadline
   to every RPC future and loop edge, independent of per-call timeout.
-- [ ] **Fail source attempts atomically** — deadline, call-budget, arithmetic,
+- [x] **Fail source attempts atomically** — deadline, call-budget, arithmetic,
   or cancellation exhaustion discards every fetched fact, publishes no tip,
   and permits no commit; deadline and call-budget exhaustion are retryable
   source errors.
-- [ ] **Cancel source attempts fully** — cancellation discards all fetched
+- [x] **Cancel source attempts fully** — cancellation discards all fetched
   facts, publishes no tip, and permits no checkpoint commit.
-- [ ] **Close the pruning sandwich** — sample `A1` after all selected blocks and
+- [x] **Close the pruning sandwich** — sample `A1` after all selected blocks and
   reject a plan when any required start/anchor/checkpoint has been pruned.
-- [ ] **Validate child continuity** — require increasing slot, produced height
+- [x] **Validate child continuity** — require increasing slot, produced height
   exactly parent height plus one, and exact parent position/hash equality.
-- [ ] **Lookup canonical references** — query the stored native slot and return
+- [x] **Lookup canonical references** — query the stored native slot and return
   a complete reference; never subtract one from a sparse slot.
-- [ ] **Detect complete canonical mismatch** — treat only a complete changed
+- [x] **Detect complete canonical mismatch** — treat only a complete changed
   hash or parent as ordinary bounded-reorg evidence.
-- [ ] **Prove canonical omission** — require `T > S`, both lower bounds at or
+- [x] **Prove canonical omission** — require `T > S`, both lower bounds at or
   below `S`, and an empty exact `[S,S]` enumeration with `minContextSlot = T`
   before treating omitted stored slot `S` as mismatch.
-- [ ] **Keep unavailable data retryable** — null, pruned, incomplete,
+- [x] **Keep unavailable data retryable** — null, pruned, incomplete,
   temporarily unavailable, failed-witness, or `T <= S` data is not reorg
   evidence.
-- [ ] **Implement the Solana source contract** — connect complete tip, bounded
+- [x] **Implement the Solana source contract** — connect complete tip, bounded
   range, and canonical lookup to the accepted generic `BlockSource` without a
   Solana-specific synchronizer.
 
-- [ ] **Validate transaction identity** — require canonical first-signature
+- [x] **Validate transaction identity** — require canonical first-signature
   IDs, coherent signer/signature cardinality, and a first static fee payer that
   is marked as a signer for every admitted transaction.
-- [ ] **Resolve legacy account keys** — map static keys and fee payer in exact
+- [x] **Resolve legacy account keys** — map static keys and fee payer in exact
   message order.
-- [ ] **Resolve version-zero keys** — append loaded writable then loaded
+- [x] **Resolve version-zero keys** — append loaded writable then loaded
   read-only addresses exactly as the protocol defines.
-- [ ] **Validate balance vectors** — reject missing metadata/loaded addresses,
+- [x] **Validate balance vectors** — reject missing metadata/loaded addresses,
   invalid indices, or pre/post length mismatch before emitting facts.
-- [ ] **Validate inner instruction groups** — reject duplicate outer-index
+- [x] **Validate inner instruction groups** — reject duplicate outer-index
   groups; for a successful relevant transaction require present inner metadata,
   treating `[]` as valid but omitted/null as incomplete.
-- [ ] **Map transaction status** — use `meta.err` for failed status and never
+- [x] **Map transaction status** — use `meta.err` for failed status and never
   invent meaning from provider prose.
-- [ ] **Map the actual fee** — preserve exact `meta.fee` for successful and
+- [x] **Map the actual fee** — preserve exact `meta.fee` for successful and
   failed transactions with the resolved fee payer.
-- [ ] **Decode top-level transfers** — use the maintained System interface to
+- [x] **Decode top-level transfers** — use the maintained System interface to
   decode supported `Transfer` instructions in execution order; transfer-shaped
   bytes owned by any non-System program produce no movement.
-- [ ] **Decode transfer-with-seed** — use the protocol-defined destination
+- [x] **Decode transfer-with-seed** — use the protocol-defined destination
   account index and retain exact source/destination/lamports.
-- [ ] **Decode inner transfers** — preserve outer/inner execution order and
+- [x] **Decode inner transfers** — preserve outer/inner execution order and
   deterministic movement identities.
-- [ ] **Preserve transfer occurrences** — keep repeated and self-transfer facts
+- [x] **Preserve transfer occurrences** — keep repeated and self-transfer facts
   distinct while omitting zero-lamport movements.
-- [ ] **Suppress failed movements** — failed transactions retain actual fee and
+- [x] **Suppress failed movements** — failed transactions retain actual fee and
   status but emit no attempted value movement.
-- [ ] **Apply relevance policy** — persist transactions only when an active
+- [x] **Apply relevance policy** — persist transactions only when an active
   address is fee payer or endpoint of a supported movement. Once relevant,
   retain every supported movement in that transaction, including movements
   whose endpoints are both outside the active filter.
-- [ ] **Shield selected balances** — reconcile selected-wallet pre/post deltas
+- [x] **Shield selected balances** — reconcile selected-wallet pre/post deltas
   against supported movements and fee so unsupported value effects fail the
   whole block.
-- [ ] **Reject unsupported versions** — transaction versions above zero fail
+- [x] **Reject unsupported versions** — transaction versions above zero fail
   the complete block with no partial history or checkpoint movement. Raising
   the supported version requires separate decoder and fixture evidence before
   cluster activation.
-- [ ] **Emit no UTXO changes** — every Solana interpreted block returns empty
+- [x] **Emit no UTXO changes** — every Solana interpreted block returns empty
   output changes.
-- [ ] **Pass interpreter completeness** — cover legacy/v0, loaded addresses,
+- [x] **Pass interpreter completeness** — cover legacy/v0, loaded addresses,
   outer/inner transfers, failed transactions, fees, unsupported effects,
   relevance, and all-or-nothing block behavior.
-- [ ] **Pass sparse source evidence** — cover backward/forward windows, huge
+- [x] **Pass sparse source evidence** — cover backward/forward windows, huge
   gaps, skipped birthdays, prefix resume, pruning movement, deadlines, call
   budgets, cancellation, unavailable blocks, retained reorg, restart, and deep
   reorg failure.
-- [ ] **Link central-plan evidence** — mark its Solana source/edge-case steps
+- [x] **Link central-plan evidence** — mark its Solana source/edge-case steps
   complete only by linking these exact source/interpreter tests; do not copy
   implementation or create Solana-only storage tables.
-- [ ] **Prove PostgreSQL coexistence** — after central composition, write
+- [x] **Prove PostgreSQL coexistence** — after central composition, write
   Bitcoin, Ethereum, and Solana scopes plus native/token assets through one
   pool/schema; prove isolation and byte-for-byte unchanged `payment_wallets`.
-- [ ] **Pass the indexing gate** — run generic indexing, runtime, both
+- [x] **Pass the indexing gate** — run generic indexing, runtime, both
   repository contracts, Solana source/interpreter, PostgreSQL, and design-lint
-  gates under Rust 1.85 with no silent test skip.
+  gates under Rust 1.91 with no silent test skip.
 
 The central **Wallet Handoff** gate and native indexing evidence are now
 available. Return to the **Native Submission** workstream and complete its
 history-dependent surface:
 
-- [ ] **Wake reconciliation on checkpoints** — inject the matching scope's
+- [x] **Wake reconciliation on checkpoints** — inject the matching scope's
   checkpoint notification and reset deterministic backoff on progress.
-- [ ] **Cap reconciliation backoff** — retry status/history from 500 ms doubling
+- [x] **Cap reconciliation backoff** — retry status/history from 500 ms doubling
   to 10 s without a busy loop and without changing endpoint or envelope bytes.
-- [ ] **Resolve indexed presence** — clear a guard as submitted when canonical
+- [x] **Resolve indexed presence** — clear a guard as submitted when canonical
   source history contains the exact signature, regardless of execution status.
-- [ ] **Start an absence proof** — require confirmed height beyond expiry and a
+- [x] **Start an absence proof** — require confirmed height beyond expiry and a
   finalized checkpoint height at least the last valid height before scanning.
-- [ ] **Scan absence pages** — traverse source history in pages of at most 100
+- [x] **Scan absence pages** — traverse source history in pages of at most 100
   against one checkpoint-bound cursor until exhaustion.
-- [ ] **Reject unstable absence** — discard the scan on cursor conflict,
+- [x] **Reject unstable absence** — discard the scan on cursor conflict,
   checkpoint change, reorg, pruning, page failure, gap, or incomplete
   traversal; wait for later evidence.
-- [ ] **Release on proven absence** — only one complete exhausted scan at one
+- [x] **Release on proven absence** — only one complete exhausted scan at one
   unchanged checkpoint may classify expiry-without-landing and release the
   guarded source.
-- [ ] **Hold unresolved sources indefinitely** — null status, unavailable
+- [x] **Hold unresolved sources indefinitely** — null status, unavailable
   history, indexer failure, pruning, or lost in-process state never becomes a
   false absence proof.
-- [ ] **Build the Solana wallet view** — expose canonical address, native SOL
+- [x] **Build the Solana wallet view** — expose canonical address, native SOL
   balance, and checkpoint-bound history through existing wallet capabilities
   without returning secret material.
-- [ ] **Build the Solana provider** — inject the singular client, index
+- [x] **Build the Solana provider** — inject the singular client, index
   capabilities, and completed shared submission coordinator into generated and
   imported wallets; generation and import converge on the same native
   validation path, successful generation derives the address from its signer,
   and generated wallets remain process-lifetime only. Prove an injected
   randomness failure through `Wallets::generate` remains typed as
   `wallets::ErrorKind::Generation` and registers no wallet/filter.
-- [ ] **Route single sends to the coordinator** — implement the Solana wallet's
+- [x] **Route single sends to the coordinator** — implement the Solana wallet's
   chain-native transaction/broadcast bridge so `Wallets::send` enters the same
   coordinator exactly once and never creates an independent source guard.
-- [ ] **Build the Solana batch sender** — route the registered-family `Sender`
+- [x] **Build the Solana batch sender** — route the registered-family `Sender`
   batch path to that same private coordinator rather than adding a universal
   transaction/RPC abstraction.
-- [ ] **Defend the Solana sender bound** — reject impossible zero/51-item direct
+- [x] **Defend the Solana sender bound** — reject impossible zero/51-item direct
   calls before account RPC, RNG, fee, signing, simulation, or task
   registration; prove success at 1 and 50.
-- [ ] **Prove shared coordinator identity** — an ambiguity entered through
+- [x] **Prove shared coordinator identity** — an ambiguity entered through
   single send must block batch send for the same source, and the inverse must
   also hold.
-- [ ] **Prove submission state is ephemeral** — prove neither PostgreSQL nor
+- [x] **Prove submission state is ephemeral** — prove neither PostgreSQL nor
   redb persists source leases, signed envelopes, attempts, guarded outcomes,
   replay counters, or reconciliation state.
-- [ ] **Prove the restart limitation** — deterministic tests and documentation
+- [x] **Prove the restart limitation** — deterministic tests and documentation
   show that process restart, active-active writers, response loss, or a new
   logical invocation may double-pay because durable idempotency is out of scope.
-- [ ] **Pass the account/wallet gate** — run Rust-1.85 Solana provider, wallet,
+- [x] **Pass the account/wallet gate** — run Rust-1.91 Solana provider, wallet,
   balance, history, sender, shared-coordinator, and public-contract tests with
   owned doubles only.
-- [ ] **Pass the submission gate** — run all construction, fee, balance,
+- [x] **Pass the submission gate** — run all construction, fee, balance,
   signature, simulation, replay, status, cancellation, prefix, reconciliation,
-  and shared public-error tests under Rust 1.85 with owned doubles only.
+  and shared public-error tests under Rust 1.91 with owned doubles only.
 
 ## Runtime & Release Evidence
 

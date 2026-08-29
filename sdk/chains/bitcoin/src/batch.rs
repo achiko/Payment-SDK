@@ -19,6 +19,7 @@ pub(crate) struct Batch {
     network: Network,
     utxos: Arc<IndexUtxos>,
     fees: Arc<dyn Fees>,
+    transactions: Arc<dyn crate::Transactions>,
     fee_target_blocks: u16,
     max_fee_rate: FeeRate,
 }
@@ -28,6 +29,7 @@ impl Batch {
         network: Network,
         utxos: Arc<IndexUtxos>,
         fees: Arc<dyn Fees>,
+        transactions: Arc<dyn crate::Transactions>,
         fee_target_blocks: u16,
         max_fee_rate: FeeRate,
     ) -> Self {
@@ -35,6 +37,7 @@ impl Batch {
             network,
             utxos,
             fees,
+            transactions,
             fee_target_blocks,
             max_fee_rate,
         }
@@ -145,12 +148,13 @@ impl Sender for Batch {
                 BaseId::new(signed.id().to_string()),
                 Envelope::new(signed.consensus_bytes().to_vec()),
             );
-            let submitted = sources[0]
-                .wallet
-                .broadcaster()
-                .broadcast(&prepared)
-                .await
-                .map_err(grouped_failure)?;
+            let submitted = crate::wallet::broadcast_prepared(
+                self.transactions.as_ref(),
+                self.max_fee_rate,
+                &prepared,
+            )
+            .await
+            .map_err(grouped_failure)?;
             Ok(vec![submitted.id])
         })
     }

@@ -32,7 +32,7 @@ impl Key {
     }
 
     pub fn generate() -> Result<Self, Error> {
-        Self::generate_with(|bytes| getrandom::fill(bytes).map_err(|_| ()))
+        Self::from_secret(Self::generate_secret()?)
     }
 
     #[must_use]
@@ -45,7 +45,7 @@ impl Key {
         SignedMessage::verified(&self.address, message, signature)
     }
 
-    fn from_secret(secret: SecretBytes) -> Result<Self, Error> {
+    pub(super) fn from_secret(secret: SecretBytes) -> Result<Self, Error> {
         let bytes: [u8; 32] = secret.as_bytes().try_into().map_err(|_| {
             Error::new(
                 ErrorKind::InvalidSecret,
@@ -59,7 +59,13 @@ impl Key {
         })
     }
 
-    fn generate_with(mut fill: impl FnMut(&mut [u8; 32]) -> Result<(), ()>) -> Result<Self, Error> {
+    pub(super) fn generate_secret() -> Result<SecretBytes, Error> {
+        Self::generate_secret_with(|bytes| getrandom::fill(bytes).map_err(|_| ()))
+    }
+
+    fn generate_secret_with(
+        mut fill: impl FnMut(&mut [u8; 32]) -> Result<(), ()>,
+    ) -> Result<SecretBytes, Error> {
         let mut bytes = Zeroizing::new([0_u8; 32]);
         fill(&mut bytes).map_err(|()| {
             Error::new(
@@ -67,7 +73,7 @@ impl Key {
                 "operating system random source is unavailable",
             )
         })?;
-        Self::from_secret(SecretBytes::new(*bytes))
+        Ok(SecretBytes::new(*bytes))
     }
 
     fn native_key(&self) -> Result<Keypair, Error> {
@@ -223,7 +229,7 @@ mod tests {
         assert_ne!(first.address(), second.address());
 
         let calls = std::cell::Cell::new(0);
-        let error = Key::generate_with(|_| {
+        let error = Key::generate_secret_with(|_| {
             calls.set(calls.get() + 1);
             Err(())
         })

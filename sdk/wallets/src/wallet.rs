@@ -319,54 +319,62 @@ pub trait HistoryReader: Send + Sync {
     fn history<'a>(&'a self, request: HistoryRequest) -> FutureResult<'a, History>;
 }
 
-/// Chain-independent capabilities available after application composition.
-pub trait Wallet:
-    Addresser
-    + AddressFormat
-    + BalanceReader
-    + TransactionFactory
-    + HistoryReader
-    + Signer
-    + Send
-    + Sync
-{
-    /// Builds, signs, and submits one transfer through this wallet's native
-    /// transaction implementation. Inclusion and confirmation remain indexing
-    /// facts rather than RPC results.
+/// Submits one native transfer through the concrete wallet's coordinator.
+///
+/// Concrete wallets may use the transaction-builder default below or keep
+/// preparation and submission inside one guarded operation that cannot be
+/// split across a generic signed-transaction value.
+pub trait SingleSender: Send + Sync {
     fn send<'a>(
         &'a self,
         destination: crate::AddressText,
         amount: Decimal,
-    ) -> FutureResult<'a, TransactionId> {
-        Box::pin(async move {
-            if amount <= Decimal::zero() {
-                return Err(Error::new(
-                    crate::ErrorKind::InvalidAmount,
-                    "amount must be positive",
-                ));
-            }
-            let destination = self.parse_address(&destination)?;
-            let mut transaction = self.transaction();
-            transaction.transfer(destination, amount)?;
-            let signed = transaction.prepare().await?;
-            let submitted = self.broadcaster().broadcast(&signed).await?;
-            if submitted.id != *signed.id() {
-                return Err(Error::new(
-                    crate::ErrorKind::Transaction,
-                    "broadcaster returned a different transaction ID",
-                ));
-            }
-            Ok(submitted.id)
-        })
-    }
+    ) -> FutureResult<'a, TransactionId>;
+}
+
+#[doc(hidden)]
+pub fn send_with_transaction<W>(
+    wallet: &W,
+    destination: crate::AddressText,
+    amount: Decimal,
+) -> FutureResult<'_, TransactionId>
+where
+    W: AddressFormat + TransactionFactory + Sync + ?Sized,
+{
+    Box::pin(async move {
+        if amount <= Decimal::zero() {
+            return Err(Error::new(
+                crate::ErrorKind::InvalidAmount,
+                "amount must be positive",
+            ));
+        }
+        let destination = wallet.parse_address(&destination)?;
+        let mut transaction = wallet.transaction();
+        transaction.transfer(destination, amount)?;
+        let signed = transaction.prepare().await?;
+        let submitted = wallet.broadcaster().broadcast(&signed).await?;
+        if submitted.id != *signed.id() {
+            return Err(Error::new(
+                crate::ErrorKind::Transaction,
+                "broadcaster returned a different transaction ID",
+            ));
+        }
+        Ok(submitted.id)
+    })
+}
+
+/// Chain-independent capabilities available after application composition.
+pub trait Wallet:
+    Addresser + AddressFormat + BalanceReader + HistoryReader + SingleSender + Signer + Send + Sync
+{
 }
 
 impl<T> Wallet for T where
     T: Addresser
         + AddressFormat
         + BalanceReader
-        + TransactionFactory
         + HistoryReader
+        + SingleSender
         + Signer
         + Send
         + Sync

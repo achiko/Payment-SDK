@@ -54,7 +54,7 @@ where
     /// The caller supplies the identifier derived from the exact locally
     /// signed envelope. Every failure after dispatch preserves that local ID
     /// and remains unknown; provider output never becomes authority.
-    pub async fn request_after_dispatch<T>(
+    pub(super) async fn request_after_dispatch<T>(
         &self,
         method: &'static str,
         params: Value,

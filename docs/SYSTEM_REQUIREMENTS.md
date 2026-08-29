@@ -862,6 +862,7 @@ uniqueness, full-batch zero-broadcast preparation failures, source locking,
 exact fees/balances/signatures/simulation, blockhash expiry, returned-signature
 mismatch, three-call exact-byte replay, ambiguity metadata, cancellation,
 status/history reconciliation, indefinite evidence failure, and documented
-restart/double-payment limitations. Exact application runtime-composition tests
-required by ADR-0027 are also unimplemented. Every Solana test MUST use owned
+restart/double-payment limitations. These native-chain contracts are now
+implemented; exact application runtime-composition tests required by ADR-0027
+remain unimplemented. Every Solana test MUST use owned
 RPC doubles or a local validator and MUST NOT contact a public RPC endpoint.

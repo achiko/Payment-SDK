@@ -196,6 +196,16 @@ impl TransactionFactory for FixtureWallet {
     }
 }
 
+impl wallets::SingleSender for FixtureWallet {
+    fn send<'a>(
+        &'a self,
+        destination: AddressText,
+        amount: Decimal,
+    ) -> wallets::FutureResult<'a, TransactionId> {
+        wallets::send_with_transaction(self, destination, amount)
+    }
+}
+
 impl Broadcaster for FixtureWallet {
     fn broadcast<'a>(
         &'a self,

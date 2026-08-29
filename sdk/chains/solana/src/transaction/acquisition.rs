@@ -22,15 +22,17 @@ pub struct ResolvedTransfer {
     index: usize,
     source: Address,
     destination: String,
+    amount: Lamport,
 }
 
 impl ResolvedTransfer {
     #[must_use]
-    pub fn new(index: usize, source: Address, destination: String) -> Self {
+    pub fn new(index: usize, source: Address, destination: String, amount: Lamport) -> Self {
         Self {
             index,
             source,
             destination,
+            amount,
         }
     }
 
@@ -42,6 +44,11 @@ impl ResolvedTransfer {
     #[must_use]
     pub const fn source(&self) -> &Address {
         &self.source
+    }
+
+    #[must_use]
+    pub const fn amount(&self) -> Lamport {
+        self.amount
     }
 }
 
@@ -62,14 +69,14 @@ impl Cancellation {
         self.state.notify.notify_waiters();
     }
 
-    async fn cancelled(&self) {
+    pub(super) async fn cancelled(&self) {
         if self.state.cancelled.load(Ordering::Acquire) {
             return;
         }
         self.state.notify.notified().await;
     }
 
-    fn ensure(&self) -> Result<(), SendError> {
+    pub(super) fn ensure(&self) -> Result<(), SendError> {
         if self.state.cancelled.load(Ordering::Acquire) {
             return Err(operation("Solana account acquisition was cancelled"));
         }
@@ -79,9 +86,10 @@ impl Cancellation {
 
 pub struct AcquiredAccounts {
     floor: u64,
+    transfers: Vec<ResolvedTransfer>,
     balances: Vec<Lamport>,
     destinations: Vec<Address>,
-    _leases: SourceLeases,
+    leases: SourceLeases,
 }
 
 impl AcquiredAccounts {
@@ -96,8 +104,31 @@ impl AcquiredAccounts {
     }
 
     #[must_use]
+    pub fn transfers(&self) -> &[ResolvedTransfer] {
+        &self.transfers
+    }
+
+    #[must_use]
     pub fn destinations(&self) -> &[Address] {
         &self.destinations
+    }
+
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        u64,
+        Vec<ResolvedTransfer>,
+        Vec<Lamport>,
+        Vec<Address>,
+        SourceLeases,
+    ) {
+        (
+            self.floor,
+            self.transfers,
+            self.balances,
+            self.destinations,
+            self.leases,
+        )
     }
 }
 
@@ -163,9 +194,10 @@ where
         cancellation.ensure()?;
         Ok(AcquiredAccounts {
             floor: closing,
+            transfers: items.to_vec(),
             balances,
             destinations,
-            _leases: leases,
+            leases,
         })
     }
 }
@@ -265,7 +297,7 @@ fn supported(account: &AccountSnapshot, system: &Address) -> bool {
     !account.executable() && account.owner() == system && account.data().is_empty()
 }
 
-async fn raced<T>(
+pub(super) async fn raced<T>(
     cancellation: &Cancellation,
     future: impl Future<Output = Result<T, crate::Error>>,
 ) -> Result<T, SendError> {
@@ -363,7 +395,12 @@ mod tests {
     }
 
     fn transfer(index: usize, source: &Address, destination: &Address) -> ResolvedTransfer {
-        ResolvedTransfer::new(index, source.clone(), destination.to_string())
+        ResolvedTransfer::new(
+            index,
+            source.clone(),
+            destination.to_string(),
+            Lamport::from_atomic(1),
+        )
     }
 
     fn account(
@@ -448,8 +485,13 @@ mod tests {
         ] {
             let failure = acquirer
                 .acquire(
-                    Batch::new(vec![ResolvedTransfer::new(0, source.clone(), destination)])
-                        .unwrap(),
+                    Batch::new(vec![ResolvedTransfer::new(
+                        0,
+                        source.clone(),
+                        destination,
+                        Lamport::from_atomic(1),
+                    )])
+                    .unwrap(),
                     &Cancellation::default(),
                 )
                 .await
@@ -477,6 +519,7 @@ mod tests {
                     4,
                     source.clone(),
                     destination.to_string(),
+                    Lamport::from_atomic(1),
                 )])
                 .unwrap(),
                 &Cancellation::default(),

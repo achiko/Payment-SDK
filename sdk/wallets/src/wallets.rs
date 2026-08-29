@@ -514,7 +514,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::{AddressEncoding, AddressFormat, BalanceReader, HistoryReader, TransactionFactory};
+    use crate::{
+        AddressEncoding, AddressFormat, BalanceReader, HistoryReader, SingleSender,
+        TransactionFactory,
+    };
 
     struct FixtureIndex(Option<BlockRef>);
 
@@ -686,6 +689,16 @@ mod tests {
 
         fn broadcaster(&self) -> &dyn Broadcaster {
             self
+        }
+    }
+
+    impl crate::SingleSender for FixtureWallet {
+        fn send<'a>(
+            &'a self,
+            destination: AddressText,
+            amount: Decimal,
+        ) -> FutureResult<'a, TransactionId> {
+            crate::send_with_transaction(self, destination, amount)
         }
     }
 

@@ -14,17 +14,20 @@ pub use address::{Address, AddressParseError};
 pub use batch::Batch;
 pub use error::{Error, ErrorKind};
 pub use identity::NativeAsset;
-pub use indexer::{BlockInterpreter, SourceBudget};
+pub use indexer::{Block, BlockInterpreter, Source, SourceBudget};
 pub use lamport::{Lamport, LamportError, LamportErrorKind};
 pub use rpc::{
     Client as RpcClient, Commitment as RpcCommitment, Config as RpcConfig, Context as RpcContext,
-    GenesisHash,
+    GenesisHash, SignatureStatus,
 };
 pub use transaction::{
-    AcquiredAccounts, Acquirer, BlockhashLifetime, Cancellation, Memo, NativeDestination,
-    ResolvedTransfer, SourceCoordinator,
+    AcquiredAccounts, Acquirer, BlockhashLifetime, Cancellation, Coordinator, Envelope, Memo,
+    Message, NativeDestination, PreparedBatch, Preparer, Reconciler, RegistrationError,
+    ResolvedTransfer, SourceCoordinator, SubmissionRegistrar, SubmissionTask, Submitter,
 };
-pub use wallet::{AccountSnapshot, Key, Seed, SignedMessage};
+pub use wallet::{
+    AccountSnapshot, Key, NativeSender, NativeTransfer, Seed, SignedMessage, WalletProvider,
+};
 
 /// Canonical chain key shared by metadata, indexing scopes, and persistence.
 pub const CHAIN: &str = "solana";

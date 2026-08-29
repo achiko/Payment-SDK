@@ -4,16 +4,17 @@ This document describes the target reusable Rust boundaries. Current source is
 authoritative for exact lifetimes, generic bounds, and error types that are
 already implemented. The accepted Public Transaction Semantics, Destination
 Account Acquisition and shared-PostgreSQL target changes below are not fully
-integrated: the Solana crate now implements primitive, one-shot RPC, source-
-lease, and witnessed account-acquisition boundaries, while `apps/api` still
-composes per-chain redb repositories and no Solana provider/sender is registered.
+integrated: the Solana crate now implements its native values, wallet/provider,
+one-shot RPC, submission coordinator, sparse source, and block interpreter,
+while `apps/api` still composes per-chain redb repositories and registers no
+Solana wallet family.
 Complete native block coordinates,
 the position-aware redb/PostgreSQL repositories, sparse synchronization,
 bounded transaction admission, exact ambiguity propagation, provider-owned
 Bitcoin/Ethereum generation, and per-scope wallet/filter admission are now
-implemented. Canonical plain Base58 and the pre-submission account handoff are
-implemented; Native SOL Submission and Solana Runtime Composition remain
-accepted but unimplemented.
+implemented. Canonical plain Base58, witnessed account handoff, Native SOL
+Submission, and the reusable Solana wallet/indexing adapters are implemented;
+Solana Runtime Composition remains accepted but unimplemented.
 
 ## Wallet collection
 
@@ -129,9 +130,13 @@ supports:
   canonical observation `BlockRef` when the concrete source supplies one;
 - `HistoryReader` for complete checkpoint-bound history of the wallet's
   configured payment asset;
-- `TransactionFactory` for a chain-backed transaction builder and broadcaster;
-  and
+- `SingleSender` for one guarded chain-native submission operation; and
 - `Signer` for the minimal signing request.
+
+Bitcoin and Ethereum concrete wallets additionally implement
+`TransactionFactory` for their native prepare/broadcast workflows. Solana does
+not expose that split because its source lease, preparation, registration,
+ordered dispatch, and ambiguity reconciliation form one indivisible operation.
 
 Code needing one capability accepts that capability rather than `dyn Wallet`.
 `Provider` is construction and does not become a post-construction wallet

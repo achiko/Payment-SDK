@@ -17,6 +17,7 @@ pub enum ErrorKind {
     ResponseTooLarge,
     BelowFloor,
     UnsupportedDestination,
+    Simulation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

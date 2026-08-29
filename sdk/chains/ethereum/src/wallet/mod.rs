@@ -252,6 +252,16 @@ impl TransactionFactory for Wallet {
     }
 }
 
+impl wallets::SingleSender for Wallet {
+    fn send<'a>(
+        &'a self,
+        destination: wallets::AddressText,
+        amount: Decimal,
+    ) -> FutureResult<'a, base::TransactionId> {
+        wallets::send_with_transaction(self, destination, amount)
+    }
+}
+
 struct Builder {
     config: WalletConfig,
     from: Address,
