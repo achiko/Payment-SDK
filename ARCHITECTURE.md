@@ -159,10 +159,14 @@ protocol abstraction.
 
 Its protocol stack is the exact modular Anza/SPL dependency family selected in
 ADR-0027, not `solana-client`, a monolithic SDK, handwritten wire encoding, or
-copied System discriminants. Before a Solana manifest change, the workspace
-must reconcile Alloy and all other dependencies with Rust 1.85, pass focused
-Ethereum regressions, and prove a locked build on an actual Rust 1.85 toolchain.
-Failure to preserve behavior stops implementation for a separate MSRV decision.
+copied System discriminants. The workspace baseline is Rust 1.91; the reverted
+Rust 1.85 experiment is historical evidence, not an active requirement. An
+exact scratch-only Rust 1.91 proof combined the current workspace graph with
+the selected modular Solana family while retaining `alloy-consensus`,
+`alloy-eips`, and `alloy-rpc-types-eth` 1.8.3; `alloy-primitives` and
+`alloy-sol-types` 1.6.1; and redb 4.2.0. Repository manifest work must preserve
+that graph and repeat the locked Rust 1.91 checks and focused regressions;
+divergence stops the affected step.
 
 Deleting one chain must leave the other chain and every generic crate coherent.
 

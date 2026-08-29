@@ -341,7 +341,7 @@ registry query surface is removed.
 
 ## Coding, errors, security, and concurrency
 
-- Rust 2024, resolver 3, MSRV 1.85, locked dependencies. Workspace
+- Rust 2024, resolver 3, MSRV 1.91, locked dependencies. Workspace
   `unsafe_code = "forbid"` must not be weakened.
 - Return typed errors from libraries and add actionable context at application
   and transport boundaries. Preserve retryability and ambiguous outcomes.

@@ -25,6 +25,8 @@ pub enum ErrorKind {
 pub struct Error {
     pub kind: ErrorKind,
     pub message: String,
+    /// Canonical local identifier for reconciling an unknown submission outcome.
+    pub ambiguous_transaction_id: Option<Id>,
 }
 
 impl Error {
@@ -33,7 +35,19 @@ impl Error {
         Self {
             kind,
             message: message.into(),
+            ambiguous_transaction_id: None,
         }
+    }
+
+    /// Marks an unknown submission outcome with its locally derived identity.
+    ///
+    /// Only the concrete chain transaction layer that derived `transaction_id`
+    /// from the exact locally signed envelope may attach it. Higher layers must
+    /// preserve the typed value and must not derive it from provider output.
+    #[must_use]
+    pub fn with_ambiguous_transaction_id(mut self, transaction_id: Id) -> Self {
+        self.ambiguous_transaction_id = Some(transaction_id);
+        self
     }
 }
 
@@ -224,6 +238,37 @@ pub struct Submission {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_error_has_no_ambiguous_transaction_id() {
+        let error = Error::new(ErrorKind::Unavailable, "submission is unavailable");
+
+        assert_eq!(error.kind, ErrorKind::Unavailable);
+        assert_eq!(error.message, "submission is unavailable");
+        assert_eq!(error.ambiguous_transaction_id, None);
+    }
+
+    #[test]
+    fn provider_message_cannot_supply_an_ambiguous_transaction_id() {
+        let error = Error::new(
+            ErrorKind::Unknown,
+            "provider claimed transaction canonical-id",
+        );
+
+        assert_eq!(error.ambiguous_transaction_id, None);
+    }
+
+    #[test]
+    fn explicit_ambiguity_preserves_the_typed_transaction_id() {
+        let id = Id::new("canonical-id");
+        let error = Error::new(ErrorKind::Timeout, "submission outcome is unknown")
+            .with_ambiguous_transaction_id(id.clone());
+
+        assert_eq!(error.kind, ErrorKind::Timeout);
+        assert_eq!(error.message, "submission outcome is unknown");
+        assert_eq!(error.to_string(), "submission outcome is unknown");
+        assert_eq!(error.ambiguous_transaction_id, Some(id));
+    }
 
     #[test]
     fn snapshot_round_trips_as_versioned_json() {

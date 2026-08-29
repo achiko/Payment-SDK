@@ -108,6 +108,19 @@ impl WalletProvider {
         }
     }
 
+    fn generate_with(
+        &self,
+        generator: fn() -> Result<SecretBytes, crypto::Error>,
+    ) -> FutureResult<'_, Arc<dyn WalletContract>> {
+        match generator() {
+            Ok(secret) => self.create(secret),
+            Err(error) => {
+                let error = wallet_error(WalletErrorKind::Generation, error);
+                Box::pin(async move { Err(error) })
+            }
+        }
+    }
+
     #[must_use]
     pub fn transactions(&self) -> Arc<dyn wallets::Sender> {
         Arc::new(crate::batch::Batch::new(
@@ -141,6 +154,10 @@ impl Provider for WalletProvider {
                 history: self.history.clone(),
             }) as Arc<dyn WalletContract>)
         })
+    }
+
+    fn generate(&self) -> FutureResult<'_, Arc<dyn WalletContract>> {
+        self.generate_with(SecretBytes::generate_secp256k1)
     }
 }
 
@@ -442,7 +459,63 @@ fn wallet_error(kind: WalletErrorKind, error: impl std::fmt::Display) -> WalletE
 mod tests {
     use super::*;
     use crate::TransferIntent;
+    use base::{Digest, SignRequest, SignablePayload, SignatureEncoding, SignatureScheme};
+    use futures_executor::block_on;
     use indexing::ChainId;
+
+    struct InactiveDependencies;
+
+    impl Accounts for InactiveDependencies {
+        fn balance<'a>(
+            &'a self,
+            _address: Address,
+            _asset: &'a AssetKind,
+            _at: Option<indexing::BlockRef>,
+        ) -> indexing::BoxFuture<'a, Result<Wei, SourceError>> {
+            Box::pin(async { unreachable!("wallet generation must not read account balances") })
+        }
+
+        fn nonce<'a>(
+            &'a self,
+            _address: Address,
+        ) -> indexing::BoxFuture<'a, Result<u64, SourceError>> {
+            Box::pin(async { unreachable!("wallet generation must not read account nonces") })
+        }
+    }
+
+    impl crate::Transactions for InactiveDependencies {
+        fn build_context<'a>(
+            &'a self,
+            _request: &'a TransferRequest,
+            _nonce: u64,
+        ) -> indexing::BoxFuture<'a, Result<crate::BuildContext, ChainError>> {
+            Box::pin(async { unreachable!("wallet generation must not build a transaction") })
+        }
+
+        fn broadcast<'a>(
+            &'a self,
+            _transaction: SignedTransaction,
+        ) -> indexing::BoxFuture<'a, Result<crate::TransactionId, SourceError>> {
+            Box::pin(async { unreachable!("wallet generation must not broadcast a transaction") })
+        }
+
+        fn known<'a>(
+            &'a self,
+            _transaction: &'a crate::TransactionId,
+        ) -> indexing::BoxFuture<'a, Result<bool, SourceError>> {
+            Box::pin(async { unreachable!("wallet generation must not query a transaction") })
+        }
+    }
+
+    impl IndexHistory for InactiveDependencies {
+        fn history<'a>(
+            &'a self,
+            _request: indexing::HistoryQuery,
+        ) -> indexing::BoxFuture<'a, Result<indexing::TransactionPage, indexing::IndexError>>
+        {
+            Box::pin(async { unreachable!("wallet generation must not read indexed history") })
+        }
+    }
 
     fn config(asset: AssetKind, decimals: u32) -> WalletConfig {
         WalletConfig {
@@ -454,6 +527,122 @@ mod tests {
             asset,
             decimals,
         }
+    }
+
+    fn provider() -> WalletProvider {
+        let dependencies = Arc::new(InactiveDependencies);
+        let accounts: Arc<dyn Accounts> = dependencies.clone();
+        let transactions: Arc<dyn crate::Transactions> = dependencies.clone();
+        let history: Arc<dyn IndexHistory> = dependencies;
+        let coordinator = Arc::new(TransactionCoordinator::new(accounts.clone(), transactions));
+        WalletProvider::new(
+            config(AssetKind::Native, crate::ETH.decimals),
+            accounts,
+            coordinator,
+            history,
+        )
+    }
+
+    #[test]
+    fn generation_derives_address_from_native_secp256k1_signer() {
+        let wallet = block_on(provider().generate())
+            .expect("native Ethereum generation must create a wallet");
+        let signed = block_on(wallet.sign(SignRequest {
+            payload: SignablePayload::Digest(Digest {
+                bytes: vec![0x42; 32],
+            }),
+            scheme: SignatureScheme::EcdsaSecp256k1,
+            encoding: SignatureEncoding::Recoverable,
+            public_key_format: PublicKeyFormat::Raw,
+            key_tweak: None,
+        }))
+        .expect("generated Ethereum wallet must sign with its native key");
+        let hash = keccak256(&signed.public_key.bytes);
+        let mut derived = [0_u8; 20];
+        derived.copy_from_slice(&hash[12..]);
+        let derived = Address(derived);
+        let address = wallet.address();
+        let text = wallet
+            .address_text(&address)
+            .expect("generated Ethereum address must format");
+
+        assert_eq!(signed.public_key.curve, crypto::Curve::Secp256k1);
+        assert_eq!(signed.public_key.format, PublicKeyFormat::Raw);
+        assert_eq!(address, derived.address());
+        assert_eq!(text.encoding, AddressEncoding::Hex);
+        assert_eq!(text.text, derived.to_string());
+    }
+
+    #[test]
+    fn generated_secret_reuses_create_and_preserves_signed_wire() {
+        let provider = provider();
+        let generated = block_on(provider.generate_with(fixed_secret))
+            .expect("fixed valid secret must generate a wallet");
+        let created = block_on(provider.create(SecretBytes::new([1_u8; 32])))
+            .expect("fixed valid secret must create a wallet");
+        let source = Address(
+            generated
+                .address()
+                .as_bytes()
+                .try_into()
+                .expect("generated Ethereum address must contain 20 bytes"),
+        );
+        let transaction = crate::TransactionBuilder::new(
+            TransferRequest::native_atomic(source, Address([0x22; 20]), Wei::from_u128(7)),
+            crate::BuildContext {
+                chain_id: 11_155_111,
+                nonce: 2,
+                gas_limit: 21_000,
+                max_fee_per_gas: Wei::from_u128(10),
+                max_priority_fee_per_gas: Wei::from_u128(3),
+            },
+        );
+        let generated_signed = block_on(transaction.sign(generated.as_ref()))
+            .expect("generated wallet must sign a valid EIP-1559 transaction");
+        let created_signed = block_on(transaction.sign(created.as_ref()))
+            .expect("created wallet must sign the same EIP-1559 transaction");
+        let fees = generated_signed
+            .inspect_eip1559_fees()
+            .expect("generated signed wire must be a valid EIP-1559 envelope");
+
+        assert_eq!(generated.address(), created.address());
+        assert_eq!(generated_signed, created_signed);
+        assert_eq!(generated_signed.envelope.first(), Some(&0x02));
+        assert_eq!(
+            generated_signed.id.0,
+            keccak256(&generated_signed.envelope).0
+        );
+        assert_eq!(fees.chain_id, 11_155_111);
+        assert_eq!(fees.gas_limit, 21_000);
+    }
+
+    #[test]
+    fn generation_failure_is_typed_before_wallet_creation() {
+        let mut provider = provider();
+        provider.config.scope.chain = ChainId("not-ethereum".to_owned());
+
+        let result = block_on(provider.generate_with(unavailable_secret));
+        let error = match result {
+            Ok(_) => panic!("generation failure must not create a wallet"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind, WalletErrorKind::Generation);
+        assert_eq!(
+            error.message,
+            "operating system random source is unavailable"
+        );
+    }
+
+    fn unavailable_secret() -> Result<SecretBytes, crypto::Error> {
+        Err(crypto::Error {
+            kind: crypto::ErrorKind::KeyGeneration,
+            message: "operating system random source is unavailable".to_owned(),
+        })
+    }
+
+    fn fixed_secret() -> Result<SecretBytes, crypto::Error> {
+        Ok(SecretBytes::new([1_u8; 32]))
     }
 
     #[test]

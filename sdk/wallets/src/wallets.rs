@@ -24,6 +24,9 @@ pub struct WalletInfo<I, F> {
     pub address: AddressText,
 }
 
+/// Maximum authored transfer occurrences accepted by one batch.
+pub const MAX_TRANSFERS: usize = 50;
+
 /// One batch item referencing a wallet already held by [`Wallets`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WalletTransfer<I> {
@@ -394,20 +397,22 @@ where
         requests: Vec<WalletTransfer<I>>,
     ) -> Result<(Arc<dyn Sender>, Vec<Transfer>), SendError> {
         if requests.is_empty() {
-            return Err(SendError::at(
-                0,
-                Vec::new(),
-                Error::new(
-                    ErrorKind::InvalidAmount,
-                    "at least one transfer is required",
-                ),
+            return Err(SendError::collection(
+                ErrorKind::InvalidBatch,
+                "at least one transfer is required",
+            ));
+        }
+        if requests.len() > MAX_TRANSFERS {
+            return Err(SendError::collection(
+                ErrorKind::InvalidBatch,
+                "at most 50 transfers are allowed",
             ));
         }
         let mut family = None;
         let mut transfers = Vec::with_capacity(requests.len());
         for (index, request) in requests.into_iter().enumerate() {
             if request.amount <= Decimal::zero() {
-                return Err(SendError::at(
+                return Err(SendError::item(
                     index,
                     Vec::new(),
                     Error::new(ErrorKind::InvalidAmount, "amount must be positive"),
@@ -415,12 +420,12 @@ where
             }
             let entry = self
                 .entry(&request.wallet)
-                .map_err(|error| SendError::at(index, Vec::new(), error))?;
+                .map_err(|error| SendError::item(index, Vec::new(), error))?;
             if family
                 .as_ref()
                 .is_some_and(|expected| expected != &entry.info.family)
             {
-                return Err(SendError::at(
+                return Err(SendError::item(
                     index,
                     Vec::new(),
                     Error::new(
@@ -437,22 +442,14 @@ where
             });
         }
         let family = family.ok_or_else(|| {
-            SendError::at(
-                0,
-                Vec::new(),
-                Error::new(ErrorKind::Unsupported, "transfer family is missing"),
-            )
+            SendError::operation(ErrorKind::Unsupported, "transfer family is missing")
         })?;
         let sender = self
             .families
             .get(&family)
             .map(|configured| configured.sender.clone())
             .ok_or_else(|| {
-                SendError::at(
-                    0,
-                    Vec::new(),
-                    Error::new(ErrorKind::Unsupported, "wallet family is not configured"),
-                )
+                SendError::operation(ErrorKind::Unsupported, "wallet family is not configured")
             })?;
         Ok((sender, transfers))
     }
@@ -472,7 +469,13 @@ fn lock_error() -> Error {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{
+        cmp::Ordering,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        },
+    };
 
     use base::{
         Address, Addresser, Broadcaster, SignFuture, SignRequest, SignedTransaction, Signer,
@@ -495,6 +498,33 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct CountedId {
+        value: usize,
+        comparisons: Arc<AtomicUsize>,
+    }
+
+    impl PartialEq for CountedId {
+        fn eq(&self, other: &Self) -> bool {
+            self.value == other.value
+        }
+    }
+
+    impl Eq for CountedId {}
+
+    impl PartialOrd for CountedId {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Ord for CountedId {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.comparisons.fetch_add(1, AtomicOrdering::Relaxed);
+            self.value.cmp(&other.value)
+        }
+    }
+
     #[derive(Clone)]
     struct FixtureSender {
         calls: Arc<Mutex<usize>>,
@@ -512,6 +542,23 @@ mod tests {
         }
     }
 
+    struct RecordingSender {
+        batches: Arc<Mutex<Vec<Vec<Transfer>>>>,
+        result: Vec<TransactionId>,
+    }
+
+    impl Sender for RecordingSender {
+        fn send<'a>(&'a self, transfers: Vec<Transfer>) -> SendFuture<'a> {
+            Box::pin(async move {
+                self.batches
+                    .lock()
+                    .expect("recording sender lock")
+                    .push(transfers);
+                Ok(self.result.clone())
+            })
+        }
+    }
+
     enum FixtureProvider {
         Value,
     }
@@ -523,6 +570,23 @@ mod tests {
 
         fn generate(&self) -> FutureResult<'_, Arc<dyn Wallet>> {
             self.create(SecretBytes::new([7; 32]))
+        }
+    }
+
+    struct GenerationFailureProvider;
+
+    impl Provider for GenerationFailureProvider {
+        fn create<'a>(&'a self, _secret: SecretBytes) -> FutureResult<'a, Arc<dyn Wallet>> {
+            Box::pin(async { unreachable!("generation failure must not reach wallet creation") })
+        }
+
+        fn generate(&self) -> FutureResult<'_, Arc<dyn Wallet>> {
+            Box::pin(async {
+                Err(Error::new(
+                    ErrorKind::Generation,
+                    "fixture generation failed",
+                ))
+            })
         }
     }
 
@@ -669,6 +733,60 @@ mod tests {
         )
     }
 
+    fn batch_wallets() -> (
+        Wallets<CountedId, String>,
+        CountedId,
+        Arc<AtomicUsize>,
+        Arc<Mutex<usize>>,
+    ) {
+        let comparisons = Arc::new(AtomicUsize::new(0));
+        let wallet_id = CountedId {
+            value: 1,
+            comparisons: comparisons.clone(),
+        };
+        let (sender, calls) = sender();
+        let family = "family".to_owned();
+        let mut wallets = Wallets::new(Arc::new(FixtureIndex(None)));
+        wallets
+            .register(
+                family.clone(),
+                scope("mainnet"),
+                FixtureProvider::Value,
+                sender,
+                None,
+            )
+            .expect("family registration");
+        futures_executor::block_on(wallets.import(
+            wallet_id.clone(),
+            &family,
+            SecretBytes::new([1; 32]),
+            BlockHeight(1),
+        ))
+        .expect("wallet import");
+        comparisons.store(0, AtomicOrdering::Relaxed);
+        (wallets, wallet_id, comparisons, calls)
+    }
+
+    fn batch_transfers(wallet: &CountedId, count: usize) -> Vec<WalletTransfer<CountedId>> {
+        std::iter::repeat_with(|| WalletTransfer {
+            wallet: wallet.clone(),
+            to: AddressText::new(AddressEncoding::Hex, "destination"),
+            amount: Decimal::from(1_u64),
+        })
+        .take(count)
+        .collect()
+    }
+
+    fn assert_invalid_batch(failure: SendError, message: &str) {
+        assert!(failure.accepted.is_empty());
+        assert_eq!(failure.failed_index, None);
+        assert_eq!(failure.ambiguous_transaction_id, None);
+        assert_eq!(failure.source.kind, ErrorKind::InvalidBatch);
+        assert_eq!(failure.source.message, message);
+        assert_eq!(failure.source.ambiguous_transaction_id, None);
+        assert_eq!(failure.to_string(), message);
+    }
+
     #[test]
     fn generated_wallet_owns_lookup_reads_send_and_tip_birthday() {
         let (sender, _) = sender();
@@ -717,6 +835,35 @@ mod tests {
     }
 
     #[test]
+    fn generation_failure_publishes_no_wallet_or_filter() {
+        let (sender, _) = sender();
+        let family = "family".to_owned();
+        let mut wallets = Wallets::<String, String>::new(Arc::new(FixtureIndex(None)));
+        wallets
+            .register(
+                family.clone(),
+                scope("mainnet"),
+                GenerationFailureProvider,
+                sender,
+                None,
+            )
+            .expect("family registration");
+
+        let error = futures_executor::block_on(wallets.generate("alice".to_owned(), &family))
+            .expect_err("generation must fail");
+
+        assert_eq!(error.kind, ErrorKind::Generation);
+        assert_eq!(
+            wallets
+                .get("alice")
+                .expect_err("wallet must not be stored")
+                .kind,
+            ErrorKind::NotFound
+        );
+        assert!(wallets.filters().expect("filters").is_empty());
+    }
+
+    #[test]
     fn startup_imports_deduplicate_address_at_earliest_birthday() {
         let (sender, _) = sender();
         let mut wallets = Wallets::<String, String>::new(Arc::new(FixtureIndex(None)));
@@ -747,6 +894,214 @@ mod tests {
         let filters = wallets.filters().expect("filters");
         assert_eq!(filters.len(), 1);
         assert_eq!(filters[0].start_height, BlockHeight(5));
+    }
+
+    #[test]
+    fn batch_bounds_reject_zero_and_fifty_one_before_lookup_or_sender() {
+        assert_eq!(crate::MAX_TRANSFERS, 50);
+        let (wallets, wallet_id, comparisons, calls) = batch_wallets();
+
+        let empty =
+            futures_executor::block_on(wallets.send_all(Vec::new())).expect_err("empty batch");
+        assert_invalid_batch(empty, "at least one transfer is required");
+        assert_eq!(comparisons.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(*calls.lock().expect("sender calls"), 0);
+
+        let oversized = futures_executor::block_on(
+            wallets.send_all(batch_transfers(&wallet_id, MAX_TRANSFERS + 1)),
+        )
+        .expect_err("oversized batch");
+        assert_invalid_batch(oversized, "at most 50 transfers are allowed");
+        assert_eq!(comparisons.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(*calls.lock().expect("sender calls"), 0);
+    }
+
+    #[test]
+    fn batch_bounds_admit_one_and_fifty() {
+        let (wallets, wallet_id, comparisons, calls) = batch_wallets();
+
+        let one = futures_executor::block_on(wallets.send_all(batch_transfers(&wallet_id, 1)))
+            .expect("one transfer");
+        assert_eq!(one, vec![TransactionId::new("batch-1")]);
+        assert!(comparisons.load(AtomicOrdering::Relaxed) > 0);
+        assert_eq!(*calls.lock().expect("sender calls"), 1);
+
+        comparisons.store(0, AtomicOrdering::Relaxed);
+        let fifty = futures_executor::block_on(
+            wallets.send_all(batch_transfers(&wallet_id, MAX_TRANSFERS)),
+        )
+        .expect("fifty transfers");
+        assert_eq!(fifty, vec![TransactionId::new("batch-50")]);
+        assert!(comparisons.load(AtomicOrdering::Relaxed) > 0);
+        assert_eq!(*calls.lock().expect("sender calls"), 2);
+    }
+
+    #[test]
+    fn batch_preserves_authored_occurrences_and_sender_result() {
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let sender_result = vec![
+            TransactionId::new("sender-result-two"),
+            TransactionId::new("sender-result-one"),
+        ];
+        let sender = Arc::new(RecordingSender {
+            batches: batches.clone(),
+            result: sender_result.clone(),
+        });
+        let family = "family".to_owned();
+        let primary = "primary".to_owned();
+        let alias = "alias".to_owned();
+        let mut wallets = Wallets::<String, String>::new(Arc::new(FixtureIndex(None)));
+        wallets
+            .register(
+                family.clone(),
+                scope("mainnet"),
+                FixtureProvider::Value,
+                sender,
+                None,
+            )
+            .expect("family registration");
+        let primary_info = futures_executor::block_on(wallets.import(
+            primary.clone(),
+            &family,
+            SecretBytes::new([1; 32]),
+            BlockHeight(1),
+        ))
+        .expect("primary wallet");
+        let alias_info = futures_executor::block_on(wallets.import(
+            alias.clone(),
+            &family,
+            SecretBytes::new([2; 32]),
+            BlockHeight(1),
+        ))
+        .expect("alias wallet");
+        assert_eq!(primary_info.address, alias_info.address);
+
+        let first = AddressText::new(AddressEncoding::Hex, "first");
+        let second = AddressText::new(AddressEncoding::Hex, "second");
+        let one = Decimal::from(1_u64);
+        let two = Decimal::from(2_u64);
+        let requests = vec![
+            WalletTransfer {
+                wallet: primary.clone(),
+                to: first.clone(),
+                amount: one.clone(),
+            },
+            WalletTransfer {
+                wallet: primary.clone(),
+                to: first.clone(),
+                amount: one.clone(),
+            },
+            WalletTransfer {
+                wallet: alias.clone(),
+                to: first.clone(),
+                amount: one.clone(),
+            },
+            WalletTransfer {
+                wallet: primary.clone(),
+                to: second.clone(),
+                amount: two.clone(),
+            },
+            WalletTransfer {
+                wallet: alias,
+                to: second.clone(),
+                amount: two.clone(),
+            },
+            WalletTransfer {
+                wallet: primary,
+                to: first.clone(),
+                amount: two.clone(),
+            },
+        ];
+
+        let result = futures_executor::block_on(wallets.send_all(requests)).expect("batch send");
+        assert_eq!(result, sender_result);
+
+        let recorded = batches.lock().expect("recorded batches");
+        assert_eq!(recorded.len(), 1);
+        let transfers = &recorded[0];
+        assert_eq!(transfers.len(), 6);
+        assert!(Arc::ptr_eq(&transfers[0].wallet, &transfers[1].wallet));
+        assert!(Arc::ptr_eq(&transfers[0].wallet, &transfers[3].wallet));
+        assert!(Arc::ptr_eq(&transfers[0].wallet, &transfers[5].wallet));
+        assert!(Arc::ptr_eq(&transfers[2].wallet, &transfers[4].wallet));
+        assert!(!Arc::ptr_eq(&transfers[0].wallet, &transfers[2].wallet));
+        assert_eq!(
+            transfers
+                .iter()
+                .map(|transfer| (
+                    transfer.wallet.address(),
+                    transfer.to.clone(),
+                    transfer.amount.clone(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (Address::from([1]), first.clone(), one.clone()),
+                (Address::from([1]), first.clone(), one.clone()),
+                (Address::from([1]), first.clone(), one.clone()),
+                (Address::from([1]), second.clone(), two.clone()),
+                (Address::from([1]), second, two.clone()),
+                (Address::from([1]), first, two),
+            ]
+        );
+    }
+
+    #[test]
+    fn batch_failure_keeps_original_authored_index() {
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let sender = Arc::new(RecordingSender {
+            batches: batches.clone(),
+            result: Vec::new(),
+        });
+        let family = "family".to_owned();
+        let primary = "primary".to_owned();
+        let alias = "alias".to_owned();
+        let mut wallets = Wallets::<String, String>::new(Arc::new(FixtureIndex(None)));
+        wallets
+            .register(
+                family.clone(),
+                scope("mainnet"),
+                FixtureProvider::Value,
+                sender,
+                None,
+            )
+            .expect("family registration");
+        futures_executor::block_on(wallets.import(
+            primary.clone(),
+            &family,
+            SecretBytes::new([1; 32]),
+            BlockHeight(1),
+        ))
+        .expect("primary wallet");
+        futures_executor::block_on(wallets.import(
+            alias.clone(),
+            &family,
+            SecretBytes::new([2; 32]),
+            BlockHeight(1),
+        ))
+        .expect("alias wallet");
+
+        let transfer = |wallet: String| WalletTransfer {
+            wallet,
+            to: AddressText::new(AddressEncoding::Hex, "destination"),
+            amount: Decimal::from(1_u64),
+        };
+        let failure = futures_executor::block_on(wallets.send_all(vec![
+            transfer(primary.clone()),
+            transfer(alias.clone()),
+            transfer(primary.clone()),
+            transfer(alias),
+            transfer("missing".to_owned()),
+            transfer(primary),
+        ]))
+        .expect_err("missing wallet");
+
+        assert!(failure.accepted.is_empty());
+        assert_eq!(failure.failed_index, Some(4));
+        assert_eq!(failure.ambiguous_transaction_id, None);
+        assert_eq!(failure.source.kind, ErrorKind::NotFound);
+        assert_eq!(failure.source.message, "wallet does not exist");
+        assert_eq!(failure.source.ambiguous_transaction_id, None);
+        assert!(batches.lock().expect("recorded batches").is_empty());
     }
 
     #[test]
@@ -801,7 +1156,7 @@ mod tests {
         ]))
         .expect_err("mixed family batch");
 
-        assert_eq!(error.failed_index, 1);
+        assert_eq!(error.failed_index, Some(1));
         assert_eq!(*first_calls.lock().expect("first calls"), 0);
         assert_eq!(*second_calls.lock().expect("second calls"), 0);
     }
@@ -820,7 +1175,9 @@ mod tests {
         ));
 
         assert_eq!(conflict.kind, ErrorKind::Conflict);
+        assert_eq!(conflict.ambiguous_transaction_id, None);
         assert_eq!(unavailable.kind, ErrorKind::Unavailable);
+        assert_eq!(unavailable.ambiguous_transaction_id, None);
     }
 
     #[test]

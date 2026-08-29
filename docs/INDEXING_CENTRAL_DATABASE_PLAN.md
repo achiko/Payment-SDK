@@ -2,12 +2,13 @@
 
 ## Status
 
-The **Indexing & Central Database** decision is Accepted. Implementation has
-not started.
+**Superseded.** The [Native Solana Master Implementation Plan](SOLANA_MASTER_IMPLEMENTATION_PLAN.md)
+is the only active plan for the Native Solana and central-indexing
+implementation. Everything below is retained as historical, non-executable
+planning evidence; its checkboxes, ordering, and approvals MUST NOT guide
+implementation.
 
-This document is the flat execution plan for that one decision. It introduces
-no new ADR and does not approve Rust changes, SQL changes, dependency changes,
-database access, migration execution, or runtime rollout.
+## Historical content (non-executable)
 
 ## Execution rule
 

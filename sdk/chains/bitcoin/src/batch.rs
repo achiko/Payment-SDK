@@ -53,7 +53,7 @@ impl Batch {
         for (index, transfer) in transfers.into_iter().enumerate() {
             let (wallet, address, output) = self
                 .parse(transfer)
-                .map_err(|error| SendError::at(index, Vec::new(), error))?;
+                .map_err(|error| SendError::item(index, Vec::new(), error))?;
             if let Some(source) = sources.iter_mut().find(|source| source.address == address) {
                 source.recipients.push(output);
             } else {
@@ -72,16 +72,21 @@ impl Sender for Batch {
     fn send<'a>(&'a self, transfers: Vec<Transfer>) -> SendFuture<'a> {
         Box::pin(async move {
             if transfers.is_empty() {
-                return Err(failure("transaction batch is empty"));
+                return Err(SendError::collection(
+                    ErrorKind::Transaction,
+                    "transaction batch is empty",
+                ));
             }
             let sources = self.sources(transfers)?;
             let fee_rate = self
                 .fees
                 .estimate(self.fee_target_blocks)
                 .await
-                .map_err(failure_with)?;
+                .map_err(operation_failure_with)?;
             if fee_rate > self.max_fee_rate {
-                return Err(failure("estimated fee rate exceeds the configured maximum"));
+                return Err(operation_failure(
+                    "estimated fee rate exceeds the configured maximum",
+                ));
             }
 
             let mut funding = Vec::with_capacity(sources.len());
@@ -92,12 +97,12 @@ impl Sender for Batch {
                     .utxos
                     .utxos(vec![source.address.clone()])
                     .await
-                    .map_err(failure_with)?;
+                    .map_err(operation_failure_with)?;
                 if checkpoint
                     .as_ref()
                     .is_some_and(|expected| expected != &set.checkpoint)
                 {
-                    return Err(failure(
+                    return Err(operation_failure(
                         "indexed output snapshot changed while building the transaction",
                     ));
                 }
@@ -114,7 +119,7 @@ impl Sender for Batch {
                             output.value,
                             output.script_pubkey,
                         )
-                        .map_err(failure_with)
+                        .map_err(operation_failure_with)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 owners.extend(std::iter::repeat_n(source.wallet.as_ref(), available.len()));
@@ -128,7 +133,7 @@ impl Sender for Batch {
             let signed = BatchBuilder::new(self.network, funding, fee_rate)
                 .sign_each(&owners)
                 .await
-                .map_err(failure_with)?;
+                .map_err(operation_failure_with)?;
             let prepared = Prepared::new(
                 PREPARED_KIND,
                 BaseId::new(signed.id().to_string()),
@@ -139,7 +144,7 @@ impl Sender for Batch {
                 .broadcaster()
                 .broadcast(&prepared)
                 .await
-                .map_err(failure_with)?;
+                .map_err(grouped_failure)?;
             Ok(vec![submitted.id])
         })
     }
@@ -151,14 +156,40 @@ fn native_address(address: &base::Address, network: Network) -> Result<Address, 
     Address::parse_for_network(value, network).map_err(transaction_error)
 }
 
-fn failure(message: &'static str) -> SendError {
-    SendError::at(0, Vec::new(), Error::new(ErrorKind::Transaction, message))
+fn operation_failure(message: &'static str) -> SendError {
+    SendError::operation(ErrorKind::Transaction, message)
 }
 
-fn failure_with(error: impl std::fmt::Display) -> SendError {
-    SendError::at(0, Vec::new(), transaction_error(error))
+fn operation_failure_with(error: impl std::fmt::Display) -> SendError {
+    SendError::operation(ErrorKind::Transaction, error.to_string())
+}
+
+fn grouped_failure(error: base::TransactionError) -> SendError {
+    SendError::grouped(Vec::new(), error.into())
 }
 
 fn transaction_error(error: impl std::fmt::Display) -> Error {
     Error::new(ErrorKind::Transaction, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grouped_broadcast_failure_preserves_exact_ambiguity_without_an_index() {
+        let ambiguous = BaseId::new("grouped-canonical-id");
+        let failure = grouped_failure(
+            base::TransactionError::new(
+                base::TransactionErrorKind::Timeout,
+                "grouped submission outcome is unknown",
+            )
+            .with_ambiguous_transaction_id(ambiguous.clone()),
+        );
+
+        assert!(failure.accepted.is_empty());
+        assert_eq!(failure.failed_index, None);
+        assert_eq!(failure.ambiguous_transaction_id, Some(ambiguous));
+        assert_eq!(failure.source.ambiguous_transaction_id, None);
+    }
 }

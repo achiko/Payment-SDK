@@ -16,4 +16,4 @@ pub use wallet::{
     Balance, BalanceReader, FutureResult, History, HistoryAsset, HistoryEntry, HistoryFee,
     HistoryMovement, HistoryReader, HistoryRequest, HistoryStatus, TransactionFactory, Wallet,
 };
-pub use wallets::{WalletInfo, WalletTransfer, Wallets};
+pub use wallets::{MAX_TRANSFERS, WalletInfo, WalletTransfer, Wallets};

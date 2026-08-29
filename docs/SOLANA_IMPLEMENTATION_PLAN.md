@@ -2,15 +2,12 @@
 
 ## Status
 
-All existing Solana architecture decisions are **Accepted** and the canonical
-requirements, contracts, API, indexing, architecture, and validation documents
-describe the same target. Solana implementation has not started: there is no
-`chain-solana` crate, Solana application composition, or native SOL runtime.
+**Superseded.** The [Native Solana Master Implementation Plan](SOLANA_MASTER_IMPLEMENTATION_PLAN.md)
+is the only active Native Solana implementation plan. Everything below is
+retained as historical, non-executable planning evidence; its checkboxes,
+ordering, approvals, and Rust 1.85 instructions MUST NOT guide implementation.
 
-This document is the flat execution plan for that accepted target. It adds no
-new architecture decision and does not itself authorize Rust, manifest,
-lockfile, SQL, migration, database, dependency-installation, signing,
-broadcast, or live-network changes.
+## Historical content (non-executable)
 
 ## Execution rule
 

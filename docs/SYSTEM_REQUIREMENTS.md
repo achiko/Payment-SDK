@@ -97,12 +97,16 @@ standards remain compatibility contracts.
 - MUST NOT add `solana-client`, a monolithic Solana SDK, handwritten transaction
   encoding, copied System Program discriminants, or an alternative crypto/RPC
   stack.
-- Before any Solana manifest patch, implementation MUST reconcile Alloy and all
-  other workspace dependencies with the authoritative Rust 1.85 MSRV, restore
-  root `rust-version = "1.85"`, run focused Ethereum regressions, and pass a
-  locked workspace build using an actual Rust 1.85 toolchain. Lowering only the
-  manifest is invalid. If compatible resolution cannot preserve behavior,
-  Solana implementation MUST stop for a separate MSRV-policy decision.
+- The authoritative workspace baseline MUST remain Rust 1.91. The reverted
+  Rust 1.85 experiment is historical evidence and MUST NOT be treated as an
+  active requirement. A Solana manifest patch MUST preserve the proven graph,
+  including `alloy-consensus`, `alloy-eips`, and `alloy-rpc-types-eth` 1.8.3;
+  `alloy-primitives` and `alloy-sol-types` 1.6.1; and redb 4.2.0. No Alloy or
+  redb downgrade is required.
+- Every repository manifest or lockfile change for Solana MUST repeat the
+  locked Rust 1.91 workspace all-target check, strict workspace Clippy, and the
+  focused Ethereum, redb, indexing, runtime, wallet, and API regressions. A
+  divergence from the proven graph or behavior MUST stop the affected step.
 
 ### `sdk/indexing`
 

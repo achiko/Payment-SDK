@@ -15,7 +15,7 @@ Accepted by the user on 2026-08-28 under the simplified decision name
 
 Acceptance includes the complete runtime boundary in this record: the
 independently deletable `chain-solana` crate and modular dependency family; the
-Rust 1.85/Alloy reconciliation prerequisite; zeroizing Ed25519 custody limits;
+proven Rust 1.91 dependency boundary; zeroizing Ed25519 custody limits;
 one singular no-retry Solana endpoint; one shared PostgreSQL schema and pool;
 closed configuration; startup genesis and executable Memo-v3 checks; explicit
 composition, readiness, submission supervision, and shutdown ordering; and the
@@ -26,8 +26,7 @@ authorizes implementation planning against it. It is not implementation
 evidence and does not by itself authorize Rust, manifest, lockfile, SQL, or
 migration edits; dependency installation; migration execution; signing; or
 live-network actions. Those changes still require explicit implementation-step
-approval and must preserve the stop condition for an unsuccessful Rust 1.85
-dependency reconciliation.
+approval and must preserve the proven Rust 1.91 graph and regressions.
 
 ## Context
 
@@ -83,15 +82,23 @@ Memo tokens are encoded from raw random bytes; they are never coerced into an
 account-address type merely to obtain Base58. No alternative cryptographic or
 RPC stack is added. `Cargo.lock` pins the complete resolved graph.
 
-The repository guide declares MSRV 1.85 while the current root manifest says
-1.91, and the current lock contains Alloy 1.8.3 crates that themselves require
-Rust 1.91. The guide remains authoritative: before any Solana manifest patch,
-a workspace-wide prerequisite must pin/downgrade the Alloy family and any other
-incompatible dependency, restore `rust-version = "1.85"`, and pass focused
-Ethereum regressions plus an actual locked Rust 1.85 workspace build. Merely
-lowering the root manifest is invalid. If that reconciliation cannot preserve
-behavior, implementation stops for a separate MSRV-policy decision; Solana
-does not silently raise it.
+The authoritative workspace baseline is Rust 1.91. The attempted Rust 1.85
+cutover was reverted and is rejected historical evidence, not an active
+requirement. An exact scratch-only proof used `rustc 1.91.0 (f8297e351)` and
+`cargo 1.91.0 (ea2d97820)` to combine the current workspace with the selected
+modular Solana family. The resolved lockfile SHA-256 is
+`5d578ca06eb117006b5dd518220d741963a1036091b7c756d40e17eb05bfe060`.
+It contains 472 packages: 367 declare `rust-version`, 105 omit it, and zero
+declare a version above 1.91. The exact modular fixture passed 1/1; locked
+offline workspace all-target check, strict workspace Clippy, and 163 focused
+Ethereum, redb, indexing, runtime, wallet, and API tests passed without public
+RPC access.
+
+The proven current graph retains `alloy-consensus`, `alloy-eips`, and
+`alloy-rpc-types-eth` 1.8.3; `alloy-primitives` and `alloy-sol-types` 1.6.1;
+and redb 4.2.0. No Alloy or redb downgrade is required. Repository manifest
+and lockfile changes must repeat the exact Rust 1.91 checks; graph or
+behavioral divergence stops the affected implementation step.
 
 Ed25519 secrets stay in a private zeroizing wrapper with no `Clone`, `Debug`,
 `Display`, or Serde. The registry-ownership prerequisite in the accepted
@@ -289,10 +296,10 @@ and executes that target.
 - Startup fails before repository mutation on wrong chain or missing Memo.
 - All configured scopes share one pool and schema while each repository rejects
   cross-scope access; adding an asset does not create another database.
-- A temporary Rust 1.97 dependency probe proves the selected modular APIs can
-  construct, sign, and serialize the exact legacy System-plus-Memo transaction;
-  it is not an MSRV proof. Full implementation remains blocked until the Alloy
-  reconciliation and an actual locked Rust 1.85 workspace build succeed.
+- An exact scratch-only Rust 1.91 proof shows the selected modular APIs can
+  construct, sign, and serialize the legacy System-plus-Memo transaction while
+  retaining the current Alloy/redb graph. It proves dependency feasibility,
+  not repository integration or runtime support.
 - Multi-endpoint failover, durable request idempotency, and production custody
   require separate product decisions.
 
@@ -331,8 +338,8 @@ shutdown during preparation, registrar-close races, dispatch, ambiguity, and
 fatal indexing;
 positive-status-only recovery after fatal indexing; tracked readiness; owned validator isolation
 and binary hashes; the explicit application test target; locked dependency
-resolution; the Alloy/MSRV prerequisite; an actual Rust 1.85 build; design
-lint; and full workspace gates.
+resolution on Rust 1.91 with the proven Alloy/redb graph; design lint; and full
+workspace gates.
 
 ## Implementation boundary
 

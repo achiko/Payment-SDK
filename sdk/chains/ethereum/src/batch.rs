@@ -41,14 +41,17 @@ impl Sender for Batch {
     fn send<'a>(&'a self, transfers: Vec<Transfer>) -> SendFuture<'a> {
         Box::pin(async move {
             if transfers.is_empty() {
-                return Err(failure(0, Vec::new(), "transaction batch is empty"));
+                return Err(SendError::collection(
+                    ErrorKind::Transaction,
+                    "transaction batch is empty",
+                ));
             }
             let preparations = transfers
                 .iter()
                 .enumerate()
                 .map(|(index, transfer)| {
                     self.preparation(transfer)
-                        .map_err(|error| SendError::at(index, Vec::new(), error))
+                        .map_err(|error| SendError::item(index, Vec::new(), error))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let mut prepared = self
@@ -59,7 +62,7 @@ impl Sender for Batch {
             let mut accepted = Vec::with_capacity(prepared.len());
             loop {
                 let id = prepared.next().await.map_err(|error| {
-                    SendError::at(accepted.len(), accepted.clone(), broadcast_error(error))
+                    SendError::item(accepted.len(), accepted.clone(), broadcast_error(error))
                 })?;
                 let Some(id) = id else {
                     return Ok(accepted);
@@ -81,7 +84,7 @@ fn ethereum_address(address: &BaseAddress) -> Result<Address, Error> {
 }
 
 fn preparation_failure(error: PreparationError) -> SendError {
-    SendError::at(
+    SendError::item(
         error.index,
         Vec::new(),
         preparation_error(error.source).into(),
@@ -95,10 +98,6 @@ fn broadcast_error(error: SourceError) -> Error {
         ErrorKind::Transaction
     };
     Error::new(kind, error.message)
-}
-
-fn failure(index: usize, accepted: Vec<base::Id>, message: &'static str) -> SendError {
-    SendError::at(index, accepted, Error::new(ErrorKind::Transaction, message))
 }
 
 #[cfg(test)]
@@ -124,7 +123,7 @@ mod tests {
             },
         });
 
-        assert_eq!(failure.failed_index, 2);
+        assert_eq!(failure.failed_index, Some(2));
         assert!(failure.accepted.is_empty());
         assert_eq!(failure.source.kind, ErrorKind::Transaction);
     }

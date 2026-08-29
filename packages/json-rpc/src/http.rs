@@ -64,7 +64,7 @@ impl Default for Retry {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     pub endpoints: Vec<String>,
     pub request_timeout: Duration,
@@ -72,6 +72,25 @@ pub struct Config {
     pub max_response_bytes: usize,
     pub headers: Vec<(String, String)>,
     pub retry: Retry,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let header_names = self
+            .headers
+            .iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        formatter
+            .debug_struct("Config")
+            .field("endpoint_count", &self.endpoints.len())
+            .field("request_timeout", &self.request_timeout)
+            .field("max_request_bytes", &self.max_request_bytes)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .field("header_names", &header_names)
+            .field("retry", &self.retry)
+            .finish()
+    }
 }
 
 impl Config {

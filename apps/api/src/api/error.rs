@@ -78,6 +78,7 @@ impl From<wallets::Error> for ApiError {
             | wallets::ErrorKind::InvalidSecret
             | wallets::ErrorKind::InvalidAddress
             | wallets::ErrorKind::InvalidAmount
+            | wallets::ErrorKind::InvalidBatch
             | wallets::ErrorKind::AddressMismatch => ErrorKind::InvalidRequest,
             wallets::ErrorKind::Duplicate | wallets::ErrorKind::Conflict => ErrorKind::Conflict,
             wallets::ErrorKind::NotFound => ErrorKind::NotFound,
@@ -99,7 +100,7 @@ impl From<wallets::SendError> for ApiError {
             .into_iter()
             .map(|id| id.to_string())
             .collect();
-        response.failed_index = Some(error.failed_index);
+        response.failed_index = error.failed_index;
         response
     }
 }

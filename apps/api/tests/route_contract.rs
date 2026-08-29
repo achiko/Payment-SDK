@@ -57,6 +57,10 @@ impl Provider for FixtureProvider {
         };
         Box::pin(async move { Ok(Arc::new(wallet) as Arc<dyn wallets::Wallet>) })
     }
+
+    fn generate(&self) -> FutureResult<'_, Arc<dyn wallets::Wallet>> {
+        self.create(SecretBytes::new([7_u8; 32]))
+    }
 }
 
 struct FixtureSender {

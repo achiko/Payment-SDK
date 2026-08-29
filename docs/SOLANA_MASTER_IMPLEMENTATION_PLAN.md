@@ -1,0 +1,1112 @@
+# Native Solana Master Implementation Plan
+
+## Status
+
+**Active; the base, wallet, and `SendError` ambiguity carriers are implemented,
+while HTTP projection and every concrete-chain origin remain pending.**
+This is the single execution plan for the accepted native-SOL target. It
+supersedes the overlapping execution checklists in
+`SOLANA_IMPLEMENTATION_PLAN.md` and
+`INDEXING_CENTRAL_DATABASE_PLAN.md`; the accepted ADRs remain the architectural
+source of truth. Every unchecked step remains separately approval-gated.
+
+This plan does not itself authorize a source edit, dependency download,
+migration execution, retained-database access, public RPC call, signing with a
+funded key, commit, push, or deployment. Each unchecked bold name is one small
+approval boundary. Approval of one step does not approve the next.
+
+## Fixed implementation baseline
+
+- Rust `1.91`, edition 2024, resolver 3, locked dependencies, and
+  `unsafe_code = "forbid"` are retained. No toolchain or dependency downgrade
+  is part of Solana implementation.
+- The resolved Alloy transaction/RPC family remains
+  `alloy-consensus = 1.8.3`, `alloy-eips = 1.8.3`, and
+  `alloy-rpc-types-eth = 1.8.3`; the same lock resolves
+  `alloy-primitives = 1.6.1` and `alloy-sol-types = 1.6.1`. Redb remains
+  exactly `4.2.0`.
+- The Solana crate uses the exact modular Anza/SPL package family below. It does
+  not use `solana-client`, a monolithic SDK, copied System discriminants, or
+  hand-written transaction encoding.
+- Official `postgres:18.6-alpine` is the selected owned, disposable test
+  baseline. Its immutable digest must be recorded after the approved pull and
+  before execution; no digest or runtime pass is claimed yet. Production
+  migrations live under `sdk/indexing/postgres/migrations/` as ordered
+  deployment inputs applied outside `apps/api`; startup performs read-only
+  compatibility validation and no DDL.
+- One PostgreSQL database, schema, and process-wide pool store indexing state
+  for every chain and asset. Repository handles are bound to one exact
+  `(chain, network)` scope; assets never select a pool, schema, or repository.
+- `payment_wallets` is application-owned. `apps/api` must prove restart reads
+  through the shared pool before indexing registry code is removed. Existing
+  rows remain byte-for-byte preserved; Solana adds no row to that table.
+- Initial Solana support is native SOL only. SPL, Token-2022, priority-fee and
+  Compute Budget instructions, durable nonce accounts, remote custody, and
+  durable request idempotency are out of scope.
+- Generated Solana wallets and source guards are process-local. Configured
+  32-byte Ed25519 seed imports are restart-reconstructible. One API process is
+  the only writer for a managed Solana source.
+- Tests use owned RPC doubles, temporary redb files, a disposable PostgreSQL 18
+  database/schema, and an owned checksummed validator. They never contact a
+  public network or use an externally funded key.
+
+### Exact Solana direct dependencies
+
+| Package | Exact version and features |
+|---|---|
+| `solana-address` | `=2.2.0`; `std`, `decode`, `curve25519` |
+| `solana-hash` | `=4.1.0`; `decode` |
+| `solana-keypair` | `=3.1.2` |
+| `solana-instruction` | `=3.0.0` |
+| `solana-message` | `=3.1.0`; `bincode` |
+| `solana-signature` | `=3.3.0`; `verify` |
+| `solana-transaction` | `=3.1.0`; `bincode`, `verify` |
+| `solana-system-interface` | `=3.0.0`; `bincode` |
+| `spl-memo-interface` | `=2.0.0` |
+| `bincode` | `=1.3.3` |
+| `base64` | `=0.22.1` |
+| `bs58` | `=0.5.1` |
+| `getrandom` | `=0.3.4` |
+
+Its remaining direct edges are fixed as follows:
+
+- internal: `base = { path = "../base" }`,
+  `indexing = { path = "../../indexing" }`,
+  `wallets = { path = "../../wallets" }`, and
+  `json-rpc = { path = "../../../packages/json-rpc" }`;
+- external: `futures-util = "=0.3.33"` with default features disabled and
+  `std`, workspace `hex = "=0.4.3"`, workspace Serde with `derive`, workspace
+  `serde_json`, workspace Tokio `=1.49.0` with only `sync`/`time`, and workspace
+  `zeroize = "=1.8.2"`; and
+- development: workspace `futures-executor`.
+
+It does not depend on `apps/api`, a concrete repository, another chain, the
+generic secp256k1 `crypto` package, `num-bigint`, or an additional hash/error/
+UUID/RPC stack. The research probe compiled the exact protocol/wire dependency
+table as a standalone temporary workspace member; it did not pretend to compile
+the future `chain-solana` manifest. The first real manifest change must combine
+the proven protocol family with the supplemental set above and pass the full
+package/workspace gates. A different dependency, version, feature, or crypto/
+RPC stack is a stop condition requiring a revised plan.
+
+## Target component flow
+
+```mermaid
+flowchart LR
+    HTTP["Existing wallet and transaction HTTP routes"]
+    W["sdk/wallets\nfamily registry and batch orchestration"]
+    SOL["chain-solana\naddress, wallet, coordinator, RPC, source, interpreter"]
+    RPC["One endpoint-affine\nSolana JSON-RPC client"]
+    IDX["Generic indexing service\nposition-aware synchronizer"]
+    PG[("One PostgreSQL schema\nall chain scopes")]
+    SUP["apps/api\ncomposition and task supervision"]
+
+    HTTP --> W
+    W --> SOL
+    SOL --> RPC
+    SOL --> IDX
+    IDX --> PG
+    SUP --> HTTP
+    SUP --> W
+    SUP --> SOL
+    SUP --> IDX
+    SUP --> PG
+```
+
+Generic crates receive only the accepted shared prerequisites. Solana-native
+account, transaction, RPC, retry, and interpretation rules remain inside
+`chain-solana`. `apps/api` owns configuration, the shared pool, wallet restore,
+concrete construction, readiness, submission task supervision, and shutdown.
+
+Completion means the runtime can generate a process-local native-SOL wallet or
+load a configured seed import, while the existing public API returns its
+canonical address, exact finalized balance, and complete checkpoint-bound
+history and submits one transfer or a 1-through-50 ordered batch. Finalized
+native movements and fees are indexed, restart and retained reorg behavior is
+proven, and Solana participates in the same readiness/shutdown lifecycle as
+Bitcoin and Ethereum. Parity is at the product/capability boundary; Solana
+keeps its own account, transaction, slot, fee, and submission semantics.
+
+## Public and shared contract target
+
+The implementation must converge on these exact contracts rather than create
+parallel compatibility types:
+
+- Add `BlockPosition(u64)` and atomic `BlockParent { position, hash }`.
+  `BlockRef` becomes `{ position, height, hash, parent, timestamp }`; only
+  genesis may have no parent. Position drives RPC traversal, birthdays,
+  restart, and canonical lookup. Produced height drives confirmations, history
+  ordering, journal keys, and retention.
+- Keep `BlockSource` at three methods named `tip()`,
+  `blocks(start: BlockPosition, end: BlockPosition, limit: usize)`, and
+  `canonical_at(position: BlockPosition)`. They return a complete tip, bounded
+  actual blocks in an inclusive position range, and an optional complete
+  canonical reference at one position. `None` from canonical lookup means
+  proven omission; unavailable or incomplete evidence is an error. Returned
+  blocks are unique and strictly increasing, and a positive limit counts
+  blocks rather than numeric positions.
+- Make `Provider::generate` and `Provider::create` mandatory object-safe
+  methods. Bitcoin and Ethereum explicitly retain secp256k1 generation; Solana
+  owns Ed25519 seed generation. Generated secrets never leave their provider.
+- Export one `MAX_TRANSFERS = 50`. `Wallets::send_all` owns the authoritative
+  1-through-50 guard. `SendError` carries `accepted`, optional
+  `failed_index`, optional locally derived `ambiguous_transaction_id`, and its
+  typed source. Collection/operation failures carry neither index nor IDs.
+- Add canonical plain `AddressEncoding::Base58`, public `Chain::Solana`, and
+  `WalletAsset::Sol`. Existing wallet/transaction routes remain the only public
+  interface; no Solana-specific route or request wrapper is added.
+- Transaction DTOs remain exact closed objects. Both transaction POST routes
+  reject a non-empty query before JSON conversion. Normal infrastructure
+  headers are permitted but never interpreted as commitment, lag, reference,
+  retry, Memo, or priority-fee controls.
+- Public block JSON and checkpoint-bound cursors carry position and height plus
+  an atomic parent when present. Pre-release height-only cursors and old redb
+  records are rejected; no inferred position fallback or legacy reader is
+  added.
+- Solana configuration is singular and closed:
+
+  ```text
+  postgres { url_env, schema, max_connections }
+
+  indexes.solana {
+    network
+    genesis_hash
+    rpc { endpoint, headers, timeout_seconds, max_response_bytes }
+    sync { confirmation_depth, reorg_retention, poll_millis, batch_size }
+  }
+  ```
+
+  Configured imports use `start_position` and exactly 64 lowercase ASCII hex
+  characters from a named environment variable. Per-chain databases,
+  `start_height`, endpoint lists, commitment/lag/reference/quorum/retry,
+  priority-fee, and Memo override fields are rejected as unknown.
+
+## Execution and stop rules
+
+- Work on one named checkbox at a time. Land its focused behavioral test in the
+  same reviewable diff unless the step explicitly says test-only.
+- After each step report exact files, commands, results, and remaining risk.
+  Do not commit or advance automatically.
+- The only intentionally broad compile slices are the complete `BlockRef`
+  cutover and the first Solana package topology. Splitting either would require
+  placeholder coordinates or filler modules, so each receives one explicit
+  approval and an immediate workspace check.
+- Never run a migration against retained data from this plan. A production
+  migration needs a separate approval naming the database, schema, restore
+  point, writer barrier, command, verification, and rollback response.
+- Stop if the dependency graph diverges from the accepted versions, an existing
+  Bitcoin/Ethereum wire regression appears, PostgreSQL cannot preserve another
+  scope or `payment_wallets`, a selected Solana block is incomplete, or an
+  ambiguous send cannot retain its source guard.
+
+The research closeout is the entry gate. It records the passing Rust 1.91
+dependency/wire probe, the PostgreSQL schema/ownership review, current baseline
+regressions, and documentation synchronization. Exact durable evidence belongs
+in the canonical validation documents; this plan retains only the facts needed
+to gate implementation:
+
+| Closeout evidence | Result |
+|---|---|
+| Rust toolchain | `rustc 1.91.0 (f8297e351 2025-10-28)` and `cargo 1.91.0 (ea2d97820 2025-10-10)` with rustfmt and Clippy |
+| Isolated Solana graph | Exact accepted direct family resolved only in a disposable temporary workspace outside the repository; 45 registry packages were added to the scratch graph and its lock SHA-256 was `5d578ca06eb117006b5dd518220d741963a1036091b7c756d40e17eb05bfe060` |
+| Solana wire probe | System transfer followed by Memo-v3 built, signed, verified, decoded, and bincode-round-tripped; address/hash/curve/Base64/Base58/randomness probes passed, 1 test |
+| Compatibility probe | Rust 1.91 formatting, locked offline workspace all-target check, strict all-target/all-feature Clippy, and 163 focused Ethereum/redb/indexing/runtime/wallet/API regressions passed; no public RPC was used |
+| Dependency metadata | Current graph had 472 packages; 367 declared a Rust version, 105 omitted it, and none declared above 1.91 |
+| PostgreSQL static baseline | Three ordered scripts and checksums, effective schema, ownership, adapter SQL, fresh/retained paths, external migration boundary, and preservation/restore requirements are recorded in `POSTGRESQL_SCHEMA_BASELINE.md`; no SQL or database access was claimed |
+| PostgreSQL runtime fixture | Official `postgres:18.6-alpine` is selected; pull completion, immutable digest, and non-skipping runtime evidence remain the first database implementation gate and are not claimed by research |
+| Synchronized repository | Canonical requirements, architecture, validation, indexing plan, Solana plan, and runtime ADR were synchronized; exact Rust 1.91 formatting, locked workspace check and tests, strict Clippy, no-deps documentation, and design-lint passed afterward. The eight PostgreSQL contract functions still short-circuit without a database URL and are not runtime evidence |
+
+No scratch manifest or lock change entered this repository. The first real
+Solana manifest step must reproduce the accepted graph and resulting locked
+workspace evidence rather than copy a temporary path.
+
+## Phase: Shared Contracts and RPC/API Prerequisites
+
+- [x] **Specify RPC redaction** — test-only: prove `json_rpc::Config` debug
+  output cannot contain endpoint text, URL credentials, or header values while
+  still exposing endpoint count, header names, timeout, response limit, and
+  retry policy. **Proof:** focused JSON-RPC redaction test fails for the current
+  derive and passes only after the next step.
+- [x] **Redact RPC configuration** — replace derived `Debug` with the manual
+  redacted representation; keep `Http` redaction unchanged. **Depends on:**
+  **Specify RPC redaction**. **Proof:** JSON-RPC tests and secret-string absence
+  assertions.
+- [x] **Prove one-shot transport** — cover exactly one HTTP execution, selected
+  endpoint affinity, no transparent retry/failover, cancellation, response-byte
+  rejection, and wire-ID correlation in generic JSON-RPC. Add no Solana DTO or
+  slot state there. **Depends on:** **Redact RPC configuration**. **Proof:**
+  loopback transport tests.
+
+- [x] **Specify native provider generation** — test-only: require every fixture
+  and concrete provider to select its key algorithm and require generation
+  failure to publish no wallet/filter. **Proof:** focused wallet/provider tests.
+- [x] **Own Bitcoin generation** — implement explicit secp256k1 generation in
+  the Bitcoin provider through its existing `create` path and a private test
+  failure seam. **Depends on:** **Specify native provider generation**.
+  **Proof:** Bitcoin generation/address/failure tests.
+- [x] **Own Ethereum generation** — implement the same provider-owned
+  secp256k1 rule for Ethereum without changing its address or signing behavior.
+  **Depends on:** **Specify native provider generation**. **Proof:** Ethereum
+  generation, address, and signed-wire regressions.
+- [x] **Close provider generation** — update test providers, make
+  `Provider::generate` mandatory, and retain `Arc<T>` forwarding. **Depends
+  on:** **Own Bitcoin generation**, **Own Ethereum generation**. **Proof:**
+  wallet, Bitcoin, Ethereum, API, and workspace checks.
+
+- [x] **Add transaction ambiguity** — add optional canonical transaction ID to
+  the base transaction error; only a concrete transaction layer may originate
+  it from exact locally signed bytes. **Proof:** base error construction and
+  conversion tests.
+- [x] **Preserve wallet ambiguity** — carry that exact ID unchanged through
+  wallet errors; never parse provider prose or synthesize another ID. **Depends
+  on:** **Add transaction ambiguity**. **Proof:** wallet conversion tests.
+- [x] **Make batch failures truthful** — add `InvalidBatch`; make
+  `SendError.failed_index` optional; add distinct item and operation
+  constructors; and carry optional ambiguity. **Depends on:** **Preserve wallet
+  ambiguity**. **Proof:** display and metadata-shape tests for collection,
+  operation, item, and grouped failures.
+- [x] **Enforce SDK batch bounds** — export `MAX_TRANSFERS = 50`; reject zero
+  with `at least one transfer is required` and 51 with
+  `at most 50 transfers are allowed` before lookup or sender invocation; admit
+  1 and 50. **Depends on:** **Make batch failures truthful**. **Proof:** direct
+  `Wallets::send_all` boundary tests.
+- [x] **Preserve authored occurrences** — prove exact length, order,
+  multiplicity, aliases, duplicate wallet IDs/destinations/amounts, and original
+  indices through common conversion and sender handoff. **Depends on:**
+  **Enforce SDK batch bounds**. **Proof:** wallet orchestration tests.
+- [ ] **Fix common precedence** — validate each authored occurrence in order:
+  positive amount, wallet lookup, then family compatibility before advancing.
+  **Depends on:** **Preserve authored occurrences**. **Proof:** competing-error
+  table tests.
+- [ ] **Defend Bitcoin batches** — reject impossible zero/51 direct sender
+  calls before chain I/O and make grouped failures index-free. Originate
+  ambiguity only from the exact local Bitcoin envelope. **Depends on:**
+  **Make batch failures truthful**. **Proof:** Bitcoin batch and ambiguity
+  regressions.
+- [ ] **Defend Ethereum batches** — reject impossible zero/51 direct sender
+  calls before chain I/O, preserve original indices/accepted prefix, and
+  originate ambiguity only from the exact local Ethereum envelope. **Depends
+  on:** **Make batch failures truthful**. **Proof:** Ethereum nonce, prefix,
+  duplicate, and ambiguity regressions.
+
+- [ ] **Reject transaction queries** — after authentication but before body
+  extraction, reject any non-empty query on both transaction POST routes with
+  `transaction query parameters are not supported`; an empty query component
+  and ordinary infrastructure headers remain inert. **Proof:** route precedence
+  tests against malformed JSON, empty batch, and 51 items.
+- [ ] **Apply the wire maximum first** — reject more than 50 decoded wire items
+  before converting any amount; leave the empty list to the SDK minimum guard.
+  **Depends on:** **Enforce SDK batch bounds**. **Proof:** 0/1/50/51 route tests
+  with wallet and RPC call counters.
+- [ ] **Close transaction bodies** — enforce `additionalProperties: false` for
+  `AddressInput`, `SendFunds`, `WalletTransfer`, and `TransferRequest`; reject
+  every unknown lag/reference/commitment/retry/Memo/priority member before SDK
+  delegation. **Depends on:** **Reject transaction queries**. **Proof:** unknown
+  destination, single-root, batch-item, and batch-root matrix.
+- [ ] **Project public ambiguity** — add optional
+  `ambiguous_transaction_id`; any ambiguity maps to `503`, while definite,
+  collection, item, and grouped cases omit unrelated fields. **Depends on:**
+  **Make batch failures truthful**. **Proof:** exact JSON body tests.
+- [ ] **Publish transaction schemas** — publish `minItems: 1`, `maxItems: 50`,
+  no `uniqueItems`, closed objects, and conditional accepted IDs/index/
+  ambiguity descriptions. Mention native SOL without exposing a Solana-only
+  route. **Depends on:** **Apply the wire maximum first**, **Close transaction
+  bodies**, **Project public ambiguity**. **Proof:** OpenAPI snapshot/assertion
+  tests.
+- [ ] **Pass shared-contract gate** — run focused JSON-RPC, base, wallets,
+  Bitcoin, Ethereum, API route/OpenAPI, design-lint, formatting, and locked
+  workspace checks. **Stop if:** existing wire bytes, transaction IDs, batch
+  order, or public error precedence changes outside the accepted contract.
+
+## Phase: PostgreSQL, Block Coordinates, and Wallet Handoff
+
+- [ ] **Own PostgreSQL 18 tests** — after separate pull approval, record the
+  immutable digest for official `postgres:18.6-alpine` and make repository
+  tests provision and clean an isolated database/schema from exactly that
+  artifact instead of returning early when an environment variable is absent.
+  Keep a unique schema per test run. **Proof:** version/digest assertion and an
+  intentionally wrong connection fail rather than report a skipped pass.
+- [ ] **Validate baseline migrations** — apply `0001`, `0002`, and `0003` in
+  order only to the owned database; verify recorded checksums, the effective
+  schema, scope keys, indexes, and ownership classification. **Depends on:**
+  **Own PostgreSQL 18 tests**. **Proof:** schema-catalog assertions and unchanged
+  application sentinel.
+- [ ] **Validate startup schema** — add a read-only adapter compatibility check
+  for the configured schema and required relations; it performs no create,
+  alter, repair, or migration. **Depends on:** **Validate baseline migrations**.
+  **Proof:** compatible, missing, wrong-column, and wrong-schema tests.
+- [ ] **Reject zero pool size** — return a typed invalid request before
+  constructing a pool with zero connections. **Proof:** focused pool test.
+- [ ] **Qualify output spends** — include address in unnested spend input and
+  SQL matching so one address cannot spend another address's identical output
+  identity. **Proof:** required-spend and tracked-spend regressions.
+- [ ] **Reject duplicate output identity** — reject one `OutputId` supplied
+  under different addresses in the same block at domain validation before a
+  PostgreSQL unique-key error. **Proof:** repository-independent block test and
+  both repository contracts.
+- [ ] **Serialize scope commits** — take one transaction-scoped advisory lock
+  derived from exact `(chain, network)` before checkpoint reads in add/remove.
+  Add no lock table. **Proof:** deterministic concurrent first-commit test.
+- [ ] **Stabilize history pages** — execute one checkpoint-bound history page
+  inside a read-only `REPEATABLE READ` transaction. **Proof:** forced checkpoint
+  drift between page queries.
+- [ ] **Stabilize output pages** — apply the same snapshot rule to live-output
+  pagination and cursor validation. **Proof:** forced output/checkpoint drift.
+- [ ] **Isolate PostgreSQL benchmarks** — replace global truncation with a
+  unique scope and scope-only dependency-ordered cleanup. **Proof:** sentinel
+  rows in another scope and `payment_wallets` survive.
+- [ ] **Prove shared-pool isolation** — use one pool and schema with at least
+  two chain/network scopes and native/token assets; reject cross-scope handles
+  and preserve every unrelated row. **Depends on:** all adapter-safety steps.
+  **Proof:** non-skipping PostgreSQL contract test.
+
+- [ ] **Add application wallet reads** — add an `apps/api`-owned startup loader
+  over the shared pool for existing `payment_wallets` rows. It reads the exact
+  current columns, maps `start_height` to native position only for verified
+  Bitcoin/Ethereum scopes, rejects a Solana row, and never logs/returns/rewrites
+  secret bytes. **Depends on:** **Validate baseline migrations**. **Proof:**
+  complete row restoration, malformed row, wrong scope, redaction, and
+  byte-for-byte sentinel tests.
+- [ ] **Restore wallets before sync** — reconstruct every required persisted
+  Bitcoin/Ethereum wallet through its provider and publish its address/birthday
+  before the first filter snapshot. **Depends on:** **Add application wallet
+  reads**. **Proof:** process restart retains address/history and does not write
+  `payment_wallets`.
+- [ ] **Remove indexing custody** — only after restoration passes, remove
+  `Registry`, `RegisteredAddress`, PostgreSQL registry queries, the optional
+  registry family argument, and `Wallets::adopt`/`restore` coupling. Keep the
+  physical table and application loader unchanged. **Depends on:** **Restore
+  wallets before sync**. **Proof:** dependency/source audit plus indexing,
+  wallets, PostgreSQL, and restart tests.
+
+- [ ] **Add block coordinates** — add `BlockPosition`, `BlockParent`, checked
+  successors, and the additive constructor/conversion tests without yet
+  changing `BlockRef`. **Proof:** base boundary tests at zero and `u64::MAX`.
+- [ ] **Specify coordinate migration** — add
+  `sdk/indexing/postgres/migrations/0004_block_positions.sql` with only these
+  eight indexing columns: checkpoint current/parent position, history block/
+  parent position, and journal current/parent plus previous-checkpoint/
+  previous-parent position. It may alter no movement, output, journal-output,
+  or application table. **Depends on:** **Validate baseline migrations**.
+  **Proof:** SQL statement and ownership review.
+- [ ] **Rehearse dense backfill** — in an owned restored copy, add the columns
+  as nullable, abort on any populated unverified scope, backfill only verified
+  Bitcoin/Ethereum rows with `position = height`, validate parent pairs, and
+  prove all counts/hashes/application bytes are unchanged. **Depends on:**
+  **Specify coordinate migration**. **Proof:** before/after hashes and negative
+  unknown-scope fixture.
+- [ ] **Finalize coordinate constraints** — in the same transactional
+  migration, require current positions, enforce complete optional parent pairs,
+  and remove transition nullability only after backfill validation. No runtime
+  height-to-position fallback is allowed. **Depends on:** **Rehearse dense
+  backfill**. **Proof:** fresh and retained owned-database migration tests,
+  rollback-on-invalid-row, and unchanged `payment_wallets` sentinel.
+- [ ] **Write the retained transition runbook** — document the external-only
+  sequence: record applied versions/checksums and scope hashes, prove a restore,
+  stop and fence every old writer, apply the ordered migration to the explicit
+  schema, verify all position/parent constraints and preservation sentinels,
+  then admit only the position-aware binary. An old binary may not restart
+  after the migration. This step prepares commands but executes none. **Depends
+  on:** **Finalize coordinate constraints**. **Proof:** restored-copy rehearsal
+  and reviewed roll-forward/failure response.
+- [ ] **Cut over complete block references** — intentionally broad compile
+  slice: replace every base/indexing/Bitcoin/Ethereum constructor, fixture,
+  cursor, redb record/key, and PostgreSQL reader/writer with
+  `{ position, height, hash, parent, timestamp }`. Dense adapters set position
+  equal to height only at their protocol boundaries. Reject old redb records
+  and height-only cursors. **Depends on:** **Add block coordinates**,
+  **Finalize coordinate constraints**. **Proof:** immediate locked workspace
+  check and no placeholder/default positions.
+- [ ] **Round-trip both repositories** — prove sparse positions, produced
+  heights, atomic parents, checkpoint/history/journal/add/remove/restart,
+  rollback, and old-record rejection in redb and PostgreSQL. **Depends on:**
+  **Cut over complete block references**. **Proof:** shared non-skipping
+  repository contract.
+- [ ] **Cut over the source contract** — replace dense `block_at(height)` and
+  `canonical_hash(height)` with complete tip, inclusive position-range fetch
+  with positive returned-block limit, and complete canonical reference lookup;
+  update all doubles in one compiling slice. **Depends on:** **Cut over complete
+  block references**. **Proof:** generic source contract tests.
+- [ ] **Prove dense sources** — adapt Bitcoin and Ethereum with contiguous
+  native positions and complete parent references; equality with produced
+  height exists only inside those adapters. **Depends on:** **Cut over the
+  source contract**. **Proof:** focused source/reorg/restart regressions.
+- [ ] **Specify sparse synchronization** — test positions `100, 103, 107`,
+  produced heights `50, 51, 52`, skipped birthdays, prefix resume, retained
+  reorg, and `ReorgTooDeep` before changing the synchronizer. **Depends on:**
+  **Cut over the source contract**. **Proof:** failing generic synchronizer
+  fixtures.
+- [ ] **Implement sparse synchronization** — traverse actual returned blocks,
+  validate strict position growth, exact produced-height increment, and exact
+  parent position/hash; query canonical state by stored position and retain
+  produced-height confirmation/retention. **Depends on:** **Specify sparse
+  synchronization**. **Proof:** sparse plus existing dense synchronizer tests.
+- [ ] **Rename wallet birthdays** — replace chain-neutral `start_height` with
+  `start_position`, use checked successor publication, and reject overflow.
+  This does not rename the preserved `payment_wallets.start_height` column.
+  **Depends on:** **Cut over complete block references**. **Proof:** generated,
+  imported, skipped-position, and overflow tests.
+- [ ] **Specify admission races** — test both wallet-publication/commit orders,
+  revision invalidation, cancellation after repository I/O begins, checkpoint
+  reload, and lock ordering. **Depends on:** **Implement sparse
+  synchronization**, **Rename wallet birthdays**. **Proof:** deterministic
+  race fixtures, not sleeps.
+- [ ] **Coordinate filters and commits** — implement one in-memory coordinator
+  per `IndexScope` with persisted-checkpoint snapshot, filter revision, commit
+  permit, publication permit, async waiters, and recovery-required state. RPC
+  and repository I/O occur outside its short lock, and no lock crosses
+  `.await`. A sync plan reads checkpoint/revision, captures filters outside the
+  lock, and retries if revision changed; pre-commit rechecks both values before
+  granting one permit. Publication waits for any commit, inserts the
+  wallet/filter at the checked checkpoint successor, then increments revision
+  under the serialized boundary. **Depends on:** **Specify admission races**.
+  **Proof:** all race, drop, reload, and cancellation fixtures.
+- [ ] **Break old public cursors** — publish native position and atomic parent
+  in block JSON/checkpoint cursors and reject height-only encodings. **Depends
+  on:** **Cut over complete block references**. **Proof:** encode/decode,
+  conflict, and old-shape rejection tests.
+- [ ] **Pass persistence-coordinate gate** — run base, wallets, indexing,
+  runtime, redb, PostgreSQL 18, Bitcoin, Ethereum, API, design-lint, formatting,
+  and locked workspace checks. **Stop if:** any PostgreSQL test skips, another
+  scope/application row changes, an old writer could emit null positions, or
+  the runtime wallet race remains reproducible.
+
+## Phase: Solana Primitives, RPC, and Account Acquisition
+
+- [ ] **Add Solana lint ownership** — add the `solana-chain` layer with exact
+  dependencies on package, base, indexing, and wallets; permit it only from
+  application/acceptance and own `solana`/`sol` vocabulary only in the app and
+  Solana crate. Preserve narrow existing Ethereum `sol!` suppressions. **Proof:**
+  design-lint positive/negative cases and policy check.
+- [ ] **Create the Solana package** — intentionally broad topology slice: add
+  the workspace member, manifest with the complete fixed dependency family,
+  lock resolution, and non-empty chain skeleton. Establish real owners for the
+  singular client, blockhash lifetime, Memo operation, account snapshot,
+  interpreter, and source budget; add no filler module. **Depends on:** **Add
+  Solana lint ownership**, **Pass persistence-coordinate gate**. **Proof:**
+  immediate Rust 1.91 locked package check, dependency-tree audit, design lint,
+  formatting, and diff check.
+- [ ] **Parse Solana addresses** — accept only canonical plain Base58 decoding
+  to exactly 32 bytes; reject malformed alphabet, wrong length, and a decode/
+  re-encode mismatch. Keep valid off-curve values readable/indexable. **Proof:**
+  canonical, malformed, boundary, and off-curve fixtures.
+- [ ] **Render Solana addresses** — emit canonical plain Base58 from all 32
+  bytes and add the distinct wallet `AddressEncoding::Base58`; never route it
+  through Bitcoin Base58Check. **Depends on:** **Parse Solana addresses**.
+  **Proof:** round trips and cross-codec rejection.
+- [ ] **Classify send curves** — use the maintained curve predicate only as a
+  native-send gate; reject off-curve destinations before RPC without calling
+  them malformed. **Depends on:** **Parse Solana addresses**. **Proof:** local
+  on/off-curve tests and zero RPC count.
+- [ ] **Add checked lamports** — own `Lamport(u64)` with checked arithmetic and
+  exact nine-decimal conversion; reject zero, negative, fractional-lamport,
+  overflow, and one lamport above `u64::MAX`; round-trip `u64::MAX`. **Proof:**
+  decimal boundary table with no floating point.
+- [ ] **Add native SOL identity** — add private chain/network/native-asset
+  facts required by wallets/indexing, using `{ chain: "solana", asset:
+  "native" }` and nine-decimal presentation. Add no SPL identity. **Depends
+  on:** **Add checked lamports**. **Proof:** scope/asset conversion tests.
+- [ ] **Parse imported seeds** — accept exactly 64 lowercase ASCII hex
+  characters as one 32-byte Ed25519 seed; reject prefix, uppercase, whitespace,
+  alternate keypair encoding, and wrong length. **Proof:** exhaustive boundary
+  matrix.
+- [ ] **Protect seed memory** — keep environment input, decode buffer, errors,
+  and the final key wrapper zeroized with no `Clone`, `Debug`, `Display`, or
+  Serde surface. **Depends on:** **Parse imported seeds**. **Proof:** trait/source
+  audit, redacted error tests, and zeroization seam.
+- [ ] **Generate Ed25519 seeds** — use OS randomness behind a Solana-private,
+  test-only failure seam; do not expose generated seed bytes. **Depends on:**
+  **Protect seed memory**, **Close provider generation**. **Proof:** uniqueness,
+  injected failure, and no wallet/filter publication.
+- [ ] **Sign Solana messages** — derive the canonical address, sign one exact
+  message once, locally verify, derive the canonical first-signature ID, and
+  reject a mismatched key/signature. **Depends on:** **Generate Ed25519 seeds**.
+  **Proof:** maintained-library signature fixtures.
+
+- [ ] **Add the Solana RPC double** — build an owned loopback harness that
+  asserts exact method, parameters, order, call count, endpoint, body limit,
+  cancellation, and response. **Depends on:** **Prove one-shot transport**.
+  **Proof:** harness self-tests including unexpected-call failure.
+- [ ] **Build the singular RPC client** — expose one endpoint with fixed
+  headers, timeout, response limit, redacted debug, and `request_once`; no
+  endpoint list, failover, or transparent retry is representable. **Depends
+  on:** **Add the Solana RPC double**. **Proof:** affinity and one-call tests.
+- [ ] **Map native RPC failures** — preserve transport, HTTP, JSON-RPC,
+  malformed-data, response-resource, retryable-source, and post-wire ambiguity
+  classes without trusting provider prose. **Depends on:** **Build the singular
+  RPC client**. **Proof:** error-code/envelope matrix.
+- [ ] **Read Solana identity** — implement one-shot `getGenesisHash` with
+  canonical Base58/32-byte validation and exact no-parameter `getHealth` where
+  only string `"ok"` passes. **Depends on:** **Map native RPC failures**.
+  **Proof:** exact method/shape and malformed-result tests.
+- [ ] **Read contextual slots** — implement confirmed/finalized `getSlot` with
+  optional exact `minContextSlot`; accept only direct JSON unsigned integers
+  through `u64::MAX` and never narrow or perform floor arithmetic. **Depends
+  on:** **Map native RPC failures**. **Proof:** JSON number-form and floor tests.
+- [ ] **Decode native accounts** — require context slot even for null; decode
+  exact `[string, "base64"]`, strict padding/alphabet, canonical owner,
+  lamports, executable, and space/data agreement; ignore additive context
+  metadata. **Depends on:** **Parse Solana addresses**. **Proof:** malformed
+  field/encoding/cardinality matrix.
+- [ ] **Read one account** — implement Base64/full-data `getAccountInfo` with
+  commitment/floor and complete/null account mapping for startup Memo checks.
+  **Depends on:** **Decode native accounts**, **Read contextual slots**.
+  **Proof:** exact request and context-floor tests.
+- [ ] **Read many accounts** — implement one `getMultipleAccounts` request for
+  at most 100 addresses with exact cardinality and positional mapping; never
+  chunk or send `dataSlice`. **Depends on:** **Decode native accounts**, **Read
+  contextual slots**. **Proof:** 0/1/100/101 and short/extra response tests.
+- [ ] **Read finalized SOL balance** — implement exact finalized `getBalance`
+  with valid context and checked lamport conversion. **Depends on:** **Read
+  contextual slots**, **Add checked lamports**. **Proof:** zero, max, malformed,
+  below-floor, and exact decimal presentation.
+
+- [ ] **Resolve source occurrences** — preserve each original item, map its
+  already-resolved wallet to a canonical source address, and record the
+  earliest occurrence per source without sorting or grouping public items.
+  **Depends on:** **Preserve authored occurrences**. **Proof:** source aliases,
+  duplicates, and original-index tests.
+- [ ] **Lease sources canonically** — acquire distinct source keys in canonical
+  byte order with lexical preparing state; on `SourceBusy`, release this
+  invocation's provisional leases and report the earliest original occurrence
+  with no new ambiguous ID. **Depends on:** **Resolve source occurrences**.
+  **Proof:** inverse order, partial acquisition, cross-path contention, and
+  cancellation tests.
+- [ ] **Expose source busy truthfully** — add the typed wallet/public mapping
+  for `SourceBusy`: `503`, original batch item index when one exists, no
+  accepted IDs from the new invocation, and no new ambiguous ID. A single send
+  has no index. **Depends on:** **Lease sources canonically**, **Project public
+  ambiguity**. **Proof:** exact single/batch HTTP and direct SDK error shapes.
+- [ ] **Validate Solana destinations** — after source leases are held, parse
+  every destination in original order, require on-curve, and reject every
+  source-equals-destination occurrence before account RPC. Release this
+  invocation's lexical leases on failure. **Depends on:** **Expose source busy
+  truthfully**, **Classify send curves**. **Proof:** syntax, curve, self-transfer,
+  original-index, precedence, lease-release, and zero-RPC tests.
+- [ ] **Build the stable account query** — append source then destination for
+  every occurrence, deduplicate canonical bytes at first appearance, retain
+  reverse mapping, and issue at most one 100-address call. **Depends on:**
+  **Validate Solana destinations**, **Read many accounts**. **Proof:**
+  duplicates, aliases, exact order, and 50-item bound.
+- [ ] **Open the confirmed attempt** — call `getHealth`, then exactly one
+  `getSlot(confirmed) = F` on the same endpoint; initial support performs no
+  automatic retry or failover. **Depends on:** **Build the stable account
+  query**, **Read Solana identity**. **Proof:** ordering, one-shot, health
+  failure, and no-account-call tests.
+- [ ] **Acquire the account context** — call one `getMultipleAccounts` with
+  `minContextSlot = F`, validate the entire structure/cardinality before
+  interpretation, and require its context `C >= F`. **Depends on:** **Open the
+  confirmed attempt**. **Proof:** low-context and malformed response discard
+  every observation.
+- [ ] **Close the account witness** — call one closing confirmed `getSlot` with
+  `minContextSlot = C`, require `U >= C`, and retain it provisionally without
+  publishing a floor or account fact.
+  **Depends on:** **Acquire the account context**. **Proof:** closing failure,
+  equality including `u64::MAX`, and no partial floor/fact publication.
+- [ ] **Classify native accounts** — in original order, accept absent or
+  non-executable zero-data System-owned destinations; require the same shape
+  for present sources; treat absent source as zero balance; map a semantic
+  failure to the earliest truthful item. Only complete classification atomically
+  publishes eligibility, balances, and operation floor `P = U`. **Depends on:**
+  **Close the account witness**. **Proof:** owner/executable/data/source/
+  destination policy table and no floor publication on semantic failure.
+- [ ] **Cancel account acquisition** — race every health, slot, account,
+  decoding, classification, and handoff boundary against cancellation and the
+  response-size limit; leave no task, floor, account fact, or lexical lease.
+  **Depends on:** all account-acquisition steps. **Proof:** deterministic
+  cancellation point matrix and zero downstream calls.
+- [ ] **Pass Solana account gate** — run Rust 1.91 Solana address, value, key,
+  RPC, account, balance, acquisition, source-lease, cancellation, package,
+  dependency, design-lint, formatting, and locked workspace checks with owned
+  doubles only. **Depends on:** all Solana primitive, RPC, and account-
+  acquisition steps. **Proof:** exact commands, non-skipping results, and a
+  source/dependency audit recorded in implementation evidence.
+
+## Phase: Native Submission, Sparse Indexing, and Wallet Adapters
+
+- [ ] **Define submission registration** — add one Solana-owned one-method
+  capability whose success means the application has inserted the submission
+  task before dispatch. Generic crates gain no Tokio task contract. **Proof:**
+  accepted, closed, and lost-acknowledgement doubles.
+- [ ] **Model immutable envelopes** — privately bind source, original
+  occurrence, message, first signature, exact signed bytes, operation floor,
+  blockhash, and last valid block height. No field is mutable after signing.
+  **Depends on:** **Sign Solana messages**. **Proof:** construction invariants
+  and redacted debug/source audit.
+- [ ] **Generate opaque Memo tokens** — generate a fresh 256-bit OS-random
+  value for every occurrence and encode its raw bytes as canonical Base58; it
+  contains no caller, wallet, amount, destination, or time data. **Proof:**
+  uniqueness including identical/sequential payments and injected RNG failure.
+- [ ] **Build System-plus-Memo messages** — build one legacy message per item
+  with the source as fee payer/only signer, exact System transfer first, then a
+  zero-account Memo using only
+  `MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr`. **Depends on:** **Generate
+  opaque Memo tokens**, **Add checked lamports**. **Proof:** canonical wire
+  fixture, instruction order, account roles, and no override/fallback.
+- [ ] **Read blockhash lifetime** — implement confirmed
+  `getLatestBlockhash` with the current floor and atomically retain response
+  context, blockhash, and `lastValidBlockHeight`; reject a response below its
+  exact sent floor. **Depends on:** **Read contextual slots**. **Proof:** exact
+  request/response and malformed lifetime tests.
+- [ ] **Quote exact message fees** — implement sequential confirmed
+  `getFeeForMessage` over exact Base64 bincode message bytes and the
+  nondecreasing floor; require each response context to meet its exact sent
+  floor before advancing that floor; treat null as failure, never zero.
+  **Depends on:** **Build System-plus-Memo messages**, **Read blockhash
+  lifetime**. **Proof:** exact byte, context, floor, and per-item order tests.
+- [ ] **Check source sufficiency** — checked-sum every amount plus exact fee by
+  source against the witnessed account snapshot without crediting incoming
+  batch transfers; report the first threshold-crossing original occurrence.
+  **Depends on:** **Quote exact message fees**, **Classify native accounts**.
+  **Proof:** repeated-source, incoming-credit, overflow, and exact-balance tests.
+- [ ] **Sign every envelope once** — sign in original order, locally verify,
+  serialize exact bytes, derive the first signature locally, and reject any
+  duplicate message, signature, or signed bytes. **Depends on:** **Check source
+  sufficiency**, **Model immutable envelopes**. **Proof:** duplicates and
+  mismatched signature/key tests.
+- [ ] **Simulate exact envelopes** — call sequential
+  `simulateTransaction` with Base64, confirmed, `sigVerify: true`,
+  `replaceRecentBlockhash: false`, and the current floor; require each response
+  context to meet its exact sent floor before advancing that floor, and require
+  RPC success with `value.err == null`. **Depends on:** **Sign every envelope
+  once**. **Proof:** exact params/order/context plus error/malformed/
+  cancellation tests.
+- [ ] **Prove preparation atomicity** — verify every address, account, RNG,
+  blockhash, fee, arithmetic, signing, encoding, and simulation failure causes
+  zero broadcasts, no registered task, no envelope guard, and release of only
+  this invocation's lexical leases. **Depends on:** all preparation steps.
+  **Proof:** deterministic stage-failure matrix with truthful index policy.
+
+- [ ] **Read confirmed block height** — implement `getBlockHeight` with the
+  current slot floor; equality with `lastValidBlockHeight` is valid, and expiry
+  begins only above it. The bare height never advances a slot floor. **Depends
+  on:** **Read blockhash lifetime**. **Proof:** below/equal/above and numeric
+  decoding tests.
+- [ ] **Register before dispatch** — atomically transition lexical leases to
+  guarded immutable envelopes, obtain task-insertion acknowledgement, and make
+  closed/lost registration fail definitely before any wire call. **Depends
+  on:** **Define submission registration**, **Prove preparation atomicity**.
+  **Proof:** serialized close/insert races and zero-wire losing branches.
+- [ ] **Broadcast exact signed bytes** — implement one-shot
+  `sendTransaction` with Base64, preflight enabled, confirmed preflight,
+  current floor, and `maxRetries: 0`; accept only a returned signature equal to
+  the local first signature. **Depends on:** **Register before dispatch**.
+  **Proof:** exact request/response and mismatch tests.
+- [ ] **Mark the ambiguity boundary** — after the first send wire execution
+  begins, treat timeout, disconnect, cancellation, every JSON-RPC error,
+  malformed/uncorrelated response, internal failure, and signature mismatch as
+  unknown acceptance carrying only the local ID. **Depends on:** **Broadcast
+  exact signed bytes**, **Add transaction ambiguity**. **Proof:** complete error
+  matrix with a retained guard.
+- [ ] **Read historical signature status** — implement exactly one
+  `getSignatureStatuses([local_id], searchTransactionHistory: true)` entry;
+  require coherent cardinality/context/status/slot within operation-floor to
+  response-context bounds. Non-null means submitted even with execution error;
+  null remains unknown and never advances the floor. **Depends on:** **Mark the
+  ambiguity boundary**. **Proof:** null/non-null/malformed/low-context matrix.
+- [ ] **Bound exact-byte replay** — replay only identical bytes after a valid
+  null status and confirmed height at or below expiry; allow at most the
+  original plus two replays, checking status/height between attempts and once
+  after the final unknown. Never change endpoint, Memo, blockhash, signature,
+  bytes, or order. **Depends on:** **Read historical signature status**, **Read
+  confirmed block height**. **Proof:** byte equality and three-call maximum.
+- [ ] **Stop ordered broadcasts** — submit original occurrences in order,
+  expose only the definitely acknowledged prefix, retain the ambiguous
+  occurrence's original index/ID, attempt no later item, and release sources
+  used only by unattempted later items. Check confirmed block height immediately
+  before the first wire call and every later item; never rebuild after any item
+  may have been submitted. **Depends on:** **Bound exact-byte replay**.
+  **Proof:** definite, ambiguous, cancellation, expiry, and prefix matrices.
+- [ ] **Detach only the result waiter** — after registration, handler
+  cancellation drops only its waiter while the application-supervised
+  submission/reconciliation task continues. **Depends on:** **Stop ordered
+  broadcasts**. **Proof:** cancellation after registration and after wire start.
+
+- [ ] **Add finalized indexing RPC** — implement `getFirstAvailableBlock`,
+  inclusive `getBlocks`, and full/json/version-0/no-rewards `getBlock` with
+  finalized commitment, strict bounds, and exact response pairing. Never use
+  `getBlocksWithLimit`. **Depends on:** **Build the singular RPC client**, **Cut
+  over the source contract**. **Proof:** exact RPC request/shape tests.
+- [ ] **Find the complete produced tip** — from finalized slot `T`, search
+  descending closed 10,000-position windows bounded by sampled `A0`, always
+  passing `minContextSlot = T`; validate unique in-range ordering and fetch the
+  greatest retained candidate as a complete block. Never fabricate `T`.
+  **Depends on:** **Add finalized indexing RPC**. **Proof:** non-produced tip,
+  empty windows, `A0 > T`, huge gap, and unavailable candidate tests.
+- [ ] **Fetch sparse ranges** — enumerate checked forward inclusive windows
+  sized `min(max(remaining, 10_000), 500_000)`, append only the earliest
+  remaining produced slots, validate the complete response, fetch every chosen
+  block, and resume at the successor of the last committed position. Sample
+  `A0` before enumeration; if start is above the proved produced tip, return an
+  empty range without enumeration. **Depends on:** **Find the complete produced
+  tip**. **Proof:** `100/103/107`, skipped windows, above-tip empty range,
+  truncation suffix, prefix resume, and known-tip omission tests.
+- [ ] **Bound source attempts** — apply one 30-second monotonic deadline, at
+  most 64 enumeration calls, at most 500,000 numeric positions per call, and
+  cancellation at every future/loop edge; any exhaustion discards all facts and
+  permits no commit. Deadline/call-budget errors are retryable. **Depends on:**
+  **Fetch sparse ranges**. **Proof:** deterministic time/call/cancel fixtures.
+- [ ] **Close the pruning sandwich** — sample `A1` after selected blocks and
+  reject the plan if required start, anchor, or checkpoint was pruned between
+  witnesses. Treat unavailable selected blocks as retryable. **Depends on:**
+  **Bound source attempts**. **Proof:** moving lower-bound scenarios.
+- [ ] **Prove canonical omission** — return mismatch for a changed complete
+  block, or for exact omission only after `T > S`, `A0 <= S`, empty finalized
+  `getBlocks(S,S,minContextSlot=T)`, and `A1 <= S`; otherwise return
+  unavailable, never false reorg evidence. **Depends on:** **Close the pruning
+  sandwich**. **Proof:** every witness failure and same-slot replacement.
+- [ ] **Implement the Solana source** — connect tip, bounded range, and
+  canonical lookup to generic `BlockSource`; require non-null produced height,
+  strict slot growth, exact height increment, and exact parent position/hash.
+  **Depends on:** all sparse source steps. **Proof:** source contract, restart,
+  retained reorg, pruning, and deep-reorg tests.
+
+- [ ] **Resolve Solana transaction keys** — validate canonical first-signature
+  identity and signer cardinality; require first static signer as fee payer;
+  resolve legacy static keys and v0 static + loaded writable + loaded read-only
+  order; reject unsupported versions above zero. **Proof:** legacy/v0/index/
+  signer/version fixtures.
+- [ ] **Validate transaction metadata** — require pre/post balance vectors to
+  match resolved keys; reject missing metadata/loaded addresses, invalid
+  indices, and duplicate inner-instruction groups; use `meta.err` for status and
+  retain exact `meta.fee` for success/failure. **Depends on:** **Resolve Solana
+  transaction keys**. **Proof:** malformed and failed-transaction fixtures.
+- [ ] **Decode System transfers** — decode only maintained System `Transfer`
+  and `TransferWithSeed` at top-level and recorded inner instructions, preserve
+  execution order and repeated/self occurrences, omit zero lamports, and emit
+  movement IDs `<signature>:ix:<outer-index>` and
+  `<signature>:ix:<outer-index>:inner:<inner-ordinal>`. For
+  `TransferWithSeed`, account 2 is the destination; account 1 is its base
+  authority. Lookalike bytes from other programs emit nothing. **Depends on:**
+  **Validate transaction metadata**. **Proof:** variant/program/order/duplicate
+  fixtures.
+- [ ] **Apply SOL relevance** — retain a transaction only when an active
+  address is fee payer or supported movement endpoint; once relevant, retain
+  all supported movements, keep fee-only/failed fee-payer history, suppress all
+  failed movements, and emit no UTXO changes. **Depends on:** **Decode System
+  transfers**. **Proof:** relevance and failed-status matrix.
+- [ ] **Shield selected balances** — for every successful selected-wallet value
+  effect, reconcile pre/post lamport delta against supported movements and fee;
+  reject unexplained System/program/reward/rent effects for the whole block.
+  Require present inner metadata for relevant success; `[]` is valid, null/
+  omitted is incomplete. **Depends on:** **Apply SOL relevance**. **Proof:**
+  supported and unsupported native-effect fixtures.
+- [ ] **Implement the Solana interpreter** — emit canonical observations for
+  complete legacy/v0 blocks with actual fee/status/movements and all-or-nothing
+  block failure. **Depends on:** all interpreter steps. **Proof:** complete
+  interpreter contract and no partial checkpoint/history/output writes.
+- [ ] **Pass sparse indexing evidence** — cover huge gaps, skipped birthdays,
+  prefix resume, pruning movement, deadlines, call budgets, cancellation,
+  unavailable blocks, version rejection, restart, retained reorg, and deep
+  reorg through generic synchronization and both repositories. **Depends on:**
+  **Implement the Solana source**, **Implement the Solana interpreter**.
+  **Proof:** focused Solana source/interpreter tests plus the shared
+  synchronizer and redb/PostgreSQL repository contracts.
+
+- [ ] **Wake guarded reconciliation** — inject matching scope checkpoint
+  notification and retry status/history on progress plus deterministic backoff
+  from 500 ms doubling to 10 s; checkpoint progress resets backoff and no loop
+  spins. **Depends on:** **Stop ordered broadcasts**, **Pass sparse indexing
+  evidence**. **Proof:** virtual-time notification/backoff tests.
+- [ ] **Resolve indexed presence** — classify submitted when coherent status or
+  canonical source history contains the exact signature, regardless of
+  execution result; indexing remains final confirmation authority. **Depends
+  on:** **Wake guarded reconciliation**. **Proof:** status/history/reorg tests.
+- [ ] **Prove terminal absence** — only after confirmed height exceeds expiry
+  and finalized checkpoint height covers it, scan source history in pages of at
+  most 100 against one unchanged checkpoint until exhaustion. Any cursor
+  conflict, checkpoint change, reorg, pruning, gap, or page failure discards the
+  scan and retains the guard. **Depends on:** **Resolve indexed presence**.
+  **Proof:** complete/unstable/unavailable scan matrix.
+- [ ] **Release proven-absent sources** — release only after one complete
+  exhausted stable scan; null status, unavailable history, lost process state,
+  or fatal indexer never becomes absence. **Depends on:** **Prove terminal
+  absence**. **Proof:** indefinite-guard and exact release tests.
+- [ ] **Build the Solana provider and wallet** — generated and imported seeds
+  share one native create path; expose canonical address, finalized SOL balance,
+  checkpoint-bound history, and existing wallet capabilities without exposing
+  secret bytes. Generation remains process-lifetime only. **Depends on:**
+  **Release proven-absent sources**, **Generate Ed25519 seeds**, **Read finalized
+  SOL balance**. **Proof:** generation/import/address/balance/history/failure
+  tests.
+- [ ] **Route both send paths** — route `Wallet::send` and registered-family
+  batch `Sender` through the same source-keyed coordinator exactly once; reject
+  zero/51 direct sender calls before RPC/RNG/signing/registration. **Depends
+  on:** **Build the Solana provider and wallet**. **Proof:** single-to-batch and
+  batch-to-single contention, 1/50 success, 0/51 rejection, and no duplicate
+  guard.
+- [ ] **Prove ephemeral submission state** — prove neither PostgreSQL nor redb
+  stores leases, envelopes, attempts, replays, or reconciliation. Document that
+  restart, response loss, active-active writers, or a new logical invocation
+  can double-pay and callers must not automatically retry unknown outcomes.
+  **Depends on:** **Route both send paths**. **Proof:** storage audit and
+  deterministic restart/response-loss tests.
+- [ ] **Prove central chain coexistence** — through one PostgreSQL 18 pool and
+  schema write Bitcoin, Ethereum, and Solana scopes plus native/token facts;
+  prove isolation and byte-for-byte unchanged `payment_wallets`. **Depends on:**
+  **Pass sparse indexing evidence**, **Prove shared-pool isolation**. **Proof:**
+  non-skipping multi-chain repository/system contract.
+- [ ] **Pass native-chain gate** — run all Solana package, account, wallet,
+  construction, fee, signature, simulation, broadcast, replay, ambiguity,
+  reconciliation, sparse source/interpreter, both repository, generic indexing,
+  existing-chain regression, design-lint, formatting, and locked workspace
+  checks using owned doubles/databases only. **Depends on:** all native-chain
+  implementation steps. **Proof:** exact commands, non-skipping counts, and
+  owned-resource evidence recorded in implementation validation.
+
+## Phase: Runtime Composition and System Evidence
+
+- [ ] **Specify closed runtime config** — test the exact PostgreSQL/Solana
+  objects, singular endpoint, schema identifier
+  `[a-z][a-z0-9_]{0,62}` excluding `pg_`, required imports, unknown members,
+  rejected aliases/per-chain databases/`start_height`, and forbidden controls.
+  **Proof:** config-deserialization matrix with zero startup side effects.
+- [ ] **Implement closed runtime config** — add non-flattened
+  `deny_unknown_fields` objects, load database URL and Solana seeds only through
+  named environment variables, and keep credentials/seeds out of debug/errors.
+  **Depends on:** **Specify closed runtime config**, **Redact RPC configuration**.
+  **Proof:** config/redaction/environment tests.
+- [ ] **Expose Solana publicly** — add `Chain::Solana`, `WalletAsset::Sol`, and
+  public Base58 mapping in one compiling exhaustive-match slice; expose only
+  native SOL through existing wallet/transaction routes and OpenAPI. **Depends
+  on:** **Build the Solana provider and wallet**, **Publish transaction schemas**.
+  **Proof:** route, enum, serialization, and OpenAPI tests.
+
+- [ ] **Verify genesis before storage** — construct all configured chain
+  clients and finish every existing Bitcoin/Ethereum identity check plus the
+  one-shot canonical Solana `getGenesisHash` comparison before pool creation or
+  schema access. **Depends on:** **Implement closed runtime config**, **Read
+  Solana identity**. **Proof:** each wrong-identity test observes zero database
+  calls.
+- [ ] **Verify Memo before storage** — obtain finalized `S`, read exactly
+  Memo-v3 with Base64/finalized/`minContextSlot = S`, require context at least
+  `S` and a non-null executable account, still before pool creation. **Depends
+  on:** **Verify genesis before storage**, **Read one account**. **Proof:**
+  absent/non-executable/malformed/low-floor tests with zero database calls.
+- [ ] **Open the central pool** — only after every configured chain identity
+  and Memo check succeeds, construct one process-wide pool, pin each connection
+  search path to the validated schema plus `pg_catalog`, and run read-only
+  compatibility validation. **Depends on:** **Verify Memo before storage**,
+  **Validate startup schema**. **Proof:** URL search-path override cannot redirect
+  SQL; startup issues no DDL.
+- [ ] **Construct all scope handles** — clone the shared pool into one exact
+  repository per configured chain/network; reuse Ethereum scope for native and
+  ERC-20 assets; create one Solana scope, not one per asset. Load checkpoints
+  before services. **Depends on:** **Open the central pool**, **Prove central
+  chain coexistence**. **Proof:** composition identity and scope-isolation tests.
+- [ ] **Initialize scope coordination** — create one filter/commit coordinator
+  and checkpoint notification from each persisted checkpoint. **Depends on:**
+  **Construct all scope handles**, **Coordinate filters and commits**. **Proof:**
+  restart/recovery initialization tests.
+- [ ] **Compose the Solana service** — construct the singular client, source,
+  interpreter, indexing service, provider, coordinator, and sender once; inject
+  the same service's checkpoint/history/notification views into submission and
+  add the indexer to the generic Composer. Keep the concrete object graph
+  explicit at the composition root rather than hiding it in a generic
+  `Application` facade. **Depends on:** **Initialize scope coordination**,
+  **Pass native-chain gate**. **Proof:** object-identity and no-per-handler-
+  construction tests plus dependency/source audit.
+- [ ] **Restore and import before sync** — restore application-owned existing
+  Bitcoin/Ethereum rows and import configured chain wallets at explicit
+  `start_position` before the first filter revision/sync snapshot. Register one
+  Solana native family and no SPL family or durable generated-wallet row.
+  **Depends on:** **Compose the Solana service**, **Restore wallets before
+  sync**. **Proof:** startup ordering and complete initial filter tests.
+
+- [ ] **Own submission supervision** — add one application-owned bounded
+  `mpsc` admission queue and `JoinSet`; acknowledge registration only after
+  insertion and retain the sole close/wait controls. **Depends on:** **Define
+  submission registration**, **Compose the Solana service**. **Proof:** close-
+  winning, insert-winning, and lost-acknowledgement races.
+- [ ] **Track index and readiness tasks** — supervise synchronization and the
+  readiness bridge; remove bare self-owned readiness spawning and make every
+  unexpected completion/error visible to the application. **Depends on:**
+  **Compose the Solana service**. **Proof:** task-exit propagation tests.
+- [ ] **Gate HTTP readiness** — bind the listener only after every configured
+  index is `Ready` with a persisted checkpoint and all configured imports are
+  visible. Retryable source errors publish not-ready and recover; startup fatal
+  exits join owned tasks and never open HTTP. **Depends on:** **Restore and
+  import before sync**, **Track index and readiness tasks**. **Proof:**
+  CatchingUp/Ready/retry/recovery/fatal/cancel runtime-loop tests.
+- [ ] **Handle runtime fatality** — on fatal indexer exit, publish not-ready and
+  close new HTTP admission immediately. Exit only if no guarded envelope needs
+  evidence; otherwise keep the ambiguity barrier active. **Depends on:** **Gate
+  HTTP readiness**, **Own submission supervision**. **Proof:** guarded and
+  unguarded fatal-exit tests.
+- [ ] **Order graceful shutdown** — execute exactly: publish not-ready, stop new
+  admission, close registrar, drain handlers, drain registered sends/guards
+  while status/history/indexing remain alive, cancel sync after guards clear,
+  then join submission/readiness/storage tasks. **Depends on:** **Handle runtime
+  fatality**. **Proof:** deterministic event-order trace.
+- [ ] **Hold unresolved ambiguity** — impose no graceful-shutdown deadline while
+  a guard is unknown. After fatal indexing only positive historical status may
+  clear it; force-kill is the explicit operator choice accepting duplicate risk.
+  **Depends on:** **Order graceful shutdown**. **Proof:** unavailable evidence,
+  recovered evidence, positive status, and force-kill documentation tests.
+
+- [ ] **Declare the Solana system target** — explicitly add `[[test]] name =
+  "solana_stack"` because application autotest discovery is disabled. **Proof:**
+  `cargo test --no-run --test solana_stack` resolves the declared target.
+- [ ] **Record validator checksums** — pin Agave `solana-test-validator`
+  `v3.1.14`, commit
+  `3134055b562e95902233be308453fffa1c4a8902`, and platform-specific SHA-256
+  values before any artifact is downloaded or executed. **Depends on:**
+  **Declare the Solana system target**. **Proof:** checksum manifest parser and
+  unsupported-platform test.
+- [ ] **Acquire the validator artifact** — with separate network approval,
+  download only the exact named platform artifact into harness-owned cache and
+  refuse checksum mismatch before execution. **Depends on:** **Record validator
+  checksums**. **Proof:** valid and corrupted artifact tests.
+- [ ] **Own validator resources** — allocate temporary ledger, ports, logs,
+  keys, child process, and disposable PostgreSQL 18 database/schema; fund only
+  an ephemeral local payer from the owned validator and preserve an
+  application-owned sentinel. **Depends on:** **Acquire the validator artifact**.
+  **Proof:** collision-free parallel run and cleanup after success/failure.
+- [ ] **Verify owned validator identity** — verify genesis and the bundled
+  executable `spl_memo-3.0.0.so` at exact Memo-v3 before application database
+  setup. **Depends on:** **Own validator resources**. **Proof:** wrong-genesis
+  and missing/non-executable Memo negative fixtures.
+- [ ] **Execute native SOL end to end** — generate/import through the SDK,
+  submit exact legacy System-transfer-plus-Memo bytes, match the local
+  signature, index the finalized transaction, and expose one System movement,
+  exact fee/status, canonical history, and no UTXO row through existing APIs.
+  **Depends on:** **Verify owned validator identity**, **Hold unresolved
+  ambiguity**. **Proof:** explicit `solana_stack` pass with owned resources.
+- [ ] **Prove runtime restart and reorg** — restart against retained disposable
+  PostgreSQL state, resume from native slot, preserve wallets/scopes, exercise
+  skipped slots and retained rollback, and fail visibly on deep reorg or
+  unavailable required history. **Depends on:** **Execute native SOL end to
+  end**. **Proof:** deterministic system scenarios; no public cluster.
+- [ ] **Classify system-test ownership** — if no checked-in CI workflow owns
+  the pinned validator and PostgreSQL 18 fixture, document `solana_stack` as a
+  required manual integration target rather than automated CI evidence.
+  **Depends on:** **Execute native SOL end to end**. **Proof:** workflow and
+  validation-document audit.
+- [ ] **Keep negative fixtures owned** — cover wrong genesis, missing Memo,
+  malformed/oversized account data, unavailable history, pruning, unsupported
+  transaction version, fatal indexer, and ambiguous shutdown with doubles or
+  owned validator fixtures; no negative case is skipped for environment.
+  **Depends on:** system target and runtime steps. **Proof:** each negative
+  condition reaches its exact typed/public failure with no public RPC access.
+
+- [ ] **Update implementation evidence** — move validation rows from accepted/
+  missing only when cited code and focused tests exist; synchronize API,
+  contracts, indexing, architecture, and requirements with exact implemented
+  behavior and retain process-local custody/idempotency limitations. **Depends
+  on:** all implementation steps. **Proof:** path/terminology review and no
+  aspirational implemented claims.
+- [ ] **Run the release gate** — execute formatting, locked workspace check and
+  tests, strict all-features Clippy, no-deps docs, design-lint tests/policy, the
+  non-skipping PostgreSQL 18 contract, explicit `solana_stack` where its owned
+  artifact is available, and `git diff --check`. Report unavailable external
+  tools separately; never weaken a gate. **Depends on:** **Update
+  implementation evidence**. **Proof:** exact commands, versions, test counts,
+  and failures or unavailable tooling recorded without skipped-pass claims.
+- [ ] **Review final boundaries** — prove deleting `chain-solana` leaves
+  Bitcoin, Ethereum, and generic crates usable; prove no secrets/endpoints are
+  logged, no public-network/funded-key path exists, no hidden retry/SPL/generic
+  Solana DTO/application DDL was added, and no retained migration was executed.
+  **Depends on:** **Run the release gate**. **Proof:** dependency/source/diff
+  audit plus the existing-chain regression commands from the release evidence.
+- [ ] **Prepare the implementation handoff** — report implemented and missing
+  capabilities, exact test evidence, database transition status, manual
+  validator/CI boundary, process-local duplicate risk, and the first separately
+  authorized deployment action. Do not commit, migrate, download, or deploy
+  unless separately requested. **Depends on:** **Review final boundaries**.
+  **Proof:** one reviewed closeout report whose claims link to exact code and
+  test evidence and whose remaining actions stay separately approval-gated.
+
+## Phase acceptance gates
+
+| Gate | Required outcome | Blocks |
+|---|---|---|
+| Shared contracts | Existing Bitcoin/Ethereum wire behavior passes with truthful batch and ambiguity contracts | block-coordinate/API-wide changes |
+| Persistence and coordinates | Non-skipping PostgreSQL 18 plus redb contracts pass; wallet restoration precedes registry removal; sparse generic synchronization is correct | Solana source and production repository composition |
+| Solana accounts | Fixed dependency graph, native values, singular RPC, and one witnessed account attempt pass using owned doubles | signing or submission |
+| Native chain | Full preparation, bounded exact-byte submission, reconciliation, sparse indexing, wallet adapters, and three-chain database coexistence pass | application exposure |
+| Runtime and system | Identity-before-storage, one pool, readiness, supervision, shutdown, validator wire execution, indexing, and workspace release gates pass | any deployment or support claim |
+
+The first implementation slice, **Specify RPC redaction** plus
+**Redact RPC configuration**, passed under exact Rust 1.91: formatting,
+`json-rpc` tests (5/5), and strict package Clippy. **Prove one-shot transport**
+then passed with four deterministic loopback proofs covering one selected-
+endpoint execution despite configured retry/failover, caller-future
+cancellation after remote observation, response-byte rejection, and wire-ID
+correlation; the complete `json-rpc` suite passed 8/8 with strict package
+Clippy. Cancellation does not retract an execution already observed by the
+remote endpoint. **Specify native provider generation** then added a green
+wallet invariant proving a typed generation failure publishes neither a wallet
+nor an indexing filter; the focused wallet library suite passed 8/8. Its
+compiler contract is intentionally red: the provider doctest still compiles an
+implementation that omits `generate` because the generic secp256k1 default
+remains. **Own Bitcoin generation** then moved secp256k1 selection into the
+Bitcoin provider, reused its existing `create` validation/address/signer path,
+and added a private per-call entropy failure seam. Three focused generation,
+signer/address, and failure tests passed; the complete Bitcoin library suite
+passed 44/44 with strict package Clippy, the workspace all-target check, and
+design-lint. **Own Ethereum generation** then moved secp256k1 selection into
+the Ethereum provider without changing its existing `create`, Keccak address,
+or signing paths. Three focused generation, address, exact EIP-1559 signed-wire,
+and failure proofs passed; the complete Ethereum library suite passed 77/77,
+the wallet regression suite passed 8/8, and strict package Clippy, the workspace
+all-target check, and design-lint passed. **Close provider generation** then
+removed the generic key policy, made the API route fixture explicitly
+deterministic, and retained `Arc<T>` forwarding unchanged. The E0046 compiler
+doctest, Bitcoin 44/44, Ethereum 77/77 plus its adapter test, API 14/14, complete
+workspace tests, strict workspace Clippy, no-deps documentation, and
+design-lint passed. **Add transaction ambiguity** then extended the base
+transaction error with an optional typed canonical ID while keeping ordinary
+construction ID-free and message-only display unchanged. Focused tests prove
+that provider prose cannot supply reconciliation metadata and that explicit
+typed attachment preserves the exact ID. The complete base suite passed 23/23;
+the workspace all-target check, complete workspace tests, strict all-target/
+all-feature Clippy, no-deps documentation, formatting, design-lint, and diff
+checks passed. **Preserve wallet ambiguity** then added the same optional typed
+ID to the wallet error. Ordinary wallet and indexing errors remain ID-free;
+the consuming exhaustive transaction-error conversion moves the ID unchanged
+without cloning or parsing provider prose, and display remains message-only.
+The wallet suite passed 11/11 plus its compiler doctest; the workspace
+all-target check, complete workspace tests, strict all-target/all-feature
+Clippy, no-deps documentation, formatting, design-lint, and diff checks passed.
+No concrete chain attaches the ID yet. **Make batch failures truthful** then
+replaced the mandatory item index and `SendError::at` with explicit collection,
+operation, item, and grouped constructors. Collection/operation/grouped errors
+no longer manufacture item zero; item errors preserve their original index and
+accepted prefix. Construction consumes the wallet error and moves its optional
+canonical ID into item/grouped `SendError`s, leaving no second mutable
+authority; collection/operation construction creates an ID-free source. The four
+metadata/display proofs pass, as do wallets 15/15 plus its compiler doctest,
+Bitcoin 45/45, Ethereum 77/77 plus its adapter test, API 22/22, the workspace
+all-target check and complete tests, strict all-target/all-feature Clippy,
+no-deps documentation, formatting, design-lint, and diff checks. HTTP ambiguity
+projection and concrete chain ambiguity origin remain deferred. **Enforce SDK
+batch bounds** then exported the one `MAX_TRANSFERS = 50` product constant and
+made `Wallets::send_all` reject zero before 51, both before allocation, item
+validation, wallet lookup, or sender selection. Direct SDK tests prove exact
+index-free `InvalidBatch` metadata/messages, zero key comparisons and sender
+calls for invalid counts, and successful handoff at 1 and 50. The wallet suite
+passes 17/17 plus its compiler doctest; the workspace all-target check and
+complete tests, strict all-target/all-feature Clippy, no-deps documentation,
+formatting, design-lint, and diff checks pass. HTTP/OpenAPI and concrete-sender
+bounds remain deferred. **Preserve authored occurrences** then added direct
+wallet orchestration evidence without changing production behavior: one
+six-item batch proves exact length, order, multiplicity, repeated and identical
+items, distinct wallet-ID aliases resolving to one canonical source, exact
+resolved-wallet identity at sender handoff, and unchanged sender results. A
+separate one-defect case proves a lookup failure keeps authored index 4 and
+never invokes the sender. Wallet tests pass 19/19 plus the compiler doctest;
+focused strict Clippy passes. The next approval boundary is **Fix common
+precedence**.
+
+## Accepted limitations and operational failure policy
+
+| Condition | Required behavior |
+|---|---|
+| Solana RPC account/read failure before submission | Fail the complete operation, publish no floor/account facts, release only this invocation's lexical leases, and perform no later effect. |
+| Unknown `sendTransaction` outcome | Preserve exact local signature/bytes and source guard; bounded replay may use only identical bytes; return truthful `503` metadata if unresolved. |
+| Unavailable status/history or unstable checkpoint | Keep the source guarded indefinitely; never infer absence from missing evidence. |
+| Process restart, response loss, active-active writer, or new logical invocation | Duplicate payment remains possible because durable request identity/envelope recovery is not implemented; callers must not automatically retry unknown outcomes. |
+| Provider pruning below required birthday/checkpoint | Fail visibly as provider capability loss; do not skip, fabricate, or reset automatically. |
+| PostgreSQL transition failure | Transactional disposable rehearsal must roll back; retained execution is a separately authorized operational event using a tested restore point and writer barrier. |
+| Fatal indexer with no guarded send | Publish not-ready, close admission, join supervised tasks, and return the fatal error. |
+| Fatal indexer with a guarded send | Keep reconciliation/evidence services alive; only positive status can clear the guard, otherwise graceful shutdown remains blocked until explicit force-kill. |
