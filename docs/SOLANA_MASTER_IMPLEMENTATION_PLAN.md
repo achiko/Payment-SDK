@@ -294,7 +294,7 @@ workspace evidence rather than copy a temporary path.
   `transaction query parameters are not supported`; an empty query component
   and ordinary infrastructure headers remain inert. **Proof:** route precedence
   tests against malformed JSON, empty batch, and 51 items.
-- [ ] **Apply the wire maximum first** — reject more than 50 decoded wire items
+- [x] **Apply the wire maximum first** — reject more than 50 decoded wire items
   before converting any amount; leave the empty list to the SDK minimum guard.
   **Depends on:** **Enforce SDK batch bounds**. **Proof:** 0/1/50/51 route tests
   with wallet and RPC call counters.
@@ -1143,6 +1143,16 @@ library, 5/5 binary, and 16/16 integration tests. The workspace all-target
 check and complete tests, strict all-target/all-feature Clippy, no-deps
 documentation, formatting, design-lint, and diff checks pass. The next
 approval boundary is **Apply the wire maximum first**.
+**Apply the wire maximum first** then made HTTP request conversion compare the
+decoded array length with the shared `wallets::MAX_TRANSFERS` before parsing an
+amount or constructing any SDK transfer. The zero-item body still reaches the
+SDK minimum guard; one and 50 items reach the sender unchanged; and 51 invalid
+items return only the index-free maximum error without a sender, transaction,
+or broadcast call. The complete API suite passes 3/3 library, 5/5 binary, and
+17/17 integration tests. The workspace all-target check and complete tests,
+strict all-target/all-feature Clippy, no-deps documentation, formatting,
+design-lint, and diff checks pass. The next approval boundary is **Close
+transaction bodies**.
 
 ## Accepted limitations and operational failure policy
 

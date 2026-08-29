@@ -649,6 +649,102 @@ async fn empty_query_and_unrecognized_headers_do_not_change_transaction_semantic
     );
 }
 
+#[tokio::test]
+async fn batch_wire_maximum_precedes_conversion_and_leaves_minimum_to_the_sdk() {
+    let fixture = fixture(true);
+
+    let empty = request(
+        &fixture.app,
+        "POST",
+        "/v1/transactions",
+        Some(json!({"transfers": []})),
+        true,
+    )
+    .await;
+    assert_eq!(empty.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(&empty),
+        json!({"message": "at least one transfer is required"})
+    );
+
+    let oversized = request(
+        &fixture.app,
+        "POST",
+        "/v1/transactions",
+        Some(json!({
+            "transfers": (0..=wallets::MAX_TRANSFERS)
+                .map(|_| json!({
+                    "wallet_id": "missing-wallet",
+                    "destination": {
+                        "encoding": "hex",
+                        "text": "fixture-destination"
+                    },
+                    "amount": "not-a-decimal"
+                }))
+                .collect::<Vec<_>>()
+        })),
+        true,
+    )
+    .await;
+    assert_eq!(oversized.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(&oversized),
+        json!({"message": "at most 50 transfers are allowed"})
+    );
+    assert_no_transaction_calls(&fixture.calls);
+
+    let wallet_id = generated_wallet_id(&fixture).await;
+    for admitted_count in [1, wallets::MAX_TRANSFERS] {
+        let transfers = (0..admitted_count)
+            .map(|_| {
+                json!({
+                    "wallet_id": wallet_id,
+                    "destination": {
+                        "encoding": "hex",
+                        "text": "fixture-destination"
+                    },
+                    "amount": "1"
+                })
+            })
+            .collect::<Vec<_>>();
+        let admitted = request(
+            &fixture.app,
+            "POST",
+            "/v1/transactions",
+            Some(json!({"transfers": transfers})),
+            true,
+        )
+        .await;
+        assert_eq!(admitted.status, StatusCode::ACCEPTED);
+        assert_eq!(
+            json_body(&admitted),
+            json!({"transaction_ids": ["fixture-batch"]})
+        );
+    }
+
+    assert_eq!(
+        fixture
+            .calls
+            .batches
+            .lock()
+            .expect("batch calls")
+            .as_slice(),
+        &[1, wallets::MAX_TRANSFERS]
+    );
+    assert!(
+        fixture
+            .calls
+            .transfers
+            .lock()
+            .expect("transfer calls")
+            .is_empty()
+    );
+    assert_eq!(
+        *fixture.calls.broadcasts.lock().expect("broadcast calls"),
+        0
+    );
+}
+
 async fn generated_wallet_id(fixture: &Fixture) -> String {
     let response = request(
         &fixture.app,

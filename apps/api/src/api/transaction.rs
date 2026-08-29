@@ -394,6 +394,12 @@ impl TryFrom<TransferRequest> for Vec<wallets::WalletTransfer<String>> {
     type Error = ApiError;
 
     fn try_from(request: TransferRequest) -> Result<Self, Self::Error> {
+        if request.transfers.len() > wallets::MAX_TRANSFERS {
+            return Err(ApiError::invalid_request(format!(
+                "at most {} transfers are allowed",
+                wallets::MAX_TRANSFERS
+            )));
+        }
         request
             .transfers
             .into_iter()

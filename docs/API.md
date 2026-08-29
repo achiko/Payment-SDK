@@ -8,10 +8,11 @@ The Public Transaction Semantics, Destination Account Acquisition, and Native
 SOL Submission sections below describe accepted target contracts that are not
 yet fully implemented. The current Rust source enforces the shared SDK 50-item
 maximum, rejects transaction queries, and originates Bitcoin/Ethereum
-ambiguity from exact local envelopes. It does not yet apply the HTTP
-pre-conversion maximum, project ambiguous transaction IDs, or contain native
-SOL acquisition or submission. `docs/FEATURE_VALIDATION.md` records those
-gaps; unmarked existing-runtime descriptions remain current.
+ambiguity from exact local envelopes. It also rejects oversized HTTP batches
+before converting an item. It does not yet publish the OpenAPI batch bounds,
+project ambiguous transaction IDs, or contain native SOL acquisition or
+submission. `docs/FEATURE_VALIDATION.md` records those gaps; unmarked
+existing-runtime descriptions remain current.
 
 Native SOL Submission is Accepted and selects blockhash, fee, signing,
 simulation, broadcast, exact-byte replay, and ambiguity behavior below. Solana
