@@ -298,9 +298,11 @@ indexes.solana {
 - A configured Solana import MUST read exactly 64 lowercase ASCII hexadecimal
   characters from its named environment variable and decode one 32-byte seed.
   Prefixes, whitespace, uppercase, and alternate keypair encodings MUST fail.
-  The environment string, decoded temporaries, construction failures, and final
-  private wrapper MUST be zeroized and MUST NOT implement ordinary formatting,
-  cloning, or serialization that exposes the secret.
+  Accepted bytes MUST pass through the existing `SecretBytes` boundary into a
+  Solana-private key owner. Owned secret bytes MUST be zeroized on drop and MUST
+  NOT be exposed by errors, ordinary formatting, cloning, or serialization.
+  Solana does not add a stronger guarantee for zeroizing the environment
+  `String` or rejected decode temporaries than current Bitcoin/Ethereum imports.
 - A generated Solana wallet is process-lifetime only and is not restart-
   recoverable. A configured import is reconstructible at restart. This target
   adds no Solana row to `payment_wallets`, remote custody, HSM, or plaintext key

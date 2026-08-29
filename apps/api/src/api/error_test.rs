@@ -90,6 +90,21 @@ async fn ambiguity_and_definite_failures_project_only_truthful_metadata() {
         ),
         (
             SendError::item(
+                3,
+                Vec::new(),
+                Error::new(ErrorKind::SourceBusy, "source is busy"),
+            )
+            .into(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"message": "source is busy", "failed_index": 3}),
+        ),
+        (
+            SendError::operation(ErrorKind::SourceBusy, "single source is busy").into(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"message": "single source is busy"}),
+        ),
+        (
+            SendError::item(
                 2,
                 Vec::new(),
                 Error::new(ErrorKind::Transaction, "item failure"),

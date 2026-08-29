@@ -15,6 +15,7 @@ base = { path = "../../sdk/chains/base" }
 base64 = "=0.22.1"
 chain-bitcoin = { path = "../../sdk/chains/bitcoin" }
 chain-ethereum = { path = "../../sdk/chains/ethereum" }
+chain-solana = { path = "../../sdk/chains/solana" }
 http-support = { package = "http", path = "../../packages/http" }
 hex.workspace = true
 indexing = { path = "../../sdk/indexing" }

@@ -9,6 +9,7 @@ pub enum ErrorKind {
     NotFound,
     Conflict,
     Unavailable,
+    SourceBusy,
     Generation,
     InvalidSecret,
     InvalidAddress,

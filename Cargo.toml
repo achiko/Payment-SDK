@@ -4,6 +4,7 @@ members = [
     "sdk/chains/base",
     "sdk/chains/bitcoin",
     "sdk/chains/ethereum",
+    "sdk/chains/solana",
     "sdk/indexing",
     "sdk/indexing/postgres",
     "sdk/indexing/redb",

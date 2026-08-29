@@ -191,7 +191,7 @@ async fn request_once_rejects_an_oversized_response_after_one_execution() {
         .request_once("oversized", json!([]))
         .await
         .expect_err("oversized response must fail");
-    assert_eq!(error.kind, ErrorKind::InvalidResponse);
+    assert_eq!(error.kind, ErrorKind::ResponseTooLarge);
     assert_eq!(executions.load(Ordering::SeqCst), 1);
 }
 

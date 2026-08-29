@@ -1,20 +1,28 @@
-use std::{error::Error as StdError, fmt};
+use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
-    InvalidConfiguration,
-    InvalidRequest,
-    Timeout,
-    Unavailable,
-    HttpStatus(u16),
+    InvalidBatch,
+    InvalidBudget,
+    InvalidIdentity,
+    InvalidSecret,
+    Generation,
+    Signing,
+    InvalidRpcConfiguration,
+    RpcTimeout,
+    RpcUnavailable,
+    RpcHttpStatus(u16),
+    RpcRemote(i64),
+    MalformedRpc,
     ResponseTooLarge,
-    InvalidResponse,
+    BelowFloor,
+    UnsupportedDestination,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error {
-    pub kind: ErrorKind,
-    pub message: String,
+    kind: ErrorKind,
+    message: String,
 }
 
 impl Error {
@@ -26,13 +34,8 @@ impl Error {
     }
 
     #[must_use]
-    pub const fn is_retryable(&self) -> bool {
-        matches!(
-            self.kind,
-            ErrorKind::Timeout
-                | ErrorKind::Unavailable
-                | ErrorKind::HttpStatus(429 | 502 | 503 | 504)
-        )
+    pub fn kind(&self) -> ErrorKind {
+        self.kind
     }
 }
 
@@ -42,4 +45,4 @@ impl fmt::Display for Error {
     }
 }
 
-impl StdError for Error {}
+impl std::error::Error for Error {}

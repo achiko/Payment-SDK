@@ -97,6 +97,7 @@ impl From<wallets::Error> for ApiError {
             wallets::ErrorKind::NotFound => ErrorKind::NotFound,
             wallets::ErrorKind::Transaction => ErrorKind::Transaction,
             wallets::ErrorKind::Unavailable
+            | wallets::ErrorKind::SourceBusy
             | wallets::ErrorKind::Generation
             | wallets::ErrorKind::Balance
             | wallets::ErrorKind::History => ErrorKind::Unavailable,

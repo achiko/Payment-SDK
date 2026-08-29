@@ -527,7 +527,7 @@ suppression or policy weakening.
   application/acceptance and own `solana`/`sol` vocabulary only in the app and
   Solana crate. Preserve narrow existing Ethereum `sol!` suppressions. **Proof:**
   design-lint positive/negative cases and policy check.
-- [ ] **Create the Solana package** — intentionally broad topology slice: add
+- [x] **Create the Solana package** — intentionally broad topology slice: add
   the workspace member, manifest with the complete fixed dependency family,
   lock resolution, and non-empty chain skeleton. Establish real owners for the
   singular client, blockhash lifetime, Memo operation, account snapshot,
@@ -535,136 +535,139 @@ suppression or policy weakening.
   Solana lint ownership**, **Pass persistence-coordinate gate**. **Proof:**
   immediate Rust 1.91 locked package check, dependency-tree audit, design lint,
   formatting, and diff check.
-- [ ] **Parse Solana addresses** — accept only canonical plain Base58 decoding
+- [x] **Parse Solana addresses** — accept only canonical plain Base58 decoding
   to exactly 32 bytes; reject malformed alphabet, wrong length, and a decode/
   re-encode mismatch. Keep valid off-curve values readable/indexable. **Proof:**
   canonical, malformed, boundary, and off-curve fixtures.
-- [ ] **Render Solana addresses** — emit canonical plain Base58 from all 32
+- [x] **Render Solana addresses** — emit canonical plain Base58 from all 32
   bytes and add the distinct wallet `AddressEncoding::Base58`; never route it
   through Bitcoin Base58Check. **Depends on:** **Parse Solana addresses**.
   **Proof:** round trips and cross-codec rejection.
-- [ ] **Classify send curves** — use the maintained curve predicate only as a
+- [x] **Classify send curves** — use the maintained curve predicate only as a
   native-send gate; reject off-curve destinations before RPC without calling
   them malformed. **Depends on:** **Parse Solana addresses**. **Proof:** local
   on/off-curve tests and zero RPC count.
-- [ ] **Add checked lamports** — own `Lamport(u64)` with checked arithmetic and
+- [x] **Add checked lamports** — own `Lamport(u64)` with checked arithmetic and
   exact nine-decimal conversion; reject zero, negative, fractional-lamport,
   overflow, and one lamport above `u64::MAX`; round-trip `u64::MAX`. **Proof:**
   decimal boundary table with no floating point.
-- [ ] **Add native SOL identity** — add private chain/network/native-asset
+- [x] **Add native SOL identity** — add private chain/network/native-asset
   facts required by wallets/indexing, using `{ chain: "solana", asset:
   "native" }` and nine-decimal presentation. Add no SPL identity. **Depends
   on:** **Add checked lamports**. **Proof:** scope/asset conversion tests.
-- [ ] **Parse imported seeds** — accept exactly 64 lowercase ASCII hex
+- [x] **Parse imported seeds** — accept exactly 64 lowercase ASCII hex
   characters as one 32-byte Ed25519 seed; reject prefix, uppercase, whitespace,
   alternate keypair encoding, and wrong length. **Proof:** exhaustive boundary
   matrix.
-- [ ] **Protect seed memory** — keep environment input, decode buffer, errors,
-  and the final key wrapper zeroized with no `Clone`, `Debug`, `Display`, or
-  Serde surface. **Depends on:** **Parse imported seeds**. **Proof:** trait/source
-  audit, redacted error tests, and zeroization seam.
-- [ ] **Generate Ed25519 seeds** — use OS randomness behind a Solana-private,
+- [x] **Use shared secret handling** — move an accepted decoded seed through
+  the existing `SecretBytes` boundary into a Solana-private key owner that
+  follows current Bitcoin/Ethereum behavior: owned secret bytes are zeroized
+  on drop and no secret is exposed through errors, `Clone`, `Debug`, `Display`,
+  or Serde. Do not add a Solana-only guarantee for zeroizing the environment
+  `String` or rejected decode temporaries. **Depends on:** **Parse imported
+  seeds**. **Proof:** shared-wrapper/trait audit and redacted error tests.
+- [x] **Generate Ed25519 seeds** — use OS randomness behind a Solana-private,
   test-only failure seam; do not expose generated seed bytes. **Depends on:**
-  **Protect seed memory**, **Close provider generation**. **Proof:** uniqueness,
+  **Use shared secret handling**, **Close provider generation**. **Proof:** uniqueness,
   injected failure, and no wallet/filter publication.
-- [ ] **Sign Solana messages** — derive the canonical address, sign one exact
+- [x] **Sign Solana messages** — derive the canonical address, sign one exact
   message once, locally verify, derive the canonical first-signature ID, and
   reject a mismatched key/signature. **Depends on:** **Generate Ed25519 seeds**.
   **Proof:** maintained-library signature fixtures.
 
-- [ ] **Add the Solana RPC double** — build an owned loopback harness that
+- [x] **Add the Solana RPC double** — build an owned loopback harness that
   asserts exact method, parameters, order, call count, endpoint, body limit,
   cancellation, and response. **Depends on:** **Prove one-shot transport**.
   **Proof:** harness self-tests including unexpected-call failure.
-- [ ] **Build the singular RPC client** — expose one endpoint with fixed
+- [x] **Build the singular RPC client** — expose one endpoint with fixed
   headers, timeout, response limit, redacted debug, and `request_once`; no
   endpoint list, failover, or transparent retry is representable. **Depends
   on:** **Add the Solana RPC double**. **Proof:** affinity and one-call tests.
-- [ ] **Map native RPC failures** — preserve transport, HTTP, JSON-RPC,
+- [x] **Map native RPC failures** — preserve transport, HTTP, JSON-RPC,
   malformed-data, response-resource, retryable-source, and post-wire ambiguity
   classes without trusting provider prose. **Depends on:** **Build the singular
   RPC client**. **Proof:** error-code/envelope matrix.
-- [ ] **Read Solana identity** — implement one-shot `getGenesisHash` with
+- [x] **Read Solana identity** — implement one-shot `getGenesisHash` with
   canonical Base58/32-byte validation and exact no-parameter `getHealth` where
   only string `"ok"` passes. **Depends on:** **Map native RPC failures**.
   **Proof:** exact method/shape and malformed-result tests.
-- [ ] **Read contextual slots** — implement confirmed/finalized `getSlot` with
+- [x] **Read contextual slots** — implement confirmed/finalized `getSlot` with
   optional exact `minContextSlot`; accept only direct JSON unsigned integers
   through `u64::MAX` and never narrow or perform floor arithmetic. **Depends
   on:** **Map native RPC failures**. **Proof:** JSON number-form and floor tests.
-- [ ] **Decode native accounts** — require context slot even for null; decode
+- [x] **Decode native accounts** — require context slot even for null; decode
   exact `[string, "base64"]`, strict padding/alphabet, canonical owner,
   lamports, executable, and space/data agreement; ignore additive context
   metadata. **Depends on:** **Parse Solana addresses**. **Proof:** malformed
   field/encoding/cardinality matrix.
-- [ ] **Read one account** — implement Base64/full-data `getAccountInfo` with
+- [x] **Read one account** — implement Base64/full-data `getAccountInfo` with
   commitment/floor and complete/null account mapping for startup Memo checks.
   **Depends on:** **Decode native accounts**, **Read contextual slots**.
   **Proof:** exact request and context-floor tests.
-- [ ] **Read many accounts** — implement one `getMultipleAccounts` request for
+- [x] **Read many accounts** — implement one `getMultipleAccounts` request for
   at most 100 addresses with exact cardinality and positional mapping; never
   chunk or send `dataSlice`. **Depends on:** **Decode native accounts**, **Read
   contextual slots**. **Proof:** 0/1/100/101 and short/extra response tests.
-- [ ] **Read finalized SOL balance** — implement exact finalized `getBalance`
+- [x] **Read finalized SOL balance** — implement exact finalized `getBalance`
   with valid context and checked lamport conversion. **Depends on:** **Read
   contextual slots**, **Add checked lamports**. **Proof:** zero, max, malformed,
   below-floor, and exact decimal presentation.
 
-- [ ] **Resolve source occurrences** — preserve each original item, map its
+- [x] **Resolve source occurrences** — preserve each original item, map its
   already-resolved wallet to a canonical source address, and record the
   earliest occurrence per source without sorting or grouping public items.
   **Depends on:** **Preserve authored occurrences**. **Proof:** source aliases,
   duplicates, and original-index tests.
-- [ ] **Lease sources canonically** — acquire distinct source keys in canonical
+- [x] **Lease sources canonically** — acquire distinct source keys in canonical
   byte order with lexical preparing state; on `SourceBusy`, release this
   invocation's provisional leases and report the earliest original occurrence
   with no new ambiguous ID. **Depends on:** **Resolve source occurrences**.
   **Proof:** inverse order, partial acquisition, cross-path contention, and
   cancellation tests.
-- [ ] **Expose source busy truthfully** — add the typed wallet/public mapping
+- [x] **Expose source busy truthfully** — add the typed wallet/public mapping
   for `SourceBusy`: `503`, original batch item index when one exists, no
   accepted IDs from the new invocation, and no new ambiguous ID. A single send
   has no index. **Depends on:** **Lease sources canonically**, **Project public
   ambiguity**. **Proof:** exact single/batch HTTP and direct SDK error shapes.
-- [ ] **Validate Solana destinations** — after source leases are held, parse
+- [x] **Validate Solana destinations** — after source leases are held, parse
   every destination in original order, require on-curve, and reject every
   source-equals-destination occurrence before account RPC. Release this
   invocation's lexical leases on failure. **Depends on:** **Expose source busy
   truthfully**, **Classify send curves**. **Proof:** syntax, curve, self-transfer,
   original-index, precedence, lease-release, and zero-RPC tests.
-- [ ] **Build the stable account query** — append source then destination for
+- [x] **Build the stable account query** — append source then destination for
   every occurrence, deduplicate canonical bytes at first appearance, retain
   reverse mapping, and issue at most one 100-address call. **Depends on:**
   **Validate Solana destinations**, **Read many accounts**. **Proof:**
   duplicates, aliases, exact order, and 50-item bound.
-- [ ] **Open the confirmed attempt** — call `getHealth`, then exactly one
+- [x] **Open the confirmed attempt** — call `getHealth`, then exactly one
   `getSlot(confirmed) = F` on the same endpoint; initial support performs no
   automatic retry or failover. **Depends on:** **Build the stable account
   query**, **Read Solana identity**. **Proof:** ordering, one-shot, health
   failure, and no-account-call tests.
-- [ ] **Acquire the account context** — call one `getMultipleAccounts` with
+- [x] **Acquire the account context** — call one `getMultipleAccounts` with
   `minContextSlot = F`, validate the entire structure/cardinality before
   interpretation, and require its context `C >= F`. **Depends on:** **Open the
   confirmed attempt**. **Proof:** low-context and malformed response discard
   every observation.
-- [ ] **Close the account witness** — call one closing confirmed `getSlot` with
+- [x] **Close the account witness** — call one closing confirmed `getSlot` with
   `minContextSlot = C`, require `U >= C`, and retain it provisionally without
   publishing a floor or account fact.
   **Depends on:** **Acquire the account context**. **Proof:** closing failure,
   equality including `u64::MAX`, and no partial floor/fact publication.
-- [ ] **Classify native accounts** — in original order, accept absent or
+- [x] **Classify native accounts** — in original order, accept absent or
   non-executable zero-data System-owned destinations; require the same shape
   for present sources; treat absent source as zero balance; map a semantic
   failure to the earliest truthful item. Only complete classification atomically
   publishes eligibility, balances, and operation floor `P = U`. **Depends on:**
   **Close the account witness**. **Proof:** owner/executable/data/source/
   destination policy table and no floor publication on semantic failure.
-- [ ] **Cancel account acquisition** — race every health, slot, account,
+- [x] **Cancel account acquisition** — race every health, slot, account,
   decoding, classification, and handoff boundary against cancellation and the
   response-size limit; leave no task, floor, account fact, or lexical lease.
   **Depends on:** all account-acquisition steps. **Proof:** deterministic
   cancellation point matrix and zero downstream calls.
-- [ ] **Pass Solana account gate** — run Rust 1.91 Solana address, value, key,
+- [x] **Pass Solana account gate** — run Rust 1.91 Solana address, value, key,
   RPC, account, balance, acquisition, source-lease, cancellation, package,
   dependency, design-lint, formatting, and locked workspace checks with owned
   doubles only. **Depends on:** all Solana primitive, RPC, and account-
@@ -1566,6 +1569,76 @@ the two Ethereum ERC-20 ABI tests pass, generated cases remain empty, strict
 design-lint Clippy, formatting, policy check, and diff checks pass. No Solana
 crate or dependency was added in this boundary. The next boundary is **Create
 the Solana package**.
+**Create the Solana package** then added `sdk/chains/solana` as a Rust 1.91
+workspace member and application dependency with the complete accepted direct
+dependency family. The non-empty chain skeleton establishes real owners for
+the shared single-client transport, recent-blockhash lifetime, 32-byte Memo
+token, structural account snapshot, scope-bound interpreter, and produced-block
+source budget; it also enforces the shared 1-through-50 batch boundary without
+implementing address text, RPC methods, signing, submission, or indexing.
+Offline resolution added exactly 43 packages to the then-current 504-package
+lockfile, producing 547 packages and SHA-256
+`aeaa2571a739d9de53de70e8ce1372add05e9defe19a81ff2eca5620c99e3226`.
+The resolved direct tree matches every fixed version, contains no
+`solana-client` or monolithic `solana-sdk`, and retains Alloy 1.8.3/1.6.1 plus
+redb 4.2.0. Rust 1.91 locked package compilation, all 9 foundation tests,
+strict package Clippy, formatting, design-lint, and diff checks pass. The
+locked workspace all-target check, strict all-target/all-feature Clippy, and
+complete workspace suite also pass, including PostgreSQL 5/5 migration and
+23/23 repository tests, Bitcoin 58/58, Ethereum 81/81, wallets 23/23, and API
+18/18. The next boundary is **Parse Solana addresses**.
+**Parse Solana addresses** then added `FromStr` over the maintained
+`solana-address` decoder with typed invalid-alphabet, wrong-length, and
+non-canonical errors. Parsing requires an exact decode/re-encode match and
+preserves all 32 bytes without applying destination curve policy. Canonical
+zero and maximum values, malformed alphabet, empty/31/33/oversized inputs, the
+explicit canonicality guard, and a deterministic off-curve address pass 14/14
+package tests plus the public parser doctest. Strict package Clippy, formatting,
+design-lint, and diff checks pass. Rendering and the wallet plain-Base58 codec
+remain the next boundary: **Render Solana addresses**.
+**Render Solana addresses** then added canonical `Display` output over all 32
+bytes, lossless conversion to and from the protocol-neutral `base::Address`,
+and the distinct wallet `AddressEncoding::Base58` tag. The Solana address
+boundary emits and accepts only that plain-Base58 tag, explicitly rejecting
+`Base58Check`, Bech32, Bech32m, and hexadecimal tags before parsing. Canonical
+zero, intermediate, and maximum byte values round-trip through text; exact
+portable bytes round-trip separately; and cross-codec rejection passes in
+17/17 Solana tests plus the public doctest and 24/24 wallet tests. Public API
+Solana/Base58 variants remain deferred to application composition. The next
+boundary is **Classify send curves**.
+**Classify send curves** then added the transaction-owned
+`NativeDestination` invariant over the maintained `solana-address` Ed25519
+curve predicate. A fixed-seed keypair public key passes; a known program-derived
+address fails with typed `UnsupportedDestination` before the zero-call RPC and
+signer counters. Both curve classes still round-trip through the unchanged
+canonical address parser, so off-curve identities remain readable and
+indexable rather than becoming malformed syntax. All 21 Solana tests plus the
+public address doctest, strict package Clippy, formatting, design-lint, and diff
+checks pass.
+
+**Solana Primitives, RPC, and Account Acquisition** then added exact checked
+lamports and native identity; strict lowercase-hex Ed25519 import, shared
+zeroizing secret ownership, OS generation, exact-message signing, local
+verification, and canonical first-signature identity; and a singular redacted
+one-shot RPC client with owned loopback evidence. Health, genesis, contextual
+slot, complete Base64 account, multi-account, and finalized-balance methods
+preserve transport, HTTP, remote-code, malformed-data, response-resource,
+floor, and post-dispatch ambiguity classes without trusting provider prose.
+
+The transaction-owned acquisition path preserves authored occurrences, leases
+distinct sources in canonical byte order, projects `SourceBusy` truthfully,
+validates destinations and self-transfer before RPC, builds one stable query,
+and executes the accepted `getHealth -> F -> C -> U` witness. Only complete
+System-account classification returns the floor and source balances; every
+failure or cancellation drops provisional observations and leases. The final
+owned suite passes 57 Solana tests plus the public doctest, including exact
+1/100 bounds, `u64::MAX` closing-witness behavior, strict account matrices,
+and cancellation at every RPC await. The locked workspace test suite,
+all-target check, strict all-target/all-feature Clippy, no-deps docs,
+design-lint tests/cases/policy, formatting, dependency/source audit, and diff
+check pass. The existing duplicate `bench` example-name Cargo warning remains
+non-blocking and unrelated. The next phase begins with **Define submission
+registration**.
 
 ## Accepted limitations and operational failure policy
 

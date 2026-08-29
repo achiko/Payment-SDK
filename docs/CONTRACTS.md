@@ -4,13 +4,16 @@ This document describes the target reusable Rust boundaries. Current source is
 authoritative for exact lifetimes, generic bounds, and error types that are
 already implemented. The accepted Public Transaction Semantics, Destination
 Account Acquisition and shared-PostgreSQL target changes below are not fully
-implemented: no Solana crate or account-acquisition path exists and `apps/api`
-still composes per-chain redb repositories. Complete native block coordinates,
+integrated: the Solana crate now implements primitive, one-shot RPC, source-
+lease, and witnessed account-acquisition boundaries, while `apps/api` still
+composes per-chain redb repositories and no Solana provider/sender is registered.
+Complete native block coordinates,
 the position-aware redb/PostgreSQL repositories, sparse synchronization,
 bounded transaction admission, exact ambiguity propagation, provider-owned
 Bitcoin/Ethereum generation, and per-scope wallet/filter admission are now
-implemented. Canonical plain Base58, Native SOL Submission, and Solana Runtime
-Composition remain accepted but unimplemented.
+implemented. Canonical plain Base58 and the pre-submission account handoff are
+implemented; Native SOL Submission and Solana Runtime Composition remain
+accepted but unimplemented.
 
 ## Wallet collection
 
@@ -70,10 +73,13 @@ prerequisite work, not implemented evidence.
 A generated Solana wallet exists only for the current process and is not
 restart-recoverable. A configured Solana import is reconstructed from exactly
 one lowercase 64-character hexadecimal seed held in its named environment
-variable and is registered before synchronization. Secret strings, decoded
-temporaries, and private wrappers are zeroized and never ordinarily formatted,
-serialized, or cloned. This contract adds no Solana row to `payment_wallets` and
-does not claim durable production custody.
+variable and is registered before synchronization. Accepted bytes pass through
+the shared `SecretBytes` boundary into a Solana-private key owner whose owned
+secret bytes are zeroized on drop and never exposed through ordinary formatting,
+serialization, cloning, or errors. Environment strings and rejected decode
+temporaries follow the same existing handling as Bitcoin/Ethereum imports; this
+contract adds no stricter Solana-only custody guarantee, no Solana row to
+`payment_wallets`, and no claim of durable production custody.
 
 Import requires a native-position birthday. Generation assigns the checked
 successor of the current checkpoint position, or position zero when the scope

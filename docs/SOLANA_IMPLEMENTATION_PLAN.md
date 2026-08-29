@@ -240,7 +240,7 @@ once, under Rust 1.85:
   complete modular graph and the required generic `base`, `indexing`,
   `wallets`, `json-rpc`, serialization, async, and zeroization edges against
   Rust 1.85 without changing a repository manifest or lockfile.
-- [ ] **Create the first Solana package slice** — in one unavoidable topology
+- [x] **Create the first Solana package slice** — in one unavoidable topology
   packet, add the workspace member, `chain-solana` manifest, complete accepted
   dependency table, lock resolution, required chain skeleton, and these six
   real second-owner slices: singular one-shot `rpc/client.rs`; private
@@ -251,127 +251,129 @@ once, under Rust 1.85:
   `mod.rs` directories or weaken design lint. Before completion, run an
   immediate Rust-1.85 locked package check, dependency-tree/MSRV audit, design
   lint, formatting, and diff check.
-- [ ] **Parse canonical Solana addresses** — accept canonical Base58 that
+- [x] **Parse canonical Solana addresses** — accept canonical Base58 that
   decodes to exactly 32 bytes; reject invalid alphabet, wrong length, and
   non-canonical spellings; preserve valid off-curve addresses for reading and
   indexing.
-- [ ] **Render canonical Solana addresses** — make display/public conversion
+- [x] **Render canonical Solana addresses** — make display/public conversion
   emit plain canonical Base58 and the chain-neutral address carry the exact
   32 account-address bytes; keep chain and network scope solely in existing
   wallet/indexing metadata.
-- [ ] **Separate Base58 codec tags** — prove Solana `AddressFormat` accepts only
+- [x] **Separate Base58 codec tags** — prove Solana `AddressFormat` accepts only
   plain `Base58`, rejects `Base58Check`, and no plain-Base58 value is decoded
   through Bitcoin's Base58Check path or vice versa.
-- [ ] **Classify on-curve destinations** — add the maintained curve check as a
+- [x] **Classify on-curve destinations** — add the maintained curve check as a
   send-only predicate; prove off-curve parsing/history remains valid while
   native SOL destination submission rejects it before RPC.
-- [ ] **Add checked lamports** — introduce a private/native `u64` lamport value
+- [x] **Add checked lamports** — introduce a private/native `u64` lamport value
   with checked add/subtract; reject zero, negative, fractional-lamport,
   overflow, and out-of-range public payment inputs; prove `u64::MAX` round-
   trips and one lamport above it fails before RPC.
-- [ ] **Convert exact SOL decimals** — prove `1 SOL = 1_000_000_000` lamports
+- [x] **Convert exact SOL decimals** — prove `1 SOL = 1_000_000_000` lamports
   with exact base-10 formatting and no floating point.
-- [ ] **Add native SOL identity** — define only the Solana chain/network/native
+- [x] **Add native SOL identity** — define only the Solana chain/network/native
   asset facts needed by wallets and indexing; do not add SPL or Token-2022.
 - [ ] **Parse configured seeds** — accept exactly 64 lowercase ASCII hex
   characters from the named environment value; reject prefixes, whitespace,
   uppercase, wrong length, and alternate keypair encodings.
-- [ ] **Protect seed memory** — keep the environment string, decode buffer,
-  construction failure, and final private wrapper zeroized with no `Clone`,
-  `Debug`, `Display`, or Serde surface.
-- [ ] **Generate Ed25519 seed material** — generate one OS-random 32-byte seed
+- [x] **Use shared secret handling** — pass an accepted decoded seed through
+  the existing `SecretBytes` boundary into a Solana-private key owner. Match
+  Bitcoin/Ethereum behavior: zeroize owned secret bytes on drop, expose no
+  secret through errors or ordinary traits, and add no stronger Solana-only
+  guarantee for environment strings or rejected decode temporaries.
+- [x] **Generate Ed25519 seed material** — generate one OS-random 32-byte seed
   through a Solana-private deterministic failure seam that is not production
   configurable; do not construct or return a wallet yet.
-- [ ] **Sign and verify locally** — sign one exact message, derive its canonical
+- [x] **Sign and verify locally** — sign one exact message, derive its canonical
   first-signature ID, verify locally, and reject any mismatched key/signature.
-- [ ] **Pass the package foundation gate** — run Rust-1.85 package checks,
+- [x] **Pass the package foundation gate** — run Rust-1.91 package checks,
   address/key/value tests, dependency tree review, design lint, formatting, and
   diff checks before adding RPC behavior.
 
 ## Account Reads & Wallets
 
-- [ ] **Add the Solana RPC double** — create a deterministic loopback harness
+- [x] **Add the Solana RPC double** — create a deterministic loopback harness
   that asserts exact method, params, call count, ordering, body limit, and
   cancellation without any public network.
-- [ ] **Verify the singular RPC client** — prove the package slice's one
+- [x] **Verify the singular RPC client** — prove the package slice's one
   endpoint uses fixed headers, timeout, maximum response bytes, and
   `request_once`; expose no endpoint list, failover, transparent retry, or
   ignored safety field.
-- [ ] **Map Solana RPC failures** — preserve transport, HTTP, JSON-RPC,
+- [x] **Map Solana RPC failures** — preserve transport, HTTP, JSON-RPC,
   malformed-data, resource, retryable-source, and post-wire ambiguity classes
   without using provider prose as authority.
-- [ ] **Read the genesis hash** — implement one-shot `getGenesisHash` with
+- [x] **Read the genesis hash** — implement one-shot `getGenesisHash` with
   canonical Base58/32-byte validation.
-- [ ] **Read node health** — implement one-shot `getHealth`; only exact `"ok"`
+- [x] **Read node health** — implement one-shot `getHealth`; only exact `"ok"`
   admits account acquisition.
-- [ ] **Read contextual slots** — implement confirmed/finalized `getSlot` with
+- [x] **Read contextual slots** — implement confirmed/finalized `getSlot` with
   an optional `minContextSlot`; accept JSON integers from zero through
   `u64::MAX`, reject signed/fractional/exponent/string/Boolean/collection forms,
   and validate the exact sent floor without narrowing or arithmetic.
-- [ ] **Read one contextual account** — implement Base64 `getAccountInfo` with
+- [x] **Read one contextual account** — implement Base64 `getAccountInfo` with
   commitment/floor, exact context, null handling, and complete account fields
   for the Memo readiness probe.
-- [ ] **Read multiple contextual accounts** — implement one
+- [x] **Read multiple contextual accounts** — implement one
   `getMultipleAccounts` call for at most 100 addresses with Base64/full data,
   no `dataSlice`, exact cardinality, and positional mapping.
-- [ ] **Decode strict account data** — require exact `[string, "base64"]`,
+- [x] **Decode strict account data** — require exact `[string, "base64"]`,
   strict alphabet/padding, canonical 32-byte owner, valid lamports/executable/
   space, and decoded-length agreement before semantic classification. Require
   `context.slot` even for `value: null` and ignore additive `apiVersion` or
   unrelated context metadata regardless of its JSON value.
-- [ ] **Read finalized SOL balance** — implement exact finalized `getBalance`
+- [x] **Read finalized SOL balance** — implement exact finalized `getBalance`
   with context validation and checked lamport conversion.
-- [ ] **Prove RPC endpoint affinity** — run every account/identity method
+- [x] **Prove RPC endpoint affinity** — run every account/identity method
   through one client and prove one-shot call counts, no switch, and no retry.
 
-- [ ] **Resolve source occurrences** — map every authored item to its actual
+- [x] **Resolve source occurrences** — map every authored item to its actual
   wallet/address and retain the earliest original occurrence for each source.
-- [ ] **Create lexical source leases** — add process-local source states for
-  preparing, submitting, and ambiguous envelopes without leaking them into a
-  generic crate or PostgreSQL.
-- [ ] **Acquire sources canonically** — acquire all distinct sources by
+- [x] **Create lexical source leases** — add process-local preparing state
+  without leaking it into a generic crate or PostgreSQL. Submitted and
+  ambiguous envelope ownership remains in the Native Submission phase.
+- [x] **Acquire sources canonically** — acquire all distinct sources by
   canonical bytes, fail fast/all-or-nothing, and release provisional leases in
   reverse ownership-safe order.
-- [ ] **Report source busy truthfully** — map an occupied source to the earliest
+- [x] **Report source busy truthfully** — map an occupied source to the earliest
   original occurrence as `503 SourceBusy`, with no accepted or ambiguous ID
   from the new invocation.
-- [ ] **Reject self transfers** — reject every resolved source-equals-
+- [x] **Reject self transfers** — reject every resolved source-equals-
   destination occurrence before health or account RPC.
-- [ ] **Validate destination syntax first** — parse and require on-curve native
+- [x] **Validate destination syntax first** — parse and require on-curve native
   destinations before any account request while retaining original indices.
-- [ ] **Build the stable account query** — append source then destination per
+- [x] **Build the stable account query** — append source then destination per
   occurrence, deduplicate by canonical bytes at first occurrence, preserve
   reverse mapping, and cap the one request at 100 unique addresses.
-- [ ] **Open the confirmed attempt** — execute `getHealth`, then
+- [x] **Open the confirmed attempt** — execute `getHealth`, then
   `getSlot(confirmed) = F`, exactly once on the singular endpoint.
-- [ ] **Acquire the account snapshot** — request all addresses with
+- [x] **Acquire the account snapshot** — request all addresses with
   `minContextSlot = F`; validate structure/cardinality before interpreting any
   account or calling the closing witness.
-- [ ] **Validate the account context** — require `C >= F`; keep `F` and `C`
+- [x] **Validate the account context** — require `C >= F`; keep `F` and `C`
   provisional and private to the attempt.
-- [ ] **Close the confirmed attempt** — call `getSlot(confirmed,
+- [x] **Close the confirmed attempt** — call `getSlot(confirmed,
   minContextSlot = C) = U`, require `U >= C`, and publish none of the three
   floors if this witness fails.
-- [ ] **Classify destination accounts** — in original-item order accept absence
+- [x] **Classify destination accounts** — in original-item order accept absence
   or a non-executable, zero-data, System-owned account; assign coherent semantic
   failures to the earliest truthful occurrence.
-- [ ] **Classify source accounts** — require the same supported System-account
+- [x] **Classify source accounts** — require the same supported System-account
   shape; treat absence as zero balance for later sufficiency checks.
-- [ ] **Handoff snapshot atomically** — publish only witnessed `U` together
+- [x] **Handoff snapshot atomically** — publish only witnessed `U` together
   with complete eligibility and source-balance facts; never publish a floor by
   itself, and never treat the observed balance as a durable reservation.
-- [ ] **Cancel every account await** — race health, both slot reads, account
+- [x] **Cancel every account await** — race health, both slot reads, account
   fetch, decoding boundary, classification boundary, and pre-handoff point;
   leave no background work, floor, task registration, or lexical lease.
-- [ ] **Reject oversized account responses** — enforce configured response
+- [x] **Reject oversized account responses** — enforce configured response
   bytes before unbounded buffering and prove zero downstream effects.
-- [ ] **Prove false-high behavior** — reject an unclosed `u64::MAX` claim
+- [x] **Prove false-high behavior** — reject an unclosed `u64::MAX` claim
   without publication and allow a self-consistent `F = C = U = u64::MAX` only
   as one live atomic handoff that later stages may reject.
-- [ ] **Prove acquisition atomicity** — cover malformed JSON/Base64/owner/
+- [x] **Prove acquisition atomicity** — cover malformed JSON/Base64/owner/
   fields, short/extra values, below-floor responses, timeouts, cancellation,
   and semantic shape errors with exact index-free versus item-scoped outcomes.
-- [ ] **Pass the account acquisition gate** — run Rust-1.85 identity/account
+- [x] **Pass the account acquisition gate** — run Rust-1.91 identity/account
   RPC, decoding, acquisition, cancellation, source-lease, balance, and
   design-lint tests with zero public RPC access.
 
@@ -676,8 +678,9 @@ perform every chain identity/Memo check before opening the PostgreSQL pool.
 - [ ] **Publish Solana OpenAPI** — expose native SOL and Base58 only on existing
   wallet/transaction routes; add no Solana-specific endpoint or SPL asset.
 - [ ] **Parse imported seed environments** — load through the configured
-  environment-variable name, zeroize all temporary values, and never include
-  seed text in config/debug/error/OpenAPI output.
+  environment-variable name, pass accepted bytes through `SecretBytes`, and
+  never include seed text in config/debug/error/OpenAPI output. Use the same
+  temporary-value handling as current Bitcoin/Ethereum imports.
 
 - [ ] **Test genesis before database** — prove a wrong canonical genesis fails
   before pool construction or schema access.

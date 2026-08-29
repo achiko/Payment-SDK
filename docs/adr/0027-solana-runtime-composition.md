@@ -100,8 +100,9 @@ and redb 4.2.0. No Alloy or redb downgrade is required. Repository manifest
 and lockfile changes must repeat the exact Rust 1.91 checks; graph or
 behavioral divergence stops the affected implementation step.
 
-Ed25519 secrets stay in a private zeroizing wrapper with no `Clone`, `Debug`,
-`Display`, or Serde. The registry-ownership prerequisite in the accepted
+Ed25519 secrets use the existing `SecretBytes` handoff and stay in a private
+key owner with no `Clone`, `Debug`, `Display`, or Serde; owned secret bytes are
+zeroized on drop. The registry-ownership prerequisite in the accepted
 Indexing & Central Database decision
 removes the plain secret-material query surface from indexing. It does not
 delete or rewrite the existing application-owned `payment_wallets` table, and
@@ -109,9 +110,10 @@ this decision adds no Solana row to that table. Configured imports accept
 exactly lowercase ASCII
 `[0-9a-f]{64}` from an environment variable—no `0x` prefix, whitespace, or
 alternate keypair encoding—and decode it into one 32-byte seed.
-The environment `String`, decoded temporary storage, construction failures,
-and final key wrapper are all zeroized and never ordinarily formatted. This
-decision adds no remote custody, HSM, or plaintext key database.
+The seed is never included in errors or ordinary output. Environment strings
+and rejected decode temporaries follow the same handling as current
+Bitcoin/Ethereum imports rather than a stronger Solana-only zeroization
+guarantee. This decision adds no remote custody, HSM, or plaintext key database.
 
 Generated Solana wallets follow the repository's existing development-custody
 boundary: they are process-lifetime only and are neither returned as secrets

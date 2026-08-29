@@ -318,12 +318,14 @@ fn map_error(error: RpcError) -> Error {
                         ErrorKind::HttpStatus(*status_code),
                         "JSON-RPC endpoint rejected the request",
                     ),
-                    transport::Error::Http(HttpError::TooLarge | HttpError::Malformed) => {
-                        Error::new(
-                            ErrorKind::InvalidResponse,
-                            "JSON-RPC endpoint returned an invalid response",
-                        )
-                    }
+                    transport::Error::Http(HttpError::TooLarge) => Error::new(
+                        ErrorKind::ResponseTooLarge,
+                        "JSON-RPC response exceeded its configured limit",
+                    ),
+                    transport::Error::Http(HttpError::Malformed) => Error::new(
+                        ErrorKind::InvalidResponse,
+                        "JSON-RPC endpoint returned an invalid response",
+                    ),
                     _ => Error::new(ErrorKind::Unavailable, "JSON-RPC transport is unavailable"),
                 };
             }
