@@ -3,18 +3,14 @@
 This document describes the target reusable Rust boundaries. Current source is
 authoritative for exact lifetimes, generic bounds, and error types that are
 already implemented. The accepted Public Transaction Semantics, Destination
-Account Acquisition, block-coordinate, and shared-PostgreSQL target changes
-below are not fully implemented: the current batch path has no 50-item guard or
-locally derived ambiguous-ID projection, no Solana crate or account-acquisition
-path exists, `apps/api` still composes per-chain redb repositories, and both the
-current `BlockRef` and PostgreSQL adapter remain height-only. The existing
-PostgreSQL adapter does already provide scope-bound persistence collections;
-the production shared-pool composition, dual-coordinate model, and preservation
-evidence are missing. Provider-owned native generation and canonical plain
-Base58 are also accepted but unimplemented. Native SOL Submission is Accepted
-but unimplemented. Solana Runtime Composition is Accepted and fixes the target
-dependency, application supervision, readiness, and shutdown contract, but none
-of that runtime composition is implemented.
+Account Acquisition and shared-PostgreSQL target changes below are not fully
+implemented: no Solana crate or account-acquisition path exists and `apps/api`
+still composes per-chain redb repositories. Complete native block coordinates,
+the position-aware redb/PostgreSQL repositories, sparse synchronization,
+bounded transaction admission, exact ambiguity propagation, provider-owned
+Bitcoin/Ethereum generation, and per-scope wallet/filter admission are now
+implemented. Canonical plain Base58, Native SOL Submission, and Solana Runtime
+Composition remain accepted but unimplemented.
 
 ## Wallet collection
 
@@ -109,14 +105,13 @@ family's sender. Directly pairing a public `Transfer` with a sender from a
 different provider or family is outside the reusable contract.
 
 Business and HTTP code use these methods without matching on the concrete
-chain. Wallet/custody persistence belongs to the embedding application. An
-application-owned `payment_wallets` table may share the physical PostgreSQL
-database, but indexing must not query or mutate it. The application loads
-encrypted secrets, identities, family keys, and birthdays from its trusted
-store before synchronization. Preserving the current table does not certify its
-opaque secret bytes as encrypted custody; that application design requires a
-separate decision. Application-owned restart reads must be verified before the
-current indexing-owned query path is removed.
+chain. The reusable SDK owns the registry/restoration capability used by
+`Wallets::adopt`/`restore`; the embedding application selects custody policy
+and composes that capability. PostgreSQL continues implementing the SDK
+`Registry` over `payment_wallets`, while synchronizer repository operations do
+not query or mutate it. Preserving this path does not certify the current
+opaque secret bytes as encrypted production custody; that custody design
+requires a separate decision.
 
 ## Wallet capabilities
 
@@ -315,6 +310,8 @@ pub trait Indexer: Checkpoint + History {
 
 pub trait FilterSource: Send + Sync {
     fn filters(&self) -> Result<Vec<AddressFilter>, IndexError>;
+    fn plan(&self, scope: &IndexScope, checkpoint: Option<BlockRef>)
+        -> Result<SyncPlan, IndexError>;
 }
 ```
 
@@ -325,13 +322,15 @@ canonical lookup, restart, readiness, and birthdays. `BlockHeight` drives
 confirmation arithmetic, history/output ordering, journal keys, and retained-
 block counts. Only genesis may omit the parent pair.
 
-`sync` reads the selection itself rather than receiving a snapshot, and the
-ordering is part of the contract: it reads once before any source I/O so a
-malformed selection fails without a reachable node, then reads it again after
-observing the tip and indexes against that newer set. A set captured before the
-tip was observed cannot contain an address registered in between, so the blocks
-that tip admits — blocks the new address's birthday already covers — would be
-applied without it, and nothing rescans them once the checkpoint passes.
+`sync` asks the selection for one immutable checkpoint/filter-revision plan.
+Before each canonical repository transition it obtains a commit permit that
+rechecks both values. Runtime wallet publication waits for an in-flight commit,
+uses the resulting persisted checkpoint's checked successor as its birthday,
+inserts the wallet/filter, and only then increments the revision. If publication
+wins, an older plan cannot commit. If cancellation occurs after repository I/O
+starts, the next plan must reload the authoritative repository checkpoint.
+Coordinator mutex guards never cross `.await`; source and repository I/O happen
+outside the short critical section.
 
 `Service<S, I, R>` implements `Indexer` for one exact scope. `Composer` requires
 at least one child, rejects duplicate scopes, validates a complete filter
@@ -347,12 +346,11 @@ SyncConfig::new(scope, minimum_confirmations, reorg_retention, batch_size)?;
 The three numeric inputs must be greater than zero. Confirmation depth is the
 `u64` value itself; it does not need a one-field policy wrapper.
 
-`Wallets` owns the address selection and receives the composed `Checkpoint`
-capability to choose safe runtime birthdays. Indexing owns no address registry,
-wallet identity, secret, or watch lifecycle. The sync task hands the composed
-indexer a `FilterSource` that reads `wallets.filters()`, rather than a set read
-in advance, so a wallet admitted while a pass is starting is still covered from
-its birthday.
+`Wallets` owns the address selection, one admission coordinator per registered
+scope, and the composed `Checkpoint` capability used to choose safe runtime
+birthdays. Indexing owns no wallet identity, secret, or watch lifecycle. The
+sync task hands the composed indexer `Wallets` as its `FilterSource`, so plan
+capture and runtime publication share the same scope boundary.
 
 Filter addresses are non-empty, unique, and scoped to a configured child.
 Composer validates the whole selection before any source I/O and narrows it per
@@ -428,24 +426,25 @@ handle refuses another scope. An asset is a history fact, so native and token
 assets on the same chain share the same repository rather than acquiring an
 asset repository or schema.
 
-The PostgreSQL adapter owns only checkpoint, canonical history/movement, live-
-output, and bounded-journal tables. Application-owned tables, including
-`payment_wallets`, remain outside these collections even when physically
-colocated. redb remains an embedded implementation and test backend; current
-`apps/api` still uses it pending the target composition change.
+The PostgreSQL `Repository` owns only checkpoint, canonical history/movement,
+live-output, and bounded-journal collections. The same SDK adapter preserves
+its separate `Registry` capability over `payment_wallets`; that table remains
+outside synchronization collections even when physically colocated. redb
+remains an embedded implementation and test backend; current `apps/api` still
+uses it pending the target composition change.
 
 Shared PostgreSQL evolution is preservation-first. Generic columns and
 constraints are added and validated without destroying existing scopes. A
 scope-local rescan may replace only indexing-owned rows for its explicitly
 approved `(chain, network)` and must preserve every other scope and
-application-owned row. No legacy runtime reader, inferred coordinate fallback,
+SDK registry row. No legacy runtime reader, inferred coordinate fallback,
 compatibility alias, or versioned storage DTO is part of the contract.
 
 The deployment-owned canonical creation and ordered migration scripts live
 physically under `sdk/indexing/postgres/migrations/`. This one history may
-describe the central schema, but a change to an application-owned table still
-requires its owner's approval; the indexing runtime repository contract
-remains limited to indexing tables and issues no application-table DDL.
+describe the central schema, but a change to the SDK registry table still
+requires separate SDK-level custody approval; synchronization repository
+operations remain limited to indexing tables and issue no registry-table DDL.
 
 ## History model
 
@@ -486,9 +485,10 @@ produced block. A historical address
 cannot be added after `Wallets` becomes shared because import is startup-only.
 If the authoritative startup set changes below the persisted checkpoint, the
 embedding application may recreate and rescan only that scope's indexing-owned
-rows. It must not drop the shared database, alter another scope, or touch
-application-owned wallet rows. Indexing stores no filter registry and cannot
-infer selection drift across restarts.
+rows. It must not drop the shared database, alter another scope, or touch SDK
+registry wallet rows. Synchronization stores no durable filter selection and
+cannot infer selection drift across restarts; the separate SDK `Registry`
+persists the wallet restoration facts used to rebuild that selection.
 
 ## Composition contract
 
@@ -499,8 +499,9 @@ The target process is assembled directly in `apps/api/src/main.rs`:
    no-retry Solana endpoint and redacted configuration;
 3. verify all chain identities before database mutation, including one-shot
    Solana genesis and finalized executable Memo-v3 checks;
-4. construct one process-wide PostgreSQL pool and validate the already-applied
-   pinned schema without DDL;
+4. construct one process-wide PostgreSQL pool and call
+   `indexing_postgres::validate_schema(&pool, configured_schema)` to validate
+   the already-applied pinned schema in one read-only transaction without DDL;
 5. clone the pool into one scope-bound repository per `(chain, network)`, load
    checkpoints, and initialize filter/commit coordination;
 6. construct services and one `Arc<Composer>`, then expose narrow `Indexer`,
@@ -538,7 +539,7 @@ block references, sparse native positions, dense Bitcoin/Ethereum positions,
 atomic parent presence, scope rejection, commit/rollback atomicity, and
 checkpoint-bound pagination. Shared-schema tests must use one pool to prove
 Bitcoin, Ethereum, and Solana scope isolation, native/token asset coexistence,
-and byte-for-byte preservation of sentinel application-owned wallet rows.
+and byte-for-byte preservation of sentinel SDK registry wallet rows.
 
 Application system tests must compose the target shared PostgreSQL topology,
 prove restart/readiness from native position while confirmations remain

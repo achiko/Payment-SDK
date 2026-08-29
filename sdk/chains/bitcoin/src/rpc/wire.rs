@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use bitcoin::{BlockHash as NativeBlockHash, hashes::Hash};
-use indexing::{BlockHash, BlockHeight, BlockRef, SourceError};
+use indexing::{BlockHash, BlockHeight, BlockParent, BlockPosition, BlockRef, SourceError};
 use serde_json::{Map, Number, Value};
 
 use crate::{FeeRate, Network};
@@ -77,20 +77,24 @@ pub(crate) fn parse_header(
         "hash",
         "Bitcoin block-header hash",
     )?)?;
-    let parent_hash = if height.0 == 0 {
+    let parent = if height.0 == 0 {
         None
     } else {
-        Some(parse_bitcoin_block_hash(&required_string(
-            &result,
-            "previousblockhash",
-            "Bitcoin previous block hash",
-        )?)?)
+        Some(BlockParent {
+            position: BlockPosition(height.0 - 1),
+            hash: parse_bitcoin_block_hash(&required_string(
+                &result,
+                "previousblockhash",
+                "Bitcoin previous block hash",
+            )?)?,
+        })
     };
     let timestamp = required_u64(&result, "time", "Bitcoin block-header timestamp")?;
     Ok(BlockRef {
+        position: BlockPosition(height.0),
         height,
         hash,
-        parent_hash,
+        parent,
         timestamp: Some(timestamp),
     })
 }

@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, fmt};
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_eth::{Block as RpcBlock, BlockTransactions};
-use indexing::{BlockHash, BlockHeight, BlockRef};
+use indexing::{BlockHash, BlockHeight, BlockParent, BlockPosition, BlockRef};
 use serde_json::{Map, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,9 +80,13 @@ impl ParsedBlock {
         let hash = block.hash().0;
         let parent_hash = block.header.parent_hash.0;
         let reference = BlockRef {
+            position: BlockPosition(height.0),
             height,
             hash: BlockHash(hash.to_vec()),
-            parent_hash: (height.0 != 0).then(|| BlockHash(parent_hash.to_vec())),
+            parent: (height.0 != 0).then(|| BlockParent {
+                position: BlockPosition(height.0 - 1),
+                hash: BlockHash(parent_hash.to_vec()),
+            }),
             timestamp: Some(block.header.timestamp),
         };
 

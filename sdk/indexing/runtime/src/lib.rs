@@ -5,34 +5,10 @@
 //! the SDK can reuse it rather than reimplementing the readiness and
 //! shutdown semantics.
 
-use std::{error::Error, io, marker::PhantomData, sync::Arc, time::Duration};
+use std::{error::Error, io, sync::Arc, time::Duration};
 
-use indexing::{AddressFilter, FilterSource, IndexError, IndexErrorKind, Indexer, SyncPhase};
+use indexing::{FilterSource, Indexer, SyncPhase};
 use tokio::sync::watch;
-
-/// Adapts the caller's filter closure to the selection synchronization reads.
-///
-/// The closure is handed down rather than called here, because reading it
-/// before `sync` observes the source tip is exactly the ordering that loses a
-/// newly registered address. See [`indexing::FilterSource`].
-struct Selection<F, E> {
-    filters: F,
-    marker: PhantomData<fn() -> E>,
-}
-
-impl<F, E> FilterSource for Selection<F, E>
-where
-    F: Fn() -> Result<Vec<AddressFilter>, E> + Send + Sync,
-    E: Error + Send + Sync + 'static,
-{
-    fn filters(&self) -> Result<Vec<AddressFilter>, IndexError> {
-        // A selection that cannot be read is a caller fault, not a transient
-        // one, so it stops the loop instead of retrying forever.
-        (self.filters)().map_err(|error| {
-            IndexError::new(IndexErrorKind::InvalidRequest, error.to_string(), false)
-        })
-    }
-}
 
 pub type TaskError = Box<dyn Error + Send + Sync>;
 
@@ -52,28 +28,20 @@ pub enum SyncState {
 }
 
 /// Keeps the composed index current until shutdown or a terminal failure.
-pub async fn run<F, E>(
+pub async fn run(
     indexer: Arc<dyn Indexer>,
-    filters: F,
+    selection: Arc<dyn FilterSource>,
     interval: Duration,
     mut shutdown: watch::Receiver<bool>,
     state: watch::Sender<SyncState>,
-) -> Result<(), TaskError>
-where
-    F: Fn() -> Result<Vec<AddressFilter>, E> + Send + Sync + 'static,
-    E: Error + Send + Sync + 'static,
-{
-    let selection = Selection {
-        filters,
-        marker: PhantomData,
-    };
+) -> Result<(), TaskError> {
     loop {
         if *shutdown.borrow() {
             return Ok(());
         }
 
         let result = tokio::select! {
-            result = indexer.sync(&selection) => result,
+            result = indexer.sync(selection.as_ref()) => result,
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     return Ok(());

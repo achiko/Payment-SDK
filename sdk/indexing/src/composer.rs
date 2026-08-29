@@ -129,4 +129,19 @@ impl crate::FilterSource for Scoped<'_> {
             .filter(|filter| self.scopes.contains(&filter.address.scope))
             .collect())
     }
+
+    fn plan(
+        &self,
+        scope: &IndexScope,
+        checkpoint: Option<BlockRef>,
+    ) -> Result<crate::SyncPlan, IndexError> {
+        let plan = self.selection.plan(scope, checkpoint)?;
+        let filters = plan
+            .filters()
+            .iter()
+            .filter(|filter| self.scopes.contains(&filter.address.scope))
+            .cloned()
+            .collect();
+        Ok(plan.with_filters(filters))
+    }
 }

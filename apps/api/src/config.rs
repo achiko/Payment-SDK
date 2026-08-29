@@ -94,7 +94,7 @@ pub(crate) struct ConfiguredWallet {
     pub(crate) id: String,
     pub(crate) asset: WalletAsset,
     pub(crate) secret_env: String,
-    pub(crate) start_height: u64,
+    pub(crate) start_position: u64,
 }
 
 #[derive(Deserialize)]
@@ -436,7 +436,7 @@ mod tests {
             "id": "treasury-usdc",
             "asset": "usdc",
             "secret_env": "USDC_SECRET",
-            "start_height": 1
+            "start_position": 1
         }]);
         let error = parse(ethereum(None), wallets)
             .expect("configuration JSON")
@@ -445,6 +445,21 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "configured wallet references a disabled asset"
+        );
+    }
+
+    #[test]
+    fn rejects_height_only_wallet_birthday_configuration() {
+        let wallets = json!([{
+            "id": "treasury",
+            "asset": "eth",
+            "secret_env": "ETH_SECRET",
+            "start_height": 1
+        }]);
+
+        assert!(
+            parse(ethereum(None), wallets).is_err(),
+            "the pre-release height-only birthday spelling must be rejected"
         );
     }
 

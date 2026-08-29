@@ -1,7 +1,7 @@
 //! Durable address selection, stored in `payment_wallets`.
 
 use indexing::{
-    AddressFilter, BlockHeight, BoxFuture, CanonicalAddress, IndexError, IndexErrorKind,
+    AddressFilter, BlockPosition, BoxFuture, CanonicalAddress, IndexError, IndexErrorKind,
     IndexScope, RegisteredAddress, Registry,
 };
 use tokio_postgres::Row;
@@ -19,7 +19,7 @@ WHERE chain = $1 AND network = $2 ORDER BY created_at, id";
 impl Repository {
     async fn write_registration(&self, entry: RegisteredAddress) -> Result<(), IndexError> {
         self.check_scope(&entry.filter.address.scope)?;
-        let height = row::as_i64(entry.filter.start_height.0, "start height")?;
+        let position = row::as_i64(entry.filter.start_position.0, "start position")?;
         let client = self.client().await?;
         let statement = prepare(&client, REGISTER).await?;
         let written = client
@@ -30,7 +30,7 @@ impl Repository {
                     &self.scope.chain.0,
                     &self.scope.network,
                     &entry.filter.address.value,
-                    &height,
+                    &position,
                     &entry.material,
                 ],
             )
@@ -86,8 +86,9 @@ fn registered(scope: &IndexScope, entry: &Row) -> Result<RegisteredAddress, Inde
                 scope: scope.clone(),
                 value: entry.try_get("address").map_err(crate::store)?,
             },
-            start_height: BlockHeight(
-                u64::try_from(start).map_err(|_| row::store("stored start height is negative"))?,
+            start_position: BlockPosition(
+                u64::try_from(start)
+                    .map_err(|_| row::store("stored start position is negative"))?,
             ),
         },
         material: entry.try_get("secret").map_err(crate::store)?,

@@ -1,8 +1,10 @@
 use alloy_primitives::{Address as AlloyAddress, U256};
+// design-lint: allow owned-vocabulary -- Alloy's standard Solidity ABI macro import belongs to this Ethereum adapter
 use alloy_sol_types::{SolCall, sol};
 
 use crate::{Address, Wei};
 
+// design-lint: allow owned-vocabulary -- Alloy's standard Solidity ABI declaration macro belongs to this Ethereum adapter
 sol! {
     interface Erc20 {
         function balanceOf(address account) external view returns (uint256);

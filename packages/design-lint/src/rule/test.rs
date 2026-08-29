@@ -104,6 +104,88 @@ fn vocabulary_understands_camel_case_and_ownership() {
 }
 
 #[test]
+fn solana_vocabulary_allows_only_owners_and_reasoned_alloy_suppressions() {
+    let (root, workspace) = fixture(&[
+        ("Cargo.toml", "[package]\nname='sample'\nversion='0.0.0'"),
+        (
+            "apps/api/src/lib.rs",
+            "struct SolanaConfig { enabled: bool }",
+        ),
+        (
+            "sdk/chains/solana/src/lib.rs",
+            "struct SolanaClient { endpoint: String }",
+        ),
+        (
+            "sdk/chains/ethereum/src/lib.rs",
+            "// design-lint: allow owned-vocabulary -- standard Alloy Solidity ABI import\nuse alloy_sol_types::sol;\n// design-lint: allow owned-vocabulary -- standard Alloy Solidity ABI invocation\nsol! {}",
+        ),
+        (
+            "sdk/indexing/src/lib.rs",
+            "struct SolanaCursor { position: u64 }",
+        ),
+    ]);
+    let mut policy = Policy::default();
+    policy.vocabulary.owners.push(VocabularyOwner {
+        words: vec!["solana".into(), "sol".into()],
+        allowed_paths: vec!["apps/".into(), "sdk/chains/solana/".into()],
+    });
+
+    let findings = repository::vocabulary(&workspace, &policy).unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].subject, "solana");
+    assert!(
+        findings[0]
+            .location
+            .path
+            .ends_with("sdk/indexing/src/lib.rs")
+    );
+    clean(root);
+}
+
+#[test]
+fn repository_policy_limits_solana_dependencies_and_vocabulary() {
+    let policy_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("lint.toml");
+    let policy = Policy::load(policy_path).expect("repository policy");
+    let layer = policy
+        .dependency
+        .layers
+        .iter()
+        .find(|layer| layer.name == "solana-chain")
+        .expect("Solana chain layer");
+    assert_eq!(
+        layer.may_depend_on,
+        ["package", "base", "indexing", "wallets"]
+    );
+    let consumers = policy
+        .dependency
+        .layers
+        .iter()
+        .filter(|layer| {
+            layer
+                .may_depend_on
+                .iter()
+                .any(|name| name == "solana-chain")
+        })
+        .map(|layer| layer.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(consumers, ["application", "acceptance"]);
+    assert!(
+        policy.dependency.package_layers.iter().any(|mapping| {
+            mapping.package == "chain-solana" && mapping.layer == "solana-chain"
+        })
+    );
+    let owner = policy
+        .vocabulary
+        .owners
+        .iter()
+        .find(|owner| owner.words == ["solana", "sol"])
+        .expect("Solana vocabulary owner");
+    assert_eq!(owner.allowed_paths, ["apps/", "sdk/chains/solana/"]);
+}
+
+#[test]
 fn dependencies_follow_configured_layers() {
     let files = [
         (

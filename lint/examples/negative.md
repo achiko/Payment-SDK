@@ -27,3 +27,13 @@ Use a module or functions unless the type owns meaningful state.
 Inside a concrete chain crate, use `Address` rather than repeating the chain
 name in every type. Outside that crate, do not mention the concrete chain at
 all except at the application composition boundary.
+
+## Leaking Solana ownership
+
+```rust
+struct SolanaCheckpoint;
+```
+
+This name is invalid in base, indexing, wallets, packages, and sibling chain
+crates. Use the chain-neutral `BlockRef` contract there, or move the concrete
+concept into `sdk/chains/solana` or application composition.

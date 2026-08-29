@@ -3,10 +3,10 @@ use std::ops::Deref;
 use base::Decimal;
 use futures_executor::block_on;
 use indexing::{
-    AssetId, BlockAddition, BlockHash, BlockHeight, BlockOutcome, BlockRef, BlockSelector, Blocks,
-    CanonicalAddress, ChainId, HistoryQuery, IndexScope, IndexedOutput, InterpretedBlock,
-    MovementId, ObservationDraft, ObservationDraftStatus, OutputChanges, OutputId, OutputRequest,
-    Outputs, TransactionRef, Transactions, ValueMovement,
+    AssetId, BlockAddition, BlockHash, BlockHeight, BlockOutcome, BlockParent, BlockPosition,
+    BlockRef, BlockSelector, Blocks, CanonicalAddress, ChainId, HistoryQuery, IndexScope,
+    IndexedOutput, InterpretedBlock, MovementId, ObservationDraft, ObservationDraftStatus,
+    OutputChanges, OutputId, OutputRequest, Outputs, TransactionRef, Transactions, ValueMovement,
 };
 use tempfile::TempDir;
 
@@ -44,9 +44,13 @@ fn repository() -> TestRepository {
 
 fn block(height: u64, hash: u8, parent: u8) -> BlockRef {
     BlockRef {
+        position: BlockPosition(height),
         height: BlockHeight(height),
         hash: BlockHash(vec![hash]),
-        parent_hash: Some(BlockHash(vec![parent])),
+        parent: Some(BlockParent {
+            position: BlockPosition(height - 1),
+            hash: BlockHash(vec![parent]),
+        }),
         timestamp: Some(1_000 + height),
     }
 }

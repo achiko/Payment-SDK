@@ -185,9 +185,11 @@ Deleting one chain must leave the other chain and every generic crate coherent.
 
 One-chain `Service` and `Composer` implement the same `Indexer` trait. The sync
 caller supplies the authoritative address selection through the chain-neutral
-filter source; synchronization owns no durable selection state. Wallet and
-application code owns identities, secrets, family selection, and birthdays.
-Indexing never queries that custody state directly.
+filter source; synchronization owns no durable selection state. Wallet SDK and
+embedding-application code own identities, secrets, family selection, and
+birthdays. The synchronizer never queries custody state directly; the separate
+reusable SDK `Registry` capability remains implemented by PostgreSQL for wallet
+adoption/restoration.
 
 `BlockPosition` is the native monotonic RPC coordinate: Bitcoin height,
 Ethereum block number, or Solana slot. It drives traversal, canonical lookup,
@@ -200,7 +202,10 @@ parent hash. Only genesis has no parent.
 `Blocks::add` atomically commits canonical history, live output changes, a
 storage-derived bounded journal entry, and checkpoint movement. `Blocks::remove`
 uses only that private journal to remove an orphan tip and restore live outputs.
-`Transactions` and `Outputs` are read projections over this lifecycle.
+`Transactions` and `Outputs` are read projections over this lifecycle. Each
+PostgreSQL history or output page uses one read-only repeatable-read transaction
+for its checkpoint and projection queries so it cannot mix canonical views;
+history movements use that same snapshot.
 
 The target `apps/api` uses exactly one PostgreSQL database, one shared schema,
 and one process-wide connection pool. It constructs one
@@ -210,34 +215,39 @@ duplicated per chain or asset. The canonical central schema creation and
 migration history is a deployment concern stored physically under
 `sdk/indexing/postgres/migrations/`.
 `sdk/indexing/postgres` owns indexing row encoding, set-based statements,
-transactions, and compare-and-swap rules.
+transactions, and compare-and-swap rules. Its add/remove transaction takes a
+scope-derived advisory lock before reading the checkpoint, including when the
+scope has no checkpoint row, and retains the row lock as a second guard.
+Its benchmark uses a unique scope and scope-only dependency-ordered cleanup;
+it never truncates the shared schema or deletes SDK registry rows.
+Owned PostgreSQL contracts compose multiple scope-bound repositories from that
+one pool, preserve native/token facts, reject cross-scope reads and writes, and
+compare all unrelated scope rows across a neighboring commit.
 
-Physical migration colocation does not erase logical table ownership. A script
-touching an application-owned table such as `payment_wallets` requires the
-application's explicit approval and preservation evidence; indexing runtime
-code still must not query, mutate, or issue DDL for that table.
+Physical migration colocation does not erase capability boundaries. A script
+touching the SDK registry table `payment_wallets` requires explicit SDK-level
+custody approval and preservation evidence. Synchronizer repository operations
+still must not query, mutate, or issue DDL for that table; only the existing
+registry capability may read or write it.
 
 `sdk/indexing/redb` remains an embedded persistence implementation and test
 backend, but it is not the target production composition. Backend records never
 appear in a chain interpreter or generic consumer.
 
-The durable set is deliberately limited to checkpoint, address-primary
-canonical history, live outputs, and a bounded rollback journal. Those are the
-only tables owned by indexing. Confirmation, readiness, status, watches,
-revisions, wallet identities, secrets, raw blocks, and event feeds are not
-indexing persistence. Process-local submission leases, exact outgoing
-envelopes, request identities, and reconciliation state are also not PostgreSQL
-or indexing-owned records.
+The synchronizer's durable set is deliberately limited to checkpoint,
+address-primary canonical history, live outputs, and a bounded rollback
+journal. Confirmation, readiness, status, watches, revisions, raw blocks, and
+event feeds are not synchronization persistence. Process-local submission
+leases, exact outgoing envelopes, request identities, and reconciliation state
+are also not PostgreSQL or indexing-owned records.
 
-An application-owned `payment_wallets` table may be physically colocated in
-the central database. Colocation does not transfer ownership to indexing:
-indexing runtime/repository code must not read it, write it, truncate it, delete
-it, or issue DDL for it. Existing rows must be preserved while indexing
-ownership is separated. Preservation is not approval of the current opaque
-secret bytes as production custody; an encrypted custody design remains a
-separate application decision. Application-owned restart reads must be working
-before the current indexing-owned query path is removed, so preservation never
-strands the rows.
+The physically colocated `payment_wallets` table belongs to the reusable SDK
+registry/restoration and custody-integration path. It is not checkpoint,
+history, output, or journal state, and scope-local indexing operations never
+touch it. Existing registry rows remain byte-for-byte preserved. This does not
+certify the current opaque secret bytes as production custody; custody policy
+and a future encrypted implementation remain separate decisions. The existing
+SDK registry path is preserved rather than moved exclusively into `apps/api`.
 
 ### Wallets
 

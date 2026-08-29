@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, env, future::IntoFuture, sync::Arc};
 use chain_bitcoin::{AddressType, FeeRate, IndexUtxos};
 use chain_ethereum::AssetKind;
 use config::{AnyError, Config};
-use indexing::BlockHeight;
+use indexing::BlockPosition;
 use payment_api::{State, WalletAsset};
 use tokio::sync::watch;
 
@@ -148,7 +148,7 @@ async fn main() -> Result<(), AnyError> {
                 configured.id,
                 &asset,
                 wallets::SecretBytes::new(secret),
-                BlockHeight(configured.start_height),
+                BlockPosition(configured.start_position),
             )
             .await?;
         if matches!(asset, WalletAsset::Eth | WalletAsset::Usdc) {
@@ -163,10 +163,9 @@ async fn main() -> Result<(), AnyError> {
     let (shutdown, shutdown_rx) = watch::channel(false);
     let (sync_state, sync_state_rx) = watch::channel(indexing_runtime::SyncState::CatchingUp);
     let (readiness, mut readiness_rx) = watch::channel(false);
-    let filters = wallets.clone();
     let mut synchronization = tokio::spawn(indexing_runtime::run(
         indexer,
-        move || filters.filters(),
+        wallets.clone(),
         interval,
         shutdown_rx,
         sync_state,

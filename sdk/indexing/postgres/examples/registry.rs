@@ -6,7 +6,8 @@ const OTHER: &str = "other";
 const NETWORK: &str = "testing";
 
 use indexing::{
-    AddressFilter, BlockHeight, CanonicalAddress, ChainId, IndexScope, RegisteredAddress, Registry,
+    AddressFilter, BlockPosition, CanonicalAddress, ChainId, IndexScope, RegisteredAddress,
+    Registry,
 };
 
 fn entry(scope: &IndexScope, id: &str, address: &str, height: u64) -> RegisteredAddress {
@@ -17,7 +18,7 @@ fn entry(scope: &IndexScope, id: &str, address: &str, height: u64) -> Registered
                 scope: scope.clone(),
                 value: address.to_owned(),
             },
-            start_height: BlockHeight(height),
+            start_position: BlockPosition(height),
         },
         material: vec![0xde, 0xad, 0xbe, 0xef],
     }

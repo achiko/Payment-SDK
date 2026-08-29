@@ -147,6 +147,8 @@ a chain RPC as a substitute coordinate.
 `BlockAddition::new` receives the scope, expected checkpoint, retention, and
 `InterpretedBlock`. It validates the parent connection, duplicate transaction
 IDs, scoped movements, amounts, and output changes before storage is called.
+Created outputs must have unique `OutputId` values across the complete block;
+changing the address does not create a second output identity.
 For every non-genesis child, its position must increase, its produced height
 must equal its parent's height plus one, and its atomic parent position/hash
 must match the checkpoint.
@@ -173,24 +175,48 @@ not a reason to move the checkpoint anyway.
 `Transactions::list` and `Outputs::list` are read projections. They do not
 write independent state or contain synchronization policy.
 
+Each PostgreSQL history or output page reads its checkpoint, projection rows,
+and verification checkpoint inside one read-only `REPEATABLE READ`
+transaction. History movements share that same transaction. The page and
+cursor therefore describe one canonical snapshot even if another transaction
+changes the projection and advances the checkpoint while the page is being
+assembled.
+
+The PostgreSQL benchmark generates a unique scope by default. Its optional
+reset deletes only that exact scope in dependency order and never truncates the
+shared schema or touches the reusable SDK registry table.
+
+One owned PostgreSQL contract composes distinct chain/network repositories from
+the same pool and schema. It proves native/token coexistence, typed cross-scope
+read/write rejection, and exact preservation of every unrelated indexing row
+plus the reusable SDK registry sentinel.
+
 The target PostgreSQL adapter owns only the checkpoint, history/movement,
 live-output, journal, and journal-output tables. One schema holds every scope;
 each repository handle is bound to one exact `(chain, network)`. An asset is a
 fact in a movement row, not a reason to create another repository, schema, or
 pool. Solana writes no UTXO output rows.
 
+PostgreSQL add and remove transactions take one transaction-scoped advisory
+lock derived from the length-framed exact `(chain, network)` tuple before they
+read the checkpoint. This serializes an empty scope where no checkpoint row yet
+exists; the later `FOR UPDATE` row lock remains a second guard. The lock is
+released automatically by commit or rollback and requires no lock table.
+
 Deployment-owned central schema creation and migration scripts live physically
 under `sdk/indexing/postgres/migrations/`. Their physical location does not
-make an application-owned table part of the indexing repository contract.
+make the SDK registry table part of the synchronization repository contract.
 
-Application-owned custody tables are outside indexing even when physically
-colocated in the central database. In particular, the indexing runtime adapter
-must not read, write, truncate, delete, or issue DDL for `payment_wallets`.
-Shared-schema evolution is preservation-first: add and backfill generic fields
-under validation, then enforce final constraints. A scope-local rescan may
-replace only indexing-owned rows for an explicitly approved scope and must
-preserve all other scopes and application-owned rows. No runtime compatibility
-reader, versioned storage DTO, or inferred coordinate fallback is introduced.
+`payment_wallets` remains the reusable SDK registry/restoration table even
+though it is physically colocated in the central database. The PostgreSQL
+adapter implements that separate `Registry` capability, while synchronization
+repository operations and scope-local cleanup never read, write, truncate,
+delete, or issue DDL for it. Shared-schema evolution is preservation-first:
+add and backfill generic fields under validation, then enforce final
+constraints. A scope-local rescan may replace only indexing-owned rows for an
+explicitly approved scope and must preserve all other scopes and SDK registry
+rows. No runtime compatibility reader, versioned storage DTO, or inferred
+coordinate fallback is introduced.
 
 ## Durable state
 
@@ -352,7 +378,7 @@ Deterministic tests cover:
   isolation and native/token asset coexistence;
 - PostgreSQL migration/backfill from the height-only baseline while preserving
   existing scope facts and a sentinel `payment_wallets` row byte-for-byte;
-- an exact-scope rescan that leaves every unrelated scope and application-owned
+- an exact-scope rescan that leaves every unrelated scope and SDK registry
   row unchanged;
 - positive native SOL reconciliation from canonical signature history;
 - blockhash expiry plus exhaustive checkpoint-stable absence proof;

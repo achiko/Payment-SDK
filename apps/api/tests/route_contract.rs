@@ -6,8 +6,8 @@ use axum::{
     http::{Request, StatusCode},
 };
 use base::{
-    Address, Addresser, BlockHash, BlockHeight, BlockRef, Broadcaster, Decimal, SignRequest,
-    SignedTransaction, Signer, Submission, TransactionBuilder, TransactionEnvelope,
+    Address, Addresser, BlockHash, BlockHeight, BlockPosition, BlockRef, Broadcaster, Decimal,
+    SignRequest, SignedTransaction, Signer, Submission, TransactionBuilder, TransactionEnvelope,
     TransactionError, TransactionId, TransactionSnapshot,
 };
 use http_body_util::BodyExt;
@@ -888,9 +888,10 @@ fn ethereum_scope() -> IndexScope {
 
 fn block(height: u64) -> BlockRef {
     BlockRef {
+        position: BlockPosition(height),
         height: BlockHeight(height),
         hash: BlockHash(vec![height as u8; 32]),
-        parent_hash: None,
+        parent: None,
         timestamp: Some(height),
     }
 }

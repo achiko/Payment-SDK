@@ -81,7 +81,7 @@ not the accepted PostgreSQL/Solana target. Its minimal two-chain shape is:
       "id": "treasury-usdc",
       "asset": "usdc",
       "secret_env": "TREASURY_USDC_SECRET",
-      "start_height": 1
+      "start_position": 1
     }
   ]
 }
@@ -300,9 +300,13 @@ GET /v1/wallets/{id}/transactions?limit=100&cursor=<opaque>
 ```json
 {
   "checkpoint": {
+    "position": 42,
     "height": 42,
     "hash": "<hex>",
-    "parent_hash": "<hex>"
+    "parent": {
+      "position": 41,
+      "hash": "<hex>"
+    }
   },
   "transactions": [],
   "next_cursor": null
@@ -317,6 +321,10 @@ response checkpoint; if canonical history changes, the API returns a conflict
 and the caller restarts from the first page. Transactions contain scoped
 identity, canonical inclusion/confirmation status, all movements, and an
 optional fee. Bitcoin inputs and outputs remain separate movements.
+Checkpoint and transaction-status blocks expose the native `position`
+separately from produced `height`; a non-genesis parent is one atomic object
+containing both its position and hash. Opaque cursors use the same complete
+shape and reject the former height-only encoding.
 
 Ethereum pages contain movements for the wallet's selected asset. A USDC page
 keeps the transaction's attributable ETH network fee but omits unrelated ETH

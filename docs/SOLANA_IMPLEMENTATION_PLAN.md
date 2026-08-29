@@ -210,7 +210,7 @@ read-only checksum and ownership review. It is not automatically complete.
   batch, duplicate, grouped, prefix, malformed, query, header, and ambiguity
   contracts before a Solana sender exists.
 
-- [ ] **Add Solana lint ownership** — add the `solana-chain` dependency layer,
+- [x] **Add Solana lint ownership** — add the `solana-chain` dependency layer,
   application/acceptance permissions, package mapping, and `solana`/`sol`
   vocabulary ownership limited to `apps/` and `sdk/chains/solana/`. In this
   same coherent lint change, add only exact, reasoned `owned-vocabulary`

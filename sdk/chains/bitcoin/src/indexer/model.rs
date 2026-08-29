@@ -4,7 +4,7 @@ use std::{
 };
 
 use bitcoin::{ScriptBuf, Transaction as NativeTransaction, Txid, consensus, hex::FromHex};
-use indexing::{BlockHash, BlockHeight, BlockRef};
+use indexing::{BlockHash, BlockHeight, BlockParent, BlockPosition, BlockRef};
 use serde_json::{Map, Value};
 
 use crate::{Network, Satoshi, TransactionId};
@@ -92,7 +92,7 @@ impl BlockData {
                 "Bitcoin block hash does not match the requested hash",
             ));
         }
-        let parent_hash = if height.0 == 0 {
+        let parent = if height.0 == 0 {
             if object
                 .get("previousblockhash")
                 .is_some_and(|value| !value.is_null())
@@ -103,11 +103,14 @@ impl BlockData {
             }
             None
         } else {
-            Some(parse_block_hash(required_string(
-                object,
-                "previousblockhash",
-                "Bitcoin previous block hash",
-            )?)?)
+            Some(BlockParent {
+                position: BlockPosition(height.0 - 1),
+                hash: parse_block_hash(required_string(
+                    object,
+                    "previousblockhash",
+                    "Bitcoin previous block hash",
+                )?)?,
+            })
         };
         let timestamp = required_u64(object, "time", "Bitcoin block timestamp")?;
         let transaction_values = object
@@ -156,9 +159,10 @@ impl BlockData {
 
         Ok(Self {
             reference: BlockRef {
+                position: BlockPosition(height.0),
                 height,
                 hash,
-                parent_hash,
+                parent,
                 timestamp: Some(timestamp),
             },
             transactions,

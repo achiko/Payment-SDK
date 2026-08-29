@@ -410,9 +410,10 @@ mod tests {
 
     fn block(height: u64) -> BlockRef {
         BlockRef {
+            position: base::BlockPosition(height),
             height: BlockHeight(height),
             hash: BlockHash(vec![height as u8; 32]),
-            parent_hash: None,
+            parent: None,
             timestamp: None,
         }
     }

@@ -3,6 +3,7 @@
 mod address;
 mod error;
 mod provider;
+mod selection;
 mod sender;
 mod wallet;
 mod wallets;

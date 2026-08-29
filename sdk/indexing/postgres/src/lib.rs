@@ -21,11 +21,15 @@
 //! with the block's transactions, movements, and outputs.
 
 mod columns;
+mod projection;
 mod read;
 mod registry;
 mod revert;
 mod row;
+mod schema;
 mod write;
+
+pub use schema::validate_schema;
 
 use deadpool_postgres::{Client, Manager, ManagerConfig, Pool, RecyclingMethod, Transaction};
 use indexing::{
@@ -36,12 +40,13 @@ use tokio_postgres::{NoTls, Statement};
 
 /// The scope's tip. Column aliases match [`row::block`] so every block-shaped
 /// row decodes through one function.
-const CHECKPOINT: &str = "SELECT height, hash, parent_hash AS parent, \
-                          block_timestamp AS timestamp \
+const CHECKPOINT: &str = "SELECT position, height, hash, parent_position, \
+                          parent_hash AS parent, block_timestamp AS timestamp \
                           FROM checkpoint WHERE chain = $1 AND network = $2";
 
 /// A retained block, which is the only place a non-tip height is recorded.
-const RETAINED_BLOCK: &str = "SELECT height, block_hash AS hash, block_parent AS parent, \
+const RETAINED_BLOCK: &str = "SELECT block_position AS position, height, block_hash AS hash, \
+                              block_parent_position AS parent_position, block_parent AS parent, \
                               block_timestamp AS timestamp FROM journal \
                               WHERE chain = $1 AND network = $2 AND height = $3";
 
@@ -54,6 +59,9 @@ const RETAINED_BLOCK: &str = "SELECT height, block_hash AS hash, block_parent AS
 /// discards the session, which would throw away the prepared statements this
 /// backend depends on and put the parse round trip back on every query.
 pub fn pool(url: &str, max_size: usize) -> Result<Pool, IndexError> {
+    if max_size == 0 {
+        return Err(invalid("PostgreSQL pool size must be greater than zero"));
+    }
     let config = url
         .parse::<tokio_postgres::Config>()
         .map_err(|error| invalid(format!("invalid PostgreSQL URL: {error}")))?;
@@ -114,6 +122,19 @@ impl Repository {
     ) -> Result<Option<BlockRef>, IndexError> {
         let statement = prepare(client, CHECKPOINT).await?;
         let row = client
+            .query_opt(&statement, &[&self.scope.chain.0, &self.scope.network])
+            .await
+            .map_err(store)?;
+        row.as_ref().map(|row| row::block(row, "")).transpose()
+    }
+
+    /// Reads the scope checkpoint inside a caller-owned transaction snapshot.
+    pub(crate) async fn checkpoint_in(
+        &self,
+        transaction: &Transaction<'_>,
+    ) -> Result<Option<BlockRef>, IndexError> {
+        let statement = prepare_in(transaction, CHECKPOINT).await?;
+        let row = transaction
             .query_opt(&statement, &[&self.scope.chain.0, &self.scope.network])
             .await
             .map_err(store)?;
@@ -213,4 +234,21 @@ fn store(error: tokio_postgres::Error) -> IndexError {
 
 fn unavailable(error: deadpool_postgres::PoolError) -> IndexError {
     IndexError::new(IndexErrorKind::Store, error.to_string(), true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_pool_size_is_invalid_before_url_parsing() {
+        let error = pool("not a PostgreSQL URL", 0).expect_err("zero pool size must fail");
+
+        assert_eq!(error.kind, IndexErrorKind::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "PostgreSQL pool size must be greater than zero"
+        );
+        assert!(!error.retryable);
+    }
 }

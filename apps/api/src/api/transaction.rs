@@ -156,17 +156,28 @@ impl From<wallets::HistoryFee> for Fee {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct Block {
+    pub position: u64,
     pub height: u64,
     pub hash: String,
-    pub parent_hash: Option<String>,
+    pub parent: Option<ParentBlock>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct ParentBlock {
+    pub position: u64,
+    pub hash: String,
 }
 
 impl From<base::BlockRef> for Block {
     fn from(value: base::BlockRef) -> Self {
         Self {
+            position: value.position.0,
             height: value.height.0,
             hash: hex::encode(value.hash.0),
-            parent_hash: value.parent_hash.map(|hash| hex::encode(hash.0)),
+            parent: value.parent.map(|parent| ParentBlock {
+                position: parent.position.0,
+                hash: hex::encode(parent.hash.0),
+            }),
         }
     }
 }

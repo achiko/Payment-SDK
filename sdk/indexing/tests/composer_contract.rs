@@ -2,9 +2,9 @@ use std::sync::{Arc, Mutex};
 
 use futures_executor::block_on;
 use indexing::{
-    AddressFilter, BlockHash, BlockHeight, BlockRef, BoxFuture, CanonicalAddress, ChainId,
-    Checkpoint, Composer, FilterSource, History, HistoryQuery, IndexError, IndexErrorKind,
-    IndexScope, Indexer, SyncPhase, SyncStatus, TransactionPage,
+    AddressFilter, BlockHash, BlockHeight, BlockParent, BlockPosition, BlockRef, BoxFuture,
+    CanonicalAddress, ChainId, Checkpoint, Composer, FilterSource, History, HistoryQuery,
+    IndexError, IndexErrorKind, IndexScope, Indexer, SyncPhase, SyncStatus, TransactionPage,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,11 +111,13 @@ fn address(scope: &IndexScope, value: &str) -> CanonicalAddress {
 
 fn block(height: u64) -> BlockRef {
     BlockRef {
+        position: BlockPosition(height),
         height: BlockHeight(height),
         hash: BlockHash(vec![height as u8]),
-        parent_hash: height
-            .checked_sub(1)
-            .map(|value| BlockHash(vec![value as u8])),
+        parent: height.checked_sub(1).map(|value| BlockParent {
+            position: BlockPosition(value),
+            hash: BlockHash(vec![value as u8]),
+        }),
         timestamp: None,
     }
 }
@@ -130,7 +132,7 @@ fn exercise_indexer(indexer: &dyn Indexer, scope: &IndexScope, height: u64) {
     let owner = address(scope, "owner");
     let filter = AddressFilter {
         address: owner.clone(),
-        start_height: BlockHeight(height),
+        start_position: BlockPosition(height),
     };
     let page = block_on(indexer.history(HistoryQuery {
         scope: scope.clone(),
@@ -231,7 +233,7 @@ fn rejects_operations_for_an_unconfigured_scope() {
     .expect_err("missing history");
     let sync_error = block_on(composer.sync(&vec![AddressFilter {
         address: address(&missing, "owner"),
-        start_height: BlockHeight(0),
+        start_position: BlockPosition(0),
     }]))
     .expect_err("missing sync scope");
 
@@ -257,11 +259,11 @@ fn partitions_filters_and_combines_statuses_from_every_indexer() {
 
     let first_filter = AddressFilter {
         address: address(&first_scope, "first-owner"),
-        start_height: BlockHeight(2),
+        start_position: BlockPosition(2),
     };
     let second_filter = AddressFilter {
         address: address(&second_scope, "second-owner"),
-        start_height: BlockHeight(5),
+        start_position: BlockPosition(5),
     };
     let statuses = block_on(composer.sync(&vec![second_filter.clone(), first_filter.clone()]))
         .expect("composed sync");

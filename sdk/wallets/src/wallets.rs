@@ -5,9 +5,10 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use base::{BlockHeight, Decimal, TransactionId};
+use base::{BlockPosition, Decimal, TransactionId};
 use indexing::{
-    AddressFilter, CanonicalAddress, Checkpoint, IndexScope, RegisteredAddress, Registry,
+    AddressFilter, CanonicalAddress, Checkpoint, IndexScope, PublicationPermit, RegisteredAddress,
+    Registry, ScopeAdmission,
 };
 
 use crate::{
@@ -58,6 +59,7 @@ struct Entry<I, F> {
 pub struct Wallets<I: Ord, F: Ord> {
     checkpoint: Arc<dyn Checkpoint>,
     families: BTreeMap<F, Family>,
+    pub(crate) admissions: BTreeMap<IndexScope, Arc<ScopeAdmission>>,
     values: RwLock<BTreeMap<I, Entry<I, F>>>,
 }
 
@@ -71,6 +73,7 @@ where
         Self {
             checkpoint,
             families: BTreeMap::new(),
+            admissions: BTreeMap::new(),
             values: RwLock::new(BTreeMap::new()),
         }
     }
@@ -90,6 +93,9 @@ where
                 "a wallet family is already registered for this key",
             ));
         }
+        self.admissions
+            .entry(scope.clone())
+            .or_insert_with(|| Arc::new(ScopeAdmission::new()));
         self.families.insert(
             family,
             Family {
@@ -110,7 +116,9 @@ where
         Box::pin(async move {
             let configured = configured?;
             let wallet = configured.provider.generate().await?;
-            let (info, _) = self.store(id, family_key, configured, wallet, None).await?;
+            let (info, _, publication) =
+                self.store(id, family_key, configured, wallet, None).await?;
+            crate::selection::publication(publication)?.complete()?;
             Ok(info)
         })
     }
@@ -143,7 +151,7 @@ where
             let material = secret.as_bytes().to_vec();
             let registry = configured.registry.clone();
             let wallet = configured.provider.create(secret).await?;
-            let (info, filter) = self
+            let (info, filter, publication) = self
                 .store(id.clone(), family_key, configured, wallet, None)
                 .await?;
             if let Some(registry) = &registry
@@ -160,6 +168,7 @@ where
                 self.forget(&id);
                 return Err(error.into());
             }
+            crate::selection::publication(publication)?.complete()?;
             Ok(info)
         })
     }
@@ -192,14 +201,16 @@ where
                     .provider
                     .create(SecretBytes::new(entry.material))
                     .await?;
-                self.store(
-                    I::from(entry.id),
-                    family_key.clone(),
-                    configured.clone(),
-                    wallet,
-                    Some(entry.filter.start_height),
-                )
-                .await?;
+                let (_, _, publication) = self
+                    .store(
+                        I::from(entry.id),
+                        family_key.clone(),
+                        configured.clone(),
+                        wallet,
+                        Some(entry.filter.start_position),
+                    )
+                    .await?;
+                debug_assert!(publication.is_none());
                 restored += 1;
             }
             Ok(restored)
@@ -215,16 +226,17 @@ where
         id: I,
         family: &F,
         secret: SecretBytes,
-        start_height: BlockHeight,
+        start_position: BlockPosition,
     ) -> FutureResult<'a, WalletInfo<I, F>> {
         let family_key = family.clone();
         let configured = self.family(family);
         Box::pin(async move {
             let configured = configured?;
             let wallet = configured.provider.create(secret).await?;
-            let (info, _) = self
-                .store(id, family_key, configured, wallet, Some(start_height))
+            let (info, _, publication) = self
+                .store(id, family_key, configured, wallet, Some(start_position))
                 .await?;
+            debug_assert!(publication.is_none());
             Ok(info)
         })
     }
@@ -285,18 +297,18 @@ where
     /// Wallets sharing an address contribute the earliest birthday.
     pub fn filters(&self) -> Result<Vec<AddressFilter>, Error> {
         let values = self.values.read().map_err(|_| lock_error())?;
-        let mut filters = BTreeMap::<CanonicalAddress, BlockHeight>::new();
+        let mut filters = BTreeMap::<CanonicalAddress, BlockPosition>::new();
         for entry in values.values() {
             filters
                 .entry(entry.filter.address.clone())
-                .and_modify(|height| *height = (*height).min(entry.filter.start_height))
-                .or_insert(entry.filter.start_height);
+                .and_modify(|position| *position = (*position).min(entry.filter.start_position))
+                .or_insert(entry.filter.start_position);
         }
         Ok(filters
             .into_iter()
-            .map(|(address, start_height)| AddressFilter {
+            .map(|(address, start_position)| AddressFilter {
                 address,
-                start_height,
+                start_position,
             })
             .collect())
     }
@@ -316,10 +328,33 @@ where
         family_key: F,
         family: Family,
         wallet: Arc<dyn Wallet>,
-        start_height: Option<BlockHeight>,
-    ) -> Result<(WalletInfo<I, F>, AddressFilter), Error> {
+        start_position: Option<BlockPosition>,
+    ) -> Result<(WalletInfo<I, F>, AddressFilter, Option<PublicationPermit>), Error> {
+        let publication = if start_position.is_none() {
+            let persisted = self.checkpoint.checkpoint(&family.scope).await?;
+            Some(
+                crate::selection::admission(self, &family.scope)?
+                    .publication(persisted)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let start_position = match (start_position, publication.as_ref()) {
+            (Some(position), _) => position,
+            (None, Some(permit)) => match permit.checkpoint() {
+                Some(block) => block.position.checked_successor().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Unavailable,
+                        "checkpoint position has no successor for wallet publication",
+                    )
+                })?,
+                None => BlockPosition(0),
+            },
+            (None, None) => return Err(crate::selection::publication_error()),
+        };
         let entry = self
-            .activate(id.clone(), family_key, family, wallet, start_height)
+            .activate(id.clone(), family_key, family, wallet, start_position)
             .await?;
         let info = entry.info.clone();
         let filter = entry.filter.clone();
@@ -331,7 +366,7 @@ where
             ));
         }
         values.insert(id, entry);
-        Ok((info, filter))
+        Ok((info, filter, publication))
     }
 
     /// Drops an in-memory wallet again after a durable write failed, so the two
@@ -348,25 +383,15 @@ where
         family_key: F,
         family: Family,
         wallet: Arc<dyn Wallet>,
-        start_height: Option<BlockHeight>,
+        start_position: BlockPosition,
     ) -> Result<Entry<I, F>, Error> {
         let address = wallet.address_text(&wallet.address())?;
-        let start_height = match start_height {
-            Some(height) => height,
-            None => self
-                .checkpoint
-                .checkpoint(&family.scope)
-                .await?
-                .map_or(BlockHeight(0), |block| {
-                    BlockHeight(block.height.0.saturating_add(1))
-                }),
-        };
         let filter = AddressFilter {
             address: CanonicalAddress {
                 scope: family.scope.clone(),
                 value: address.text.clone(),
             },
-            start_height,
+            start_position,
         };
         Ok(Entry {
             info: WalletInfo {
@@ -475,6 +500,7 @@ mod tests {
             Mutex,
             atomic::{AtomicUsize, Ordering as AtomicOrdering},
         },
+        task::{Context, Poll, Waker},
     };
 
     use base::{
@@ -482,7 +508,10 @@ mod tests {
         Submission, TransactionBuilder, TransactionEnvelope, TransactionError, TransactionFuture,
         TransactionSnapshot,
     };
-    use indexing::{BlockHash, BlockRef, BoxFuture, ChainId, HistoryCursor, IndexError};
+    use indexing::{
+        BlockHash, BlockHeight, BlockRef, BoxFuture, ChainId, FilterSource, HistoryCursor,
+        IndexError, IndexErrorKind,
+    };
 
     use super::*;
     use crate::{AddressEncoding, AddressFormat, BalanceReader, HistoryReader, TransactionFactory};
@@ -716,9 +745,10 @@ mod tests {
 
     fn block(height: u64) -> BlockRef {
         BlockRef {
+            position: base::BlockPosition(height),
             height: BlockHeight(height),
             hash: BlockHash(vec![height as u8]),
-            parent_hash: None,
+            parent: None,
             timestamp: None,
         }
     }
@@ -760,7 +790,7 @@ mod tests {
             wallet_id.clone(),
             &family,
             SecretBytes::new([1; 32]),
-            BlockHeight(1),
+            BlockPosition(1),
         ))
         .expect("wallet import");
         comparisons.store(0, AtomicOrdering::Relaxed);
@@ -829,9 +859,80 @@ mod tests {
             "single"
         );
         assert_eq!(
-            wallets.filters().expect("filters")[0].start_height,
-            BlockHeight(8)
+            wallets.filters().expect("filters")[0].start_position,
+            BlockPosition(8)
         );
+    }
+
+    #[test]
+    fn checkpoint_commit_wins_before_wallet_publication() {
+        let (sender, _) = sender();
+        let family = "family".to_owned();
+        let index_scope = scope("mainnet");
+        let mut wallets = Wallets::<String, String>::new(Arc::new(FixtureIndex(Some(block(7)))));
+        wallets
+            .register(
+                family.clone(),
+                index_scope.clone(),
+                FixtureProvider::Value,
+                sender,
+                None,
+            )
+            .expect("family registration");
+
+        let plan = wallets
+            .plan(&index_scope, Some(block(7)))
+            .expect("sync plan");
+        let mut commit = plan.begin().expect("commit permit");
+        commit.start();
+        let mut generation = wallets.generate("alice".to_owned(), &family);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            generation.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+
+        commit.complete(Some(block(8))).expect("checkpoint commit");
+        futures_executor::block_on(generation).expect("wallet publication");
+
+        assert_eq!(
+            wallets.filters().expect("filters")[0].start_position,
+            BlockPosition(9)
+        );
+    }
+
+    #[test]
+    fn wallet_publication_invalidates_an_older_sync_plan() {
+        let (sender, _) = sender();
+        let family = "family".to_owned();
+        let index_scope = scope("mainnet");
+        let mut wallets = Wallets::<String, String>::new(Arc::new(FixtureIndex(Some(block(7)))));
+        wallets
+            .register(
+                family.clone(),
+                index_scope.clone(),
+                FixtureProvider::Value,
+                sender,
+                None,
+            )
+            .expect("family registration");
+
+        let stale = wallets
+            .plan(&index_scope, Some(block(7)))
+            .expect("sync plan");
+        futures_executor::block_on(wallets.generate("alice".to_owned(), &family))
+            .expect("wallet publication");
+
+        let error = match stale.begin() {
+            Ok(_) => panic!("old filter revision must not commit"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, IndexErrorKind::Conflict);
+        let current = wallets
+            .plan(&index_scope, Some(block(7)))
+            .expect("replacement plan");
+        assert_eq!(current.filters().len(), 1);
+        assert_eq!(current.filters()[0].start_position, BlockPosition(8));
     }
 
     #[test]
@@ -864,6 +965,34 @@ mod tests {
     }
 
     #[test]
+    fn generated_wallet_rejects_exhausted_checkpoint_position_without_publication() {
+        let (sender, _) = sender();
+        let family = "family".to_owned();
+        let mut wallets =
+            Wallets::<String, String>::new(Arc::new(FixtureIndex(Some(block(u64::MAX)))));
+        wallets
+            .register(
+                family.clone(),
+                scope("mainnet"),
+                FixtureProvider::Value,
+                sender,
+                None,
+            )
+            .expect("family registration");
+
+        let error = futures_executor::block_on(wallets.generate("alice".to_owned(), &family))
+            .expect_err("maximum checkpoint position has no safe birthday");
+
+        assert_eq!(error.kind, ErrorKind::Unavailable);
+        assert!(error.message.contains("no successor"));
+        assert!(wallets.filters().expect("filters").is_empty());
+        assert_eq!(
+            wallets.get("alice").expect_err("wallet not published").kind,
+            ErrorKind::NotFound
+        );
+    }
+
+    #[test]
     fn startup_imports_deduplicate_address_at_earliest_birthday() {
         let (sender, _) = sender();
         let mut wallets = Wallets::<String, String>::new(Arc::new(FixtureIndex(None)));
@@ -880,20 +1009,20 @@ mod tests {
             "newer".to_owned(),
             &"family".to_owned(),
             SecretBytes::new([1; 32]),
-            BlockHeight(20),
+            BlockPosition(20),
         ))
         .expect("newer wallet");
         futures_executor::block_on(wallets.import(
             "older".to_owned(),
             &"family".to_owned(),
             SecretBytes::new([2; 32]),
-            BlockHeight(5),
+            BlockPosition(5),
         ))
         .expect("older wallet");
 
         let filters = wallets.filters().expect("filters");
         assert_eq!(filters.len(), 1);
-        assert_eq!(filters[0].start_height, BlockHeight(5));
+        assert_eq!(filters[0].start_position, BlockPosition(5));
     }
 
     #[test]
@@ -964,14 +1093,14 @@ mod tests {
             primary.clone(),
             &family,
             SecretBytes::new([1; 32]),
-            BlockHeight(1),
+            BlockPosition(1),
         ))
         .expect("primary wallet");
         let alias_info = futures_executor::block_on(wallets.import(
             alias.clone(),
             &family,
             SecretBytes::new([2; 32]),
-            BlockHeight(1),
+            BlockPosition(1),
         ))
         .expect("alias wallet");
         assert_eq!(primary_info.address, alias_info.address);
@@ -1069,14 +1198,14 @@ mod tests {
             primary.clone(),
             &family,
             SecretBytes::new([1; 32]),
-            BlockHeight(1),
+            BlockPosition(1),
         ))
         .expect("primary wallet");
         futures_executor::block_on(wallets.import(
             alias.clone(),
             &family,
             SecretBytes::new([2; 32]),
-            BlockHeight(1),
+            BlockPosition(1),
         ))
         .expect("alias wallet");
 
@@ -1133,14 +1262,14 @@ mod tests {
             "first".to_owned(),
             &first_family,
             SecretBytes::new([1; 32]),
-            BlockHeight(1),
+            BlockPosition(1),
         ))
         .expect("first wallet");
         futures_executor::block_on(wallets.import(
             "second".to_owned(),
             &second_family,
             SecretBytes::new([2; 32]),
-            BlockHeight(1),
+            BlockPosition(1),
         ))
         .expect("second wallet");
 
@@ -1225,14 +1354,14 @@ mod tests {
             "alice".to_owned(),
             &"first".to_owned(),
             SecretBytes::new([1; 32]),
-            BlockHeight(1),
+            BlockPosition(1),
         ))
         .expect("alice");
         futures_executor::block_on(wallets.import(
             "bob".to_owned(),
             &"second".to_owned(),
             SecretBytes::new([2; 32]),
-            BlockHeight(1),
+            BlockPosition(1),
         ))
         .expect("bob");
 

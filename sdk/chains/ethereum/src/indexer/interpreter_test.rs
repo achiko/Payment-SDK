@@ -1,4 +1,7 @@
-use indexing::{BlockHash, BlockHeight, BlockRef, ChainId, IndexedBlock, MovementKind};
+use indexing::{
+    BlockHash, BlockHeight, BlockParent, BlockPosition, BlockRef, ChainId, IndexedBlock,
+    MovementKind,
+};
 use serde_json::{Value, json};
 
 use super::*;
@@ -289,9 +292,13 @@ fn raw_block_reference_is_stable() {
     assert_eq!(
         block.block_ref(),
         BlockRef {
+            position: BlockPosition(10),
             height: BlockHeight(10),
             hash: BlockHash(hash(BLOCK_HASH).to_vec()),
-            parent_hash: Some(BlockHash(hash(PARENT_HASH).to_vec())),
+            parent: Some(BlockParent {
+                position: BlockPosition(9),
+                hash: BlockHash(hash(PARENT_HASH).to_vec()),
+            }),
             timestamp: Some(100),
         }
     );

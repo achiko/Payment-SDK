@@ -178,19 +178,24 @@ standards remain compatibility contracts.
   scripts MUST live physically under `sdk/indexing/postgres/migrations/`.
 - `Repository::new` MUST bind a cloned process-wide pool to exactly one
   `(chain, network)` and MUST reject operations for another scope.
-- MUST own only the indexing checkpoint, history/movement, live-output, and
-  bounded-journal runtime model, including row mapping, set-based statements,
-  transactions, and compare-and-swap behavior.
+- Its `Repository` MUST own only the indexing checkpoint, history/movement,
+  live-output, and bounded-journal runtime model, including row mapping,
+  set-based statements, transactions, and compare-and-swap behavior.
+- MUST preserve the existing reusable SDK `Registry` implementation over
+  `payment_wallets` for `Wallets::adopt`/`restore`. Registry persistence is a
+  separate capability and MUST NOT become synchronizer checkpoint/history/
+  output state or an `apps/api`-private implementation.
 - MUST NOT create a schema, database, pool, or repository per asset. Native and
   token assets are facts in shared history rows.
-- The runtime adapter MUST NOT read, write, truncate, delete, or issue DDL for
-  application-owned wallet or custody tables. In particular, physical
-  colocation of `payment_wallets` MUST NOT make that table part of indexing.
-- A central migration script that changes an application-owned table MUST have
-  separate application-level approval and preservation evidence. Script
+- Synchronizer repository operations and scope-local cleanup MUST NOT read,
+  write, truncate, delete, or issue DDL for `payment_wallets`; only the existing
+  SDK registry capability may read/write that table through its explicit
+  contract.
+- A central migration script that changes the SDK registry table MUST have
+  separate SDK-level custody approval and preservation evidence. Script
   location and deployment ownership MUST NOT be treated as indexing runtime or
   domain ownership.
-- MUST preserve all unrelated scopes and application-owned rows during schema
+- MUST preserve all unrelated scopes and SDK registry rows during schema
   evolution or an explicitly approved scope-local rescan.
 - MUST NOT add legacy runtime readers, inferred coordinate fallbacks,
   compatibility aliases, or versioned storage DTOs.
@@ -356,12 +361,13 @@ indexes.solana {
 - A scope-local rescan MAY replace only indexing-owned rows for the explicitly
   selected `(chain, network)`. It MUST NOT drop or recreate the database, affect
   another scope, or modify `payment_wallets`.
-- Application-owned wallet rows MUST remain readable and byte-for-byte
-  preserved through an indexing migration unless a separate application-owned
-  change explicitly authorizes otherwise.
-- An application-owned restart read path MUST be implemented and verified
-  before the current indexing-owned `payment_wallets` query path is removed;
-  ownership cleanup MUST NOT strand preserved rows.
+- SDK registry wallet rows MUST remain readable and byte-for-byte preserved
+  through an indexing migration unless a separate SDK-level custody change
+  explicitly authorizes otherwise.
+- The reusable `Registry`, `RegisteredAddress`, and `Wallets::adopt`/`restore`
+  path MUST remain available to non-API integrators. It MUST NOT be removed or
+  moved exclusively into `apps/api` without an approved reusable SDK-level
+  replacement.
 
 ## Address coverage requirements
 

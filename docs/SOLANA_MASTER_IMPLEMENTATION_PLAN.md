@@ -17,6 +17,33 @@ migration execution, retained-database access, public RPC call, signing with a
 funded key, commit, push, or deployment. Each unchecked bold name is one small
 approval boundary. Approval of one step does not approve the next.
 
+## Reusable SDK ownership thesis
+
+Payment-SDK is the reusable product. `apps/api` is one top-layer integration of
+that SDK, not the owner of capabilities that every integrator needs. Wallet
+generation, import, persistence, registry-backed restoration, custody
+integration, address/birthday selection, indexing, transaction construction,
+and submission must remain available through SDK-owned contracts and concrete
+SDK implementations. A desktop application, CLI, background service, or
+different HTTP server must be able to compose the same behavior without
+copying functionality from `apps/api` or depending on that executable.
+
+Therefore this plan must preserve `Registry`, `RegisteredAddress`,
+`Wallets::adopt`/`restore`, the existing SDK PostgreSQL wallet persistence and
+restoration path, and the current custody model. `apps/api` may configure,
+construct, and invoke those SDK capabilities while owning HTTP, readiness,
+supervision, and shutdown; it must not become their exclusive implementation
+home. Solana may extend shared SDK contracts only where its protocol requires
+it, principally native block position, sparse traversal, exact chain-native
+values, and transaction semantics. It must not use Solana work as a reason to
+remove an existing reusable SDK capability or move it into the API service.
+
+Any step that makes functionality available only through `apps/api`, requires
+another integrator to reimplement wallet restoration or persistence, removes
+the existing registry/custody behavior without an approved SDK-level
+replacement, or changes a shared/base layer beyond a demonstrated
+cross-chain requirement is out of scope and blocks the next step.
+
 ## Fixed implementation baseline
 
 - Rust `1.91`, edition 2024, resolver 3, locked dependencies, and
@@ -30,18 +57,21 @@ approval boundary. Approval of one step does not approve the next.
 - The Solana crate uses the exact modular Anza/SPL package family below. It does
   not use `solana-client`, a monolithic SDK, copied System discriminants, or
   hand-written transaction encoding.
-- Official `postgres:18.6-alpine` is the selected owned, disposable test
-  baseline. Its immutable digest must be recorded after the approved pull and
-  before execution; no digest or runtime pass is claimed yet. Production
+- Official `postgres:18.6-alpine` is the owned, disposable test baseline and is
+  executed only as
+  `postgres@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2`.
+  The owned harness asserts both that immutable digest and server version
+  `18.6` before applying the existing test schema. Production
   migrations live under `sdk/indexing/postgres/migrations/` as ordered
   deployment inputs applied outside `apps/api`; startup performs read-only
   compatibility validation and no DDL.
 - One PostgreSQL database, schema, and process-wide pool store indexing state
   for every chain and asset. Repository handles are bound to one exact
   `(chain, network)` scope; assets never select a pool, schema, or repository.
-- `payment_wallets` is application-owned. `apps/api` must prove restart reads
-  through the shared pool before indexing registry code is removed. Existing
-  rows remain byte-for-byte preserved; Solana adds no row to that table.
+- `payment_wallets` remains part of the existing reusable SDK registry and
+  restoration path. It must not become an `apps/api`-private implementation,
+  and the indexing registry code is not removed. Existing rows remain
+  byte-for-byte preserved; initial Solana support adds no row to that table.
 - Initial Solana support is native SOL only. SPL, Token-2022, priority-fee and
   Compute Budget instructions, durable nonce accounts, remote custody, and
   durable request idempotency are out of scope.
@@ -117,8 +147,11 @@ flowchart LR
 
 Generic crates receive only the accepted shared prerequisites. Solana-native
 account, transaction, RPC, retry, and interpretation rules remain inside
-`chain-solana`. `apps/api` owns configuration, the shared pool, wallet restore,
-concrete construction, readiness, submission task supervision, and shutdown.
+`chain-solana`. SDK crates own reusable wallet restoration, persistence,
+indexing, and chain behavior. `apps/api` owns configuration, concrete
+construction, HTTP, readiness, submission task supervision, and shutdown while
+invoking those SDK capabilities through the same surfaces available to other
+integrators.
 
 Completion means the runtime can generate a process-local native-SOL wallet or
 load a configured seed import, while the existing public API returns its
@@ -320,90 +353,99 @@ workspace evidence rather than copy a temporary path.
   workspace checks. **Stop if:** existing wire bytes, transaction IDs, batch
   order, or public error precedence changes outside the accepted contract.
 
-## Phase: PostgreSQL, Block Coordinates, and Wallet Handoff
+## Phase: PostgreSQL, Block Coordinates, and Wallet Coordination
 
-- [ ] **Own PostgreSQL 18 tests** — after separate pull approval, record the
+This phase preserves the existing wallet-restoration and indexing-custody
+design. It does not move wallet restoration into `apps/api`, remove the
+indexing registry, remove `Wallets::adopt`/`restore`, or transfer custody
+ownership. The coordinate migration may alter only the explicitly listed
+indexing tables; `payment_wallets` and every other non-coordinate table remain
+unchanged. Wallet publication is coordinated with index commits only to close
+the existing runtime race, not to perform a custody handoff.
+
+The phase order is:
+
+```text
+Own PostgreSQL tests
+  -> Validate migrations and startup schema
+  -> Prove shared database safety
+  -> Add block-coordinate types
+  -> Create and rehearse migration 0004
+  -> Cut over repositories and chain sources
+  -> Implement sparse synchronization
+  -> Coordinate wallet publication with index commits
+  -> Pass the persistence-coordinate gate
+```
+
+After every named step below, run
+`cargo run --locked -p design-lint -- --policy lint.toml check .` and record the
+result before advancing. A new finding introduced by the step blocks the next
+step; a pre-existing finding is recorded separately and must not be hidden by a
+suppression or policy weakening.
+
+- [x] **Own PostgreSQL 18 tests** — after separate pull approval, record the
   immutable digest for official `postgres:18.6-alpine` and make repository
   tests provision and clean an isolated database/schema from exactly that
   artifact instead of returning early when an environment variable is absent.
   Keep a unique schema per test run. **Proof:** version/digest assertion and an
   intentionally wrong connection fail rather than report a skipped pass.
-- [ ] **Validate baseline migrations** — apply `0001`, `0002`, and `0003` in
+- [x] **Validate baseline migrations** — apply `0001`, `0002`, and `0003` in
   order only to the owned database; verify recorded checksums, the effective
   schema, scope keys, indexes, and ownership classification. **Depends on:**
   **Own PostgreSQL 18 tests**. **Proof:** schema-catalog assertions and unchanged
   application sentinel.
-- [ ] **Validate startup schema** — add a read-only adapter compatibility check
+- [x] **Validate startup schema** — add a read-only adapter compatibility check
   for the configured schema and required relations; it performs no create,
   alter, repair, or migration. **Depends on:** **Validate baseline migrations**.
   **Proof:** compatible, missing, wrong-column, and wrong-schema tests.
-- [ ] **Reject zero pool size** — return a typed invalid request before
+- [x] **Reject zero pool size** — return a typed invalid request before
   constructing a pool with zero connections. **Proof:** focused pool test.
-- [ ] **Qualify output spends** — include address in unnested spend input and
+- [x] **Qualify output spends** — include address in unnested spend input and
   SQL matching so one address cannot spend another address's identical output
   identity. **Proof:** required-spend and tracked-spend regressions.
-- [ ] **Reject duplicate output identity** — reject one `OutputId` supplied
+- [x] **Reject duplicate output identity** — reject one `OutputId` supplied
   under different addresses in the same block at domain validation before a
   PostgreSQL unique-key error. **Proof:** repository-independent block test and
   both repository contracts.
-- [ ] **Serialize scope commits** — take one transaction-scoped advisory lock
+- [x] **Serialize scope commits** — take one transaction-scoped advisory lock
   derived from exact `(chain, network)` before checkpoint reads in add/remove.
   Add no lock table. **Proof:** deterministic concurrent first-commit test.
-- [ ] **Stabilize history pages** — execute one checkpoint-bound history page
+- [x] **Stabilize history pages** — execute one checkpoint-bound history page
   inside a read-only `REPEATABLE READ` transaction. **Proof:** forced checkpoint
   drift between page queries.
-- [ ] **Stabilize output pages** — apply the same snapshot rule to live-output
+- [x] **Stabilize output pages** — apply the same snapshot rule to live-output
   pagination and cursor validation. **Proof:** forced output/checkpoint drift.
-- [ ] **Isolate PostgreSQL benchmarks** — replace global truncation with a
+- [x] **Isolate PostgreSQL benchmarks** — replace global truncation with a
   unique scope and scope-only dependency-ordered cleanup. **Proof:** sentinel
   rows in another scope and `payment_wallets` survive.
-- [ ] **Prove shared-pool isolation** — use one pool and schema with at least
+- [x] **Prove shared-pool isolation** — use one pool and schema with at least
   two chain/network scopes and native/token assets; reject cross-scope handles
   and preserve every unrelated row. **Depends on:** all adapter-safety steps.
   **Proof:** non-skipping PostgreSQL contract test.
 
-- [ ] **Add application wallet reads** — add an `apps/api`-owned startup loader
-  over the shared pool for existing `payment_wallets` rows. It reads the exact
-  current columns, maps `start_height` to native position only for verified
-  Bitcoin/Ethereum scopes, rejects a Solana row, and never logs/returns/rewrites
-  secret bytes. **Depends on:** **Validate baseline migrations**. **Proof:**
-  complete row restoration, malformed row, wrong scope, redaction, and
-  byte-for-byte sentinel tests.
-- [ ] **Restore wallets before sync** — reconstruct every required persisted
-  Bitcoin/Ethereum wallet through its provider and publish its address/birthday
-  before the first filter snapshot. **Depends on:** **Add application wallet
-  reads**. **Proof:** process restart retains address/history and does not write
-  `payment_wallets`.
-- [ ] **Remove indexing custody** — only after restoration passes, remove
-  `Registry`, `RegisteredAddress`, PostgreSQL registry queries, the optional
-  registry family argument, and `Wallets::adopt`/`restore` coupling. Keep the
-  physical table and application loader unchanged. **Depends on:** **Restore
-  wallets before sync**. **Proof:** dependency/source audit plus indexing,
-  wallets, PostgreSQL, and restart tests.
-
-- [ ] **Add block coordinates** — add `BlockPosition`, `BlockParent`, checked
+- [x] **Add block coordinates** — add `BlockPosition`, `BlockParent`, checked
   successors, and the additive constructor/conversion tests without yet
   changing `BlockRef`. **Proof:** base boundary tests at zero and `u64::MAX`.
-- [ ] **Specify coordinate migration** — add
+- [x] **Specify coordinate migration** — add
   `sdk/indexing/postgres/migrations/0004_block_positions.sql` with only these
   eight indexing columns: checkpoint current/parent position, history block/
   parent position, and journal current/parent plus previous-checkpoint/
   previous-parent position. It may alter no movement, output, journal-output,
   or application table. **Depends on:** **Validate baseline migrations**.
   **Proof:** SQL statement and ownership review.
-- [ ] **Rehearse dense backfill** — in an owned restored copy, add the columns
+- [x] **Rehearse dense backfill** — in an owned restored copy, add the columns
   as nullable, abort on any populated unverified scope, backfill only verified
   Bitcoin/Ethereum rows with `position = height`, validate parent pairs, and
   prove all counts/hashes/application bytes are unchanged. **Depends on:**
   **Specify coordinate migration**. **Proof:** before/after hashes and negative
   unknown-scope fixture.
-- [ ] **Finalize coordinate constraints** — in the same transactional
+- [x] **Finalize coordinate constraints** — in the same transactional
   migration, require current positions, enforce complete optional parent pairs,
   and remove transition nullability only after backfill validation. No runtime
   height-to-position fallback is allowed. **Depends on:** **Rehearse dense
   backfill**. **Proof:** fresh and retained owned-database migration tests,
   rollback-on-invalid-row, and unchanged `payment_wallets` sentinel.
-- [ ] **Write the retained transition runbook** — document the external-only
+- [x] **Write the retained transition runbook** — document the external-only
   sequence: record applied versions/checksums and scope hashes, prove a restore,
   stop and fence every old writer, apply the ordered migration to the explicit
   schema, verify all position/parent constraints and preservation sentinels,
@@ -411,7 +453,7 @@ workspace evidence rather than copy a temporary path.
   after the migration. This step prepares commands but executes none. **Depends
   on:** **Finalize coordinate constraints**. **Proof:** restored-copy rehearsal
   and reviewed roll-forward/failure response.
-- [ ] **Cut over complete block references** — intentionally broad compile
+- [x] **Cut over complete block references** — intentionally broad compile
   slice: replace every base/indexing/Bitcoin/Ethereum constructor, fixture,
   cursor, redb record/key, and PostgreSQL reader/writer with
   `{ position, height, hash, parent, timestamp }`. Dense adapters set position
@@ -419,41 +461,41 @@ workspace evidence rather than copy a temporary path.
   and height-only cursors. **Depends on:** **Add block coordinates**,
   **Finalize coordinate constraints**. **Proof:** immediate locked workspace
   check and no placeholder/default positions.
-- [ ] **Round-trip both repositories** — prove sparse positions, produced
+- [x] **Round-trip both repositories** — prove sparse positions, produced
   heights, atomic parents, checkpoint/history/journal/add/remove/restart,
   rollback, and old-record rejection in redb and PostgreSQL. **Depends on:**
   **Cut over complete block references**. **Proof:** shared non-skipping
   repository contract.
-- [ ] **Cut over the source contract** — replace dense `block_at(height)` and
+- [x] **Cut over the source contract** — replace dense `block_at(height)` and
   `canonical_hash(height)` with complete tip, inclusive position-range fetch
   with positive returned-block limit, and complete canonical reference lookup;
   update all doubles in one compiling slice. **Depends on:** **Cut over complete
   block references**. **Proof:** generic source contract tests.
-- [ ] **Prove dense sources** — adapt Bitcoin and Ethereum with contiguous
+- [x] **Prove dense sources** — adapt Bitcoin and Ethereum with contiguous
   native positions and complete parent references; equality with produced
   height exists only inside those adapters. **Depends on:** **Cut over the
   source contract**. **Proof:** focused source/reorg/restart regressions.
-- [ ] **Specify sparse synchronization** — test positions `100, 103, 107`,
+- [x] **Specify sparse synchronization** — test positions `100, 103, 107`,
   produced heights `50, 51, 52`, skipped birthdays, prefix resume, retained
   reorg, and `ReorgTooDeep` before changing the synchronizer. **Depends on:**
   **Cut over the source contract**. **Proof:** failing generic synchronizer
   fixtures.
-- [ ] **Implement sparse synchronization** — traverse actual returned blocks,
+- [x] **Implement sparse synchronization** — traverse actual returned blocks,
   validate strict position growth, exact produced-height increment, and exact
   parent position/hash; query canonical state by stored position and retain
   produced-height confirmation/retention. **Depends on:** **Specify sparse
   synchronization**. **Proof:** sparse plus existing dense synchronizer tests.
-- [ ] **Rename wallet birthdays** — replace chain-neutral `start_height` with
+- [x] **Rename wallet birthdays** — replace chain-neutral `start_height` with
   `start_position`, use checked successor publication, and reject overflow.
   This does not rename the preserved `payment_wallets.start_height` column.
   **Depends on:** **Cut over complete block references**. **Proof:** generated,
   imported, skipped-position, and overflow tests.
-- [ ] **Specify admission races** — test both wallet-publication/commit orders,
+- [x] **Specify admission races** — test both wallet-publication/commit orders,
   revision invalidation, cancellation after repository I/O begins, checkpoint
   reload, and lock ordering. **Depends on:** **Implement sparse
   synchronization**, **Rename wallet birthdays**. **Proof:** deterministic
   race fixtures, not sleeps.
-- [ ] **Coordinate filters and commits** — implement one in-memory coordinator
+- [x] **Coordinate filters and commits** — implement one in-memory coordinator
   per `IndexScope` with persisted-checkpoint snapshot, filter revision, commit
   permit, publication permit, async waiters, and recovery-required state. RPC
   and repository I/O occur outside its short lock, and no lock crosses
@@ -462,20 +504,25 @@ workspace evidence rather than copy a temporary path.
   granting one permit. Publication waits for any commit, inserts the
   wallet/filter at the checked checkpoint successor, then increments revision
   under the serialized boundary. **Depends on:** **Specify admission races**.
-  **Proof:** all race, drop, reload, and cancellation fixtures.
-- [ ] **Break old public cursors** — publish native position and atomic parent
+  This coordination preserves the existing indexing registry, wallet
+  restoration path, custody ownership, and `Wallets::adopt`/`restore` API.
+  **Proof:** all race, drop, reload, and cancellation fixtures plus a source/API
+  audit proving those ownership boundaries remain unchanged.
+- [x] **Break old public cursors** — publish native position and atomic parent
   in block JSON/checkpoint cursors and reject height-only encodings. **Depends
   on:** **Cut over complete block references**. **Proof:** encode/decode,
   conflict, and old-shape rejection tests.
-- [ ] **Pass persistence-coordinate gate** — run base, wallets, indexing,
+- [x] **Pass persistence-coordinate gate** — run base, wallets, indexing,
   runtime, redb, PostgreSQL 18, Bitcoin, Ethereum, API, design-lint, formatting,
   and locked workspace checks. **Stop if:** any PostgreSQL test skips, another
   scope/application row changes, an old writer could emit null positions, or
-  the runtime wallet race remains reproducible.
+  the runtime wallet race remains reproducible. Also stop if wallet restoration
+  moved into `apps/api`, indexing custody/registry behavior changed, or
+  `payment_wallets` changed in schema or content.
 
 ## Phase: Solana Primitives, RPC, and Account Acquisition
 
-- [ ] **Add Solana lint ownership** — add the `solana-chain` layer with exact
+- [x] **Add Solana lint ownership** — add the `solana-chain` layer with exact
   dependencies on package, base, indexing, and wallets; permit it only from
   application/acceptance and own `solana`/`sol` vocabulary only in the app and
   Solana crate. Preserve narrow existing Ethereum `sol!` suppressions. **Proof:**
@@ -908,12 +955,15 @@ workspace evidence rather than copy a temporary path.
   `Application` facade. **Depends on:** **Initialize scope coordination**,
   **Pass native-chain gate**. **Proof:** object-identity and no-per-handler-
   construction tests plus dependency/source audit.
-- [ ] **Restore and import before sync** — restore application-owned existing
-  Bitcoin/Ethereum rows and import configured chain wallets at explicit
-  `start_position` before the first filter revision/sync snapshot. Register one
-  Solana native family and no SPL family or durable generated-wallet row.
-  **Depends on:** **Compose the Solana service**, **Restore wallets before
-  sync**. **Proof:** startup ordering and complete initial filter tests.
+- [ ] **Restore and import through SDK before sync** — invoke the existing
+  reusable SDK registry/restoration path for Bitcoin/Ethereum rows and import
+  configured chain wallets at explicit `start_position` before the first
+  filter revision/sync snapshot. `apps/api` composes this flow but owns no
+  private restoration implementation. Register one Solana native family and
+  no SPL family or durable generated-wallet row. **Depends on:** **Compose the
+  Solana service**, **Coordinate filters and commits**. **Proof:** startup
+  ordering, complete initial filter tests, and a non-API integration fixture
+  using the same SDK surface.
 
 - [ ] **Own submission supervision** — add one application-owned bounded
   `mpsc` admission queue and `JoinSet`; acknowledge registration only after
@@ -1023,7 +1073,7 @@ workspace evidence rather than copy a temporary path.
 | Gate | Required outcome | Blocks |
 |---|---|---|
 | Shared contracts | Existing Bitcoin/Ethereum wire behavior passes with truthful batch and ambiguity contracts | block-coordinate/API-wide changes |
-| Persistence and coordinates | Non-skipping PostgreSQL 18 plus redb contracts pass; wallet restoration precedes registry removal; sparse generic synchronization is correct | Solana source and production repository composition |
+| Persistence and coordinates | Non-skipping PostgreSQL 18 plus redb contracts pass; existing SDK registry/restoration and custody behavior remains reusable and sparse generic synchronization is correct | Solana source and production repository composition |
 | Solana accounts | Fixed dependency graph, native values, singular RPC, and one witnessed account attempt pass using owned doubles | signing or submission |
 | Native chain | Full preparation, bounded exact-byte submission, reconciliation, sparse indexing, wallet adapters, and three-chain database coexistence pass | application exposure |
 | Runtime and system | Identity-before-storage, one pool, readiness, supervision, shutdown, validator wire execution, indexing, and workspace release gates pass | any deployment or support claim |
@@ -1203,6 +1253,319 @@ all-target/all-feature Clippy, no-deps documentation, formatting, design-lint,
 and diff checks pass. Cargo still reports the pre-existing duplicate `bench`
 example output-name warning for the redb and PostgreSQL indexing crates. The
 next approval boundary is **Own PostgreSQL 18 tests**.
+**Own PostgreSQL 18 tests** then removed the optional `POSTGRES_TEST_URL`
+short-circuit and made every repository contract own a disposable PostgreSQL
+18.6 container plus a unique schema. The harness executes only the recorded
+immutable image digest, asserts server version `18.6`, applies the three
+unchanged baseline scripts needed by the repository, and removes its container
+on success or failure. A ninth contract proves intentionally wrong credentials
+fail rather than skip. The contract passed 9/9 serially and 9/9 under the
+package's normal parallel runner; package unit and documentation targets also
+passed, no owned container remained, formatting and diff checks passed, and
+design-lint reported zero findings. Migration checksums, effective catalog,
+scope/index ownership, and application sentinels remain deliberately deferred
+to the next boundary, **Validate baseline migrations**.
+**Validate baseline migrations** then locked the reviewed SHA-256 for `0001`,
+`0002`, and `0003` into the owned harness and verifies each file before
+execution. The harness inserts a complete known registry sentinel after
+`0001`, applies `0002` and `0003` in order, and proves the exact
+`payment_wallets` row remains unchanged. A catalog contract classifies six
+indexing tables and the preserved reusable SDK registry table, then asserts the
+complete effective columns, nullability, constraint families, primary/scope/
+pagination keys, final movement/output indexes, removed movement foreign key,
+and retained journal-output cascade. The focused catalog proof passed 1/1 and
+the complete PostgreSQL package passed 10/10 with no skips. Strict package
+Clippy, formatting, diff checks, and design-lint passed. No retained database
+or migration file was changed. Read-only runtime compatibility validation is
+still absent and remains the next boundary, **Validate startup schema**.
+**Validate startup schema** then exported
+`indexing_postgres::validate_schema(&pool, expected_schema)`. It uses one
+read-only repeatable-read transaction, proves the pool's resolved schema equals
+the configured schema, and validates the complete required baseline columns,
+nullability, constraint families, indexes, and journal cascade without issuing
+DDL or reading wallet secret values. Focused owned PostgreSQL tests pass 4/4
+for the compatible baseline, missing relation, wrong column type, and wrong
+resolved schema; the compatible case also proves the exact registry sentinel
+is unchanged. The complete package passes 14/14 with no skips, strict package
+Clippy, formatting, diff checks, and design-lint pass, and no retained database
+was accessed. Pool-size validation is intentionally unchanged and remains the
+next boundary, **Reject zero pool size**.
+**Reject zero pool size** then made `indexing_postgres::pool` reject zero
+connections before URL parsing or pool construction with the exact typed,
+non-retryable `InvalidRequest` message
+`PostgreSQL pool size must be greater than zero`. The focused library proof
+passed 1/1, the 14 non-skipping PostgreSQL contracts still pass, strict package
+Clippy, formatting, diff checks, and design-lint pass, and no schema or database
+state changed. The next boundary is **Qualify output spends**.
+**Qualify output spends** then added each `OutputKey` address to the transposed
+spend columns and the single PostgreSQL delete/journal CTE. A live output now
+matches only exact `(chain, network, address, transaction_id, output_index)`.
+Focused owned-database regressions pass 2/2: a wrong-address required spend is
+an `InvalidBlock` and rolls back without deleting the real output, while the
+same wrong-address tracked spend is an ordinary miss and commits without
+deleting it. The complete PostgreSQL package passes its pool unit test and
+16/16 non-skipping contracts; strict package Clippy, formatting, diff checks,
+and design-lint pass. No schema or migration changed. The next boundary is
+**Reject duplicate output identity**.
+**Reject duplicate output identity** then made `BlockAddition::new` reject a
+second created output with the same chain-neutral `OutputId`, even when an
+interpreter supplies a different address. The repository-independent block
+test and the redb and owned PostgreSQL 18.6 repository contracts all prove the
+typed `InvalidBlock` occurs before `Blocks::add`; both repositories remain at
+an empty checkpoint. The complete indexing, redb, and PostgreSQL suites pass,
+as do strict Clippy, formatting, diff checks, and design-lint. No schema or
+migration changed. The next boundary is **Serialize scope commits**.
+**Serialize scope commits** then placed one PostgreSQL transaction-scoped
+advisory lock, derived from the length-framed exact `(chain, network)` tuple,
+before every add/remove checkpoint read. The existing checkpoint-row
+`FOR UPDATE` remains as a second guard, while the advisory lock covers an empty
+scope that has no row to lock. A deterministic owned PostgreSQL 18.6 contract
+held the scope lock, observed both concurrent first commits waiting, released
+it, and proved exactly one `Applied` result plus one `AlreadyApplied` replay
+with one checkpoint and one history row. The complete package passes its pool
+unit test and 18/18 non-skipping contracts; strict Clippy, formatting, diff
+checks, and design-lint pass. No lock table, schema, or migration changed. The
+next boundary is **Stabilize history pages**.
+**Stabilize history pages** then moved the initial checkpoint read, history
+rows, movement rows, and final checkpoint verification for one page into one
+read-only PostgreSQL `REPEATABLE READ` transaction. A deterministic owned
+PostgreSQL 18.6 contract locked the movement table after the reader fetched its
+history rows, advanced the checkpoint in another transaction, released the
+reader, and proved the page retained its original checkpoint and matching
+movements while a later read observed the new checkpoint. The complete package
+passes its pool unit test and 19/19 non-skipping contracts; strict Clippy,
+formatting, diff checks, and design-lint pass. No schema or migration changed.
+The next boundary is **Stabilize output pages**.
+**Stabilize output pages** then moved the initial checkpoint, live-output rows,
+and final checkpoint verification into one read-only PostgreSQL
+`REPEATABLE READ` transaction. A deterministic owned PostgreSQL 18.6 contract
+paused the reader after its checkpoint, atomically removed its live output and
+advanced the checkpoint, then proved the in-flight page retained the original
+checkpoint/output pair while a later page observed the new checkpoint and
+empty projection. The complete package passes its pool unit test and 20/20
+non-skipping contracts; strict Clippy, formatting, diff checks, and design-lint
+pass. No schema or migration changed. The next boundary is
+**Isolate PostgreSQL benchmarks**.
+**Isolate PostgreSQL benchmarks** then replaced the example's schema-wide
+`TRUNCATE` with parameterized, dependency-ordered deletion for one exact
+benchmark scope. Each run now generates a unique scope unless an operator
+deliberately supplies `BENCH_SCOPE`. The shared cleanup implementation is used
+by both the example and an owned PostgreSQL 18.6 contract; that proof removes
+the target checkpoint/history/output/journal state while preserving another
+chain/network scope and the exact `payment_wallets` sentinel. The example
+all-target check, focused contract, formatting, diff checks, and design-lint
+pass. No schema or migration changed. The next boundary is
+**Prove shared-pool isolation**.
+**Prove shared-pool isolation** then constructed two repositories from one
+actual pool/schema for distinct chain/network scopes, committed native and
+USDC movement facts, and proved each history retained its exact asset. The
+owned PostgreSQL 18.6 contract rejects both cross-scope reads and writes with
+`ScopeMismatch`, mutates the native scope, and compares every raw checkpoint,
+history, movement, journal, journal-output, and output row in the token scope
+before/after byte-for-byte while also preserving the exact `payment_wallets`
+sentinel. The complete package passes its pool unit test and 22/22 non-skipping
+contracts; strict Clippy, formatting, diff checks, and design-lint pass. No
+schema or migration changed. The PostgreSQL adapter-safety sequence is closed;
+the next boundary is **Add block coordinates**.
+**Add block coordinates** then exported additive `BlockPosition(u64)` and
+atomic `BlockParent { position, hash }` values from `sdk/chains/base` without
+changing `BlockRef` or any caller. Both `BlockPosition` and the existing
+produced `BlockHeight` now provide checked successors and lossless `u64`
+conversions; `BlockParent` converts to/from its complete position/hash pair.
+Base boundary tests prove zero conversion/successors, `u64::MAX` overflow, and
+atomic parent round-trip. The base crate passes 26/26 tests, strict all-target
+Clippy, formatting, diff checks, and design-lint. No persistence or migration
+changed. The next boundary is **Specify coordinate migration**.
+**Specify coordinate migration** then added the unexecuted
+`0004_block_positions.sql` expansion with exactly eight nullable `bigint`
+columns: checkpoint position/parent position, history block/parent position,
+and journal current/parent plus previous-checkpoint/previous-parent position.
+One static migration contract accepts only `BEGIN`, those eight exact
+`ALTER TABLE ... ADD COLUMN` statements, and `COMMIT`; any statement touching
+movement, output, journal-output, `payment_wallets`, indexes, data, or
+constraints fails that contract. The focused migration proof passes 1/1,
+strict package all-target Clippy, formatting, diff checks, and design-lint
+pass. `0004` is not in the owned harness's applied migration list, has no final
+checksum yet, and has not run against PostgreSQL. The next boundary is
+**Rehearse dense backfill**.
+**Rehearse dense backfill** then extended the still-unfinalized
+`0004_block_positions.sql` transaction with an explicit session allowlist of
+exact Bitcoin/Ethereum `(chain, network)` scopes. The migration inventories all
+six indexing tables, aborts before backfill when any populated scope is absent
+from that allowlist, validates dense current and previous-parent relationships,
+and derives positions only for allowlisted rows. An owned PostgreSQL 18.6
+retained-state fixture proved `position = height`, complete parent positions,
+unchanged row counts and SHA-256 signatures for all six indexing tables, and
+unchanged `payment_wallets` bytes. A populated Solana negative fixture produced
+the required error and proved the transaction rolled back both data and all
+eight column additions. The static ownership contract plus both database
+contracts pass 3/3. No retained database was inspected or changed, and final
+nullability and pair constraints remain absent. The next boundary is
+**Finalize coordinate constraints**.
+**Finalize coordinate constraints** then completed the same transactional
+`0004_block_positions.sql` migration. Current checkpoint, history, and journal
+positions are non-null and non-negative. Each current parent is an atomic
+position/hash pair absent only at genesis; a journal previous checkpoint is
+either wholly absent or contains position, height, hash, and the same atomic
+parent rule. Seven check constraints are added `NOT VALID`, explicitly
+validated only after backfill validation, and only then are the three current
+position columns made `NOT NULL`. The finalized migration checksum is
+`5019860075ddc36d4aca97de660968c92b77f42efaabe70fe226b74f978696c7`.
+Owned PostgreSQL 18.6 contracts pass 5/5 for static ownership/checksum, an empty
+indexing-state baseline, retained Bitcoin/Ethereum backfill and preservation,
+populated Solana rollback, and invalid retained-parent rollback. Fresh invalid
+writes prove null current positions, half-present current parents, and an
+incomplete previous checkpoint are rejected. The exact `payment_wallets`
+sentinel remains unchanged in every database path. `0004` is deliberately not
+in the height-only repository harness's default migration list: the current
+writer cannot run after these constraints and must be fenced until the complete
+block-reference cutover. No retained database was inspected or changed. The
+next boundary is **Write the retained transition runbook**.
+**Write the retained transition runbook** then added
+`POSTGRESQL_COORDINATE_TRANSITION_RUNBOOK.md`. It requires an exact retained
+target and change record, immutable migration checksums, a reviewed dense-scope
+allowlist, deterministic per-scope and registry preservation evidence, and an
+opened disposable restore proof before the maintenance window. It closes and
+drains admission, stops every height-only writer, requires a deployment-level
+restart fence, rechecks checkpoint stability, and applies the unchanged `0004`
+bytes in one schema-pinned PostgreSQL 18 session. Post-commit verification
+covers columns, all seven validated constraints, backfill facts, every
+pre-existing indexing hash, registry bytes, and position-aware startup
+validation. Recovery is permitted back to the old release only before migration
+commit and only after exact baseline proof; after commit the transition is
+roll-forward and the old writer remains permanently fenced. No database command
+was executed and no retained target was named. Documentation checks and the
+required design-lint gate pass. The next implementation boundary is **Cut over
+complete block references**.
+**Cut over complete block references** then replaced every persisted and public
+block shape with atomic `{ position, height, hash, parent, timestamp }` facts.
+Bitcoin and Ethereum derive dense positions only while translating their native
+RPC blocks. redb records, PostgreSQL checkpoint/history/journal readers and
+writers, indexing validation, API block JSON, and checkpoint cursors now carry
+the complete coordinate; the finalized `0004` migration is in the owned
+repository harness and startup validation requires its columns and constraints.
+Height-only redb records and cursors have explicit rejection tests. A locked
+workspace all-target check passed, redb passed 8/8 repository and unit tests,
+the PostgreSQL migration contract passed 5/5, and the finalized PostgreSQL
+repository contract passed 22/22 on owned PostgreSQL 18.6 containers. The
+PostgreSQL write path was split into commit and projection owners to satisfy the
+500-line production limit; formatting, diff checks, and design-lint pass. No
+retained database was contacted or changed. The next boundary is **Round-trip
+both repositories**.
+**Round-trip both repositories** then added the same sparse-coordinate contract
+to redb and PostgreSQL: native positions `100` and `103` carry produced heights
+`50` and `51`, and the second block carries the exact first position/hash as its
+atomic parent. Each backend proves checkpoint, retained journal lookup,
+address-primary history, a newly opened repository handle, rollback to the
+first complete reference, and another reopen. redb additionally rejects the
+legacy height-only binary record, while the finalized PostgreSQL harness cannot
+start without all `0004` coordinates and constraints. The focused redb and
+owned PostgreSQL 18.6 sparse contracts pass. The next boundary is **Cut over the
+source contract**.
+**Cut over the source contract** then replaced height-addressed single-block
+and hash-only reads with the exact three-method interface: complete `tip`,
+inclusive `blocks(start, end, limit)`, and complete `canonical_at(position)`.
+The generic contract proof covers inclusive bounds, a returned-block limit,
+strict dense ordering, complete canonical references, proven omission, and
+zero-limit rejection. Bitcoin, Ethereum, the synchronizer, and every test double
+were changed in one compiling slice; no `BlockSource::block_at` or hash-only
+canonical call remains. Focused generic and chain-source tests, a locked
+workspace all-target check, formatting, diff checks, and design-lint pass. The
+next boundary is **Prove dense sources**.
+**Prove dense sources** then made the dense translation explicit in each chain
+adapter. Bitcoin converts its numbered height to the same native position and
+derives the complete parent position/hash from the parsed header; Ethereum does
+the same from the numbered JSON-RPC block. Their focused source tests assert
+position `10`, produced height `10`, parent position `9`, the exact native
+parent hash, and zero-limit rejection before RPC. Bitcoin source tests pass 6/6
+and Ethereum source tests pass 4/4; formatting, diff checks, and design-lint
+pass. The generic synchronizer still has a temporary dense compiling bridge;
+the next test-first sparse rewrite removes it. The next boundary is **Specify
+sparse synchronization**.
+**Specify sparse synchronization** then added generic, deterministic fixtures
+for actual positions `100 -> 103 -> 107`, produced heights `50 -> 51 -> 52`, a
+birthday on skipped position `102`, a two-block prefix and resume, a retained
+replacement at `104 -> 108`, and a replacement whose ancestor lies beyond
+retention. All three tests compile and fail at the temporary dense bridge with
+`source did not return exactly one dense block`, proving the intended sparse
+behavior is not already passing accidentally. Design-lint, formatting, and diff
+checks pass. The next boundary is **Implement sparse synchronization**.
+**Implement sparse synchronization** then removed the dense bridge. Fresh
+indexing locates the first actual block at or after the earliest birthday,
+loads and verifies that block's real parent as the empty-address anchor, and
+never manufactures a skipped coordinate. Forward passes request one inclusive
+native-position range bounded by the remaining returned-block budget, reject
+out-of-range/non-increasing/over-limit responses, activate filters by position,
+require produced height to increment exactly once, require the exact atomic
+parent, and recheck the complete canonical reference before commit. Restart and
+reorg reconciliation query each retained block's stored native position while
+retention and confirmation ordering remain produced-height based. The indexing
+crate passes 25/25 tests, including all sparse prefix, skipped-birthday,
+retained-reorg, and deep-reorg fixtures; the locked workspace all-target check,
+formatting, diff checks, and design-lint pass. The next boundary is **Rename
+wallet birthdays**.
+**Rename wallet birthdays** then changed the chain-neutral filter, wallet
+import, registry domain value, deduplication, synchronization activation, and
+closed application configuration to `start_position: BlockPosition`. Runtime
+generation now uses the persisted checkpoint position's checked successor and
+fails without publishing a wallet or filter at `u64::MAX`; configured imports
+reject the old `start_height` spelling. PostgreSQL deliberately continues to
+encode the semantic position in the existing application-owned
+`payment_wallets.start_height` column, and an owned PostgreSQL 18.6 registry
+round-trip proves the mapping without schema/content changes. Wallets pass
+21/21 tests, indexing passes 25/25, API configuration passes 5/5, and the
+focused PostgreSQL registry contract passes; formatting and diff checks pass.
+The next boundary is **Specify admission races**.
+**Specify admission races** then added four deterministic coordinator fixtures
+without timing sleeps: commit-first publication observes the newly persisted
+checkpoint, publication-first blocks and invalidates the older revision,
+cancellation after repository I/O requires an authoritative checkpoint reload,
+and a dropped publication wakes queued work without changing the revision. The
+coordinator releases its mutex before every async wait and repository operation.
+The focused indexing admission tests pass 5/5, including direct proof that
+filter capture occurs outside the admission mutex, and design-lint passes.
+**Coordinate filters and commits** then connected one `ScopeAdmission` per
+`IndexScope` to `Wallets`, `FilterSource`, `Composer`, the synchronizer, and the
+runtime. A sync plan captures checkpoint, revision, and filters; every add or
+retained-reorg removal obtains and completes a commit permit around repository
+I/O, while runtime generation/adoption obtains a publication permit, anchors at
+the checked successor, inserts the wallet/filter, and then advances the filter
+revision. Real `Wallets` tests prove both orderings and the updated birthday;
+all 23 wallet tests, the focused indexing coordination tests, formatting, diff
+checks, and design-lint pass. `Registry`, `RegisteredAddress`,
+`Wallets::adopt`/`restore`, and the physical `payment_wallets` mapping remain in
+the reusable SDK. The next boundary is **Break old public cursors**.
+**Break old public cursors** then completed the intentional wire break. Public
+checkpoint and transaction-status blocks carry native `position`, produced
+`height`, and one optional parent object containing both position and hash.
+Opaque history cursors round-trip the same complete checkpoint, reject the old
+height/`parent_hash` shape, reject a partial parent object, and retain the
+existing checkpoint-conflict behavior. Focused API and indexing cursor tests,
+formatting, diff checks, and design-lint pass. The next boundary is **Pass
+persistence-coordinate gate**.
+**Pass persistence-coordinate gate** then completed the phase. The uninterrupted
+locked workspace suite passes, including PostgreSQL migration 5/5, PostgreSQL
+repository 23/23, wallet API 18/18, wallets 23/23, Bitcoin 58/58, Ethereum
+81/81, indexing contracts, redb restart/rollback, and all doc tests. Formatting,
+locked all-target compilation, strict all-target/all-feature Clippy, no-deps
+documentation, design-lint, and diff checks pass. A complete-reference check
+also exposed an inconsistent timestamp between the Bitcoin acceptance fixture's
+block and header views; aligning those two views restored the canonical reorg,
+restart, generation, and batch acceptance cases. No retained database was
+contacted, `payment_wallets` remained unchanged, and reusable SDK restoration
+and custody ownership were not moved. The next phase starts at **Add Solana lint
+ownership**.
+**Add Solana lint ownership** then established the concrete-chain boundary
+before creating the crate. `chain-solana` maps to a `solana-chain` layer that
+may depend only on packages, base, indexing, and wallets; only application and
+acceptance layers may consume it. `solana`/`sol` production vocabulary is owned
+only by `apps/` and `sdk/chains/solana/`. Ethereum retains exactly two reasoned
+line-local exceptions for Alloy's standard `sol` import and invocation. Focused
+positive/negative ownership tests lock the policy, all 25 design-lint tests and
+the two Ethereum ERC-20 ABI tests pass, generated cases remain empty, strict
+design-lint Clippy, formatting, policy check, and diff checks pass. No Solana
+crate or dependency was added in this boundary. The next boundary is **Create
+the Solana package**.
 
 ## Accepted limitations and operational failure policy
 

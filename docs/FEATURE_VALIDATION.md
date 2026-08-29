@@ -13,9 +13,13 @@ exist in the current workspace.
 | Bitcoin addresses, RPC, UTXO transactions, signing, indexing translation | `sdk/chains/bitcoin` | chain unit tests and deterministic stack test |
 | Ethereum native/allowlisted ERC-20 balances, typed transfers, EIP-1559 signing, sender-keyed nonce coordination, exact-envelope ambiguity, and indexing translation | `sdk/chains/ethereum` | 81 chain unit tests, external adapter test, and deterministic ETH/USDC stack tests |
 | Exact wallet history mapping, transaction-ambiguity preservation, truthful batch failure metadata, and bounded batch admission | `sdk/wallets` | history and conversion tests, four scoped `SendError` tests, direct 0/1/50/51 boundary tests, and a four-case competing-error table proving authored itemwise amount, lookup, and family precedence before sender invocation |
-| Reorg-safe filtered indexing contracts and synchronizer | `sdk/indexing` | synchronizer and contract tests |
-| Atomic indexing persistence | `sdk/indexing/redb` | repository tests |
-| Current height-only PostgreSQL indexing repository | `sdk/indexing/postgres` | scope-bound `Blocks`, `Transactions`, and `Outputs`; database contract tests run when `POSTGRES_TEST_URL` is configured |
+| Native block coordinates and sparse synchronization | `sdk/chains/base`, `sdk/indexing` | every `BlockRef` carries native position, produced height, hash, atomic parent, and timestamp; deterministic fixtures prove sparse `100 -> 103 -> 107` traversal, strict height increments, skipped birthdays, prefix restart, retained reorg, and `ReorgTooDeep` |
+| Atomic indexing persistence | `sdk/indexing/redb` | complete-coordinate repository tests cover add/remove/reopen and legacy height-only record rejection, including pre-repository duplicate-output rejection |
+| Position-aware PostgreSQL indexing repository | `sdk/indexing/postgres` | scope-bound `Blocks`, `Transactions`, `Outputs`, reusable registry, read-only configured-schema validation, typed zero-pool rejection, address-qualified spends, duplicate-output rejection, serialized add/remove, checkpoint-stable pages, sparse-coordinate add/remove/reopen, and one-pool multi-scope isolation; the migration and repository contracts run against owned schemas on pinned PostgreSQL 18.6 |
+| Canonical coordinate migration and preservation runbook | `sdk/indexing/postgres/migrations`, deployment documentation | migration `0004` has a locked checksum and owned fresh/retained rehearsals proving dense backfill, all-table count/hash preservation, unchanged `payment_wallets`, final atomic-parent constraints, and rollback of invalid populated state; no retained database was contacted |
+| Atomic runtime wallet/filter admission | `sdk/indexing`, `sdk/wallets` | one coordinator per scope serializes commit and publication permits without holding mutex guards across `.await`; deterministic coordinator and real-wallet fixtures prove both orderings, revision invalidation, cancellation recovery, checkpoint reload, and successor birthdays |
+| Reusable wallet registry and restoration ownership | `sdk/wallets`, `sdk/indexing`, `sdk/indexing/postgres` | `Registry`, `RegisteredAddress`, and `Wallets::adopt`/`restore` remain reusable SDK capabilities; owned migration and registry tests preserve the physical `payment_wallets` schema/content and its existing column mapping |
+| Solana architecture ownership | `lint.toml`, `packages/design-lint` | `chain-solana` is mapped to an exact package/base/indexing/wallets layer consumed only by application and acceptance; `solana`/`sol` vocabulary is restricted to `apps/` and `sdk/chains/solana/`, with two reasoned line-local Alloy exceptions in Ethereum; positive/negative policy tests and the repository policy check pass |
 | Generic JSON-RPC/HTTP/crypto/storage mechanics | `packages/*` | package tests |
 
 ## Accepted but not implemented
@@ -28,12 +32,8 @@ exist in the current workspace.
 | Public batch bounds, occurrence identity, deterministic error precedence, and locally derived ambiguous IDs | Public Transaction Semantics ADR | base, wallet, and send errors carry one optional typed ID through consuming conversion; `SendError` has an optional original item index and explicit collection, operation, item, and grouped constructors. `wallets::MAX_TRANSFERS` exports 50, and `Wallets::send_all` rejects zero and 51 before lookup or sender invocation while admitting 1 and 50. Direct wallet orchestration tests prove exact authored length, order, multiplicity, repeated and identical items, distinct wallet-ID aliases resolving to one source, unchanged sender results, the original index of an item-scoped lookup failure, and itemwise amount-before-lookup-before-family precedence against competing defects. The concrete Bitcoin sender defensively rejects zero and 51 before chain I/O, keeps operation/grouped failures index-free, and derives ambiguity only after validating the exact local consensus envelope and txid; provider prose and mismatched returned IDs cannot replace that authority. The concrete Ethereum sender applies the same direct cardinality defense, preserves every duplicate occurrence through consecutive nonce preparation, returns only the acknowledged prefix with the original failed index, and normalizes every unknown outcome to the Keccak ID of the exact locally validated envelope rather than a provider candidate. Both authenticated transaction POST routes reject every non-empty raw query before JSON extraction; route tests prove authentication remains earlier, query rejection outranks malformed JSON and zero/51 batch semantics, and empty queries plus unrelated headers are inert. The HTTP request conversion applies the shared maximum before any item conversion; route tests prove zero reaches the SDK minimum guard, one and 50 reach the sender unchanged, and an invalid item inside 51 cannot outrank the index-free maximum error or cause sender/transaction calls. `AddressInput`, `SendFunds`, `WalletTransfer`, and `TransferRequest` deny unknown fields and publish `additionalProperties: false`; the route matrix proves lag, reference, commitment, retry, Memo, and priority controls fail with the generic schema error before SDK delegation. HTTP projects the preserved typed ambiguity as optional `ambiguous_transaction_id`, whose presence forces `503`; exact JSON tests cover single, indexed batch, grouped batch, and definite collection/operation/item/grouped shapes, and the composed Ethereum acceptance test proves the acknowledged prefix and local ID reach the public response. The generated OpenAPI publishes the exact required request properties and references, `minItems: 1`, `maxItems: 50`, no `uniqueItems` or array default, and conditional accepted-prefix, original-index, and exact-envelope ambiguity descriptions. Both operations reserve native SOL on the shared transaction routes, and the contract contains no Solana-only path. Solana does not yet implement these defenses |
 | Native SOL source/destination acquisition and closing-witness floor | Destination Account Acquisition ADR | no Solana crate, client, coordinator, account DTO, stable deduplication, exact one-call mapping, atomic `U` handoff, response-bound, cancellation, malformed-payload, floor-publication, or lexical-lease-release tests exist |
 | Native SOL construction, submission, exact-byte replay, and ambiguity reconciliation | Native SOL Submission ADR | no Solana transaction/message/Memo-v3 builder, executable-Memo readiness probe, recent-blockhash lifetime, fee/simulation RPC, source coordinator, exact-signature broadcaster, three-call replay bound, checkpoint-stable indexed absence proof, background reconciliation, ambiguous-ID projection, or duplicate-risk tests exist |
-| Native block position separated from produced height | Block Position and Indexing & Central Database ADRs | current `BlockRef`, synchronization, birthdays, redb records, PostgreSQL rows, and cursors remain height-only |
-| One central PostgreSQL database/schema/pool with scope-bound repositories | Indexing & Central Database ADR and canonical architecture | the scope-bound height-only adapter exists, but `apps/api` still composes per-chain redb; no production shared-pool, dual-coordinate, or preservation system test exists |
-| Canonical schema history under `sdk/indexing/postgres/migrations/` | Indexing & Central Database ADR | [PostgreSQL Schema Baseline](POSTGRESQL_SCHEMA_BASELINE.md) statically records the three ordered scripts, checksums, effective schema, ownership boundary, and preservation requirements; owned PostgreSQL 18 migration/repository execution remains unrun |
-| Application ownership of `payment_wallets` restart reads | Indexing & Central Database ADR | `Wallets` still accepts an optional indexing `Registry` and couples registration to `adopt`/`restore`; indexing exports that surface and the PostgreSQL adapter still queries the table |
-| Atomic runtime wallet/filter admission against checkpoint movement | Indexing & Central Database ADR | no per-scope admission coordinator prevents a sync pass from advancing beyond a newly generated wallet's birthday before that wallet enters the authoritative filter snapshot |
-| Sparse finalized Solana traversal and retained-reorg evidence | Indexing & Central Database ADR | no Solana source or deterministic sparse-slot test exists; accepted runtime/crate composition is also unimplemented |
+| One central PostgreSQL database/schema/pool with scope-bound repositories | Indexing & Central Database ADR and canonical architecture | the position-aware adapter and one-pool multi-scope isolation proof exist, but `apps/api` still composes per-chain redb; production shared-pool composition is not implemented |
+| Sparse finalized Solana traversal and retained-reorg evidence | Indexing & Central Database ADR | generic sparse-position synchronization and retained-reorg fixtures now pass, but no Solana source or native sparse-slot adapter exists; accepted runtime/crate composition is also unimplemented |
 | Solana crate and runtime composition | Solana Runtime Composition ADR | the exact Rust 1.91 dependency proof exists only in scratch; no `chain-solana` crate, repository dependency/lockfile integration, singular no-retry RPC configuration, genesis/Memo startup probes, shared-pool application composition, tracked submission supervisor, readiness regression/fatal behavior, shutdown-race/indefinite-ambiguity evidence, pinned checksummed validator fixture, or explicit `solana_stack` test target exists |
 
 ## Native Solana research closeout evidence
@@ -52,9 +52,9 @@ exist in the current workspace.
   as did 163 focused Ethereum, redb, indexing, runtime, wallet, and API tests.
 - The proof used no public RPC and made no repository manifest or lockfile
   change. It proves dependency/API feasibility, not a Solana runtime.
-- [PostgreSQL Schema Baseline](POSTGRESQL_SCHEMA_BASELINE.md) is the static
-  PostgreSQL closeout record.
-  PostgreSQL 18 runtime migration and repository execution has not run.
+- [PostgreSQL Schema Baseline](POSTGRESQL_SCHEMA_BASELINE.md) records the static
+  closeout plus owned PostgreSQL 18.6 runtime migration, catalog, sentinel, and
+  startup-validator evidence. No retained database migration has run.
 
 ## Current application validation
 
@@ -62,7 +62,7 @@ The approved architecture has one `apps/api` process. The previous wallet,
 indexer, payment, deposit, accounting, and collection service surfaces have
 been removed.
 
-The wallet API integration binary contains fourteen tests. Its process-level
+The wallet API integration binary contains eighteen tests. Its process-level
 cases start the real application binary against loopback Bitcoin and Ethereum
 RPC doubles and temporary redb files:
 
@@ -74,10 +74,10 @@ RPC doubles and temporary redb files:
 | Bitcoin batch | two compatible transfers become one broadcast transaction and one ID, then appear in indexed history |
 | Ethereum batch | two transfers submit as two IDs in request order, both become indexed, and balance reduces |
 | Lifecycle | indexes become ready before serving and both runtimes shut down cleanly |
-| Address selection | caller registry snapshots are supplied to each synchronization run |
+| Address selection | one per-scope admission boundary coordinates immutable filter plans, checkpoint commits, and runtime wallet publication without holding locks across async I/O |
 | No internal transport | dependency/source audit shows no indexing HTTP adapter or second application |
 | Restart | configured BTC and ETH wallets reopen the same databases and retain indexed history |
-| Reorg | repository-level reorg evidence passes; the combined generated-wallet acceptance case is currently blocked before reorg by the runtime filter-registration race recorded below |
+| Reorg | repository-level retained-reorg evidence and the combined generated-wallet Bitcoin/Ethereum canonical-reorg acceptance case pass |
 | Multi-source Bitcoin batch | two wallets fund one transaction; each input witness carries its owner's public key |
 | Ethereum accepted prefix | an outcome-ambiguous second submission returns HTTP 503 with the first transaction ID and `failed_index = 1` |
 | Ethereum nonce coordination | a repeated-source `[A, B, A]` batch submits nonces `[A:0, B:0, A:1]` in request order |
@@ -107,13 +107,9 @@ RPC doubles and temporary redb files:
 
 ## Known validation blockers
 
-- Runtime wallet generation is not admitted atomically against an in-flight
-  indexing pass. A pass can capture the old address-filter snapshot, observe
-  new blocks after `POST /v1/wallets` returns, and advance the checkpoint
-  without the newly generated address. The combined Bitcoin/Ethereum reorg
-  acceptance test currently exposes this pre-existing race before its reorg
-  assertions. Fixing it requires a registration/synchronization admission
-  boundary; a timing delay would not be valid evidence.
+No code-level blocker remains for the completed persistence-coordinate phase.
+Retained migration execution and production `apps/api` shared-PostgreSQL
+composition remain separately authorized work, not failed validation.
 
 ## Final gates
 
@@ -132,12 +128,10 @@ git diff --check
 If a gate fails, document the exact failure rather than weakening a lint or
 describing the workspace as complete.
 
-Latest Native Solana research closeout: exact Rust 1.91 locked workspace
-all-target check, complete workspace tests, strict all-target/all-feature
-Clippy, no-deps documentation, and design-lint policy pass in the checkout. The
-combined scratch dependency graph also passes its locked offline all-target
-check and strict Clippy; the exact modular fixture passes 1/1, and 163 focused
-regression tests pass. The eight PostgreSQL repository test functions still
-short-circuit without `POSTGRES_TEST_URL`, so PostgreSQL 18 migration and
-repository execution remains unrun. The wallet/filter admission blocker above
-remains open.
+Latest persistence-coordinate gate: the uninterrupted locked workspace suite
+passes, including owned PostgreSQL 18 migration contracts 5/5, repository
+contracts 23/23, and application acceptance 18/18. Formatting, locked workspace
+all-target compilation, strict all-target/all-feature Clippy, no-deps
+documentation, design-lint, and diff checks pass. The owned migration proof
+keeps the finalized `0004` checksum, catalog, constraints, scope rows, and
+registry sentinel under verification; no retained database migration ran.

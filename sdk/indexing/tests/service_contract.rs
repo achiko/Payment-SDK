@@ -8,13 +8,14 @@ use std::{
 
 use futures_executor::block_on;
 use indexing::{
-    AddressFilter, BlockAddition, BlockHash, BlockHeight, BlockInterpreter, BlockOutcome, BlockRef,
-    BlockSelector, BlockSource, Blocks, BoxFuture, CanonicalAddress, CanonicalPage, ChainId,
-    FilterSource, HistoryQuery, IndexError, IndexErrorKind, IndexScope, IndexedBlock, Indexer,
-    InterpretedBlock, OutputChanges, Service, SourceError, SyncConfig, SyncPhase, Transactions,
+    AddressFilter, BlockAddition, BlockHash, BlockHeight, BlockInterpreter, BlockOutcome,
+    BlockParent, BlockPosition, BlockRef, BlockSelector, BlockSource, Blocks, BoxFuture,
+    CanonicalAddress, CanonicalPage, ChainId, FilterSource, HistoryQuery, IndexError,
+    IndexErrorKind, IndexScope, IndexedBlock, Indexer, InterpretedBlock, OutputChanges, Service,
+    SourceError, SyncConfig, SyncPhase, Transactions,
 };
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct TestBlock(BlockRef);
 
 impl IndexedBlock for TestBlock {
@@ -25,7 +26,7 @@ impl IndexedBlock for TestBlock {
 
 #[derive(Clone)]
 struct Source {
-    tip: BlockHeight,
+    blocks: Arc<Mutex<BTreeMap<BlockPosition, TestBlock>>>,
     tip_calls: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<BlockHeight>>>,
     /// Runs while the tip is being observed, standing in for anything that can
@@ -35,12 +36,39 @@ struct Source {
 
 impl Source {
     fn new(tip: u64) -> Self {
+        let blocks = (0..=tip)
+            .map(|height| {
+                let block = TestBlock(block(BlockHeight(height)));
+                (block.0.position, block)
+            })
+            .collect();
         Self {
-            tip: BlockHeight(tip),
+            blocks: Arc::new(Mutex::new(blocks)),
             tip_calls: Arc::new(AtomicUsize::new(0)),
             requests: Arc::new(Mutex::new(Vec::new())),
             during_tip: None,
         }
+    }
+
+    fn sparse(blocks: impl IntoIterator<Item = BlockRef>) -> Self {
+        Self {
+            blocks: Arc::new(Mutex::new(
+                blocks
+                    .into_iter()
+                    .map(|block| (block.position, TestBlock(block)))
+                    .collect(),
+            )),
+            tip_calls: Arc::new(AtomicUsize::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            during_tip: None,
+        }
+    }
+
+    fn replace(&self, blocks: impl IntoIterator<Item = BlockRef>) {
+        *self.blocks.lock().expect("source blocks") = blocks
+            .into_iter()
+            .map(|block| (block.position, TestBlock(block)))
+            .collect();
     }
 
     fn during_tip(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
@@ -65,25 +93,59 @@ impl BlockSource for Source {
         if let Some(hook) = &self.during_tip {
             hook();
         }
-        let tip = block(self.tip);
-        Box::pin(async move { Ok(tip) })
+        let result = self
+            .blocks
+            .lock()
+            .expect("source blocks")
+            .last_key_value()
+            .map(|(_, block)| block.0.clone())
+            .ok_or_else(|| SourceError {
+                message: "source has no produced blocks".into(),
+                retryable: true,
+            });
+        Box::pin(async move { result })
     }
 
-    fn block_at<'a>(
+    fn blocks<'a>(
         &'a self,
-        height: BlockHeight,
-    ) -> BoxFuture<'a, Result<Self::Block, SourceError>> {
-        self.requests.lock().expect("source requests").push(height);
-        let block = TestBlock(block(height));
+        start: BlockPosition,
+        end: BlockPosition,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<Self::Block>, SourceError>> {
+        let result = if limit == 0 || start > end {
+            Err(SourceError {
+                message: "invalid block range".into(),
+                retryable: false,
+            })
+        } else {
+            let blocks = self
+                .blocks
+                .lock()
+                .expect("source blocks")
+                .range(start..=end)
+                .take(limit)
+                .map(|(_, block)| block.clone())
+                .collect::<Vec<_>>();
+            let mut requests = self.requests.lock().expect("source requests");
+            for block in &blocks {
+                requests.push(block.0.height);
+            }
+            Ok(blocks)
+        };
+        Box::pin(async move { result })
+    }
+
+    fn canonical_at<'a>(
+        &'a self,
+        position: BlockPosition,
+    ) -> BoxFuture<'a, Result<Option<BlockRef>, SourceError>> {
+        let block = self
+            .blocks
+            .lock()
+            .expect("source blocks")
+            .get(&position)
+            .map(|block| block.0.clone());
         Box::pin(async move { Ok(block) })
-    }
-
-    fn canonical_hash<'a>(
-        &'a self,
-        height: BlockHeight,
-    ) -> BoxFuture<'a, Result<Option<BlockHash>, SourceError>> {
-        let hash = (height <= self.tip).then(|| hash(height));
-        Box::pin(async move { Ok(hash) })
     }
 }
 
@@ -250,18 +312,169 @@ fn hash(height: BlockHeight) -> BlockHash {
 
 fn block(height: BlockHeight) -> BlockRef {
     BlockRef {
+        position: BlockPosition(height.0),
         height,
         hash: hash(height),
-        parent_hash: height
-            .0
-            .checked_sub(1)
-            .map(|parent| hash(BlockHeight(parent))),
+        parent: height.0.checked_sub(1).map(|parent| BlockParent {
+            position: BlockPosition(parent),
+            hash: hash(BlockHeight(parent)),
+        }),
         timestamp: None,
     }
 }
 
+fn sparse_block(
+    position: u64,
+    height: u64,
+    hash_byte: u8,
+    parent_position: u64,
+    parent_hash: u8,
+) -> BlockRef {
+    BlockRef {
+        position: BlockPosition(position),
+        height: BlockHeight(height),
+        hash: BlockHash(vec![hash_byte]),
+        parent: Some(BlockParent {
+            position: BlockPosition(parent_position),
+            hash: BlockHash(vec![parent_hash]),
+        }),
+        timestamp: Some(1_000 + position),
+    }
+}
+
+fn sparse_chain() -> Vec<BlockRef> {
+    vec![
+        sparse_block(97, 49, 0, 94, 9),
+        sparse_block(100, 50, 1, 97, 0),
+        sparse_block(103, 51, 2, 100, 1),
+        sparse_block(107, 52, 3, 103, 2),
+    ]
+}
+
+fn replacement_chain() -> Vec<BlockRef> {
+    vec![
+        sparse_block(97, 49, 0, 94, 9),
+        sparse_block(100, 50, 1, 97, 0),
+        sparse_block(104, 51, 12, 100, 1),
+        sparse_block(108, 52, 13, 104, 12),
+    ]
+}
+
 fn config(scope: IndexScope) -> SyncConfig {
     SyncConfig::new(scope, 1, 4, 100).expect("sync config")
+}
+
+fn bounded_config(scope: IndexScope, retention: u64, batch_size: usize) -> SyncConfig {
+    SyncConfig::new(scope, 1, retention, batch_size).expect("bounded sync config")
+}
+
+#[test]
+fn source_contract_is_complete_bounded_and_position_addressed() {
+    let source = Source::new(4);
+
+    assert_eq!(block_on(source.tip()).expect("tip"), block(BlockHeight(4)));
+    let blocks = block_on(source.blocks(BlockPosition(1), BlockPosition(4), 2))
+        .expect("bounded inclusive range");
+    assert_eq!(
+        blocks
+            .iter()
+            .map(IndexedBlock::block_ref)
+            .collect::<Vec<_>>(),
+        [block(BlockHeight(1)), block(BlockHeight(2))]
+    );
+    assert_eq!(
+        block_on(source.canonical_at(BlockPosition(3))).expect("canonical lookup"),
+        Some(block(BlockHeight(3)))
+    );
+    assert_eq!(
+        block_on(source.canonical_at(BlockPosition(5))).expect("omitted position"),
+        None
+    );
+    let error = block_on(source.blocks(BlockPosition(1), BlockPosition(4), 0))
+        .expect_err("zero returned-block limit");
+    assert!(!error.retryable);
+}
+
+#[test]
+fn sparse_sync_uses_actual_blocks_and_resumes_a_bounded_prefix() {
+    let own_scope = scope("sparse-chain");
+    let owner = address(&own_scope, "owner");
+    let source = Source::sparse(sparse_chain());
+    let interpreter = Interpreter::default();
+    let service = Service::new(
+        source,
+        interpreter.clone(),
+        Repository::default(),
+        bounded_config(own_scope, 4, 2),
+    );
+    let filters = vec![AddressFilter {
+        address: owner.clone(),
+        start_position: BlockPosition(102),
+    }];
+
+    let first = block_on(service.sync(&filters)).expect("first sparse prefix");
+    assert_eq!(first[0].phase, SyncPhase::CatchingUp);
+    assert_eq!(first[0].checkpoint, Some(sparse_chain()[2].clone()));
+
+    let second = block_on(service.sync(&filters)).expect("second sparse prefix");
+    assert_eq!(second[0].phase, SyncPhase::Ready);
+    assert_eq!(second[0].checkpoint, Some(sparse_chain()[3].clone()));
+    assert_eq!(
+        interpreter.inspections(),
+        [
+            (BlockHeight(50), Vec::new()),
+            (BlockHeight(51), vec![owner.clone()]),
+            (BlockHeight(52), vec![owner]),
+        ]
+    );
+}
+
+#[test]
+fn sparse_sync_reconciles_a_retained_reorg_by_native_position() {
+    let own_scope = scope("sparse-reorg");
+    let owner = address(&own_scope, "owner");
+    let source = Source::sparse(sparse_chain());
+    let repository = Repository::default();
+    let service = Service::new(
+        source.clone(),
+        Interpreter::default(),
+        repository,
+        config(own_scope.clone()),
+    );
+    let filters = vec![AddressFilter {
+        address: owner,
+        start_position: BlockPosition(100),
+    }];
+    block_on(service.sync(&filters)).expect("initial sparse chain");
+
+    source.replace(replacement_chain());
+    let status = block_on(service.sync(&filters)).expect("retained sparse reorg");
+
+    assert_eq!(status[0].phase, SyncPhase::Ready);
+    assert_eq!(status[0].checkpoint, Some(replacement_chain()[3].clone()));
+}
+
+#[test]
+fn sparse_sync_reports_reorg_beyond_retention() {
+    let own_scope = scope("sparse-deep-reorg");
+    let owner = address(&own_scope, "owner");
+    let source = Source::sparse(sparse_chain());
+    let service = Service::new(
+        source.clone(),
+        Interpreter::default(),
+        Repository::default(),
+        bounded_config(own_scope, 1, 100),
+    );
+    let filters = vec![AddressFilter {
+        address: owner,
+        start_position: BlockPosition(100),
+    }];
+    block_on(service.sync(&filters)).expect("initial sparse chain");
+
+    source.replace(replacement_chain());
+    let error = block_on(service.sync(&filters)).expect_err("deep sparse reorg");
+
+    assert_eq!(error.kind, IndexErrorKind::ReorgTooDeep);
 }
 
 #[test]
@@ -281,11 +494,11 @@ fn fresh_wallet_sync_starts_at_its_earliest_birthday_not_genesis() {
     let statuses = block_on(service.sync(&vec![
         AddressFilter {
             address: first.clone(),
-            start_height: BlockHeight(3),
+            start_position: BlockPosition(3),
         },
         AddressFilter {
             address: second.clone(),
-            start_height: BlockHeight(4),
+            start_position: BlockPosition(4),
         },
     ]))
     .expect("sync selected addresses");
@@ -295,7 +508,7 @@ fn fresh_wallet_sync_starts_at_its_earliest_birthday_not_genesis() {
     assert_eq!(statuses[0].checkpoint, Some(block(BlockHeight(4))));
     assert_eq!(
         source.requests(),
-        vec![BlockHeight(2), BlockHeight(3), BlockHeight(4)]
+        vec![BlockHeight(3), BlockHeight(2), BlockHeight(4)]
     );
     assert_eq!(
         interpreter.inspections(),
@@ -343,7 +556,7 @@ fn caller_can_restore_the_same_filter_selection_after_restart() {
     );
     let filters = vec![AddressFilter {
         address: owner.clone(),
-        start_height: BlockHeight(3),
+        start_position: BlockPosition(3),
     }];
     block_on(initial.sync(&filters)).expect("initial sync");
     drop(initial);
@@ -371,7 +584,7 @@ fn sync_rejects_an_address_from_another_scope() {
 
     let error = block_on(service.sync(&vec![AddressFilter {
         address: address(&scope("other-chain"), "owner"),
-        start_height: BlockHeight(0),
+        start_position: BlockPosition(0),
     }]))
     .expect_err("foreign address");
 
@@ -385,16 +598,16 @@ fn sync_rejects_empty_and_duplicate_addresses_before_source_io() {
     let cases = [
         vec![AddressFilter {
             address: address(&own_scope, ""),
-            start_height: BlockHeight(0),
+            start_position: BlockPosition(0),
         }],
         vec![
             AddressFilter {
                 address: duplicate.clone(),
-                start_height: BlockHeight(1),
+                start_position: BlockPosition(1),
             },
             AddressFilter {
                 address: duplicate,
-                start_height: BlockHeight(2),
+                start_position: BlockPosition(2),
             },
         ],
     ];
@@ -435,7 +648,7 @@ fn an_address_registered_while_the_tip_is_read_still_covers_its_birthday() {
         move || {
             selection.register(AddressFilter {
                 address: late.clone(),
-                start_height: BlockHeight(1),
+                start_position: BlockPosition(1),
             });
         }
     });

@@ -12,14 +12,27 @@ fn numbered_block_fetch_parses_transactions_and_rechecks_canonical_hash() {
     let source = block_on(Blocks::connect(ScriptedClient::new(replies), config()))
         .expect("valid scripted source must connect");
 
-    let block =
-        block_on(source.block_at(BlockHeight(10))).expect("canonical verbosity-2 block must load");
+    let block = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 1))
+        .expect("canonical verbosity-2 block must load")
+        .pop()
+        .expect("dense range contains its block");
 
     assert_eq!(block.reference.height, BlockHeight(10));
+    assert_eq!(block.reference.position, BlockPosition(10));
     assert_eq!(
         parse_bitcoin_block_hash(&hash(2)).expect("test hash must parse"),
         block.reference.hash
     );
+    assert_eq!(
+        block.reference.parent,
+        Some(indexing::BlockParent {
+            position: BlockPosition(9),
+            hash: parse_bitcoin_block_hash(&hash(3)).expect("test parent hash must parse"),
+        })
+    );
+    let zero_limit = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 0))
+        .expect_err("zero returned-block limit must fail before RPC");
+    assert!(!zero_limit.retryable);
     let transactions = block.transactions();
     assert_eq!(transactions.len(), 1);
     assert!(transactions[0].coinbase);
@@ -54,8 +67,10 @@ fn external_prevouts_are_resolved_once_into_bounded_parsed_facts() {
     let source =
         block_on(Blocks::connect(client, config())).expect("valid scripted source must connect");
 
-    let block = block_on(source.block_at(BlockHeight(10)))
-        .expect("external previous outputs must be enriched");
+    let block = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 1))
+        .expect("external previous outputs must be enriched")
+        .pop()
+        .expect("dense range contains its block");
     calls.assert_exhausted();
 
     let transactions = block.transactions();
@@ -151,7 +166,7 @@ fn external_prevout_lookup_must_return_confirmed_transaction_data() {
     let source =
         block_on(Blocks::connect(client, config())).expect("valid scripted source must connect");
 
-    let error = block_on(source.block_at(BlockHeight(10)))
+    let error = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 1))
         .expect_err("mempool-only previous-output data must retry");
     calls.assert_exhausted();
     assert!(error.retryable);
@@ -209,7 +224,7 @@ fn numbered_block_fetch_rejects_same_height_reorg_race() {
     let source = block_on(Blocks::connect(ScriptedClient::new(replies), config()))
         .expect("valid scripted source must connect");
 
-    let error = block_on(source.block_at(BlockHeight(10)))
+    let error = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 1))
         .expect_err("same-height canonical replacement must retry");
 
     assert!(error.retryable);
@@ -217,7 +232,7 @@ fn numbered_block_fetch_rejects_same_height_reorg_race() {
 }
 
 #[test]
-fn disappearing_height_is_optional_for_canonical_hash_and_retryable_for_tip() {
+fn disappearing_position_is_optional_for_canonical_reference_and_retryable_for_tip() {
     let mut canonical_replies = connect_replies();
     canonical_replies.extend([
         reply("getblockcount", json!(10)),
@@ -229,7 +244,7 @@ fn disappearing_height_is_optional_for_canonical_hash_and_retryable_for_tip() {
     ))
     .expect("valid scripted source must connect");
     assert_eq!(
-        block_on(canonical.canonical_hash(BlockHeight(10)))
+        block_on(canonical.canonical_at(BlockPosition(10)))
             .expect("a vanished reorg height is not a fatal source error"),
         None
     );

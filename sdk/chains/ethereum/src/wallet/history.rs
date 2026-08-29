@@ -115,7 +115,7 @@ fn ethereum_asset(
 
 #[cfg(test)]
 mod tests {
-    use base::{BlockHash, BlockHeight, BlockRef, Decimal};
+    use base::{BlockHash, BlockHeight, BlockPosition, BlockRef, Decimal};
     use indexing::{
         AssetId, ChainId, HistoryCursor, HistoryPosition, IndexScope, MovementId, NetworkFee,
         ObservedTransaction, TransactionPage, TransactionRef, TransactionStatus, ValueMovement,
@@ -156,9 +156,10 @@ mod tests {
 
     fn block(height: u64) -> BlockRef {
         BlockRef {
+            position: BlockPosition(height),
             height: BlockHeight(height),
             hash: BlockHash(vec![height as u8; 32]),
-            parent_hash: None,
+            parent: None,
             timestamp: None,
         }
     }

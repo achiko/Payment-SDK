@@ -24,8 +24,8 @@ async fn configured_wallet_history_survives_restart() -> Result<(), Box<dyn std:
     let bitcoin = BitcoinNode::start().await;
     let ethereum = EthereumNode::start().await;
     let wallets = json!([
-        {"id": "btc-restart", "asset": "btc", "secret_env": "BTC_TEST_SECRET", "start_height": 1},
-        {"id": "eth-restart", "asset": "eth", "secret_env": "ETH_TEST_SECRET", "start_height": 1}
+        {"id": "btc-restart", "asset": "btc", "secret_env": "BTC_TEST_SECRET", "start_position": 1},
+        {"id": "eth-restart", "asset": "eth", "secret_env": "ETH_TEST_SECRET", "start_position": 1}
     ]);
     let secrets = [
         ("BTC_TEST_SECRET", hex::encode([3_u8; 32])),

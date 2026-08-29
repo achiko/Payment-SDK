@@ -39,7 +39,7 @@ mod tests {
 
     use alloy_primitives::keccak256;
     use futures_executor::block_on;
-    use indexing::{BlockHash, BlockHeight, BlockRef};
+    use indexing::{BlockHash, BlockHeight, BlockPosition, BlockRef};
     use json_rpc::Retry;
     use serde_json::{Value, json};
 
@@ -229,9 +229,10 @@ mod tests {
         ]);
         let rpc = account_rpc(client.clone());
         let block = BlockRef {
+            position: BlockPosition(9),
             height: BlockHeight(9),
             hash: BlockHash(vec![0xaa; 32]),
-            parent_hash: None,
+            parent: None,
             timestamp: None,
         };
 

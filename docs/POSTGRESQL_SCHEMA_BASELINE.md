@@ -2,16 +2,19 @@
 
 ## Status and evidence boundary
 
-This is the read-only schema baseline recorded on 2026-08-28 for the accepted
+This schema baseline was recorded statically on 2026-08-28 for the accepted
 **Indexing & Central Database** decision. It is derived from the three SQL files
 under `sdk/indexing/postgres/migrations/`, the complete current PostgreSQL
 adapter, its examples and repository-contract tests, ADR-0026, ADR-0003, and the
-central-database plan.
+central-database plan. On 2026-08-29 the owned PostgreSQL 18.6 harness added
+runtime proof of the same baseline: reviewed checksums, ordered application,
+effective catalog, scope/index keys, constraints, and a preserved registry
+sentinel all pass in disposable schemas.
 
-No SQL was executed, no database was contacted, and no retained state was
-inspected. Consequently, this document proves the static relationship between
-the checked-in scripts and source. It does not prove that any deployed database
-has these migrations applied or that the optional PostgreSQL tests pass.
+No retained state was inspected or changed. This evidence does not prove that
+any deployed database has these migrations applied; retained migration remains
+a separately authorized operational action with its own restore and writer
+barrier.
 
 ## Ordered canonical artifacts
 
@@ -24,9 +27,27 @@ these files.
 | 1 | `0001_init.sql` | `1ca86f471b6cbe58880fcf42f4e2c433e29a0b3dc405fc1a03e517aed6bc886c` | Creates the complete height-only indexing schema and application-owned `payment_wallets` table. |
 | 2 | `0002_output_pagination.sql` | `0949bfa6a51ceb8393ba879a0643512c8c6d915aa532d288623acbf55d79e6fb` | Replaces the prefix-only output-address index with the address-and-output-identity pagination index. |
 | 3 | `0003_movement_cascade.sql` | `a9de19a7ede932b73463d62f9702133aad8bcd87b350f524679965c78c27a81b` | Adds the movement height index and removes the movement-to-history foreign key so reorg reversal deletes movements explicitly. |
+| 4 | `0004_block_positions.sql` | `5019860075ddc36d4aca97de660968c92b77f42efaabe70fe226b74f978696c7` | Adds, safely backfills, validates, and constrains native block positions on rows that persist complete block references. |
 
 Each file contains its own `BEGIN`/`COMMIT`. None is idempotent and none records
 an applied version or checksum in the database.
+
+`0004_block_positions.sql` is finalized but has not been applied to any retained
+database. It adds only eight initially nullable `bigint` columns on
+`checkpoint`, `history`, and `journal`, accepts an explicit session allowlist of
+exact Bitcoin/Ethereum scopes for a validated dense `position = height`
+backfill, validates seven final coordinate constraints, and then makes the
+three current-position columns non-null. Its checksum is locked above and by
+the migration contract. It is deliberately absent from the current height-only
+repository harness's default migration list because that writer cannot satisfy
+the final columns. Applying `0004` and admitting the position-aware binary are
+one fenced roll-forward transition whose runbook and runtime cutover remain
+separate approval boundaries.
+
+The external sequence and failure policy are specified in
+[PostgreSQL Block-Coordinate Transition Runbook](POSTGRESQL_COORDINATE_TRANSITION_RUNBOOK.md).
+The runbook is an operational contract, not authorization to access or migrate
+a retained database.
 
 ## Effective final schema
 
@@ -37,20 +58,21 @@ session's active schema.
 
 | Relation | Final columns and constraints | Final supporting indexes |
 |---|---|---|
-| `checkpoint` | `chain text NOT NULL`, `network text NOT NULL`, `height bigint NOT NULL`, `hash bytea NOT NULL`, nullable `parent_hash bytea`, nullable `block_timestamp bigint`; primary key `(chain, network)` | Primary-key index only |
-| `history` | `chain`, `network`, `address`, `transaction_id`, `status`, and `block_hash` are non-null text/bytea values; `height bigint NOT NULL`; nullable failure, parent, timestamp, and fee fields; `status` is limited to `included` or `failed`; primary key `(chain, network, address, height, transaction_id)` | `history_by_height (chain, network, height)` plus the primary-key index |
+| `checkpoint` | Existing scope, height, hash, parent, and timestamp fields; `position bigint NOT NULL`; nullable `parent_position bigint`; current position is non-negative and parent position/hash are both absent only at genesis, otherwise both present with a lower non-negative parent position; primary key `(chain, network)` | Primary-key index only |
+| `history` | Existing canonical transaction, inclusion, status, fee, and primary-key fields; `block_position bigint NOT NULL`; nullable `block_parent_position bigint`; current position is non-negative and block parent position/hash obey the same atomic genesis rule | `history_by_height (chain, network, height)` plus the primary-key index |
 | `movement` | Scope, address, height, transaction, ordinal, kind, movement identity, asset identity, and `amount numeric` are non-null; endpoints are nullable; `kind` is limited to `transfer`, `input`, `output`, `mint`, or `burn`; primary key `(chain, network, address, height, transaction_id, ordinal)`; no final foreign key to `history` | `movement_by_height (chain, network, height)` plus the primary-key index |
 | `output` | Scope, output identity, address, asset identity, `amount numeric`, `evidence bytea`, `created_at bigint`, and `coinbase boolean` are non-null; primary key `(chain, network, transaction_id, output_index)` | `output_by_address_identity (chain, network, address, transaction_id, output_index)` and `output_by_height (chain, network, created_at)` |
-| `journal` | Scope, `height`, and `block_hash` are non-null; current parent/time and every previous-checkpoint field are nullable; primary key `(chain, network, height)` | Primary-key index only |
+| `journal` | Existing scope/current/previous checkpoint fields; `block_position bigint NOT NULL`; nullable current parent position and nullable previous checkpoint/parent positions; current coordinates obey the atomic genesis rule, while a previous checkpoint is either wholly absent or has non-negative position/height, hash, and its own atomic parent pair; timestamp remains optional when present; primary key `(chain, network, height)` | Primary-key index only |
 | `journal_output` | Scope, journal height, output identity, address, asset identity, amount, evidence, creation height, and coinbase are non-null; primary key `(chain, network, height, transaction_id, output_index)`; foreign key `(chain, network, height)` references `journal` with `ON DELETE CASCADE` | Primary-key index; the referenced `journal` key is indexed by its primary key |
 
 The indexing tables store generic `chain`, `network`, `asset_chain`, `asset`,
 exact `numeric` amounts, and opaque byte evidence. Native SOL therefore requires
-no Solana-only table and no asset-specific schema. The accepted native-position
-cutover will later add generic coordinate columns only to `checkpoint`,
-`history`, and `journal`; it must not rewrite these baseline migrations.
+no Solana-only table and no asset-specific schema. Finalized migration `0004`
+adds generic coordinate columns only to `checkpoint`, `history`, and `journal`;
+the pending runtime cutover must consume that shape without rewriting any
+canonical migration.
 
-### Application-owned state
+### Reusable SDK registry and custody state
 
 `payment_wallets` has:
 
@@ -61,11 +83,12 @@ cutover will later add generic coordinate columns only to `checkpoint`,
 - unique constraint `(chain, network, address)`; and
 - index `payment_wallets_by_scope (chain, network)`.
 
-This table is application/custody state. Its physical creation in
-`0001_init.sql` does not give the indexing domain ownership. An indexing
-migration or scope-local rescan must leave it byte-for-byte unchanged unless a
-separate application-owned change is approved. Initial native SOL support adds
-no row to this table.
+This table belongs to the existing reusable SDK registry/restoration and
+custody path. Its physical creation in `0001_init.sql` does not make it
+synchronizer checkpoint/history/output state. A coordinate migration or
+scope-local rescan must leave it byte-for-byte unchanged unless a separate
+SDK-level custody change is approved. Initial native SOL support adds no row to
+this table.
 
 ### Deployment-owned objects
 
@@ -93,43 +116,57 @@ the current adapter exists after all three migrations:
   uniqueness and scope-ordering index.
 
 The static result is therefore **compatible for the current height-only source
-shape**, subject to the following explicit gaps:
+shape**. The `Registry`, `RegisteredAddress`, and `payment_wallets` queries are
+part of the existing reusable SDK persistence/restoration path and remain
+intentionally preserved. The remaining explicit gaps are:
 
-1. `registry.rs` still reads and writes `payment_wallets`. That is compatible
-   with the baseline SQL but violates the accepted target ownership. It remains
-   temporarily necessary only so retained wallet rows are not stranded. The
-   application-owned restart path must be implemented and proven first; then
-   the indexing `Registry` surface and queries must be removed without dropping
-   or changing the table.
-2. All migration and adapter SQL is unqualified. The current `pool(url,
+1. All migration and adapter SQL is unqualified. The current `pool(url,
    max_size)` accepts no schema and does not override a URL-supplied
    `search_path`. Static compatibility holds only when the intended schema is
    already first on the connection's path. This must fail closed before central
    runtime composition.
-3. The schema permits negative heights, timestamps, output indexes, and wallet
+2. The schema permits negative heights, timestamps, output indexes, and wallet
    birthdays; half-populated fee or previous-checkpoint facts; and movement
    endpoint combinations that row decoders reject. Adapter-generated rows obey
    the domain rules, but read-only startup validation must reject incompatible
    retained rows before runtime use.
-4. The spend query matches output identity but not the `OutputKey` address; the
-   empty-scope first-commit lock, checkpoint-bound page snapshot, zero-sized
-   pool, and global benchmark reset also need the repairs already listed under
-   **Adapter Safety**. These are adapter/test defects, not evidence that the
-   shared schema needs chain-specific tables.
-5. The eight repository-contract tests return early when `POSTGRES_TEST_URL` is
-   absent, and their header mentions only migration 0001. A green default suite
-   is not PostgreSQL execution evidence and the full three-file baseline is
-   required.
+3. The adapter-safety sequence is closed by one-pool, one-schema proof for
+   distinct scopes and native/token facts. The individual adapter/test defects
+   were not evidence that the shared schema needs chain-specific tables.
+   Zero-sized pools are rejected before URL parsing or pool construction, and
+   spend deletion now matches the complete
+   address-qualified `OutputKey`. Chain-neutral block validation also rejects
+   one `OutputId` created under multiple addresses before repository SQL runs.
+   Add/remove transactions now take a transaction-scoped advisory lock from
+   the length-framed exact scope before reading even an absent checkpoint; no
+   lock table or schema change is required. History pagination now reads its
+   checkpoint, rows, movements, and verification checkpoint in one read-only
+   repeatable-read snapshot. Output pagination applies the same snapshot rule
+   to its checkpoint and live projection.
+   Benchmark reset now deletes only its unique exact scope in dependency order
+   and preserves unrelated scopes plus `payment_wallets`.
+
+The former optional-test gap is closed: the owned PostgreSQL 18.6 harness runs
+22/22 contracts without `POSTGRES_TEST_URL` or a skip path. It verifies the
+three reviewed checksums, ordered effective catalog, ownership, constraints,
+scope/index keys, and exact `payment_wallets` sentinel preservation.
+Its shared-pool contract additionally rejects cross-scope reads/writes and
+compares every unrelated indexing row before and after a different scope moves.
 
 ## Fresh and retained database paths
 
 ### Fresh named schema
 
-A fresh, empty, explicitly selected schema receives `0001`, `0002`, then `0003`
-exactly once. Deployment records the database identity, validated schema,
-PostgreSQL server major, filename, ordinal, SHA-256, start/completion time, and
-result for each file. Failure of any file stops the release; the runtime does
-not repair or continue a partial history.
+A fresh, empty, explicitly selected schema for the future position-aware binary
+receives `0001`, `0002`, `0003`, then `0004` exactly once. The PostgreSQL 18.6
+fresh-schema contract proves `0004` succeeds with no indexing rows, validates
+all seven coordinate checks, makes only current positions non-null, rejects
+invalid writes, and preserves the registry sentinel. The current height-only
+writer must continue to use the `0001`-through-`0003` baseline until its fenced
+cutover. Deployment records the database identity, validated schema, PostgreSQL
+server major, filename, ordinal, SHA-256, start/completion time, and result for
+each file. Failure of any file stops the release; the runtime does not repair or
+continue a partial history.
 
 ### Retained named schema
 
@@ -138,18 +175,35 @@ baseline and applied checksums, inventories all scopes and application-owned
 tables, and restores a copy from a tested restore point. It then applies only
 the missing ordered migrations:
 
-- a schema at the exact `0001` baseline receives `0002`, then `0003`;
-- a schema at the exact `0002` baseline receives only `0003`; and
-- an exact final baseline receives nothing.
+- a schema at the exact `0001` baseline receives `0002`, `0003`, then `0004`;
+- a schema at the exact `0002` baseline receives `0003`, then `0004`;
+- a schema at the exact `0003` height-only baseline receives only `0004`; and
+- an exact finalized coordinate baseline receives nothing.
 
 An unknown checksum, an incompatible definition under a required object name, a
 partially applied migration, or a schema whose required shape cannot be tied to
 the ordered history is a stop condition. Unrelated application-owned objects
 are preserved, not treated as errors. The required objects must not be guessed
-into compliance. Future native-position work is a new additive, transactional
-migration: verified dense Bitcoin/Ethereum scopes may receive an explicit
-scoped `position = height` backfill, while Solana, unknown chains, and
+into compliance. Finalized migration `0004` is the additive transactional
+native-position change: verified dense Bitcoin/Ethereum scopes may receive its
+explicit scoped `position = height` backfill, while Solana, unknown chains, and
 unverified custom scopes must never receive that inference.
+
+That transition rule now has executable disposable evidence. The migration
+session supplies a JSON array of exact `(chain, network)` pairs through
+`payment_sdk.verified_dense_scopes`; only Bitcoin and Ethereum entries are
+eligible. Before any update, the migration inventories populated scopes across
+`checkpoint`, `history`, `movement`, `output`, `journal`, and `journal_output`
+and aborts if one is not allowlisted. Its PostgreSQL 18.6 rehearsal preserved
+the row count and SHA-256 signature of every baseline table after excluding
+only the newly added coordinate keys, preserved the exact registry sentinel,
+and produced complete current/parent coordinate pairs. Seven constraints are
+then validated before current positions become non-null. Fresh invalid writes
+prove null current positions, half-present parents, and incomplete previous
+checkpoints are rejected. Populated Solana and invalid retained-parent fixtures
+both prove errors roll back the entire transaction, including all eight column
+additions. This is not evidence of a retained deployment; the external writer-
+barrier runbook and position-aware runtime cutover remain pending.
 
 ## Deployment boundary and schema identity
 
@@ -174,10 +228,14 @@ The executor must:
 
 Runtime pool construction must independently override any URL-supplied path and
 pin every connection to exactly `<validated_schema>, pg_catalog`. Startup then
-uses a read-only catalog validator to confirm the final required relations,
-columns, types, nullability, constraints, and indexes. It reports a missing,
-partial, extra-conflicting, or decoder-incompatible schema and exits before
-constructing repositories. It does not apply migrations.
+calls `indexing_postgres::validate_schema(&pool, configured_schema)`. The
+validator uses one read-only repeatable-read transaction to confirm the
+resolved schema identity and final required relations, columns, types,
+nullability, constraints, indexes, and journal cascade. It reports a missing,
+partial, wrong-schema, or decoder-incompatible schema before repositories are
+constructed and never applies migrations or DDL. Owned PostgreSQL 18.6 tests
+prove compatible, missing-relation, wrong-column, and wrong-schema outcomes
+while preserving the exact registry sentinel.
 
 ## Preservation and restore proof
 
@@ -229,6 +287,8 @@ For every run, the harness must:
 7. destroy only the owned disposable resources.
 
 No runtime database, public network, funded key, or retained schema is part of
-this proof. Until this owned non-skipping suite runs, PostgreSQL execution and
-preservation remain **not run**, even when the ordinary workspace test command
-is green.
+this proof. Owned non-skipping repository execution and baseline migration-
+catalog/preservation evidence are now **run** against the pinned PostgreSQL
+18.6 digest. Read-only startup compatibility validation is also **run** for
+compatible, missing, wrong-column, and wrong-schema fixtures. Adapter-safety,
+retained-upgrade, and multi-scope coexistence evidence remain **not run**.
