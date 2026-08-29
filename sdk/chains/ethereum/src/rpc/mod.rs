@@ -571,9 +571,11 @@ mod tests {
     fn exact_envelope_broadcast_rejects_a_mismatched_provider_hash() {
         let envelope = vec![0x02, 0x01, 0x02, 0x03];
         let id = TransactionId(keccak256(&envelope).0);
+        let local_id = base::TransactionId::new(id.to_string());
+        let provider_candidate = format!("0x{}", "dd".repeat(32));
         let client = ScriptedClient::new(vec![success(
             "eth_sendRawTransaction",
-            json!(format!("0x{}", "dd".repeat(32))),
+            json!(provider_candidate.clone()),
         )]);
         let rpc = rpc(client.clone());
 
@@ -583,14 +585,40 @@ mod tests {
         }))
         .expect_err("provider hash mismatch must fail");
 
-        assert!(error.retryable);
+        assert_eq!(error.kind, base::TransactionErrorKind::Unavailable);
+        assert_eq!(error.ambiguous_transaction_id, Some(local_id));
+        assert_ne!(
+            error
+                .ambiguous_transaction_id
+                .as_ref()
+                .map(base::TransactionId::as_str),
+            Some(provider_candidate.as_str())
+        );
         assert_eq!(client.requests()[0].1, json!([data_hex(&envelope)]));
+    }
+
+    #[test]
+    fn mismatched_local_id_is_rejected_before_submission_without_ambiguity() {
+        let envelope = vec![0x02, 0x10, 0x20, 0x30];
+        let client = ScriptedClient::new(Vec::new());
+        let rpc = rpc(client.clone());
+
+        let error = block_on(rpc.broadcast(SignedTransaction {
+            id: TransactionId([0x99; 32]),
+            envelope,
+        }))
+        .expect_err("a local ID that does not match the envelope must fail before RPC");
+
+        assert_eq!(error.kind, base::TransactionErrorKind::InvalidTransaction);
+        assert_eq!(error.ambiguous_transaction_id, None);
+        assert!(client.requests().is_empty());
     }
 
     #[test]
     fn unknown_remote_submission_failure_remains_ambiguous() {
         let envelope = vec![0x02, 0x04, 0x05, 0x06];
         let id = TransactionId(keccak256(&envelope).0);
+        let local_id = base::TransactionId::new(id.to_string());
         let client = ScriptedClient::new(vec![failure(
             "eth_sendRawTransaction",
             -32_000,
@@ -600,9 +628,26 @@ mod tests {
         let error = block_on(rpc(client).broadcast(SignedTransaction { id, envelope }))
             .expect_err("an unclassified post-attempt remote failure must stay ambiguous");
 
-        assert!(error.retryable);
+        assert_eq!(error.kind, base::TransactionErrorKind::Unavailable);
+        assert_eq!(error.ambiguous_transaction_id, Some(local_id));
         assert!(error.message.contains("outcome is ambiguous"));
         assert!(!error.message.contains("Bearer secret"));
+    }
+
+    #[test]
+    fn missing_and_malformed_submission_results_keep_the_exact_local_id() {
+        for result in [Value::Null, json!(7)] {
+            let envelope = vec![0x02, 0x07, 0x08, 0x09];
+            let id = TransactionId(keccak256(&envelope).0);
+            let local_id = base::TransactionId::new(id.to_string());
+            let client = ScriptedClient::new(vec![success("eth_sendRawTransaction", result)]);
+
+            let error = block_on(rpc(client).broadcast(SignedTransaction { id, envelope }))
+                .expect_err("a missing or malformed result must remain ambiguous");
+
+            assert_eq!(error.kind, base::TransactionErrorKind::Unavailable);
+            assert_eq!(error.ambiguous_transaction_id, Some(local_id));
+        }
     }
 
     #[tokio::test]
@@ -636,12 +681,13 @@ mod tests {
             .await
             .expect("transaction must prepare");
 
-        assert!(
-            coordinator
-                .broadcast(signed.clone())
-                .await
-                .expect_err("unclassified remote failure must be ambiguous")
-                .retryable
+        let error = coordinator
+            .broadcast(signed.clone())
+            .await
+            .expect_err("unclassified remote failure must be ambiguous");
+        assert_eq!(
+            error.ambiguous_transaction_id,
+            Some(base::TransactionId::new(signed.id.to_string()))
         );
         client.push_replies([
             success("eth_getTransactionByHash", Value::Null),
@@ -703,9 +749,11 @@ mod tests {
             ),
         ]);
         let mismatched_rpc = rpc(mismatched);
+        let local_id = base::TransactionId::new(id.to_string());
         let error = block_on(mismatched_rpc.broadcast(SignedTransaction { id, envelope }))
             .expect_err("different known hash must not be accepted");
-        assert!(error.retryable);
+        assert_eq!(error.kind, base::TransactionErrorKind::Unavailable);
+        assert_eq!(error.ambiguous_transaction_id, Some(local_id));
     }
 
     #[test]

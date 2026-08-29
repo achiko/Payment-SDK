@@ -283,7 +283,7 @@ workspace evidence rather than copy a temporary path.
   ambiguity only from the exact local Bitcoin envelope. **Depends on:**
   **Make batch failures truthful**. **Proof:** Bitcoin batch and ambiguity
   regressions.
-- [ ] **Defend Ethereum batches** — reject impossible zero/51 direct sender
+- [x] **Defend Ethereum batches** — reject impossible zero/51 direct sender
   calls before chain I/O, preserve original indices/accepted prefix, and
   originate ambiguity only from the exact local Ethereum envelope. **Depends
   on:** **Make batch failures truthful**. **Proof:** Ethereum nonce, prefix,
@@ -1115,7 +1115,23 @@ mismatches and provider prose cannot replace it, and grouped failures remain
 index-free. The Bitcoin suite passes 58/58, as do the workspace all-target
 check and complete test suite, strict all-target/all-feature Clippy, no-deps
 documentation, formatting, design-lint, and diff checks. The next approval
-boundary is **Defend Ethereum batches**.
+boundary is **Defend Ethereum batches**. **Defend Ethereum batches** then made
+the concrete sender reject direct zero and 51 calls with the shared index-free
+`InvalidBatch` contract before account, nonce, preparation, or broadcast work.
+Three identical authored transfers remain three prepared occurrences with
+consecutive nonces; submission stops at the first unknown outcome, keeps only
+the definitely acknowledged prefix, and reports that occurrence's original
+index. Ethereum transaction submission now carries `base::TransactionError`
+from the one-attempt RPC boundary through the process-local coordinator,
+wallet, and batch. Pre-wire envelope/ID mismatch and definite rejection remain
+ID-free; post-attempt transport, malformed, missing, and returned-hash
+uncertainty use only the Keccak ID validated from the exact local EIP-2718
+envelope. The coordinator normalizes any adapter candidate back to that local
+authority and keeps the exact envelope guarded for reconciliation. Ethereum
+tests pass 81/81 plus the external adapter test; the workspace all-target
+check and complete tests, strict all-target/all-feature Clippy, no-deps
+documentation, formatting, design-lint, and diff checks pass. The next
+approval boundary is **Reject transaction queries**.
 
 ## Accepted limitations and operational failure policy
 

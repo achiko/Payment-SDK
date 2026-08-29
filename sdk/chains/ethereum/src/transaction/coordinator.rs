@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use base::{TransactionError, TransactionErrorKind, TransactionId as BaseTransactionId};
 use indexing::SourceError;
 
 use super::{BuildContext, SignedTransaction, TransactionBuilder, TransactionId, TransferRequest};
@@ -113,7 +114,7 @@ impl TransactionCoordinator {
     pub(crate) async fn broadcast(
         &self,
         transaction: SignedTransaction,
-    ) -> Result<TransactionId, SourceError> {
+    ) -> Result<TransactionId, TransactionError> {
         self.submit(Some(&transaction), transaction.id.clone())
             .await
     }
@@ -264,11 +265,15 @@ impl TransactionCoordinator {
         &self,
         expected: Option<&SignedTransaction>,
         id: TransactionId,
-    ) -> Result<TransactionId, SourceError> {
+    ) -> Result<TransactionId, TransactionError> {
         loop {
             let mut notified = Box::pin(self.core.changed.notified());
             notified.as_mut().enable();
-            let claim = match self.core.claim(&id, expected)? {
+            let claim = match self
+                .core
+                .claim(&id, expected)
+                .map_err(definite_submission_error)?
+            {
                 Claim::Ready(claim) => claim,
                 Claim::Wait => {
                     notified.await;
@@ -277,9 +282,9 @@ impl TransactionCoordinator {
             };
             if claim.recovery {
                 match self.core.transactions.known(&id).await {
-                    Ok(true) => return claim.guard.accept(),
+                    Ok(true) => return claim.guard.accept().map_err(definite_submission_error),
                     Ok(false) => {}
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(ambiguous_submission_error(&id, error)),
                 }
             }
 
@@ -289,18 +294,20 @@ impl TransactionCoordinator {
                 .broadcast(claim.transaction.clone())
                 .await
             {
-                Ok(returned) if returned == id => return claim.guard.accept(),
+                Ok(returned) if returned == id => {
+                    return claim.guard.accept().map_err(definite_submission_error);
+                }
                 Ok(_) => {
-                    return Err(source_error(
+                    return Err(ambiguous_submission_error(
+                        &id,
                         "Ethereum node returned a different hash for the exact signed envelope",
-                        true,
                     ));
                 }
-                Err(error) if !claim.recovery && !error.retryable => {
+                Err(error) if !claim.recovery && error.ambiguous_transaction_id.is_none() => {
                     claim.guard.reject();
                     return Err(error);
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(ambiguous_submission_error(&id, error)),
             }
         }
     }
@@ -383,7 +390,7 @@ impl PreparedBatch {
         self.entries.len()
     }
 
-    pub(crate) async fn next(&mut self) -> Result<Option<TransactionId>, SourceError> {
+    pub(crate) async fn next(&mut self) -> Result<Option<TransactionId>, TransactionError> {
         let Some(entry) = self.entries.get(self.cursor) else {
             self.operation.take();
             return Ok(None);
@@ -448,6 +455,23 @@ fn source_error(message: impl Into<String>, retryable: bool) -> SourceError {
         message: message.into(),
         retryable,
     }
+}
+
+fn definite_submission_error(error: SourceError) -> TransactionError {
+    let kind = if error.retryable {
+        TransactionErrorKind::Unavailable
+    } else {
+        TransactionErrorKind::Rejected
+    };
+    TransactionError::new(kind, error.message)
+}
+
+fn ambiguous_submission_error(
+    id: &TransactionId,
+    error: impl std::fmt::Display,
+) -> TransactionError {
+    TransactionError::new(TransactionErrorKind::Unavailable, error.to_string())
+        .with_ambiguous_transaction_id(BaseTransactionId::new(id.to_string()))
 }
 
 #[cfg(test)]

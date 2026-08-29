@@ -7,7 +7,7 @@ use base::{
     TransactionError, TransactionErrorKind, TransactionFuture, TransactionId, TransactionSnapshot,
 };
 use crypto::{PublicKeyFormat, SecretKey};
-use indexing::{History as IndexHistory, IndexScope, SourceError};
+use indexing::{History as IndexHistory, IndexScope};
 use wallets::{
     AddressEncoding, AddressFormat, AddressText, Balance, BalanceReader, Error as WalletError,
     ErrorKind as WalletErrorKind, FutureResult, Provider, SecretBytes, TransactionFactory,
@@ -407,11 +407,7 @@ impl Broadcaster for Wallet {
                     .map_err(|error| {
                         transaction_error(TransactionErrorKind::InvalidTransaction, error)
                     })?;
-            let id = self
-                .coordinator
-                .broadcast(signed)
-                .await
-                .map_err(submission_error)?;
+            let id = self.coordinator.broadcast(signed).await?;
             Ok(BroadcastReceipt {
                 id: TransactionId::new(id.to_string()),
             })
@@ -442,15 +438,6 @@ pub(crate) fn preparation_error(error: ChainError) -> TransactionError {
     transaction_error(kind, error)
 }
 
-fn submission_error(error: SourceError) -> TransactionError {
-    let kind = if error.retryable {
-        TransactionErrorKind::Unavailable
-    } else {
-        TransactionErrorKind::Rejected
-    };
-    transaction_error(kind, error)
-}
-
 fn wallet_error(kind: WalletErrorKind, error: impl std::fmt::Display) -> WalletError {
     WalletError::new(kind, error.to_string())
 }
@@ -461,7 +448,7 @@ mod tests {
     use crate::TransferIntent;
     use base::{Digest, SignRequest, SignablePayload, SignatureEncoding, SignatureScheme};
     use futures_executor::block_on;
-    use indexing::ChainId;
+    use indexing::{ChainId, SourceError};
 
     struct InactiveDependencies;
 
@@ -495,7 +482,7 @@ mod tests {
         fn broadcast<'a>(
             &'a self,
             _transaction: SignedTransaction,
-        ) -> indexing::BoxFuture<'a, Result<crate::TransactionId, SourceError>> {
+        ) -> indexing::BoxFuture<'a, Result<crate::TransactionId, TransactionError>> {
             Box::pin(async { unreachable!("wallet generation must not broadcast a transaction") })
         }
 
@@ -671,21 +658,6 @@ mod tests {
             message: "RPC failed".to_owned(),
         });
         assert_eq!(mapped.kind, TransactionErrorKind::Unavailable);
-    }
-
-    #[test]
-    fn submission_failures_preserve_retryability() {
-        let unavailable = submission_error(SourceError {
-            message: "submission outcome is ambiguous".to_owned(),
-            retryable: true,
-        });
-        let rejected = submission_error(SourceError {
-            message: "node rejected the transaction".to_owned(),
-            retryable: false,
-        });
-
-        assert_eq!(unavailable.kind, TransactionErrorKind::Unavailable);
-        assert_eq!(rejected.kind, TransactionErrorKind::Rejected);
     }
 
     #[test]

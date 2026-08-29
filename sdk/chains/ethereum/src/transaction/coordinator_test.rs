@@ -86,7 +86,7 @@ impl Accounts for AccountStub {
 enum BroadcastAction {
     Accept,
     Reject,
-    Retryable,
+    Ambiguous,
     Pending,
 }
 
@@ -139,7 +139,7 @@ impl Transactions for TransactionStub {
     fn broadcast<'a>(
         &'a self,
         transaction: SignedTransaction,
-    ) -> BoxFuture<'a, Result<TransactionId, SourceError>> {
+    ) -> BoxFuture<'a, Result<TransactionId, base::TransactionError>> {
         Box::pin(async move {
             let id = transaction.id.clone();
             self.broadcasts
@@ -154,8 +154,15 @@ impl Transactions for TransactionStub {
                 .unwrap_or(BroadcastAction::Accept);
             match action {
                 BroadcastAction::Accept => Ok(id),
-                BroadcastAction::Reject => Err(error("terminal rejection", false)),
-                BroadcastAction::Retryable => Err(error("ambiguous submission", true)),
+                BroadcastAction::Reject => Err(base::TransactionError::new(
+                    base::TransactionErrorKind::Rejected,
+                    "terminal rejection",
+                )),
+                BroadcastAction::Ambiguous => Err(base::TransactionError::new(
+                    base::TransactionErrorKind::Unavailable,
+                    "ambiguous submission",
+                )
+                .with_ambiguous_transaction_id(base::TransactionId::new(id.to_string()))),
                 BroadcastAction::Pending => std::future::pending().await,
             }
         })
@@ -346,12 +353,12 @@ async fn cumulative_token_amount_and_native_gas_fail_before_any_broadcast() {
 }
 
 #[tokio::test]
-async fn retryable_submission_reconciles_and_replays_the_exact_envelope() {
+async fn ambiguous_submission_reconciles_and_replays_the_exact_envelope() {
     let signer = signer(4);
     let accounts = Arc::new(AccountStub::default());
     accounts.set_nonce(signer.address.clone(), 5);
     let transactions = Arc::new(TransactionStub::default());
-    transactions.actions([BroadcastAction::Retryable, BroadcastAction::Accept]);
+    transactions.actions([BroadcastAction::Ambiguous, BroadcastAction::Accept]);
     transactions.known([Ok(false)]);
     let coordinator = coordinator(accounts, transactions.clone());
     let signed = coordinator
@@ -367,7 +374,11 @@ async fn retryable_submission_reconciles_and_replays_the_exact_envelope() {
         .broadcast(signed.clone())
         .await
         .expect_err("first submission must be ambiguous");
-    assert!(first.retryable);
+    assert_eq!(first.kind, base::TransactionErrorKind::Unavailable);
+    assert_eq!(
+        first.ambiguous_transaction_id,
+        Some(base::TransactionId::new(signed.id.to_string()))
+    );
     assert_eq!(
         coordinator
             .broadcast(signed.clone())
@@ -397,7 +408,7 @@ async fn new_same_sender_preparation_recovers_old_envelope_before_nonce_plus_one
     accounts.set_nonce(signer.address.clone(), 5);
     let transactions = Arc::new(TransactionStub::default());
     transactions.actions([
-        BroadcastAction::Retryable,
+        BroadcastAction::Ambiguous,
         BroadcastAction::Accept,
         BroadcastAction::Accept,
     ]);
@@ -412,12 +423,13 @@ async fn new_same_sender_preparation_recovers_old_envelope_before_nonce_plus_one
         .await
         .expect("old transaction must prepare");
 
-    assert!(
-        coordinator
-            .broadcast(old.clone())
-            .await
-            .expect_err("old submission must be ambiguous")
-            .retryable
+    let error = coordinator
+        .broadcast(old.clone())
+        .await
+        .expect_err("old submission must be ambiguous");
+    assert_eq!(
+        error.ambiguous_transaction_id,
+        Some(base::TransactionId::new(old.id.to_string()))
     );
     let new = coordinator
         .prepare_one(Preparation::signer(
@@ -476,7 +488,8 @@ async fn terminal_initial_rejection_releases_the_nonce_for_reuse() {
         .broadcast(rejected)
         .await
         .expect_err("scripted submission must be rejected");
-    assert!(!error.retryable);
+    assert_eq!(error.kind, base::TransactionErrorKind::Rejected);
+    assert_eq!(error.ambiguous_transaction_id, None);
 
     let replacement = coordinator
         .prepare_one(Preparation::signer(
@@ -608,11 +621,4 @@ async fn concurrent_same_sender_operations_never_reuse_a_nonce() {
             .collect::<Vec<_>>(),
         [5, 6]
     );
-}
-
-fn error(message: &str, retryable: bool) -> SourceError {
-    SourceError {
-        message: message.to_owned(),
-        retryable,
-    }
 }
