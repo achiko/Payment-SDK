@@ -1,7 +1,7 @@
 use axum::{
     Json,
-    extract::{Path, Query, State, rejection::JsonRejection},
-    http::StatusCode,
+    extract::{FromRequestParts, Path, Query, State, rejection::JsonRejection},
+    http::{StatusCode, request::Parts},
 };
 use serde::{Deserialize, Serialize};
 use utoipa::IntoParams;
@@ -19,6 +19,26 @@ pub fn routes() -> OpenApiRouter<HttpState> {
         .routes(routes!(read))
         .routes(routes!(send))
         .routes(routes!(send_all))
+}
+
+enum TransactionQuery {
+    AbsentOrEmpty,
+}
+
+impl<S> FromRequestParts<S> for TransactionQuery
+where
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        if parts.uri.query().is_some_and(|query| !query.is_empty()) {
+            return Err(ApiError::invalid_request(
+                "transaction query parameters are not supported",
+            ));
+        }
+        Ok(Self::AbsentOrEmpty)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
@@ -341,6 +361,7 @@ pub struct Submission {
 async fn send(
     State(state): State<HttpState>,
     Path(path): Path<WalletPath>,
+    _query: TransactionQuery,
     request: Result<Json<SendFunds>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Submission>), ApiError> {
     let Json(request) = request.map_err(ApiError::invalid_json)?;
@@ -413,6 +434,7 @@ pub struct TransferResponse {
 )]
 async fn send_all(
     State(state): State<HttpState>,
+    _query: TransactionQuery,
     request: Result<Json<TransferRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<TransferResponse>), ApiError> {
     let Json(request) = request.map_err(ApiError::invalid_json)?;

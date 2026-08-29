@@ -289,7 +289,7 @@ workspace evidence rather than copy a temporary path.
   on:** **Make batch failures truthful**. **Proof:** Ethereum nonce, prefix,
   duplicate, and ambiguity regressions.
 
-- [ ] **Reject transaction queries** — after authentication but before body
+- [x] **Reject transaction queries** — after authentication but before body
   extraction, reject any non-empty query on both transaction POST routes with
   `transaction query parameters are not supported`; an empty query component
   and ordinary infrastructure headers remain inert. **Proof:** route precedence
@@ -1132,6 +1132,17 @@ tests pass 81/81 plus the external adapter test; the workspace all-target
 check and complete tests, strict all-target/all-feature Clippy, no-deps
 documentation, formatting, design-lint, and diff checks pass. The next
 approval boundary is **Reject transaction queries**.
+**Reject transaction queries** then added one shared request-parts extractor to
+both transaction POST handlers. The protected-router authentication layer
+remains earlier, while any non-empty raw query now returns the exact index-free
+`400` error before the JSON extractor runs. Route-contract regressions prove
+that query rejection wins over malformed JSON, an empty batch, and 51 items;
+an empty query component and unrelated tracing, retry-like, or
+minimum-context-slot headers remain inert. The complete API suite passes 3/3
+library, 5/5 binary, and 16/16 integration tests. The workspace all-target
+check and complete tests, strict all-target/all-feature Clippy, no-deps
+documentation, formatting, design-lint, and diff checks pass. The next
+approval boundary is **Apply the wire maximum first**.
 
 ## Accepted limitations and operational failure policy
 
