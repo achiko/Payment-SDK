@@ -8,11 +8,13 @@ The Public Transaction Semantics, Destination Account Acquisition, and Native
 SOL Submission sections below describe accepted target contracts that are not
 yet fully implemented. The current Rust source enforces the shared SDK 50-item
 maximum, rejects transaction queries, and originates Bitcoin/Ethereum
-ambiguity from exact local envelopes. It also rejects oversized HTTP batches
-before converting an item. It does not yet publish the OpenAPI batch bounds,
-project ambiguous transaction IDs, or contain native SOL acquisition or
-submission. `docs/FEATURE_VALIDATION.md` records those gaps; unmarked
-existing-runtime descriptions remain current.
+ambiguity from exact local envelopes. It projects those typed IDs into `503`
+responses, rejects oversized HTTP batches before converting an item, and
+publishes the exact shared transaction schemas and conditional failure
+metadata. Native SOL is reserved on those shared routes without a Solana-only
+path, but native SOL acquisition and submission are not implemented.
+`docs/FEATURE_VALIDATION.md` records that gap; unmarked existing-runtime
+descriptions remain current.
 
 Native SOL Submission is Accepted and selects blockhash, fee, signing,
 simulation, broadcast, exact-byte replay, and ambiguity behavior below. Solana
@@ -645,11 +647,9 @@ that ID and without batch IDs or a failed index.
 
 ## Errors
 
-Current errors return JSON with required `message` and may add
-`transaction_ids` and `failed_index`. The accepted Public Transaction Semantics
-target also adds optional `ambiguous_transaction_id` and makes failed-index
-presence depend on a truthful item-scoped failure. The current status classes,
-which the target retains, are:
+Errors return JSON with required `message` and may add `transaction_ids`, a
+truthful item-scoped `failed_index`, and the chain-originated optional
+`ambiguous_transaction_id`. The current status classes are:
 
 | Status | Meaning |
 |---|---|
@@ -660,12 +660,12 @@ which the target retains, are:
 | `503` | wallet/indexing unavailable or a submission outcome is ambiguous |
 | `500` | an internal result could not be encoded |
 
-Under the accepted target, batch transaction failures use `422` for
-deterministic terminal failures and `503` for retryable or ambiguous failures.
-Accepted IDs contain only the definitely acknowledged prefix. `failed_index`
-is present only when one original occurrence truthfully failed. Presence of
-`ambiguous_transaction_id` always produces `503`; it is reconciliation metadata,
-not proof of submission or an idempotency key.
+Batch transaction failures use `422` for deterministic terminal failures and
+`503` for retryable or ambiguous failures. Accepted IDs contain only the
+definitely acknowledged prefix. `failed_index` is present only when one
+original occurrence truthfully failed. Presence of
+`ambiguous_transaction_id` always produces `503`; it is reconciliation
+metadata, not proof of submission or an idempotency key.
 
 The chain transaction layer derives that ID from the exact locally signed
 envelope before broadcast. Wallet/common-error conversion preserves it

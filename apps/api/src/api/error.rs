@@ -10,13 +10,19 @@ use utoipa::ToSchema;
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, ToSchema)]
 pub struct ErrorBody {
     pub message: String,
-    /// Transactions accepted before an ordered batch failed.
+    /// Definitely acknowledged transaction IDs before an ordered batch failed.
+    /// Present only when that accepted prefix is non-empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[schema(required = false)]
     pub transaction_ids: Vec<String>,
-    /// Zero-based transfer index whose validation or submission failed.
+    /// Zero-based original request index. Present only when one public batch
+    /// occurrence truthfully failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed_index: Option<usize>,
+    /// Canonical ID derived from the exact locally signed envelope. Present only
+    /// when its submission outcome remains unknown; its presence produces 503.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ambiguous_transaction_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -35,6 +41,7 @@ pub struct ApiError {
     message: String,
     transaction_ids: Vec<String>,
     failed_index: Option<usize>,
+    ambiguous_transaction_id: Option<String>,
 }
 
 impl ApiError {
@@ -67,13 +74,19 @@ impl ApiError {
             message: message.into(),
             transaction_ids: Vec::new(),
             failed_index: None,
+            ambiguous_transaction_id: None,
         }
     }
 }
 
 impl From<wallets::Error> for ApiError {
     fn from(error: wallets::Error) -> Self {
-        let kind = match error.kind {
+        let wallets::Error {
+            kind,
+            message,
+            ambiguous_transaction_id,
+        } = error;
+        let kind = match kind {
             wallets::ErrorKind::Unsupported
             | wallets::ErrorKind::InvalidSecret
             | wallets::ErrorKind::InvalidAddress
@@ -88,7 +101,9 @@ impl From<wallets::Error> for ApiError {
             | wallets::ErrorKind::Balance
             | wallets::ErrorKind::History => ErrorKind::Unavailable,
         };
-        Self::new(kind, error.message)
+        let mut response = Self::new(kind, message);
+        response.ambiguous_transaction_id = ambiguous_transaction_id.map(|id| id.to_string());
+        response
     }
 }
 
@@ -101,19 +116,24 @@ impl From<wallets::SendError> for ApiError {
             .map(|id| id.to_string())
             .collect();
         response.failed_index = error.failed_index;
+        response.ambiguous_transaction_id = error.ambiguous_transaction_id.map(|id| id.to_string());
         response
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = match self.kind {
-            ErrorKind::InvalidRequest => StatusCode::BAD_REQUEST,
-            ErrorKind::NotFound => StatusCode::NOT_FOUND,
-            ErrorKind::Conflict => StatusCode::CONFLICT,
-            ErrorKind::Transaction => StatusCode::UNPROCESSABLE_ENTITY,
-            ErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
-            ErrorKind::InvalidResponse => StatusCode::INTERNAL_SERVER_ERROR,
+        let status = if self.ambiguous_transaction_id.is_some() {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            match self.kind {
+                ErrorKind::InvalidRequest => StatusCode::BAD_REQUEST,
+                ErrorKind::NotFound => StatusCode::NOT_FOUND,
+                ErrorKind::Conflict => StatusCode::CONFLICT,
+                ErrorKind::Transaction => StatusCode::UNPROCESSABLE_ENTITY,
+                ErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+                ErrorKind::InvalidResponse => StatusCode::INTERNAL_SERVER_ERROR,
+            }
         };
         (
             status,
@@ -121,8 +141,13 @@ impl IntoResponse for ApiError {
                 message: self.message,
                 transaction_ids: self.transaction_ids,
                 failed_index: self.failed_index,
+                ambiguous_transaction_id: self.ambiguous_transaction_id,
             }),
         )
             .into_response()
     }
 }
+
+#[cfg(test)]
+#[path = "error_test.rs"]
+mod tests;

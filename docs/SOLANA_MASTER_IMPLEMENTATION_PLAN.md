@@ -2,11 +2,13 @@
 
 ## Status
 
-**Active; the base, wallet, and `SendError` ambiguity carriers are implemented,
-while HTTP projection and every concrete-chain origin remain pending.**
+**Active; the shared ambiguity carriers, Bitcoin/Ethereum origins, and HTTP
+projection are implemented, while the Solana origin remains pending.**
 This is the single execution plan for the accepted native-SOL target. It
 supersedes the overlapping execution checklists in
-`SOLANA_IMPLEMENTATION_PLAN.md` and
+
+###### `SOLANA_IMPLEMENTATION_PLAN.md` and
+
 `INDEXING_CENTRAL_DATABASE_PLAN.md`; the accepted ADRs remain the architectural
 source of truth. Every unchecked step remains separately approval-gated.
 
@@ -298,22 +300,22 @@ workspace evidence rather than copy a temporary path.
   before converting any amount; leave the empty list to the SDK minimum guard.
   **Depends on:** **Enforce SDK batch bounds**. **Proof:** 0/1/50/51 route tests
   with wallet and RPC call counters.
-- [ ] **Close transaction bodies** — enforce `additionalProperties: false` for
+- [x] **Close transaction bodies** — enforce `additionalProperties: false` for
   `AddressInput`, `SendFunds`, `WalletTransfer`, and `TransferRequest`; reject
   every unknown lag/reference/commitment/retry/Memo/priority member before SDK
   delegation. **Depends on:** **Reject transaction queries**. **Proof:** unknown
   destination, single-root, batch-item, and batch-root matrix.
-- [ ] **Project public ambiguity** — add optional
+- [x] **Project public ambiguity** — add optional
   `ambiguous_transaction_id`; any ambiguity maps to `503`, while definite,
   collection, item, and grouped cases omit unrelated fields. **Depends on:**
   **Make batch failures truthful**. **Proof:** exact JSON body tests.
-- [ ] **Publish transaction schemas** — publish `minItems: 1`, `maxItems: 50`,
+- [x] **Publish transaction schemas** — publish `minItems: 1`, `maxItems: 50`,
   no `uniqueItems`, closed objects, and conditional accepted IDs/index/
   ambiguity descriptions. Mention native SOL without exposing a Solana-only
   route. **Depends on:** **Apply the wire maximum first**, **Close transaction
   bodies**, **Project public ambiguity**. **Proof:** OpenAPI snapshot/assertion
   tests.
-- [ ] **Pass shared-contract gate** — run focused JSON-RPC, base, wallets,
+- [x] **Pass shared-contract gate** — run focused JSON-RPC, base, wallets,
   Bitcoin, Ethereum, API route/OpenAPI, design-lint, formatting, and locked
   workspace checks. **Stop if:** existing wire bytes, transaction IDs, batch
   order, or public error precedence changes outside the accepted contract.
@@ -1153,6 +1155,54 @@ or broadcast call. The complete API suite passes 3/3 library, 5/5 binary, and
 strict all-target/all-feature Clippy, no-deps documentation, formatting,
 design-lint, and diff checks pass. The next approval boundary is **Close
 transaction bodies**.
+**Close transaction bodies** then locked the existing exact-object contract in
+tests. `AddressInput`, `SendFunds`, `WalletTransfer`, and `TransferRequest`
+already denied unknown fields; OpenAPI regression assertions now prove each
+publishes `additionalProperties: false`. The route matrix proves unknown lag,
+reference, commitment, retry, Memo, and priority controls at the shared
+destination, single root, batch item, and batch root all return the generic
+schema `400` before SDK delegation, with no transaction metadata or effect. The
+complete API suite passes 3/3 library, 5/5 binary, and 18/18 integration tests.
+The workspace all-target check and complete tests, strict
+all-target/all-feature Clippy, no-deps documentation, formatting, design-lint,
+and diff checks pass. The next approval boundary is **Project public
+ambiguity**.
+**Project public ambiguity** then added optional
+`ambiguous_transaction_id` to the public error body and preserved the existing
+typed value through both single-wallet and batch conversion. Its presence is
+the final `503` status authority. Exact JSON projection tests cover single,
+indexed batch, grouped batch, definite collection/operation/item/grouped
+failures, and omission of every unrelated field; the composed Ethereum test
+proves a real acknowledged prefix, original failed index, and locally derived
+ambiguous ID reach the HTTP response unchanged. The complete API suite passes
+4/4 library, 5/5 binary, and 18/18 integration tests. The workspace all-target
+check and serialized complete tests, strict all-target/all-feature Clippy,
+no-deps documentation, formatting, design-lint, and diff checks pass. The next
+approval boundary is **Publish transaction schemas**.
+**Publish transaction schemas** then made the accepted transaction contract
+machine-readable. The assembled OpenAPI proves the four request objects expose
+only their exact required properties and references, the ordered transfer
+array publishes `minItems: 1` and `maxItems: 50` while omitting `uniqueItems`
+and a default, and the optional accepted-prefix, original-index, and
+exact-envelope ambiguity fields describe when they may truthfully appear. Both
+submission operations reserve native SOL on the existing shared routes, and a
+regression assertion proves no Solana-only path exists. The complete API suite
+passes 5/5 library, 5/5 binary, and 18/18 integration tests. The workspace
+all-target check and serialized complete tests, strict all-target/all-feature
+Clippy, no-deps documentation, formatting, design-lint, and diff checks pass.
+The next approval boundary is **Pass shared-contract gate**.
+**Pass shared-contract gate** then reran the shared transaction boundary without
+changing production behavior. Focused suites pass for JSON-RPC (8), base (23),
+wallets (20 plus its compile-fail doctest), Bitcoin (58), Ethereum (81 plus its
+external-adapter integration test), and the API (5 library, 5 binary, and 18
+integration tests). Exact local envelope IDs and bytes, authored occurrence
+order and multiplicity, accepted-prefix/index truthfulness, validation
+precedence, and the assembled OpenAPI contract all remain covered. The locked
+workspace all-target check and serialized complete tests, strict
+all-target/all-feature Clippy, no-deps documentation, formatting, design-lint,
+and diff checks pass. Cargo still reports the pre-existing duplicate `bench`
+example output-name warning for the redb and PostgreSQL indexing crates. The
+next approval boundary is **Own PostgreSQL 18 tests**.
 
 ## Accepted limitations and operational failure policy
 

@@ -219,8 +219,22 @@ async fn ethereum_batch_reports_the_accepted_prefix_for_an_ambiguous_failure()
     let accepted = node.submitted_ids();
     assert_eq!(accepted.len(), 1);
     assert_eq!(node.submitted_nonces(), vec![0]);
-    assert_eq!(body["transaction_ids"], json!(accepted));
-    assert_eq!(body["failed_index"], 1);
+    let ambiguous = body["ambiguous_transaction_id"]
+        .as_str()
+        .expect("ambiguous response must preserve the local transaction ID");
+    let message = body["message"]
+        .as_str()
+        .expect("ambiguous response must have a message");
+    assert!(message.contains("outcome is ambiguous"));
+    assert_eq!(
+        body,
+        json!({
+            "message": message,
+            "transaction_ids": accepted,
+            "failed_index": 1,
+            "ambiguous_transaction_id": ambiguous
+        })
+    );
 
     api.stop().await;
     node.stop().await;

@@ -347,6 +347,7 @@ pub struct Submission {
 #[utoipa::path(
     post,
     path = "/v1/wallets/{id}/transactions",
+    description = "Submits one transfer through the wallet's configured asset family. The native SOL integration is reserved for this shared route; no Solana-only transaction route is defined. A 202 response means submitted, not confirmed.",
     params(WalletPath),
     request_body = SendFunds,
     responses(
@@ -354,7 +355,7 @@ pub struct Submission {
         (status = 400, body = ErrorBody),
         (status = 404, body = ErrorBody),
         (status = 422, body = ErrorBody),
-        (status = 503, description = "Transaction unavailable or submission outcome ambiguous", body = ErrorBody)
+        (status = 503, description = "Transaction unavailable or exact-envelope submission outcome ambiguous; ambiguous_transaction_id is present only for an unknown outcome", body = ErrorBody)
     ),
     tag = "transactions"
 )]
@@ -387,6 +388,7 @@ pub struct WalletTransfer {
 #[serde(deny_unknown_fields)]
 pub struct TransferRequest {
     /// Transfers for one configured asset family, in execution order.
+    #[schema(min_items = 1, max_items = 50)]
     pub transfers: Vec<WalletTransfer>,
 }
 
@@ -427,14 +429,14 @@ pub struct TransferResponse {
 #[utoipa::path(
     post,
     path = "/v1/transactions",
-    description = "Submits one exact-asset batch. Requests mixing BTC, ETH, or USDC wallet families are rejected before any transaction is submitted. Bitcoin may group transfers into one transaction. Ethereum reserves nonces per sender and prepares the whole batch before submitting exact envelopes in request order. A failure response preserves accepted transaction IDs and the failed request index.",
+    description = "Submits one ordered exact-asset batch through the configured wallet family. The native SOL integration is reserved for this shared route; no Solana-only transaction route is defined. Requests mixing wallet families are rejected before any transaction is submitted. Bitcoin may group occurrences into one transaction. Ethereum reserves consecutive nonces per sender and prepares the whole batch before submitting exact envelopes in request order. Definitely acknowledged transaction IDs are returned only when a non-empty prefix was accepted, and a failed index is returned only when one original occurrence truthfully failed.",
     request_body = TransferRequest,
     responses(
         (status = 202, description = "Asset batch submitted", body = TransferResponse),
         (status = 400, body = ErrorBody),
         (status = 404, body = ErrorBody),
-        (status = 422, description = "Batch failed; accepted transaction IDs identify partial submission", body = ErrorBody),
-        (status = 503, description = "Batch unavailable or submission outcome ambiguous; accepted transaction IDs identify any partial submission", body = ErrorBody)
+        (status = 422, description = "Definite batch failure; transaction_ids is present only for a definitely acknowledged prefix and failed_index only for a truthful item-scoped failure", body = ErrorBody),
+        (status = 503, description = "Batch unavailable or exact-envelope submission outcome ambiguous; transaction_ids is present only for a definitely acknowledged prefix, failed_index only for a truthful item-scoped failure, and ambiguous_transaction_id only for an unknown outcome", body = ErrorBody)
     ),
     tag = "transactions"
 )]

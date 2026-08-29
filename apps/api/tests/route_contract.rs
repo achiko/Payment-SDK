@@ -745,6 +745,103 @@ async fn batch_wire_maximum_precedes_conversion_and_leaves_minimum_to_the_sdk() 
     );
 }
 
+#[tokio::test]
+async fn transaction_bodies_reject_unknown_controls_before_sdk_delegation() {
+    let fixture = fixture(true);
+    let wallet_id = generated_wallet_id(&fixture).await;
+    let single_path = format!("/v1/wallets/{wallet_id}/transactions");
+    let cases = [
+        (
+            "single destination lag control",
+            single_path.as_str(),
+            json!({
+                "destination": {
+                    "encoding": "hex",
+                    "text": "fixture-destination",
+                    "max_lag": 4
+                },
+                "amount": "1"
+            }),
+        ),
+        (
+            "batch destination reference control",
+            "/v1/transactions",
+            json!({"transfers": [{
+                "wallet_id": wallet_id,
+                "destination": {
+                    "encoding": "hex",
+                    "text": "fixture-destination",
+                    "reference_slot": 9
+                },
+                "amount": "1"
+            }]}),
+        ),
+        (
+            "single commitment control",
+            single_path.as_str(),
+            json!({
+                "destination": {
+                    "encoding": "hex",
+                    "text": "fixture-destination"
+                },
+                "amount": "1",
+                "commitment": "finalized"
+            }),
+        ),
+        (
+            "single retry control",
+            single_path.as_str(),
+            json!({
+                "destination": {
+                    "encoding": "hex",
+                    "text": "fixture-destination"
+                },
+                "amount": "1",
+                "retry": true
+            }),
+        ),
+        (
+            "batch item Memo override",
+            "/v1/transactions",
+            json!({"transfers": [{
+                "wallet_id": wallet_id,
+                "destination": {
+                    "encoding": "hex",
+                    "text": "fixture-destination"
+                },
+                "amount": "1",
+                "memo": "caller-selected"
+            }]}),
+        ),
+        (
+            "batch priority control",
+            "/v1/transactions",
+            json!({
+                "transfers": [{
+                    "wallet_id": wallet_id,
+                    "destination": {
+                        "encoding": "hex",
+                        "text": "fixture-destination"
+                    },
+                    "amount": "1"
+                }],
+                "priority_fee": "1"
+            }),
+        ),
+    ];
+
+    for (case, path, body) in cases {
+        let response = request(&fixture.app, "POST", path, Some(body), true).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST, "{case}");
+        assert_eq!(
+            json_body(&response),
+            json!({"message": "request body must match the documented JSON schema"}),
+            "{case}"
+        );
+        assert_no_transaction_calls(&fixture.calls);
+    }
+}
+
 async fn generated_wallet_id(fixture: &Fixture) -> String {
     let response = request(
         &fixture.app,
