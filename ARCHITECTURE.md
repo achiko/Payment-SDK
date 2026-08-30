@@ -8,17 +8,11 @@ combines their indexing capabilities, registers wallet families, imports
 configured wallets, starts synchronization, builds the router, and supervises
 shutdown.
 
-This document describes the target architecture. The current `apps/api`
-composition still opens separate per-chain redb repositories and does not yet
-compose Solana. Replacing that composition with the shared PostgreSQL topology
-below is implementation work, not a state already provided by the repository.
-
-This target records accepted architectural boundaries only. Native SOL
-construction, signing, simulation, broadcast, exact-byte replay, and ambiguity
-policy are Accepted in ADR-0025 but unimplemented. Exact Solana dependencies,
-configuration, supervision, shutdown, and validator-fixture choices are
-Accepted in ADR-0027 but unimplemented. Illustrative Solana components below do
-not claim that either decision is implemented.
+This object graph is implemented in `apps/api`: all configured identities are
+verified before one schema-pinned PostgreSQL pool opens, and native SOL joins
+Bitcoin and Ethereum through the same wallet and indexing contracts. Redb
+remains an SDK repository implementation and deterministic test backend; it is
+not the production application composition.
 
 Construction is intentionally visible. There is no process facade, app-local
 service facade, separate wallet process, separate indexer process, or internal
@@ -149,7 +143,7 @@ Bitcoin, Ethereum, and Solana share an enforced directory skeleton but may have
 different protocol-specific files. Equivalent boundaries use equivalent
 directories; native semantics are not flattened to make file names identical.
 
-The accepted `chain-solana` package privately owns Solana addresses, Ed25519
+The `chain-solana` package privately owns Solana addresses, Ed25519
 seed/keypair handling, lamports, RPC DTOs, legacy messages/transactions,
 account policy, source/interpreter translation, provider/sender behavior, the
 source-keyed coordinator, and its one-method submission-task registrar. Its
@@ -207,7 +201,7 @@ PostgreSQL history or output page uses one read-only repeatable-read transaction
 for its checkpoint and projection queries so it cannot mix canonical views;
 history movements use that same snapshot.
 
-The target `apps/api` uses exactly one PostgreSQL database, one shared schema,
+`apps/api` uses exactly one PostgreSQL database, one shared schema,
 and one process-wide connection pool. It constructs one
 `indexing_postgres::Repository` per exact `(chain, network)` scope by cloning
 that pool. The repository handle enforces scope isolation; the schema is not
@@ -231,7 +225,7 @@ still must not query, mutate, or issue DDL for that table; only the existing
 registry capability may read or write it.
 
 `sdk/indexing/redb` remains an embedded persistence implementation and test
-backend, but it is not the target production composition. Backend records never
+backend, but it is not the application composition. Backend records never
 appear in a chain interpreter or generic consumer.
 
 The synchronizer's durable set is deliberately limited to checkpoint,
@@ -364,9 +358,10 @@ checks cumulative lamports, signs, and simulates the complete batch before
 ordered one-shot, endpoint-stable broadcast. An unknown result may replay only
 the same bytes within the recent-blockhash lifetime and guards the source until
 status or complete finalized indexed history resolves observation or absence.
-The accepted target requires startup and the owned validator fixture to prove
-that exact Memo program executable. Accepted ADR-0027 fixes the concrete probe
-and supervised task wiring, but neither exists in the current implementation.
+Startup and the owned validator fixture require that exact Memo program to be
+executable. The ADR-0027 concrete probe and supervised task wiring are
+implemented; the checksum-pinned real-validator execution remains outstanding
+system evidence.
 
 Ethereum and Solana coordinator state is intentionally in-process because
 indexing owns no pending-transaction records and the product has no durable
@@ -427,8 +422,10 @@ accepts the documented duplicate-payment risk.
 The integration environment pins `solana-test-validator v3.1.14` at commit
 `3134055b562e95902233be308453fffa1c4a8902`, verifies committed SHA-256 values,
 and owns ledger, ports, keys, and cleanup. Default tests use RPC doubles. The
-explicit `solana_stack` application target remains unimplemented and is not CI
-automation until a checked-in workflow owns and runs the pinned fixture.
+explicit `solana_stack` application target, checksum gate, resource harness,
+and end-to-end scenario are implemented. It remains manual rather than CI
+automation until a checked-in workflow owns the pinned fixture; no run is
+claimed unless the exact artifact is locally available and verified.
 
 Shared-schema evolution is preservation-first. Indexing migrations are
 additive or backfilled under explicit validation before final constraints are
@@ -439,7 +436,7 @@ scope.
 
 ## Product boundary
 
-The target architecture supports wallet generation/import, canonical
+The architecture supports wallet generation/import, canonical
 address and exact selected-asset balance, complete checkpoint-bound paginated
 history for that selected asset, one or ordered batch submission, and
 continuous filtered indexing. Indexing may retain unrelated canonical facts for

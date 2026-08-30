@@ -219,27 +219,26 @@ leave a runtime-broken repository.
 
 ## Phase: Composition & Release Evidence
 
-This phase is deliberately last. **Solana Runtime Composition** is Accepted but
-unimplemented. Its crate, dependencies, top-level PostgreSQL configuration,
-startup sequencing, and application composition remain subject to their
-explicit implementation-step approvals and prerequisites.
+This phase is implemented. **Solana Runtime Composition** extends the same
+top-level PostgreSQL configuration, startup sequencing, and application
+composition without changing reusable SDK registry ownership.
 
 - [x] **Accept runtime composition** — ADR-0027 now fixes the runtime contract;
   this completed design prerequisite is not source-change authorization.
-- [ ] **Open one application pool** — replace per-chain redb paths with one
+- [x] **Open one application pool** — replace per-chain redb paths with one
   validated PostgreSQL pool only in its approved source step.
-- [ ] **Construct scope handles** — create the existing Bitcoin and Ethereum
+- [x] **Construct scope handles** — create the existing Bitcoin and Ethereum
   repositories per `(chain, network)` by cloning the pool; reuse the Ethereum
   scope for native ETH and configured ERC-20 assets. The Solana implementation
   plan later extends this proven pattern with its own scope handle.
-- [ ] **Prove central coexistence** — run Bitcoin and Ethereum scopes plus
+- [x] **Prove central coexistence** — run Bitcoin and Ethereum scopes plus
   native/token asset views through one schema and pool with no cross-scope
   writes and no `payment_wallets` mutation.
-- [ ] **Add the Solana source** — link the completed native source steps from
+- [x] **Add the Solana source** — link the completed native source steps from
   `docs/SOLANA_IMPLEMENTATION_PLAN.md`; that plan owns the implementation and
   deterministic RPC doubles, so this central plan does not create a second
   source or contact a public cluster.
-- [ ] **Prove Solana edge cases** — link the completed source/interpreter
+- [x] **Prove Solana edge cases** — link the completed source/interpreter
   evidence from `docs/SOLANA_IMPLEMENTATION_PLAN.md` for skipped slots, pruning
   sandwiches, sparse parents, unavailable blocks, unsupported transaction
   versions, deadlines, call budgets, cancellation, restart, and retained
@@ -257,13 +256,12 @@ explicit implementation-step approvals and prerequisites.
 - No retained-database migration execution is approved by this plan.
 - No production database, public RPC endpoint, funded key, or secret inspection
   is approved by this plan.
-- `apps/api` PostgreSQL composition and Solana crate wiring require their
-  explicit implementation-step approvals and all accepted prerequisites.
+- `apps/api` PostgreSQL composition and Solana crate wiring are implemented;
+  retained-database migration and deployment still require separate authority.
 - Indexing registry deletion and moving restoration exclusively into `apps/api`
   are outside the accepted design; the reusable SDK path remains supported.
-- Public Transaction Semantics, Destination Account Acquisition, and Native SOL
-  Submission are Accepted but unimplemented. Solana Runtime Composition is also
-  Accepted but unimplemented.
+- Public Transaction Semantics, Destination Account Acquisition, Native SOL
+  Submission, and Solana Runtime Composition are implemented.
 - Native SOL submission implementation is outside this indexing plan and
   belongs in a separately approved Solana-wide implementation plan, with
   explicit source-step approval.

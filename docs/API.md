@@ -1,26 +1,16 @@
 # API
 
-`payment-api` is the only process. It starts configured Bitcoin/Ethereum
-indexing workers, opens their redb files, composes concrete wallet
-providers, and serves one authenticated wallet API.
+`payment-api` is the only process. It starts configured Bitcoin, Ethereum, and
+Solana indexing workers, composes their concrete wallet providers, and serves
+one authenticated wallet API. Every configured scope uses one central
+PostgreSQL database, schema, and process-wide pool.
 
-The Public Transaction Semantics, Destination Account Acquisition, and Native
-SOL Submission sections below describe accepted target contracts that are not
-yet fully implemented. The current Rust source enforces the shared SDK 50-item
-maximum, rejects transaction queries, and originates Bitcoin/Ethereum
-ambiguity from exact local envelopes. It projects those typed IDs into `503`
-responses, rejects oversized HTTP batches before converting an item, and
-publishes the exact shared transaction schemas and conditional failure
-metadata. Native SOL is reserved on those shared routes without a Solana-only
-path, but native SOL acquisition and submission are not implemented.
-`docs/FEATURE_VALIDATION.md` records that gap; unmarked existing-runtime
-descriptions remain current.
-
-Native SOL Submission is Accepted and selects blockhash, fee, signing,
-simulation, broadcast, exact-byte replay, and ambiguity behavior below. Solana
-Runtime Composition is also Accepted and fixes the target dependencies,
-configuration, task supervision, readiness, and shutdown, but those application
-changes are not implemented.
+The Public Transaction Semantics, Destination Account Acquisition, Native SOL
+Submission, and Solana Runtime Composition contracts below are implemented.
+The shared routes enforce the 50-item maximum, reject transaction queries,
+preserve exact locally derived ambiguity IDs, and publish native SOL without a
+Solana-only route or SPL asset. `docs/FEATURE_VALIDATION.md` records the exact
+tested boundary, including the still-unavailable real-validator run.
 
 ## Run
 
@@ -32,86 +22,11 @@ cargo run --locked -p payment-api -- ./config.json
 The configuration file names the environment variable containing the inbound
 bearer token. The token itself must not be stored in JSON.
 
-The following is the current implemented Bitcoin/Ethereum redb configuration,
-not the accepted PostgreSQL/Solana target. Its minimal two-chain shape is:
-
-```json
-{
-  "bind": "127.0.0.1:8080",
-  "bearer_token_env": "PAYMENT_API_TOKEN",
-  "tls_terminated_upstream": false,
-  "indexes": {
-    "bitcoin": {
-      "database": "/var/lib/payment-sdk/bitcoin.redb",
-      "network": "Regtest",
-      "genesis_hash": "<canonical-bitcoin-genesis-hash>",
-      "rpc": {
-        "endpoints": ["http://127.0.0.1:18443"],
-        "headers": [],
-        "timeout_seconds": 15,
-        "max_response_bytes": 67108864
-      },
-      "confirmation_depth": 1,
-      "reorg_retention": 100,
-      "poll_millis": 1000,
-      "batch_size": 256
-    },
-    "ethereum": {
-      "database": "/var/lib/payment-sdk/ethereum.redb",
-      "network": "local",
-      "chain_id": 31337,
-      "genesis_hash": "0x<64-hex-digits>",
-      "rpc": {
-        "endpoints": ["http://127.0.0.1:8545"],
-        "headers": [],
-        "timeout_seconds": 15,
-        "max_response_bytes": 67108864
-      },
-      "usdc": {
-        "contract": "0x<40-hex-digits>"
-      },
-      "confirmation_depth": 1,
-      "reorg_retention": 100,
-      "poll_millis": 1000,
-      "batch_size": 256
-    }
-  },
-  "wallets": [
-    {
-      "id": "treasury-usdc",
-      "asset": "usdc",
-      "secret_env": "TREASURY_USDC_SECRET",
-      "start_position": 1
-    }
-  ]
-}
-```
-
-At least one chain is required. Each `database` value is an absolute path to
-one redb file. Its parent directory must already exist, the path must not be an
-existing directory, and each file must have one process owner. A RocksDB
-directory is not a valid redb file and is rejected rather than converted.
-When `tls_terminated_upstream` is false, the server accepts only a loopback
-bind. Otherwise TLS must be terminated by trusted upstream infrastructure.
-
-The embedded database uses immediate durable commits and a bounded 128 MiB
-cache per file. Backups are cold copies: stop the process, wait for shutdown to
-close the database, copy the single `.redb` file, and verify that the copy opens
-before relying on it. Do not copy an open file.
-
-Replacing an earlier RocksDB deployment requires fresh redb files and a rescan
-from the configured wallet birthdays. Keep the old binary, configuration, and
-RocksDB directories untouched until checkpoints, balances, history, and live
-Bitcoin outputs have been compared. The configured RPC providers must retain
-historical blocks and receipts back to every birthday; a pruned provider can
-make that rescan incomplete.
-
-For the cutover, record each chain's ready checkpoint, catch-up throughput,
-commit latency, crash-reopen time, resident memory, cache setting, and database
-file size. Compare complete paginated history—not only the first page—and all
-live Bitcoin outputs before switching traffic. Rollback means stopping the new
-process and restarting the old binary with its unchanged configuration and
-RocksDB directories; there is no in-place conversion or dual-write mode.
+At least one chain is required. When `tls_terminated_upstream` is false, the
+server accepts only a loopback bind. Otherwise TLS must be terminated by trusted
+upstream infrastructure. The configured PostgreSQL schema must already contain
+the canonical migrations; application startup validates it read-only and never
+executes DDL.
 
 RPC endpoints are ordered. Generic transport retries retryable failures and
 may advance to the next endpoint. Headers are configuration data and must not
@@ -135,10 +50,10 @@ Native-only Ethereum configuration may still use ordered endpoint failover.
 HTTP callers never choose a token contract or decimals. Omitting `usdc` leaves
 native ETH enabled without a USDC wallet family.
 
-## Accepted PostgreSQL/Solana configuration target
+## Runtime configuration
 
-The accepted-but-unimplemented root replaces per-chain database paths with one
-PostgreSQL object and adds one optional Solana index with a singular endpoint:
+The implemented root replaces per-chain database paths with one PostgreSQL
+object and adds one optional Solana index with a singular endpoint:
 
 ```json
 {
@@ -179,13 +94,13 @@ PostgreSQL object and adds one optional Solana index with a singular endpoint:
 }
 ```
 
-The accepted objects are exact closed schemas. `postgres.schema` is a validated
+The objects are exact closed schemas. `postgres.schema` is a validated
 lowercase identifier, and each connection pins that schema plus `pg_catalog`;
 the URL's search path cannot override it. Startup validates the already-applied
 schema without DDL. Database credentials, endpoint text, header values, and seed
 contents are redacted from ordinary diagnostics.
 
-Solana has exactly one endpoint and no transparent retry or failover. The target
+Solana has exactly one endpoint and no transparent retry or failover. The API
 rejects aliases, per-chain database fields, `start_height`, commitment, priority
 fee, lag/reference/quorum, retry, and Memo-program controls rather than ignoring
 them. Every configured import reads exactly one lowercase 64-character
@@ -204,12 +119,12 @@ Authorization: Bearer <value from PAYMENT_API_TOKEN>
 public. Liveness means the process is running. Before binding the listener, the
 composition root waits until every configured synchronizer reports that it has
 caught up with its node. Readiness is runtime state; it is not persisted in
-redb. This guarantees a newly created wallet can derive an address birthday
+PostgreSQL. This guarantees a newly created wallet can derive an address birthday
 immediately. A synchronizer exit fails startup; a fatal error
 after startup terminates the current runtime rather than leave a silently stale
 API.
 
-Under the accepted-but-unimplemented Solana target, startup first verifies every
+For Solana, startup first verifies every
 chain identity and the exact executable Memo-v3 account, then validates
 PostgreSQL and imports configured wallets before synchronization and HTTP. A
 runtime-fatal Solana indexer exit publishes not-ready and closes new admission.
@@ -245,9 +160,9 @@ Response (`201 Created`):
 }
 ```
 
-The asset must have been configured at startup. The current implementation
-accepts `btc`, `eth`, and `usdc`; `usdc` is available only when its contract is
-configured. The accepted target adds `sol`, but that value is not implemented.
+The asset must have been configured at startup. The implementation accepts
+`btc`, `eth`, `usdc`, and `sol`; `usdc` is available only when its contract is
+configured.
 Network and token contract are selected by startup configuration, not accepted
 from the request. Each generation selects exactly one payment asset, and ETH
 and USDC generations create independent keys and addresses. Before returning
@@ -260,10 +175,12 @@ EOA cannot be registered once as `eth` and again as `usdc`; a USDC address may
 still receive native ETH externally for gas, but that ETH is not exposed as a
 second wallet asset.
 
-The current key and wallet catalog are intentionally in memory. Restarting the
-process loses generated private keys, wallet IDs, and their indexing filters.
-Canonical checkpoints and indexed history remain in redb. This is
-development behavior, not production custody or durable wallet management.
+Newly generated wallet keys and IDs are intentionally process-local. Configured
+imports are reconstructed at startup, while the existing reusable SDK registry
+continues to restore adopted Bitcoin and native-Ethereum wallets. Canonical
+checkpoints and indexed history remain in PostgreSQL. SOL and USDC have no
+durable generated-wallet registry in this composition. This is development
+custody, not a production custody claim.
 
 ## Read wallet metadata
 
@@ -430,7 +347,7 @@ proved failure. A single send returns `503` with only the locally derived
 acknowledged prefix, the ambiguous occurrence's original `failed_index`, and
 that ID; it does not attempt later items.
 
-The accepted native SOL batch target therefore uses this shape:
+The native SOL batch API therefore uses this shape:
 
 ```json
 {
@@ -618,15 +535,14 @@ shared by the ETH and USDC providers. A retryable ambiguous submission retains
 the exact envelope and blocks later sends from that address until exact-hash
 reconciliation or byte-identical replay succeeds.
 
-Those are current Bitcoin and Ethereum implementation claims; the equivalent
-accepted native SOL batch and ambiguity evidence is still missing and is listed
-in `docs/FEATURE_VALIDATION.md`.
+Native SOL uses the same public single/batch routes, with its chain-owned
+transaction-uniqueness and ambiguity contracts covered by focused tests.
 
 That safety state lives only in the running API process. Operators must use one
 active transaction writer per managed EOA; an unclean restart can require
 manual reconciliation because this API does not persist outgoing operations.
 
-The accepted-but-unimplemented Solana target likewise keeps its source guard
+Solana likewise keeps its source guard
 and exact envelope only in the running process. It requires one active writer
 per source and forbids automatic client retry of an unknown logical payment;
 restart or a new invocation can create a new Memo and double-pay.
@@ -683,9 +599,7 @@ become reconciliation metadata.
 
 ## Current scope
 
-The currently implemented BTC, ETH, and USDC routes cover wallet generation,
+The currently implemented BTC, ETH, USDC, and SOL routes cover wallet generation,
 metadata, balance, history, ordinary sending, and chain-native batch sending.
-Sections explicitly marked as accepted targets do not describe implemented
-routes or fields.
 There are no deposit, payment-state, accounting, collection, indexer-service,
 or wallet-service routes.

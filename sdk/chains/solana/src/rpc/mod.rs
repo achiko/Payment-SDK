@@ -4,6 +4,7 @@ mod client;
 mod config;
 mod indexing;
 mod methods;
+mod startup;
 mod submission;
 
 #[cfg(test)]

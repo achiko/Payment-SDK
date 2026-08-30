@@ -65,6 +65,31 @@ pub fn pool(url: &str, max_size: usize) -> Result<Pool, IndexError> {
     let config = url
         .parse::<tokio_postgres::Config>()
         .map_err(|error| invalid(format!("invalid PostgreSQL URL: {error}")))?;
+    build_pool(config, max_size)
+}
+
+/// Builds a pool whose sessions resolve application SQL through the configured
+/// schema followed by `pg_catalog`.
+///
+/// Explicit options replace any URL-supplied `options` value, so a connection
+/// string cannot redirect repository queries to another schema.
+pub fn pool_for_schema(url: &str, max_size: usize, schema: &str) -> Result<Pool, IndexError> {
+    if max_size == 0 {
+        return Err(invalid("PostgreSQL pool size must be greater than zero"));
+    }
+    if !valid_schema(schema) {
+        return Err(invalid(
+            "PostgreSQL schema must be a canonical application identifier",
+        ));
+    }
+    let mut config = url
+        .parse::<tokio_postgres::Config>()
+        .map_err(|error| invalid(format!("invalid PostgreSQL URL: {error}")))?;
+    config.options(format!("-csearch_path={schema},pg_catalog"));
+    build_pool(config, max_size)
+}
+
+fn build_pool(config: tokio_postgres::Config, max_size: usize) -> Result<Pool, IndexError> {
     let manager = Manager::from_config(
         config,
         NoTls,
@@ -76,6 +101,17 @@ pub fn pool(url: &str, max_size: usize) -> Result<Pool, IndexError> {
         .max_size(max_size)
         .build()
         .map_err(|error| invalid(format!("could not build a connection pool: {error}")))
+}
+
+fn valid_schema(schema: &str) -> bool {
+    let bytes = schema.as_bytes();
+    (1..=63).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .skip(1)
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+        && !schema.starts_with("pg_")
 }
 
 /// One chain's indexing store.
@@ -250,5 +286,18 @@ mod tests {
             "PostgreSQL pool size must be greater than zero"
         );
         assert!(!error.retryable);
+    }
+
+    #[test]
+    fn schema_pool_rejects_invalid_identifiers_before_url_parsing() {
+        for schema in ["", "Pg", "0payment", "payment-data", "pg_catalog"] {
+            let error = pool_for_schema("not a PostgreSQL URL", 1, schema)
+                .expect_err("invalid schema must fail first");
+            assert_eq!(error.kind, IndexErrorKind::InvalidRequest);
+            assert_eq!(
+                error.message,
+                "PostgreSQL schema must be a canonical application identifier"
+            );
+        }
     }
 }

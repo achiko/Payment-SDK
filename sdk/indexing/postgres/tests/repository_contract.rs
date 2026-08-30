@@ -171,6 +171,22 @@ async fn wrong_database_credentials_fail_instead_of_skipping() {
 }
 
 #[tokio::test]
+async fn configured_schema_overrides_url_search_path_without_ddl() {
+    let database = TestDatabase::start().await;
+    let url = format!(
+        "{}?options=-csearch_path%3Dpublic",
+        database.url_with_password("payment-sdk-test")
+    );
+    let pool =
+        indexing_postgres::pool_for_schema(&url, 2, database.schema()).expect("schema-pinned pool");
+
+    indexing_postgres::validate_schema(&pool, database.schema())
+        .await
+        .expect("configured schema must win over URL options");
+    assert!(database.registry_sentinel_unchanged().await);
+}
+
+#[tokio::test]
 async fn baseline_migrations_match_catalog_keys_and_ownership() {
     let database = TestDatabase::start().await;
     let client = database

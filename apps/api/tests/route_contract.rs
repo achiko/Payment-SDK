@@ -282,6 +282,19 @@ fn fixture_with_usdc(initially_ready: bool, usdc: bool) -> Fixture {
             None,
         )
         .expect("fixture family must register");
+    wallets
+        .register(
+            WalletAsset::Sol,
+            solana_scope(),
+            FixtureProvider {
+                calls: Arc::clone(&calls),
+            },
+            Arc::new(FixtureSender {
+                calls: Arc::clone(&calls),
+            }),
+            None,
+        )
+        .expect("native SOL fixture family must register");
     if usdc {
         wallets
             .register(
@@ -420,6 +433,20 @@ async fn wallet_routes_delegate_to_the_wallet_collection() {
     assert_eq!(usdc["asset"], "usdc");
     assert_eq!(usdc["chain"], "ethereum");
     assert_eq!(usdc["network"], "mainnet");
+
+    let sol = request(
+        &fixture.app,
+        "POST",
+        "/v1/wallets",
+        Some(json!({"asset": "sol"})),
+        true,
+    )
+    .await;
+    assert_eq!(sol.status, StatusCode::CREATED);
+    let sol = json_body(&sol);
+    assert_eq!(sol["asset"], "sol");
+    assert_eq!(sol["chain"], "solana");
+    assert_eq!(sol["network"], "localnet");
 
     let read = request(
         &fixture.app,
@@ -893,6 +920,13 @@ fn ethereum_scope() -> IndexScope {
     IndexScope {
         chain: ChainId("ethereum".to_owned()),
         network: "mainnet".to_owned(),
+    }
+}
+
+fn solana_scope() -> IndexScope {
+    IndexScope {
+        chain: ChainId("solana".to_owned()),
+        network: "localnet".to_owned(),
     }
 }
 

@@ -1,20 +1,19 @@
 # Public contracts
 
-This document describes the target reusable Rust boundaries. Current source is
+This document describes the reusable Rust boundaries. Current source is
 authoritative for exact lifetimes, generic bounds, and error types that are
-already implemented. The accepted Public Transaction Semantics, Destination
-Account Acquisition and shared-PostgreSQL target changes below are not fully
-integrated: the Solana crate now implements its native values, wallet/provider,
-one-shot RPC, submission coordinator, sparse source, and block interpreter,
-while `apps/api` still composes per-chain redb repositories and registers no
-Solana wallet family.
+already implemented. Public Transaction Semantics, Destination Account
+Acquisition, and the shared-PostgreSQL composition are integrated: the Solana
+crate implements its native values, wallet/provider, one-shot RPC, submission
+coordinator, sparse source, and block interpreter, while `apps/api` registers
+native SOL through the central pool and reusable SDK surface.
 Complete native block coordinates,
 the position-aware redb/PostgreSQL repositories, sparse synchronization,
 bounded transaction admission, exact ambiguity propagation, provider-owned
 Bitcoin/Ethereum generation, and per-scope wallet/filter admission are now
 implemented. Canonical plain Base58, witnessed account handoff, Native SOL
-Submission, and the reusable Solana wallet/indexing adapters are implemented;
-Solana Runtime Composition remains accepted but unimplemented.
+Submission, the reusable Solana wallet/indexing adapters, and Solana Runtime
+Composition are implemented.
 
 ## Wallet collection
 
@@ -61,15 +60,14 @@ let generated = wallets.generate(other_id, &WalletAsset::Usdc).await?;
 Each family registration contains exactly one `IndexScope`, concrete
 `Provider`, and chain batch `Sender`. Duplicate family keys fail during
 composition. A separate provider registry would duplicate that same family map
-and is not part of the target API.
+and is not part of the public API.
 
-`Provider::create` and `Provider::generate` are both mandatory target methods.
+`Provider::create` and `Provider::generate` are both mandatory methods.
 Each concrete provider owns its native secret generation and validation policy,
 then reuses its own `create` path. Bitcoin and Ethereum explicitly generate
 secp256k1 material; Solana generates one Ed25519 seed. Both operations return an
-abstract wallet and never return secret material. The current source still has
-a generic secp256k1 `generate` default; removing that default is accepted
-prerequisite work, not implemented evidence.
+abstract wallet and never return secret material. There is no generic
+secp256k1 generation default; each provider must own its native policy.
 
 A generated Solana wallet exists only for the current process and is not
 restart-recoverable. A configured Solana import is reconstructed from exactly
@@ -275,9 +273,9 @@ not match the local envelope has no authority. The ID is reconciliation
 metadata, not proof of submission or an idempotency key.
 
 Request shape and mixed-family compatibility validate before the first external
-effect. All three concrete chains complete their accepted chain-level batch
-preparation before broadcast. Solana account acquisition and submission are
-Accepted in ADR-0024 and ADR-0025 but unimplemented. Ethereum uses one
+effect. All three concrete chains complete their chain-level batch preparation
+before broadcast. Solana account acquisition and submission implement
+ADR-0024 and ADR-0025. Ethereum uses one
 coordinator shared by native and ERC-20 providers,
 keyed by sender address rather than wallet family. It checks cumulative native
 value, maximum fees, and token amounts before signing, and retains an exact
@@ -430,7 +428,7 @@ rollback state.
 lifecycle. A persistence implementation may use redb, PostgreSQL, or another
 transactional backend, but backend records never cross these contracts.
 
-The target application composition opens one PostgreSQL database/schema and
+The application composition opens one PostgreSQL database/schema and
 one process-wide pool. It clones that pool into one
 `indexing_postgres::Repository` handle per exact `(chain, network)` scope. A
 handle refuses another scope. An asset is a history fact, so native and token
@@ -441,8 +439,8 @@ The PostgreSQL `Repository` owns only checkpoint, canonical history/movement,
 live-output, and bounded-journal collections. The same SDK adapter preserves
 its separate `Registry` capability over `payment_wallets`; that table remains
 outside synchronization collections even when physically colocated. redb
-remains an embedded implementation and test backend; current `apps/api` still
-uses it pending the target composition change.
+remains an embedded implementation and test backend; `apps/api` uses
+PostgreSQL.
 
 Shared PostgreSQL evolution is preservation-first. Generic columns and
 constraints are added and validated without destroying existing scopes. A
@@ -503,7 +501,7 @@ persists the wallet restoration facts used to rebuild that selection.
 
 ## Composition contract
 
-The target process is assembled directly in `apps/api/src/main.rs`:
+The process is assembled directly in `apps/api/src/main.rs`:
 
 1. validate the complete closed configuration;
 2. construct one long-lived client per configured chain, using one singular
@@ -527,8 +525,8 @@ The target process is assembled directly in `apps/api/src/main.rs`:
     and graceful shutdown.
 
 No step creates a database, schema, pool, or repository for an asset. The
-current `apps/api` redb composition is an acknowledged implementation gap, not
-evidence that this PostgreSQL contract is already live.
+current `apps/api` composition implements this PostgreSQL contract and performs
+no startup DDL.
 
 There is no process facade or app-local service facade. HTTP state contains the
 abstract wallet collection and readiness state only. Concrete handles and
@@ -552,7 +550,7 @@ checkpoint-bound pagination. Shared-schema tests must use one pool to prove
 Bitcoin, Ethereum, and Solana scope isolation, native/token asset coexistence,
 and byte-for-byte preservation of sentinel SDK registry wallet rows.
 
-Application system tests must compose the target shared PostgreSQL topology,
+Application system tests must compose the shared PostgreSQL topology,
 prove restart/readiness from native position while confirmations remain
 produced-height based, and verify that a scope-local rescan leaves unrelated
 scopes and `payment_wallets` unchanged. Solana system evidence must additionally
@@ -586,7 +584,7 @@ truthful original item index.
 
 Each endpoint-specific input and output struct is declared immediately above
 its handler. A handler performs extraction, one `Wallets` call, mapping, and
-encoding. Catch-all DTO modules are not part of the target structure. A wire
+encoding. Catch-all DTO modules are not part of the structure. A wire
 type is shared only when several endpoints use the exact same contract;
 reusable domain values remain in their SDK owner.
 

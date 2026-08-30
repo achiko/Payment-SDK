@@ -7,7 +7,7 @@ mod ethereum_node;
 #[path = "route_contract.rs"]
 mod route_contract;
 
-use std::{net::SocketAddr, process::Stdio, time::Duration};
+use std::{net::SocketAddr, process::Stdio, sync::Arc, time::Duration};
 
 use bitcoin::{CompressedPublicKey, Network, PrivateKey, PublicKey};
 use bitcoin_node::{BitcoinNode, FundingOutput};
@@ -16,6 +16,12 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::process::{Child, Command};
 
+#[allow(dead_code)] // Shared owned PostgreSQL fixture has a wider repository-test API.
+#[path = "../../../sdk/indexing/postgres/tests/support/mod.rs"]
+mod postgres;
+
+use postgres::TestDatabase;
+
 const TOKEN: &str = "wallet-api-system-test";
 const USDC_CONTRACT: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
 
@@ -23,6 +29,7 @@ struct RunningApi {
     root: String,
     child: Child,
     _config: TempDir,
+    _database: Arc<TestDatabase>,
 }
 
 impl RunningApi {
@@ -50,18 +57,16 @@ impl RunningApi {
 impl Drop for RunningApi {
     fn drop(&mut self) {
         // A failed assertion must not leave the composed API running in the
-        // background and holding its temporary redb files open.
+        // background and holding its owned database connections open.
         let _ = self.child.start_kill();
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bitcoin_wallet_is_generated_and_indexed() -> Result<(), Box<dyn std::error::Error>> {
-    let files = TempDir::new()?;
     let node = BitcoinNode::start().await;
     let api = start_api(json!({
         "bitcoin": {
-            "database": files.path().join("bitcoin.redb"),
             "network": "regtest",
             "genesis_hash": node.fixture.genesis_hash,
             "rpc": rpc_config(&node.rpc_url, true),
@@ -135,11 +140,9 @@ async fn bitcoin_wallet_is_generated_and_indexed() -> Result<(), Box<dyn std::er
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ethereum_wallet_is_generated_and_indexed() -> Result<(), Box<dyn std::error::Error>> {
-    let files = TempDir::new()?;
     let node = EthereumNode::start().await;
     let api = start_api(json!({
         "ethereum": {
-            "database": files.path().join("ethereum.redb"),
             "network": "mainnet",
             "chain_id": 1,
             "genesis_hash": ethereum_node::GENESIS_HASH,
@@ -233,11 +236,9 @@ async fn ethereum_wallet_is_generated_and_indexed() -> Result<(), Box<dyn std::e
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn usdc_wallet_is_generated_sent_and_indexed() -> Result<(), Box<dyn std::error::Error>> {
-    let files = TempDir::new()?;
     let node = EthereumNode::start().await;
     let api = start_api(json!({
         "ethereum": {
-            "database": files.path().join("ethereum-usdc.redb"),
             "network": "mainnet",
             "chain_id": 1,
             "genesis_hash": ethereum_node::GENESIS_HASH,
@@ -344,6 +345,16 @@ async fn start_api_with(
     wallets: Value,
     secrets: &[(&str, &str)],
 ) -> Result<RunningApi, Box<dyn std::error::Error>> {
+    let database = Arc::new(TestDatabase::start().await);
+    start_api_with_database(indexes, wallets, secrets, database).await
+}
+
+async fn start_api_with_database(
+    indexes: Value,
+    wallets: Value,
+    secrets: &[(&str, &str)],
+    database: Arc<TestDatabase>,
+) -> Result<RunningApi, Box<dyn std::error::Error>> {
     let bind = unused_address();
     let config_dir = TempDir::new()?;
     let config_path = config_dir.path().join("payment-api.json");
@@ -352,6 +363,11 @@ async fn start_api_with(
         serde_json::to_vec(&json!({
             "bind": bind,
             "bearer_token_env": "SYSTEM_TEST_TOKEN",
+            "postgres": {
+                "url_env": "SYSTEM_TEST_DATABASE_URL",
+                "schema": database.schema(),
+                "max_connections": 8
+            },
             "indexes": indexes,
             "wallets": wallets
         }))?,
@@ -359,6 +375,10 @@ async fn start_api_with(
     let child = Command::new(env!("CARGO_BIN_EXE_payment-api"))
         .arg(config_path)
         .env("SYSTEM_TEST_TOKEN", TOKEN)
+        .env(
+            "SYSTEM_TEST_DATABASE_URL",
+            database.url_with_password("payment-sdk-test"),
+        )
         .envs(secrets.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -368,6 +388,7 @@ async fn start_api_with(
         root: format!("http://{bind}"),
         child,
         _config: config_dir,
+        _database: database,
     };
     wait_ready(&running.root).await;
     let unauthorized = reqwest::Client::new()

@@ -1,17 +1,17 @@
 use super::*;
 
-fn bitcoin_index(path: impl Into<std::path::PathBuf>, node: &BitcoinNode) -> Value {
+fn bitcoin_index(node: &BitcoinNode) -> Value {
     json!({
-        "database": path.into(), "network": "regtest",
+        "network": "regtest",
         "genesis_hash": node.fixture.genesis_hash,
         "rpc": rpc_config(&node.rpc_url, true), "confirmation_depth": 1,
         "reorg_retention": 10, "poll_millis": 10, "batch_size": 10
     })
 }
 
-fn ethereum_index(path: impl Into<std::path::PathBuf>, node: &EthereumNode) -> Value {
+fn ethereum_index(node: &EthereumNode) -> Value {
     json!({
-        "database": path.into(), "network": "mainnet", "chain_id": 1,
+        "network": "mainnet", "chain_id": 1,
         "genesis_hash": ethereum_node::GENESIS_HASH,
         "rpc": rpc_config(&node.rpc_url, false), "confirmation_depth": 1,
         "reorg_retention": 10, "poll_millis": 10, "batch_size": 10
@@ -20,9 +20,9 @@ fn ethereum_index(path: impl Into<std::path::PathBuf>, node: &EthereumNode) -> V
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn configured_wallet_history_survives_restart() -> Result<(), Box<dyn std::error::Error>> {
-    let files = TempDir::new()?;
     let bitcoin = BitcoinNode::start().await;
     let ethereum = EthereumNode::start().await;
+    let database = Arc::new(TestDatabase::start().await);
     let wallets = json!([
         {"id": "btc-restart", "asset": "btc", "secret_env": "BTC_TEST_SECRET", "start_position": 1},
         {"id": "eth-restart", "asset": "eth", "secret_env": "ETH_TEST_SECRET", "start_position": 1}
@@ -37,12 +37,18 @@ async fn configured_wallet_history_survives_restart() -> Result<(), Box<dyn std:
         .collect::<Vec<_>>();
     let indexes = || {
         json!({
-            "bitcoin": bitcoin_index(files.path().join("bitcoin.redb"), &bitcoin),
-            "ethereum": ethereum_index(files.path().join("ethereum.redb"), &ethereum)
+            "bitcoin": bitcoin_index(&bitcoin),
+            "ethereum": ethereum_index(&ethereum)
         })
     };
 
-    let first = start_api_with(indexes(), wallets.clone(), &environment).await?;
+    let first = start_api_with_database(
+        indexes(),
+        wallets.clone(),
+        &environment,
+        Arc::clone(&database),
+    )
+    .await?;
     let btc = wallet_summary(&first.root, "btc-restart").await?;
     let eth = wallet_summary(&first.root, "eth-restart").await?;
     let btc_id = bitcoin.fund(vec![FundingOutput::new(
@@ -65,7 +71,7 @@ async fn configured_wallet_history_survives_restart() -> Result<(), Box<dyn std:
     wait_history(&first.root, "eth-restart", &eth_id).await;
     first.stop().await;
 
-    let second = start_api_with(indexes(), wallets, &environment).await?;
+    let second = start_api_with_database(indexes(), wallets, &environment, database).await?;
     assert_eq!(wallet_summary(&second.root, "btc-restart").await?, btc);
     assert_eq!(wallet_summary(&second.root, "eth-restart").await?, eth);
     wait_history(&second.root, "btc-restart", &btc_id).await;
@@ -80,12 +86,11 @@ async fn configured_wallet_history_survives_restart() -> Result<(), Box<dyn std:
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bitcoin_and_ethereum_history_follow_canonical_reorgs()
 -> Result<(), Box<dyn std::error::Error>> {
-    let files = TempDir::new()?;
     let bitcoin = BitcoinNode::start().await;
     let ethereum = EthereumNode::start().await;
     let api = start_api(json!({
-        "bitcoin": bitcoin_index(files.path().join("bitcoin.redb"), &bitcoin),
-        "ethereum": ethereum_index(files.path().join("ethereum.redb"), &ethereum)
+        "bitcoin": bitcoin_index(&bitcoin),
+        "ethereum": ethereum_index(&ethereum)
     }))
     .await?;
     let btc = create_wallet(&api.root, "btc").await?;
@@ -144,12 +149,11 @@ async fn wait_removed(root: &str, wallet: &str, transaction: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mixed_chain_batch_is_rejected_before_broadcast() -> Result<(), Box<dyn std::error::Error>>
 {
-    let files = TempDir::new()?;
     let bitcoin = BitcoinNode::start().await;
     let ethereum = EthereumNode::start().await;
     let api = start_api(json!({
-        "bitcoin": bitcoin_index(files.path().join("bitcoin.redb"), &bitcoin),
-        "ethereum": ethereum_index(files.path().join("ethereum.redb"), &ethereum)
+        "bitcoin": bitcoin_index(&bitcoin),
+        "ethereum": ethereum_index(&ethereum)
     }))
     .await?;
     let btc_wallet = create_wallet(&api.root, "btc").await?;
@@ -189,10 +193,9 @@ async fn mixed_chain_batch_is_rejected_before_broadcast() -> Result<(), Box<dyn 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ethereum_batch_reports_the_accepted_prefix_for_an_ambiguous_failure()
 -> Result<(), Box<dyn std::error::Error>> {
-    let files = TempDir::new()?;
     let node = EthereumNode::start().await;
     let api = start_api(json!({
-        "ethereum": ethereum_index(files.path().join("ethereum.redb"), &node)
+        "ethereum": ethereum_index(&node)
     }))
     .await?;
     let wallet = create_wallet(&api.root, "eth").await?;
@@ -244,10 +247,9 @@ async fn ethereum_batch_reports_the_accepted_prefix_for_an_ambiguous_failure()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ethereum_batch_reserves_nonces_per_source_in_request_order()
 -> Result<(), Box<dyn std::error::Error>> {
-    let files = TempDir::new()?;
     let node = EthereumNode::start().await;
     let api = start_api(json!({
-        "ethereum": ethereum_index(files.path().join("ethereum.redb"), &node)
+        "ethereum": ethereum_index(&node)
     }))
     .await?;
     let first = create_wallet(&api.root, "eth").await?;
@@ -302,10 +304,9 @@ async fn ethereum_batch_reserves_nonces_per_source_in_request_order()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ethereum_batch_rejects_cumulative_overspend_before_broadcast()
 -> Result<(), Box<dyn std::error::Error>> {
-    let files = TempDir::new()?;
     let node = EthereumNode::start().await;
     let api = start_api(json!({
-        "ethereum": ethereum_index(files.path().join("ethereum.redb"), &node)
+        "ethereum": ethereum_index(&node)
     }))
     .await?;
     let wallet = create_wallet(&api.root, "eth").await?;
@@ -342,10 +343,9 @@ async fn ethereum_batch_rejects_cumulative_overspend_before_broadcast()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bitcoin_batch_uses_each_source_wallet() -> Result<(), Box<dyn std::error::Error>> {
-    let files = TempDir::new()?;
     let node = BitcoinNode::start().await;
     let api = start_api(json!({
-        "bitcoin": bitcoin_index(files.path().join("bitcoin.redb"), &node)
+        "bitcoin": bitcoin_index(&node)
     }))
     .await?;
     let first = create_wallet(&api.root, "btc").await?;

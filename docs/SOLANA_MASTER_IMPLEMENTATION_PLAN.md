@@ -78,9 +78,10 @@ cross-chain requirement is out of scope and blocks the next step.
 - Generated Solana wallets and source guards are process-local. Configured
   32-byte Ed25519 seed imports are restart-reconstructible. One API process is
   the only writer for a managed Solana source.
-- Tests use owned RPC doubles, temporary redb files, a disposable PostgreSQL 18
-  database/schema, and an owned checksummed validator. They never contact a
-  public network or use an externally funded key.
+- Tests use owned RPC doubles, redb repository fixtures, a disposable
+  PostgreSQL 18 database/schema, and a checksum-gated validator harness. They
+  never contact a public network or use an externally funded key. The real
+  validator run is evidence only after the exact archive is acquired.
 
 ### Exact Solana direct dependencies
 
@@ -908,49 +909,49 @@ suppression or policy weakening.
 
 ## Phase: Runtime Composition and System Evidence
 
-- [ ] **Specify closed runtime config** — test the exact PostgreSQL/Solana
+- [x] **Specify closed runtime config** — test the exact PostgreSQL/Solana
   objects, singular endpoint, schema identifier
   `[a-z][a-z0-9_]{0,62}` excluding `pg_`, required imports, unknown members,
   rejected aliases/per-chain databases/`start_height`, and forbidden controls.
   **Proof:** config-deserialization matrix with zero startup side effects.
-- [ ] **Implement closed runtime config** — add non-flattened
+- [x] **Implement closed runtime config** — add non-flattened
   `deny_unknown_fields` objects, load database URL and Solana seeds only through
   named environment variables, and keep credentials/seeds out of debug/errors.
   **Depends on:** **Specify closed runtime config**, **Redact RPC configuration**.
   **Proof:** config/redaction/environment tests.
-- [ ] **Expose Solana publicly** — add `Chain::Solana`, `WalletAsset::Sol`, and
+- [x] **Expose Solana publicly** — add `Chain::Solana`, `WalletAsset::Sol`, and
   public Base58 mapping in one compiling exhaustive-match slice; expose only
   native SOL through existing wallet/transaction routes and OpenAPI. **Depends
   on:** **Build the Solana provider and wallet**, **Publish transaction schemas**.
   **Proof:** route, enum, serialization, and OpenAPI tests.
 
-- [ ] **Verify genesis before storage** — construct all configured chain
+- [x] **Verify genesis before storage** — construct all configured chain
   clients and finish every existing Bitcoin/Ethereum identity check plus the
   one-shot canonical Solana `getGenesisHash` comparison before pool creation or
   schema access. **Depends on:** **Implement closed runtime config**, **Read
   Solana identity**. **Proof:** each wrong-identity test observes zero database
   calls.
-- [ ] **Verify Memo before storage** — obtain finalized `S`, read exactly
+- [x] **Verify Memo before storage** — obtain finalized `S`, read exactly
   Memo-v3 with Base64/finalized/`minContextSlot = S`, require context at least
   `S` and a non-null executable account, still before pool creation. **Depends
   on:** **Verify genesis before storage**, **Read one account**. **Proof:**
   absent/non-executable/malformed/low-floor tests with zero database calls.
-- [ ] **Open the central pool** — only after every configured chain identity
+- [x] **Open the central pool** — only after every configured chain identity
   and Memo check succeeds, construct one process-wide pool, pin each connection
   search path to the validated schema plus `pg_catalog`, and run read-only
   compatibility validation. **Depends on:** **Verify Memo before storage**,
   **Validate startup schema**. **Proof:** URL search-path override cannot redirect
   SQL; startup issues no DDL.
-- [ ] **Construct all scope handles** — clone the shared pool into one exact
+- [x] **Construct all scope handles** — clone the shared pool into one exact
   repository per configured chain/network; reuse Ethereum scope for native and
   ERC-20 assets; create one Solana scope, not one per asset. Load checkpoints
   before services. **Depends on:** **Open the central pool**, **Prove central
   chain coexistence**. **Proof:** composition identity and scope-isolation tests.
-- [ ] **Initialize scope coordination** — create one filter/commit coordinator
+- [x] **Initialize scope coordination** — create one filter/commit coordinator
   and checkpoint notification from each persisted checkpoint. **Depends on:**
   **Construct all scope handles**, **Coordinate filters and commits**. **Proof:**
   restart/recovery initialization tests.
-- [ ] **Compose the Solana service** — construct the singular client, source,
+- [x] **Compose the Solana service** — construct the singular client, source,
   interpreter, indexing service, provider, coordinator, and sender once; inject
   the same service's checkpoint/history/notification views into submission and
   add the indexer to the generic Composer. Keep the concrete object graph
@@ -958,7 +959,7 @@ suppression or policy weakening.
   `Application` facade. **Depends on:** **Initialize scope coordination**,
   **Pass native-chain gate**. **Proof:** object-identity and no-per-handler-
   construction tests plus dependency/source audit.
-- [ ] **Restore and import through SDK before sync** — invoke the existing
+- [x] **Restore and import through SDK before sync** — invoke the existing
   reusable SDK registry/restoration path for Bitcoin/Ethereum rows and import
   configured chain wallets at explicit `start_position` before the first
   filter revision/sync snapshot. `apps/api` composes this flow but owns no
@@ -968,41 +969,42 @@ suppression or policy weakening.
   ordering, complete initial filter tests, and a non-API integration fixture
   using the same SDK surface.
 
-- [ ] **Own submission supervision** — add one application-owned bounded
+- [x] **Own submission supervision** — add one application-owned bounded
   `mpsc` admission queue and `JoinSet`; acknowledge registration only after
   insertion and retain the sole close/wait controls. **Depends on:** **Define
   submission registration**, **Compose the Solana service**. **Proof:** close-
   winning, insert-winning, and lost-acknowledgement races.
-- [ ] **Track index and readiness tasks** — supervise synchronization and the
+- [x] **Track index and readiness tasks** — supervise synchronization and the
   readiness bridge; remove bare self-owned readiness spawning and make every
   unexpected completion/error visible to the application. **Depends on:**
   **Compose the Solana service**. **Proof:** task-exit propagation tests.
-- [ ] **Gate HTTP readiness** — bind the listener only after every configured
+- [x] **Gate HTTP readiness** — bind the listener only after every configured
   index is `Ready` with a persisted checkpoint and all configured imports are
   visible. Retryable source errors publish not-ready and recover; startup fatal
   exits join owned tasks and never open HTTP. **Depends on:** **Restore and
   import before sync**, **Track index and readiness tasks**. **Proof:**
   CatchingUp/Ready/retry/recovery/fatal/cancel runtime-loop tests.
-- [ ] **Handle runtime fatality** — on fatal indexer exit, publish not-ready and
+- [x] **Handle runtime fatality** — on fatal indexer exit, publish not-ready and
   close new HTTP admission immediately. Exit only if no guarded envelope needs
   evidence; otherwise keep the ambiguity barrier active. **Depends on:** **Gate
   HTTP readiness**, **Own submission supervision**. **Proof:** guarded and
   unguarded fatal-exit tests.
-- [ ] **Order graceful shutdown** — execute exactly: publish not-ready, stop new
+- [x] **Order graceful shutdown** — execute exactly: publish not-ready, stop new
   admission, close registrar, drain handlers, drain registered sends/guards
   while status/history/indexing remain alive, cancel sync after guards clear,
   then join submission/readiness/storage tasks. **Depends on:** **Handle runtime
   fatality**. **Proof:** deterministic event-order trace.
-- [ ] **Hold unresolved ambiguity** — impose no graceful-shutdown deadline while
+- [x] **Hold unresolved ambiguity** — impose no graceful-shutdown deadline while
   a guard is unknown. After fatal indexing only positive historical status may
   clear it; force-kill is the explicit operator choice accepting duplicate risk.
   **Depends on:** **Order graceful shutdown**. **Proof:** unavailable evidence,
   recovered evidence, positive status, and force-kill documentation tests.
 
-- [ ] **Declare the Solana system target** — explicitly add `[[test]] name =
+- [x] **Declare the Solana system target** — explicitly add `[[test]] name =
   "solana_stack"` because application autotest discovery is disabled. **Proof:**
-  `cargo test --no-run --test solana_stack` resolves the declared target.
-- [ ] **Record validator checksums** — pin Agave `solana-test-validator`
+  `cargo test -p payment-api --features solana-stack --no-run --test
+  solana_stack` resolves the declared manual target.
+- [x] **Record validator checksums** — pin Agave `solana-test-validator`
   `v3.1.14`, commit
   `3134055b562e95902233be308453fffa1c4a8902`, and platform-specific SHA-256
   values before any artifact is downloaded or executed. **Depends on:**
@@ -1031,39 +1033,42 @@ suppression or policy weakening.
   PostgreSQL state, resume from native slot, preserve wallets/scopes, exercise
   skipped slots and retained rollback, and fail visibly on deep reorg or
   unavailable required history. **Depends on:** **Execute native SOL end to
-  end**. **Proof:** deterministic system scenarios; no public cluster.
-- [ ] **Classify system-test ownership** — if no checked-in CI workflow owns
+  end**. **Proof:** deterministic system scenarios; no public cluster. The
+  manual harness now rebuilds the service/wallet graph from the same database
+  after a storage-derived retained rollback and refills canonical history; the
+  checkbox remains open until the pinned validator executes that path.
+- [x] **Classify system-test ownership** — if no checked-in CI workflow owns
   the pinned validator and PostgreSQL 18 fixture, document `solana_stack` as a
   required manual integration target rather than automated CI evidence.
   **Depends on:** **Execute native SOL end to end**. **Proof:** workflow and
   validation-document audit.
-- [ ] **Keep negative fixtures owned** — cover wrong genesis, missing Memo,
+- [x] **Keep negative fixtures owned** — cover wrong genesis, missing Memo,
   malformed/oversized account data, unavailable history, pruning, unsupported
   transaction version, fatal indexer, and ambiguous shutdown with doubles or
   owned validator fixtures; no negative case is skipped for environment.
   **Depends on:** system target and runtime steps. **Proof:** each negative
   condition reaches its exact typed/public failure with no public RPC access.
 
-- [ ] **Update implementation evidence** — move validation rows from accepted/
+- [x] **Update implementation evidence** — move validation rows from accepted/
   missing only when cited code and focused tests exist; synchronize API,
   contracts, indexing, architecture, and requirements with exact implemented
   behavior and retain process-local custody/idempotency limitations. **Depends
   on:** all implementation steps. **Proof:** path/terminology review and no
   aspirational implemented claims.
-- [ ] **Run the release gate** — execute formatting, locked workspace check and
+- [x] **Run the release gate** — execute formatting, locked workspace check and
   tests, strict all-features Clippy, no-deps docs, design-lint tests/policy, the
   non-skipping PostgreSQL 18 contract, explicit `solana_stack` where its owned
   artifact is available, and `git diff --check`. Report unavailable external
   tools separately; never weaken a gate. **Depends on:** **Update
   implementation evidence**. **Proof:** exact commands, versions, test counts,
   and failures or unavailable tooling recorded without skipped-pass claims.
-- [ ] **Review final boundaries** — prove deleting `chain-solana` leaves
+- [x] **Review final boundaries** — prove deleting `chain-solana` leaves
   Bitcoin, Ethereum, and generic crates usable; prove no secrets/endpoints are
   logged, no public-network/funded-key path exists, no hidden retry/SPL/generic
   Solana DTO/application DDL was added, and no retained migration was executed.
   **Depends on:** **Run the release gate**. **Proof:** dependency/source/diff
   audit plus the existing-chain regression commands from the release evidence.
-- [ ] **Prepare the implementation handoff** — report implemented and missing
+- [x] **Prepare the implementation handoff** — report implemented and missing
   capabilities, exact test evidence, database transition status, manual
   validator/CI boundary, process-local duplicate risk, and the first separately
   authorized deployment action. Do not commit, migrate, download, or deploy

@@ -20,15 +20,43 @@ exist in the current workspace.
 | Atomic runtime wallet/filter admission | `sdk/indexing`, `sdk/wallets` | one coordinator per scope serializes commit and publication permits without holding mutex guards across `.await`; deterministic coordinator and real-wallet fixtures prove both orderings, revision invalidation, cancellation recovery, checkpoint reload, and successor birthdays |
 | Reusable wallet registry and restoration ownership | `sdk/wallets`, `sdk/indexing`, `sdk/indexing/postgres` | `Registry`, `RegisteredAddress`, and `Wallets::adopt`/`restore` remain reusable SDK capabilities; owned migration and registry tests preserve the physical `payment_wallets` schema/content and its existing column mapping |
 | Solana architecture ownership | `lint.toml`, `packages/design-lint` | `chain-solana` is mapped to an exact package/base/indexing/wallets layer consumed only by application and acceptance; `solana`/`sol` vocabulary is restricted to `apps/` and `sdk/chains/solana/`, with two reasoned line-local Alloy exceptions in Ethereum; positive/negative policy tests and the repository policy check pass |
-| Native Solana chain implementation | `sdk/chains/solana`, `sdk/wallets`, `sdk/indexing`, `sdk/indexing/postgres` | Canonical Base58 values, checked lamports, Ed25519 provider/wallet adapters, exact finalized balance/history, one shared single/batch coordinator, immutable System-plus-Memo envelopes, exact fee/sign/simulate/broadcast/replay behavior, process-local ambiguity reconciliation, bounded sparse finalized-slot source, complete legacy/v0 native interpreter, and empty UTXO projection are implemented. The locked workspace suite passes 114 Solana tests plus its doctest, 58 Bitcoin tests, 81 Ethereum tests, generic sparse restart/reorg contracts, redb contracts, and all 24 PostgreSQL repository contracts. A pinned PostgreSQL 18.6 contract proves Bitcoin, Ethereum native/token, and Solana facts remain isolated through one pool while preserving `payment_wallets`. Runtime composition, public Solana configuration, Memo readiness probing, and the owned validator stack remain in the next phase. |
+| Native Solana chain and runtime composition | `sdk/chains/solana`, `apps/api`, `sdk/wallets`, `sdk/indexing`, `sdk/indexing/postgres` | Canonical Base58 values, checked lamports, Ed25519 provider/wallet adapters, exact finalized balance/history, immutable System-plus-Memo envelopes, ambiguity reconciliation, bounded sparse finalized-slot indexing, public native-SOL routes/OpenAPI, closed environment-backed configuration, identity/Memo-before-storage ordering, one central pool, tracked readiness/submission tasks, and ordered ambiguity-preserving shutdown are implemented. Focused doubles and owned PostgreSQL 18.6 contracts pass. The exact Agave end-to-end run remains unavailable until the checksum-pinned archive is present. |
 | Generic JSON-RPC/HTTP/crypto/storage mechanics | `packages/*` | package tests |
 
-## Accepted but not implemented
+## Remaining system evidence
 
-| Decision | Accepted source | Missing implementation evidence |
-|---|---|---|
-| One central PostgreSQL database/schema/pool with scope-bound repositories | Indexing & Central Database ADR and canonical architecture | the position-aware adapter and one-pool multi-scope isolation proof exist, but `apps/api` still composes per-chain redb; production shared-pool composition is not implemented |
-| Solana crate and runtime composition | Solana Runtime Composition ADR | `chain-solana` is now a workspace/application dependency with the exact locked modular family, one no-retry endpoint configuration, and genesis/health methods, but no Memo startup probe, shared-pool application composition, tracked submission supervisor, readiness regression/fatal behavior, shutdown-race/indefinite-ambiguity evidence, pinned checksummed validator fixture, or explicit `solana_stack` test target exists |
+| Evidence | Current boundary |
+|---|---|
+| Owned Agave native-SOL stack | `solana_stack` is declared behind the explicit `solana-stack` manual feature and compiles; v3.1.14 commit and platform SHA-256 values, unsupported-platform handling, corruption rejection, isolated validator/PostgreSQL resources, the end-to-end scenario, and a retained-rollback/restart refill rehearsal are checked in. The real scenario is not claimed because the exact archive could not be acquired at a usable transfer rate. |
+| CI ownership | No checked-in workflow owns the pinned validator and PostgreSQL 18.6 fixture, so `solana_stack` is a required manual integration target rather than automated CI evidence. |
+
+## Runtime composition release evidence
+
+Fresh Rust 1.91 evidence recorded on 2026-08-30:
+
+- formatting, locked workspace all-target check, strict all-feature Clippy,
+  no-dependency documentation, `git diff --check`, and the design-lint policy
+  all pass;
+- the complete locked workspace test suite passes with zero failures, including
+  117 Solana tests, 81 Ethereum tests, 18 application acceptance tests, five
+  runtime-loop tests, and the owned PostgreSQL 18.6 migration and 25-case
+  repository contracts;
+- design-lint's 25 unit tests pass, case generation produces zero cases, and
+  the repository policy reports zero findings in every category;
+- the explicit `solana_stack` checksum-manifest and corruption-rejection tests
+  pass; and
+- the real `solana_stack` scenario was invoked, refused the incomplete archive
+  at the checksum gate, and executed no validator binary. Acquisition of the
+  exact pinned archive is therefore unavailable external evidence, not a
+  passing, skipped, or code-level result.
+
+The final boundary audit confirms that `chain-solana` is consumed only by
+`payment-api`, its direct workspace dependencies point to base, indexing,
+wallets, and generic JSON-RPC, and existing Bitcoin/Ethereum tests pass without
+depending on Solana internals. No migration file changed, application startup
+contains no DDL, the system target uses loopback endpoints and fixed unfunded
+test seeds only, Solana RPC configuration is redacted and no-retry, and OpenAPI
+publishes native SOL without SPL routes or assets.
 
 ## Native Solana research closeout evidence
 
@@ -49,7 +77,7 @@ exist in the current workspace.
 - Repository integration now resolves 547 locked packages on Rust 1.91, exactly
   43 more than the immediately preceding 504-package lockfile. The integrated
   lockfile SHA-256 is
-  `aeaa2571a739d9de53de70e8ce1372add05e9defe19a81ff2eca5620c99e3226`;
+  `13965c12958ceb9ac5b2086e3c3dc61a55a82e812e0c995fe62fee5c1b449071`;
   the fixed direct Solana versions match the research set, the established
   Alloy/redb versions remain unchanged, and no monolithic Solana client or SDK
   was added. Locked workspace all-target compilation, strict workspace Clippy,
@@ -66,7 +94,7 @@ been removed.
 
 The wallet API integration binary contains eighteen tests. Its process-level
 cases start the real application binary against loopback Bitcoin and Ethereum
-RPC doubles and temporary redb files:
+RPC doubles and one owned temporary PostgreSQL database/schema:
 
 | Behavior | Current evidence |
 |---|---|
@@ -96,7 +124,7 @@ RPC doubles and temporary redb files:
 - collection planners, reservations, jobs, sweeps, gas sponsorship, or automatic token-wallet ETH top-up;
 - outgoing payment state machines;
 - durable native SOL request-idempotency, outgoing-envelope, or cross-process
-  source-guard storage (ADR-0025 accepts an unimplemented process-local model);
+  source-guard storage (ADR-0025 selects the implemented process-local model);
 - durable or cross-process outgoing-envelope coordination; the Ethereum
   coordinator is process-local and requires one active writer per EOA;
 - deposit/accounting/collection semantics around ordinary wallet sends;
@@ -109,9 +137,9 @@ RPC doubles and temporary redb files:
 
 ## Known validation blockers
 
-No code-level blocker remains for the completed persistence-coordinate phase.
-Retained migration execution and production `apps/api` shared-PostgreSQL
-composition remain separately authorized work, not failed validation.
+No code-level blocker remains for production shared-PostgreSQL composition.
+Retained migration execution remains a separately authorized deployment action.
+The pinned Agave archive is the current external system-evidence blocker.
 
 ## Final gates
 
@@ -123,7 +151,7 @@ cargo check --locked --workspace --all-targets
 cargo test --locked --workspace
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo doc --locked --workspace --no-deps
-cargo run --locked -p design-lint -- check .
+cargo run --locked -p design-lint -- --policy lint.toml check .
 git diff --check
 ```
 

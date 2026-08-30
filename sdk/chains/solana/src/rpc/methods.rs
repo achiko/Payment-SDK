@@ -27,6 +27,26 @@ impl Commitment {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenesisHash(Hash);
 
+impl FromStr for GenesisHash {
+    type Err = Error;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let hash = Hash::from_str(input).map_err(|_| {
+            Error::new(
+                ErrorKind::InvalidIdentity,
+                "Solana genesis hash must be canonical Base58",
+            )
+        })?;
+        if hash.to_string() != input {
+            return Err(Error::new(
+                ErrorKind::InvalidIdentity,
+                "Solana genesis hash must be canonical Base58",
+            ));
+        }
+        Ok(Self(hash))
+    }
+}
+
 impl fmt::Display for GenesisHash {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
@@ -77,11 +97,7 @@ where
 
     pub async fn genesis_hash(&self) -> Result<GenesisHash, Error> {
         let text = self.request::<String>("getGenesisHash", json!([])).await?;
-        let hash = Hash::from_str(&text).map_err(|_| malformed("getGenesisHash"))?;
-        if hash.to_string() != text {
-            return Err(malformed("getGenesisHash"));
-        }
-        Ok(GenesisHash(hash))
+        text.parse().map_err(|_| malformed("getGenesisHash"))
     }
 
     pub async fn slot(&self, commitment: Commitment, minimum: Option<u64>) -> Result<u64, Error> {

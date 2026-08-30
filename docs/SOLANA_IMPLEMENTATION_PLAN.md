@@ -660,121 +660,123 @@ The **Schema Knowledge**, **Adapter Safety**, and **Central Composition** gates
 must be closed before the application adds a Solana repository. Startup must
 perform every chain identity/Memo check before opening the PostgreSQL pool.
 
-- [ ] **Specify closed Solana configuration tests** — after the central plan
+- [x] **Specify closed Solana configuration tests** — after the central plan
   owns the top-level PostgreSQL contract, cover exact Solana keys, unknown
   fields, singular endpoint, forbidden controls, per-chain database rejection,
   and old `start_height` rejection without reimplementing PostgreSQL config.
-- [ ] **Add singular Solana config** — accept only network, expected genesis,
+- [x] **Add singular Solana config** — accept only network, expected genesis,
   singular RPC settings, and sync settings inside `indexes.solana`; configured
   imports remain in the existing top-level wallet list. Reject aliases and
   ignored commitment/lag/reference/retry/priority/Memo fields.
-- [ ] **Add Solana start positions** — after the central plan's **Rename
+- [x] **Add Solana start positions** — after the central plan's **Rename
   birthdays** cutover, require `start_position` for configured Solana imports
   and prove old `start_height` remains rejected across every chain.
-- [ ] **Expose public Solana variants** — add `Chain::Solana` and
+- [x] **Expose public Solana variants** — add `Chain::Solana` and
   `WalletAsset::Sol`, then map the already-added wallet Base58 vocabulary into
   the public `AddressEncoding::Base58`; update every exhaustive configuration
   and composition match in one compiling slice.
-- [ ] **Publish Solana OpenAPI** — expose native SOL and Base58 only on existing
+- [x] **Publish Solana OpenAPI** — expose native SOL and Base58 only on existing
   wallet/transaction routes; add no Solana-specific endpoint or SPL asset.
-- [ ] **Parse imported seed environments** — load through the configured
+- [x] **Parse imported seed environments** — load through the configured
   environment-variable name, pass accepted bytes through `SecretBytes`, and
   never include seed text in config/debug/error/OpenAPI output. Use the same
   temporary-value handling as current Bitcoin/Ethereum imports.
 
-- [ ] **Test genesis before database** — prove a wrong canonical genesis fails
+- [x] **Test genesis before database** — prove a wrong canonical genesis fails
   before pool construction or schema access.
-- [ ] **Test Memo before database** — prove absent, non-executable, malformed,
+- [x] **Test Memo before database** — prove absent, non-executable, malformed,
   or below-floor Memo-v3 state fails before pool construction.
-- [ ] **Verify Solana identity** — call one-shot `getGenesisHash` and compare
+- [x] **Verify Solana identity** — call one-shot `getGenesisHash` and compare
   canonical expected bytes.
-- [ ] **Verify executable Memo-v3** — obtain finalized `S`, request exactly the
+- [x] **Verify executable Memo-v3** — obtain finalized `S`, request exactly the
   accepted Memo account with `minContextSlot = S`, and require context at least
   `S` plus a non-null executable account. This startup probe is distinct from
   the per-send confirmed `getHealth` admission and does not replace it.
-- [ ] **Order identity before pool access** — move no database contract into
+- [x] **Order identity before pool access** — move no database contract into
   the Solana crate; prove every configured chain identity and Memo check
   succeeds before the central plan's one PostgreSQL pool is constructed or its
   read-only schema validator runs.
-- [ ] **Construct the Solana scope handle** — clone the shared pool into one
+- [x] **Construct the Solana scope handle** — clone the shared pool into one
   exact `(solana, network)` repository; do not partition by native asset.
-- [ ] **Load the Solana checkpoint** — load persisted scope state before
+- [x] **Load the Solana checkpoint** — load persisted scope state before
   coordinator/service construction and reject incompatible/incomplete rows.
-- [ ] **Construct filter coordination** — initialize the central-plan
+- [x] **Construct filter coordination** — initialize the central-plan
   checkpoint/revision coordinator and its checkpoint notification from the
   persisted checkpoint.
-- [ ] **Compose the Solana service** — build client, source, interpreter,
+- [x] **Compose the Solana service** — build client, source, interpreter,
   service, provider, coordinator, and sender once; inject the same service's
   checkpoint/history/notification views into submission.
-- [ ] **Add Solana to the Composer** — register the native indexer through the
+- [x] **Add Solana to the Composer** — register the native indexer through the
   existing chain-neutral `Indexer` surface.
-- [ ] **Register native SOL only** — add one Solana wallet family and no SPL,
+- [x] **Register native SOL only** — add one Solana wallet family and no SPL,
   plaintext durable registry, remote custody, or hidden asset partition.
-- [ ] **Import before first snapshot** — reconstruct every configured seed and
+- [x] **Import before first snapshot** — reconstruct every configured seed and
   publish its explicit `start_position` before synchronization captures its
   first filter revision.
 
-- [ ] **Add runtime-loop tests** — cover CatchingUp, Ready with persisted
+- [x] **Add runtime-loop tests** — cover CatchingUp, Ready with persisted
   checkpoint, retryable error, successful recovery, fatal error, and
   cancellation without making runtime own coordinator state.
-- [ ] **Remove the readiness spawn** — turn the readiness bridge into an async
+- [x] **Remove the readiness spawn** — turn the readiness bridge into an async
   body tracked by the application; leave no bare self-owned `tokio::spawn`.
-- [ ] **Create submission supervision** — add one precise application-owned
+- [x] **Create submission supervision** — add one precise application-owned
   `mpsc` admission queue and `JoinSet`; retain the only close/wait controls.
-- [ ] **Acknowledge after insertion** — registration succeeds only after the
+- [x] **Acknowledge after insertion** — registration succeeds only after the
   submission task is visible in the tracked set.
-- [ ] **Reject registrar closure** — prove close-winning and lost-
+- [x] **Reject registrar closure** — prove close-winning and lost-
   acknowledgement races fail before dispatch.
-- [ ] **Track synchronization** — supervise the indexing runtime future and
+- [x] **Track synchronization** — supervise the indexing runtime future and
   make its completion/error visible to the application.
-- [ ] **Track readiness** — supervise readiness publication and make unexpected
+- [x] **Track readiness** — supervise readiness publication and make unexpected
   completion/error visible to the application.
-- [ ] **Gate listener startup** — bind HTTP only after every configured index
+- [x] **Gate listener startup** — bind HTTP only after every configured index
   reports Ready with a persisted checkpoint and all configured imports are
   visible.
-- [ ] **Fail on startup index exit** — if the Solana indexer exits fatally
+- [x] **Fail on startup index exit** — if the Solana indexer exits fatally
   before listener admission, stop startup, join owned tasks, and return the
   fatal error without opening HTTP.
-- [ ] **Handle retryable source errors** — publish not-ready until successful
+- [x] **Handle retryable source errors** — publish not-ready until successful
   catch-up without terminating the process or admitting stale work.
-- [ ] **Handle fatal indexer exit** — immediately publish not-ready, close new
+- [x] **Handle fatal indexer exit** — immediately publish not-ready, close new
   HTTP admission, and return the fatal error only when no guarded envelope
   still requires in-process evidence.
 
-- [ ] **Stop HTTP admission gracefully** — on shutdown publish not-ready and
+- [x] **Stop HTTP admission gracefully** — on shutdown publish not-ready and
   stop new admission without dropping the serving future.
-- [ ] **Serialize registrar close** — prove a registration winner is inserted
+- [x] **Serialize registrar close** — prove a registration winner is inserted
   before dispatch while a close winner prevents dispatch.
-- [ ] **Drain admitted handlers** — wait for handlers before inspecting guarded
+- [x] **Drain admitted handlers** — wait for handlers before inspecting guarded
   envelopes.
-- [ ] **Finish preparation on shutdown** — pre-dispatch work may end without
+- [x] **Finish preparation on shutdown** — pre-dispatch work may end without
   creating an ambiguous guard or submission task.
-- [ ] **Drain registered sends** — wait for every application-tracked submission
+- [x] **Drain registered sends** — wait for every application-tracked submission
   task instead of detaching it.
-- [ ] **Keep evidence services alive** — while any envelope is unknown, keep
+- [x] **Keep evidence services alive** — while any envelope is unknown, keep
   synchronization, status reconciliation, and history access running.
-- [ ] **Hold the ambiguity barrier** — graceful shutdown has no automatic
+- [x] **Hold the ambiguity barrier** — graceful shutdown has no automatic
   deadline while evidence is unavailable.
-- [ ] **Handle fatal-index ambiguity** — after fatal indexing, only positive
+- [x] **Handle fatal-index ambiguity** — after fatal indexing, only positive
   historical status may clear a guard; otherwise only explicit force-kill can
   accept duplicate-payment risk.
-- [ ] **Cancel sync after guards clear** — once the guard set is empty, cancel
+- [x] **Cancel sync after guards clear** — once the guard set is empty, cancel
   synchronization and await submission, readiness, storage, and remaining
   supervised tasks.
-- [ ] **Prove shutdown order** — verify not-ready, stop admission, close
+- [x] **Prove shutdown order** — verify not-ready, stop admission, close
   registrar, drain handlers, drain guards, cancel sync, and join tasks in that
   exact order.
 
-- [ ] **Declare the Solana system target** — add explicit `[[test]] name =
+- [x] **Declare the Solana system target** — add explicit `[[test]] name =
   "solana_stack"` with path `tests/solana_stack.rs` in `apps/api/Cargo.toml`
-  because application autotest discovery is disabled.
-- [ ] **Record pinned validator artifacts** — identify Agave v3.1.14 commit
+  because application autotest discovery is disabled; the explicit
+  `solana-stack` feature keeps the external manual fixture out of default
+  deterministic workspace gates.
+- [x] **Record pinned validator artifacts** — identify Agave v3.1.14 commit
   `3134055b562e95902233be308453fffa1c4a8902` and commit platform-specific
   SHA-256 values before executing any downloaded binary.
 - [ ] **Acquire the validator artifact** — with separate network approval,
   download only the exact platform artifact named by the checksum manifest into
   harness-owned cache/storage; do not execute it yet.
-- [ ] **Reject checksum mismatch** — make the harness refuse to start an
+- [x] **Reject checksum mismatch** — make the harness refuse to start an
   artifact whose bytes do not match its committed platform checksum.
 - [ ] **Own validator resources** — allocate an isolated temporary ledger,
   ports, keys, child process, logs, disposable PostgreSQL database/schema, and
@@ -791,35 +793,39 @@ perform every chain identity/Memo check before opening the PostgreSQL pool.
   signature.
 - [ ] **Index the native transaction** — prove the finalized transaction becomes
   canonical SOL history with one System movement, exact fee, and no UTXO rows.
-- [ ] **Keep negative fixtures owned** — exercise wrong genesis, missing Memo,
+- The manual scenario also reconstructs the Solana service and wallet graph
+  against the same PostgreSQL database after a storage-derived retained
+  rollback, then requires canonical history to refill. This remains unclaimed
+  runtime evidence until the pinned validator artifact executes it.
+- [x] **Keep negative fixtures owned** — exercise wrong genesis, missing Memo,
   unavailable history, malformed data, and unsupported version with
   deterministic doubles/fixtures rather than public clusters.
-- [ ] **Choose CI ownership** — until a checked-in workflow owns the pinned
+- [x] **Choose CI ownership** — until a checked-in workflow owns the pinned
   tools and explicit target, report `solana_stack` as a manual integration
   target rather than automated CI evidence.
 
-- [ ] **Update capability evidence** — move each Solana row in
+- [x] **Update capability evidence** — move each Solana row in
   `FEATURE_VALIDATION.md` from Accepted/unimplemented only when the cited code
   and focused tests for that row exist.
-- [ ] **Update current API examples** — replace target-only caveats only after
+- [x] **Update current API examples** — replace target-only caveats only after
   the exact runtime config, enums, errors, and OpenAPI are implemented.
-- [ ] **Update architecture evidence** — retain accepted constraints while
+- [x] **Update architecture evidence** — retain accepted constraints while
   distinguishing implemented source from accepted limitations such as
   process-local custody and non-durable idempotency.
-- [ ] **Run focused crate gates** — execute every changed crate's Rust-1.85
+- [x] **Run focused crate gates** — execute every changed crate's Rust-1.91
   locked tests, including non-skipping PostgreSQL contracts and the explicit
   Solana target where its owned fixture is available.
-- [ ] **Run workspace release gates** — run formatting, locked workspace check
+- [x] **Run workspace release gates** — run formatting, locked workspace check
   and tests, strict Clippy, docs, design lint, and `git diff --check`; report
   unavailable tools and pre-existing failures separately.
-- [ ] **Review the final dependency boundary** — prove `chain-solana` depends
+- [x] **Review the final dependency boundary** — prove `chain-solana` depends
   only on packages, base, indexing, and wallets and that deleting it leaves
   Bitcoin, Ethereum, and generic crates usable.
-- [ ] **Review the final safety boundary** — prove no secrets/logged endpoints,
+- [x] **Review the final safety boundary** — prove no secrets/logged endpoints,
   public-network tests, live signing, migration execution, Solana-specific
   generic DTOs, hidden retries, SPL support, or unapproved schema changes were
   introduced.
-- [ ] **Prepare the implementation handoff** — summarize exact implemented
+- [x] **Prepare the implementation handoff** — summarize exact implemented
   capabilities, tested/untested boundaries, process-local duplicate risks,
   database transition status, and the first separately authorized deployment
   action; do not commit or deploy unless asked.

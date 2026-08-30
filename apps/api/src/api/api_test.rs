@@ -100,6 +100,28 @@ fn openapi_contains_every_route_method_and_schema() {
 }
 
 #[test]
+fn openapi_publishes_native_solana_and_plain_base58_without_spl() {
+    let document = openapi_document();
+
+    assert_eq!(
+        document["components"]["schemas"]["Chain"]["enum"],
+        serde_json::json!(["bitcoin", "ethereum", "solana"])
+    );
+    assert_eq!(
+        document["components"]["schemas"]["WalletAsset"]["enum"],
+        serde_json::json!(["btc", "eth", "usdc", "sol"])
+    );
+    assert_eq!(
+        document["components"]["schemas"]["AddressEncoding"]["enum"],
+        serde_json::json!(["base58", "base58_check", "bech32", "bech32m", "hex"])
+    );
+    assert!(
+        !document.to_string().contains("spl"),
+        "native Solana support must not publish an SPL asset or route"
+    );
+}
+
+#[test]
 fn openapi_publishes_exact_transaction_contracts() {
     let document = openapi_document();
     let transfers = "/components/schemas/TransferRequest/properties/transfers";

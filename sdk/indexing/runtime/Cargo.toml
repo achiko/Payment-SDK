@@ -8,6 +8,9 @@ rust-version.workspace = true
 indexing = { path = ".." }
 tokio = { workspace = true, features = ["sync", "time"] }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
 
 [lints]
 workspace = true

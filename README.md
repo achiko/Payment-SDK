@@ -1,16 +1,15 @@
 # Payment SDK
 
 Payment-SDK is a design-stage Rust workspace whose current implementation is one
-Bitcoin/Ethereum wallet API process. It composes native chain clients, wallet
-implementations, embedded indexers, and redb persistence in one process. There
-are no internal HTTP hops or separately deployed wallet/indexer services.
+Bitcoin/Ethereum/Solana wallet API process. It composes native chain clients,
+wallet implementations, embedded indexers, and one central PostgreSQL
+database/schema/pool in one process. There are no internal HTTP hops or
+separately deployed wallet/indexer services.
 
-The accepted target extends that same process and the same chain-neutral wallet
-and indexing contracts with native SOL, while replacing production redb
-composition with one central PostgreSQL database/schema/pool. No Solana crate or
-runtime composition exists yet. Native SOL Submission and Solana Runtime
-Composition are Accepted but unimplemented. `docs/FEATURE_VALIDATION.md`
-separates implemented evidence from accepted implementation gaps.
+Native SOL submission and runtime composition are implemented through the same
+chain-neutral wallet and indexing contracts. The checksum-pinned owned Agave
+system target is explicit but remains manual evidence; see
+`docs/FEATURE_VALIDATION.md` for the tested and unavailable boundary.
 
 The current scope is deliberately small:
 
@@ -33,6 +32,7 @@ apps/api                 explicit composition root and public HTTP process
 sdk/chains/base          approved chain-neutral values and capabilities
 sdk/chains/bitcoin       Bitcoin RPC, transactions, wallets, and interpretation
 sdk/chains/ethereum      Ethereum RPC, transactions, wallets, and interpretation
+sdk/chains/solana        Solana RPC, transactions, wallets, and interpretation
 sdk/wallets              wallet families, instances, birthdays, and sending
 sdk/indexing             Indexer, Composer, synchronization contracts, and collections
 sdk/indexing/runtime     reusable async synchronization and readiness loop

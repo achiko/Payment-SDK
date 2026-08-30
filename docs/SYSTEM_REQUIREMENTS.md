@@ -3,8 +3,8 @@
 This file defines the accepted canonical scope for the design-stage workspace.
 An ADR marked Proposed does not change these requirements until it is accepted
 and the affected canonical documents are reconciled. Native SOL Submission
-(ADR-0025) and Solana Runtime Composition (ADR-0027) are Accepted but
-unimplemented.
+(ADR-0025) and Solana Runtime Composition (ADR-0027) are Accepted and
+implemented; validation status is recorded separately from requirements.
 
 ## Product boundary
 
@@ -250,13 +250,13 @@ standards remain compatibility contracts.
   handler or SDK object MUST NOT detach an untracked send or bare readiness
   task.
 
-These are target requirements. The current `apps/api` still composes separate
-per-chain redb repositories. That implementation gap MUST remain visible until
-the PostgreSQL composition and its preservation evidence are complete.
+The current `apps/api` implements these requirements with one process-wide
+PostgreSQL pool and scope-bound repository handles. It performs read-only
+startup schema validation and no application DDL.
 
-## Accepted Solana runtime configuration
+## Solana runtime configuration
 
-The target configuration MUST contain exactly one top-level PostgreSQL object
+The configuration MUST contain exactly one top-level PostgreSQL object
 and MAY contain one Solana index object:
 
 ```text
@@ -737,9 +737,8 @@ MUST be rejected rather than split.
 - Immediately before the first potentially submitting call, source leases MUST
   transition atomically into coordinator-owned exact-envelope state. Dropping
   or cancelling the request waiter after dispatch MUST NOT cancel submission or
-  reconciliation. Application task ownership MUST follow the accepted Solana
-  Runtime Composition decision; the current implementation does not yet provide
-  that supervisor.
+  reconciliation. Application task ownership MUST follow the Solana Runtime
+  Composition decision; the application supervisor implements that ownership.
 - After an unknown response, the coordinator MAY make at most two additional
   byte-identical submissions, for three wire calls total. Before a replay it
   MUST query the one local signature with historical search, require one valid
@@ -862,7 +861,8 @@ uniqueness, full-batch zero-broadcast preparation failures, source locking,
 exact fees/balances/signatures/simulation, blockhash expiry, returned-signature
 mismatch, three-call exact-byte replay, ambiguity metadata, cancellation,
 status/history reconciliation, indefinite evidence failure, and documented
-restart/double-payment limitations. These native-chain contracts are now
-implemented; exact application runtime-composition tests required by ADR-0027
-remain unimplemented. Every Solana test MUST use owned
+restart/double-payment limitations. These native-chain contracts and application
+runtime composition are implemented. The checksum-pinned real-validator
+scenario remains a manual integration target until its owned artifact is
+available. Every Solana test MUST use owned
 RPC doubles or a local validator and MUST NOT contact a public RPC endpoint.

@@ -16,13 +16,10 @@ The public indexing domain answers:
 It does not provide watches, event feeds, raw-block archives, migration or
 rebuild commands, or durable pending-transaction state.
 
-This is the target indexing design. The current `apps/api` still composes one
-redb repository per chain and the current `BlockRef` is height-only. The shared
-PostgreSQL topology and two-coordinate block model below are not yet claimed as
-implemented. No Solana crate, source, interpreter, or service exists yet; the
-Solana object below is a target peer of the existing Bitcoin and Ethereum
-services. ADR-0027 accepts its runtime composition, but that acceptance is an
-implementation contract rather than evidence that the target exists.
+This indexing design is implemented. `BlockRef` carries native position and
+produced height, `apps/api` clones one PostgreSQL pool into scope-bound
+repositories, and the Solana source/interpreter/service is a peer of the
+Bitcoin and Ethereum services in the generic `Composer`.
 
 ## Object graph
 
@@ -49,11 +46,11 @@ HTTP/wallet reads  -> Checkpoint / History / optional Outputs
 synchronization policy. `Composer` combines disjoint scopes and routes by
 `IndexScope`. A caller uses the same `Indexer` contract for either object.
 
-The target process opens one database/schema and one pool. It clones the pool
+The application process opens one database/schema and one pool. It clones the pool
 into one repository handle per exact `(chain, network)`; the handle rejects a
 different scope. Native and token assets are history facts and share their
 chain/network repository. redb remains an embedded implementation and test
-backend, but it is not the target `apps/api` persistence composition.
+backend, but it is not the `apps/api` persistence composition.
 
 ## Caller contract
 
@@ -191,7 +188,7 @@ the same pool and schema. It proves native/token coexistence, typed cross-scope
 read/write rejection, and exact preservation of every unrelated indexing row
 plus the reusable SDK registry sentinel.
 
-The target PostgreSQL adapter owns only the checkpoint, history/movement,
+The PostgreSQL adapter owns only the checkpoint, history/movement,
 live-output, journal, and journal-output tables. One schema holds every scope;
 each repository handle is bound to one exact `(chain, network)`. An asset is a
 fact in a movement row, not a reason to create another repository, schema, or
@@ -317,7 +314,7 @@ command.
 
 ## Submission reconciliation reads
 
-The accepted-but-unimplemented native SOL submission coordinator receives the
+The native SOL submission coordinator receives the
 same scope's existing `Checkpoint` and `History` read capabilities plus an
 application-published checkpoint-advance notification. These are narrow reads
 over canonical indexing state. Indexing stores no outgoing operation, request
@@ -389,6 +386,7 @@ Deterministic tests cover:
   PostgreSQL or redb; and
 - RPC outage without false terminal state.
 
-Repository contract tests exercise both PostgreSQL and redb. Target application
-system tests compose PostgreSQL through one process-wide pool; current redb
-system coverage does not by itself satisfy that composition requirement.
+Repository contract tests exercise both PostgreSQL and redb. The application
+composition uses PostgreSQL through one process-wide pool. The explicit owned
+validator application scenario is a manual target and is reported separately
+when its checksum-pinned artifact is unavailable.
