@@ -143,13 +143,14 @@ Bitcoin, Ethereum, and Solana share an enforced directory skeleton but may have
 different protocol-specific files. Equivalent boundaries use equivalent
 directories; native semantics are not flattened to make file names identical.
 
-The `chain-solana` package privately owns Solana addresses, Ed25519
-seed/keypair handling, lamports, RPC DTOs, legacy messages/transactions,
-account policy, source/interpreter translation, provider/sender behavior, the
-source-keyed coordinator, and its one-method submission-task registrar. Its
-design-lint layer depends only on packages, base, indexing, and wallets. No
-Solana message, account, slot, envelope, or coordinator type becomes a generic
-protocol abstraction.
+The `chain-solana` package privately owns canonical `SOL` metadata, its
+native-only `AssetKind`, runtime wallet scope configuration, Solana addresses,
+Ed25519 seed/keypair handling, lamports, RPC DTOs, legacy
+messages/transactions, account policy, source/interpreter translation,
+provider/sender behavior, the source-keyed coordinator, and its one-method
+submission-task registrar. Its design-lint layer depends only on packages,
+base, indexing, and wallets. No Solana message, account, slot, envelope, or
+coordinator type becomes a generic protocol abstraction.
 
 Its protocol stack is the exact modular Anza/SPL dependency family selected in
 ADR-0027, not `solana-client`, a monolithic SDK, handwritten wire encoding, or

@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use base::{Decimal, DecimalErrorKind};
 
-pub(crate) const DECIMALS: u32 = 9;
+use crate::SOL;
 
 /// Exact native Solana atomic value.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -19,7 +19,7 @@ impl Lamport {
     /// Converts a positive public SOL amount without rounding or truncation.
     pub fn from_decimal(amount: &Decimal) -> Result<Self, LamportError> {
         let value = amount
-            .to_atomic_u64(DECIMALS)
+            .to_atomic_u64(SOL.decimals)
             .map_err(LamportError::from_decimal)?;
         if value == 0 {
             return Err(LamportError::new(
@@ -37,7 +37,7 @@ impl Lamport {
 
     #[must_use]
     pub fn decimal(self) -> Decimal {
-        Decimal::from_atomic(self.0.into(), DECIMALS)
+        SOL.from_atomic(self.0.into())
     }
 
     #[must_use]

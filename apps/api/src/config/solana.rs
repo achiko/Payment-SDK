@@ -17,7 +17,7 @@ pub(crate) struct SolanaConfig {
 
 impl SolanaConfig {
     pub(super) fn validate(&self) -> Result<(), AnyError> {
-        chain_solana::NativeAsset::new(self.network.as_str())?;
+        chain_solana::WalletConfig::new(self.network.as_str(), chain_solana::AssetKind::Native)?;
         self.genesis_hash.parse::<chain_solana::GenesisHash>()?;
         self.rpc.validate()?;
         self.sync.validate()?;

@@ -11,7 +11,7 @@ use indexing::{
     ObservationDraftStatus, OutputChanges, TransactionRef,
 };
 
-use crate::Address;
+use crate::{Address, AssetKind};
 
 use self::{movement::Movements, wire::Transactions};
 use super::Block;
@@ -39,10 +39,7 @@ impl Interpreter {
                 false,
             ));
         }
-        let asset = AssetId {
-            chain: scope.chain.clone(),
-            asset: "native".to_owned(),
-        };
+        let asset = AssetKind::Native.id();
         Ok(Self { scope, asset })
     }
 

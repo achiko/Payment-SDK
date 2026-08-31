@@ -106,7 +106,9 @@ mod tests {
     use indexing::{BoxFuture, History, HistoryQuery, IndexError, TransactionPage};
     use wallets::{AddressText, Provider, SecretBytes};
 
-    use crate::{NativeAsset, RpcClient, Seed, WalletProvider, rpc::test_support::Scripted};
+    use crate::{
+        AssetKind, RpcClient, Seed, WalletConfig, WalletProvider, rpc::test_support::Scripted,
+    };
 
     use super::*;
 
@@ -181,7 +183,7 @@ mod tests {
     fn family() -> (WalletProvider<Scripted>, Arc<Native>) {
         let sender = Arc::new(Native::default());
         let provider = WalletProvider::new(
-            NativeAsset::new("localnet").expect("asset"),
+            WalletConfig::new("localnet", AssetKind::Native).expect("asset"),
             RpcClient::new(Scripted::new([])),
             Arc::new(Index),
             sender.clone(),
@@ -191,7 +193,7 @@ mod tests {
 
     fn guarded_family() -> WalletProvider<Scripted> {
         WalletProvider::new(
-            NativeAsset::new("localnet").expect("asset"),
+            WalletConfig::new("localnet", AssetKind::Native).expect("asset"),
             RpcClient::new(Scripted::new([])),
             Arc::new(Index),
             Arc::new(Guarded::default()),

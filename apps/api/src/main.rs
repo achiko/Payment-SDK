@@ -76,13 +76,14 @@ async fn main() -> Result<(), AnyError> {
             None
         };
         let solana = if let Some(config) = indexes.solana {
-            let asset = chain_solana::NativeAsset::new(config.network())?;
-            let scope = asset.scope().clone();
+            let wallet =
+                chain_solana::WalletConfig::new(config.network(), chain_solana::AssetKind::Native)?;
+            let scope = wallet.scope().clone();
             let client = chain_solana::RpcClient::connect(config.rpc()?)?;
             let expected = config.genesis_hash().parse::<chain_solana::GenesisHash>()?;
             client.verify_genesis(&expected).await?;
             client.verify_memo().await?;
-            Some((config, asset, scope, client))
+            Some((config, wallet, scope, client))
         } else {
             None
         };
@@ -135,7 +136,7 @@ async fn main() -> Result<(), AnyError> {
         };
     let (submission_supervisor, submission_registrar, submission_control) =
         submissions::Supervisor::new(SUBMISSION_CAPACITY)?;
-    let solana = if let Some((config, asset, scope, client)) = solana {
+    let solana = if let Some((config, wallet, scope, client)) = solana {
         let repository = indexing_postgres::Repository::new(pool.clone(), scope.clone())?;
         let mut service = indexing::Service::new(
             chain_solana::Source::new(client.clone()),
@@ -164,7 +165,7 @@ async fn main() -> Result<(), AnyError> {
             progress_rx,
         ));
         let provider =
-            chain_solana::WalletProvider::new(asset, client, solana_history, coordinator);
+            chain_solana::WalletProvider::new(wallet, client, solana_history, coordinator);
         let sender = provider.transactions();
         Some((scope, provider, sender))
     } else {

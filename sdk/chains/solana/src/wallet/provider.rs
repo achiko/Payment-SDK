@@ -11,12 +11,12 @@ use wallets::{
     Wallet as WalletContract,
 };
 
-use crate::{Address, Lamport, NativeAsset, NativeDestination, RpcClient};
+use crate::{Address, Lamport, NativeDestination, RpcClient, WalletConfig};
 
 use super::{Key, NativeSender, NativeTransfer, batch::BatchSender};
 
 pub struct WalletProvider<C> {
-    asset: NativeAsset,
+    config: WalletConfig,
     rpc: RpcClient<C>,
     history: Arc<dyn IndexHistory>,
     sender: Arc<dyn NativeSender>,
@@ -26,13 +26,13 @@ pub struct WalletProvider<C> {
 impl<C> WalletProvider<C> {
     #[must_use]
     pub fn new(
-        asset: NativeAsset,
+        config: WalletConfig,
         rpc: RpcClient<C>,
         history: Arc<dyn IndexHistory>,
         sender: Arc<dyn NativeSender>,
     ) -> Self {
         Self {
-            asset,
+            config,
             rpc,
             history,
             sender,
@@ -82,7 +82,7 @@ where
             let key = Arc::new(key);
             self.keys.insert(Arc::clone(&key));
             Ok(Arc::new(Wallet {
-                asset: self.asset.clone(),
+                config: self.config.clone(),
                 key,
                 rpc: self.rpc.clone(),
                 history: Arc::clone(&self.history),
@@ -97,7 +97,7 @@ where
 }
 
 pub(super) struct Wallet<C> {
-    pub(super) asset: NativeAsset,
+    pub(super) config: WalletConfig,
     pub(super) key: Arc<Key>,
     pub(super) rpc: RpcClient<C>,
     pub(super) history: Arc<dyn IndexHistory>,
@@ -156,7 +156,7 @@ where
                     )
                 })?;
             Ok(Balance {
-                amount: self.asset.display(balance.value),
+                amount: self.config.display(balance.value),
                 // A contextual slot is not a canonical block checkpoint.
                 observed_at: None,
             })
@@ -259,7 +259,7 @@ mod tests {
     };
     use wallets::{AddressEncoding, HistoryRequest, Provider as _};
 
-    use crate::{Seed, rpc::test_support::Scripted};
+    use crate::{AssetKind, Seed, rpc::test_support::Scripted};
 
     use super::*;
 
@@ -360,7 +360,7 @@ mod tests {
         let history_contract: Arc<dyn IndexHistory> = history;
         let sender_contract: Arc<dyn NativeSender> = sender;
         WalletProvider::new(
-            NativeAsset::new("mainnet").expect("scope"),
+            WalletConfig::new("mainnet", AssetKind::Native).expect("scope"),
             RpcClient::new(rpc),
             history_contract,
             sender_contract,

@@ -552,10 +552,12 @@ suppression or policy weakening.
   exact nine-decimal conversion; reject zero, negative, fractional-lamport,
   overflow, and one lamport above `u64::MAX`; round-trip `u64::MAX`. **Proof:**
   decimal boundary table with no floating point.
-- [x] **Add native SOL identity** — add private chain/network/native-asset
-  facts required by wallets/indexing, using `{ chain: "solana", asset:
-  "native" }` and nine-decimal presentation. Add no SPL identity. **Depends
-  on:** **Add checked lamports**. **Proof:** scope/asset conversion tests.
+- [x] **Add native SOL identity** — expose canonical `SOL` metadata, retain only
+  `AssetKind::Native`, and bind it to the configured runtime network through
+  `WalletConfig`. Wallets/indexing use `{ chain: "solana", asset: "native" }`
+  and `SOL` owns nine-decimal presentation. Add no SPL identity. **Depends on:**
+  **Add checked lamports**. **Proof:** metadata, scope, kind, and asset-conversion
+  tests.
 - [x] **Parse imported seeds** — accept exactly 64 lowercase ASCII hex
   characters as one 32-byte Ed25519 seed; reject prefix, uppercase, whitespace,
   alternate keypair encoding, and wrong length. **Proof:** exhaustive boundary

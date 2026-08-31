@@ -144,10 +144,16 @@ capability.
 address boundary decodes exactly 32 bytes and requires canonical plain-Base58
 round trips; Bitcoin encodings keep their existing network and checksum rules.
 
-A native SOL balance is an exact finalized `u64` lamport value converted to a
-nine-decimal `Decimal` without floating point. Its `observed_at` remains
-optional under the shared contract; a concrete implementation must not invent a
-checkpoint when its balance source did not supply one.
+`chain_solana::SOL` is the canonical native asset metadata: name `Solana`,
+ticker `SOL`, and nine decimal places. `chain_solana::AssetKind` currently
+contains only `Native`; `chain_solana::WalletConfig` binds that kind to one
+configured runtime network scope. The expected genesis hash remains separate
+runtime identity and is verified before storage opens.
+
+A native SOL balance is an exact finalized `u64` lamport value converted through
+`SOL` to a nine-decimal `Decimal` without floating point. Its `observed_at`
+remains optional under the shared contract; a concrete implementation must not
+invent a checkpoint when its balance source did not supply one.
 
 One-wallet sending belongs to the wallet abstraction. It validates the
 destination and exact positive amount, constructs the chain-native-backed

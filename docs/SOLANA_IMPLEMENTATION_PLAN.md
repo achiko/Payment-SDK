@@ -271,8 +271,9 @@ once, under Rust 1.85:
   trips and one lamport above it fails before RPC.
 - [x] **Convert exact SOL decimals** — prove `1 SOL = 1_000_000_000` lamports
   with exact base-10 formatting and no floating point.
-- [x] **Add native SOL identity** — define only the Solana chain/network/native
-  asset facts needed by wallets and indexing; do not add SPL or Token-2022.
+- [x] **Add native SOL identity** — expose canonical `SOL` metadata, retain only
+  `AssetKind::Native`, and bind it to one runtime scope through `WalletConfig`;
+  do not add SPL or Token-2022.
 - [ ] **Parse configured seeds** — accept exactly 64 lowercase ASCII hex
   characters from the named environment value; reject prefixes, whitespace,
   uppercase, wrong length, and alternate keypair encodings.

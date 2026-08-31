@@ -14,7 +14,7 @@ use std::{
 };
 
 use base::{BlockPosition, Decimal};
-use chain_solana::{NativeAsset, RpcClient, RpcConfig};
+use chain_solana::{AssetKind, RpcClient, RpcConfig, WalletConfig};
 use indexing::{
     BlockObservation, BlockRef, BlockSelector, Blocks as _, Checkpoint as _, Indexer as _,
     Observer, OutputRequest, Outputs, SyncConfig,
@@ -375,8 +375,8 @@ async fn native_sol_submission_indexing_and_central_storage() {
     indexing_postgres::validate_schema(&pool, database.schema())
         .await
         .expect("read-only startup schema validation");
-    let asset = NativeAsset::new("solana-stack").expect("owned scope");
-    let scope = asset.scope().clone();
+    let wallet = WalletConfig::new("solana-stack", AssetKind::Native).expect("owned scope");
+    let scope = wallet.scope().clone();
     let repository =
         indexing_postgres::Repository::new(pool.clone(), scope.clone()).expect("Solana repository");
     let (progress, progress_rx) = watch::channel(None);
@@ -398,7 +398,7 @@ async fn native_sol_submission_indexing_and_central_storage() {
         progress_rx,
     ));
     let provider =
-        chain_solana::WalletProvider::new(asset, client.clone(), service.clone(), coordinator);
+        chain_solana::WalletProvider::new(wallet, client.clone(), service.clone(), coordinator);
     let sender = provider.transactions();
     let mut wallets = Wallets::<String, payment_api::WalletAsset>::new(service.clone());
     wallets
@@ -543,7 +543,7 @@ async fn native_sol_submission_indexing_and_central_storage() {
         restarted_progress_rx,
     ));
     let restarted_provider = chain_solana::WalletProvider::new(
-        NativeAsset::new("solana-stack").expect("restarted native asset"),
+        WalletConfig::new("solana-stack", AssetKind::Native).expect("restarted native asset"),
         client,
         restarted_service.clone(),
         restarted_coordinator,
