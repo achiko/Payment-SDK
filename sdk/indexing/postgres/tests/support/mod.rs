@@ -13,28 +13,9 @@ pub const POSTGRES_IMAGE: &str =
 const DATABASE: &str = "payment_sdk";
 const PASSWORD: &str = "payment-sdk-test";
 
-const MIGRATIONS: [(&str, &str, &str); 4] = [
-    (
-        "0001_init.sql",
-        include_str!("../../migrations/0001_init.sql"),
-        "1ca86f471b6cbe58880fcf42f4e2c433e29a0b3dc405fc1a03e517aed6bc886c",
-    ),
-    (
-        "0002_output_pagination.sql",
-        include_str!("../../migrations/0002_output_pagination.sql"),
-        "0949bfa6a51ceb8393ba879a0643512c8c6d915aa532d288623acbf55d79e6fb",
-    ),
-    (
-        "0003_movement_cascade.sql",
-        include_str!("../../migrations/0003_movement_cascade.sql"),
-        "a9de19a7ede932b73463d62f9702133aad8bcd87b350f524679965c78c27a81b",
-    ),
-    (
-        "0004_block_positions.sql",
-        include_str!("../../migrations/0004_block_positions.sql"),
-        "5019860075ddc36d4aca97de660968c92b77f42efaabe70fe226b74f978696c7",
-    ),
-];
+const INITIALIZER_NAME: &str = "0001_init.sql";
+const INITIALIZER: &str = include_str!("../../migrations/0001_init.sql");
+const INITIALIZER_SHA256: &str = "4d45ff45eab2c718ab3eb554a818a11391fde4ca8806ff26be782d9f40676b7c";
 
 const INSERT_REGISTRY_SENTINEL: &str = "\
 INSERT INTO payment_wallets (
@@ -70,15 +51,6 @@ struct OwnedContainer(String);
 
 impl TestDatabase {
     pub async fn start() -> Self {
-        Self::start_with(MIGRATIONS.len()).await
-    }
-
-    #[allow(dead_code)] // This shared support module is compiled once per integration-test crate.
-    pub async fn start_baseline() -> Self {
-        Self::start_with(3).await
-    }
-
-    async fn start_with(migration_count: usize) -> Self {
         verify_image();
         let identity = unique_identity();
         let container = format!("payment-sdk-postgres-{identity}");
@@ -120,25 +92,21 @@ impl TestDatabase {
             ))
             .await
             .expect("create isolated test schema");
-        for (index, (name, sql, expected_checksum)) in
-            MIGRATIONS.into_iter().take(migration_count).enumerate()
-        {
-            assert_eq!(
-                checksum(sql),
-                expected_checksum,
-                "migration checksum changed: {name}"
-            );
-            setup
-                .batch_execute(sql)
-                .await
-                .unwrap_or_else(|error| panic!("apply migration {name} to owned schema: {error}"));
-            if index == 0 {
-                setup
-                    .batch_execute(INSERT_REGISTRY_SENTINEL)
-                    .await
-                    .expect("insert registry preservation sentinel after 0001");
-            }
-        }
+        assert_eq!(
+            checksum(INITIALIZER),
+            INITIALIZER_SHA256,
+            "schema initializer checksum changed: {INITIALIZER_NAME}"
+        );
+        setup
+            .batch_execute(INITIALIZER)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("apply schema initializer {INITIALIZER_NAME} to owned schema: {error}")
+            });
+        setup
+            .batch_execute(INSERT_REGISTRY_SENTINEL)
+            .await
+            .expect("insert registry preservation sentinel after initialization");
         let sentinel_unchanged: bool = setup
             .query_one(REGISTRY_SENTINEL_UNCHANGED, &[])
             .await
@@ -146,7 +114,7 @@ impl TestDatabase {
             .get(0);
         assert!(
             sentinel_unchanged,
-            "baseline migrations changed the payment_wallets sentinel"
+            "schema initialization changed the payment_wallets sentinel"
         );
         drop(setup);
         drop(setup_pool);

@@ -460,6 +460,9 @@ physically under `sdk/indexing/postgres/migrations/`. This one history may
 describe the central schema, but a change to the SDK registry table still
 requires separate SDK-level custody approval; synchronization repository
 operations remain limited to indexing tables and issue no registry-table DDL.
+The current predeployment history is one final-state initializer for an empty
+schema. It is frozen at the first persistent deployment; later evolution appends
+new preservation-first migrations.
 
 ## History model
 

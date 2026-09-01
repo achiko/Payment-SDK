@@ -1,9 +1,9 @@
--- Payment-SDK integration test schema.
+-- Payment-SDK canonical PostgreSQL schema initializer.
 --
 -- Two halves with different owners:
 --
 --   * indexing state (checkpoint, history, movement, output, journal) mirrors
---     what sdk/indexing/rocksdb persists. Scope (chain, network) is part of
+--     what sdk/indexing/redb persists. Scope (chain, network) is part of
 --     every primary key, so ONE set of tables serves EVERY indexer — Bitcoin
 --     and Ethereum rows live side by side and never collide.
 --
@@ -23,10 +23,25 @@ CREATE TABLE checkpoint (
     hash             bytea  NOT NULL,
     parent_hash      bytea,
     block_timestamp  bigint,
-    PRIMARY KEY (chain, network)
+    position         bigint NOT NULL,
+    parent_position  bigint,
+    PRIMARY KEY (chain, network),
+    CONSTRAINT checkpoint_position_nonnegative
+        CHECK (position >= 0),
+    CONSTRAINT checkpoint_parent_complete
+        CHECK (
+            (position = 0
+                AND parent_position IS NULL
+                AND parent_hash IS NULL)
+            OR (position > 0
+                AND parent_position IS NOT NULL
+                AND parent_hash IS NOT NULL
+                AND parent_position >= 0
+                AND parent_position < position)
+        )
 );
 
--- Canonical transactions, address-primary like the RocksDB HISTORY keyspace:
+-- Canonical transactions, address-primary like the redb HISTORY keyspace:
 -- "every transaction for this address" is the natural index order.
 CREATE TABLE history (
     chain            text    NOT NULL,
@@ -42,13 +57,28 @@ CREATE TABLE history (
     fee_asset        text,
     fee_amount       numeric,
     fee_payer        text,
-    PRIMARY KEY (chain, network, address, height, transaction_id)
+    block_position   bigint NOT NULL,
+    block_parent_position bigint,
+    PRIMARY KEY (chain, network, address, height, transaction_id),
+    CONSTRAINT history_block_position_nonnegative
+        CHECK (block_position >= 0),
+    CONSTRAINT history_block_parent_complete
+        CHECK (
+            (block_position = 0
+                AND block_parent_position IS NULL
+                AND block_parent IS NULL)
+            OR (block_position > 0
+                AND block_parent_position IS NOT NULL
+                AND block_parent IS NOT NULL
+                AND block_parent_position >= 0
+                AND block_parent_position < block_position)
+        )
 );
 
 -- Reorg reversal deletes by height; this index makes that cheap.
 CREATE INDEX history_by_height ON history (chain, network, height);
 
--- Value movements. Nested inside TransactionRecord in RocksDB because a KV
+-- Value movements. Nested inside TransactionRecord in redb because a KV
 -- store cannot query into a blob; a real table here so movements are queryable.
 --
 -- amount is numeric, not bigint: these are atomic units, and wei reaches 10^77.
@@ -68,11 +98,10 @@ CREATE TABLE movement (
     amount           numeric NOT NULL,
     from_address     text,
     to_address       text,
-    PRIMARY KEY (chain, network, address, height, transaction_id, ordinal),
-    FOREIGN KEY (chain, network, address, height, transaction_id)
-        REFERENCES history (chain, network, address, height, transaction_id)
-        ON DELETE CASCADE
+    PRIMARY KEY (chain, network, address, height, transaction_id, ordinal)
 );
+
+CREATE INDEX movement_by_height ON movement (chain, network, height);
 
 -- Live outputs (UTXO chains). Rows are deleted when spent, so this table is
 -- the unspent set, not a log. `evidence` is the chain-native script needed to
@@ -92,12 +121,13 @@ CREATE TABLE output (
     PRIMARY KEY (chain, network, transaction_id, output_index)
 );
 
-CREATE INDEX output_by_address ON output (chain, network, address);
-CREATE INDEX output_by_height  ON output (chain, network, created_at);
+CREATE INDEX output_by_address_identity
+    ON output (chain, network, address, transaction_id, output_index);
+CREATE INDEX output_by_height ON output (chain, network, created_at);
 
 -- Bounded rollback journal, retained `reorg_retention` blocks deep.
 --
--- Much smaller than the RocksDB equivalent, which must carry history_keys and
+-- Much smaller than the redb equivalent, which must carry history_keys and
 -- remove_output_keys because a KV store cannot delete by predicate. Here those
 -- are DELETE ... WHERE height = $1. Only outputs a reorged block SPENT need
 -- recording: nothing else can reconstruct them.
@@ -114,7 +144,49 @@ CREATE TABLE journal (
     previous_checkpoint_hash    bytea,
     previous_checkpoint_parent  bytea,
     previous_checkpoint_time    bigint,
-    PRIMARY KEY (chain, network, height)
+    block_position              bigint NOT NULL,
+    block_parent_position       bigint,
+    previous_checkpoint_position bigint,
+    previous_checkpoint_parent_position bigint,
+    PRIMARY KEY (chain, network, height),
+    CONSTRAINT journal_block_position_nonnegative
+        CHECK (block_position >= 0),
+    CONSTRAINT journal_block_parent_complete
+        CHECK (
+            (block_position = 0
+                AND block_parent_position IS NULL
+                AND block_parent IS NULL)
+            OR (block_position > 0
+                AND block_parent_position IS NOT NULL
+                AND block_parent IS NOT NULL
+                AND block_parent_position >= 0
+                AND block_parent_position < block_position)
+        ),
+    CONSTRAINT journal_previous_checkpoint_complete
+        CHECK (
+            (previous_checkpoint_position IS NULL
+                AND previous_checkpoint_height IS NULL
+                AND previous_checkpoint_hash IS NULL
+                AND previous_checkpoint_parent_position IS NULL
+                AND previous_checkpoint_parent IS NULL
+                AND previous_checkpoint_time IS NULL)
+            OR (previous_checkpoint_position IS NOT NULL
+                AND previous_checkpoint_height IS NOT NULL
+                AND previous_checkpoint_hash IS NOT NULL
+                AND previous_checkpoint_position >= 0
+                AND previous_checkpoint_height >= 0
+                AND (
+                    (previous_checkpoint_position = 0
+                        AND previous_checkpoint_parent_position IS NULL
+                        AND previous_checkpoint_parent IS NULL)
+                    OR (previous_checkpoint_position > 0
+                        AND previous_checkpoint_parent_position IS NOT NULL
+                        AND previous_checkpoint_parent IS NOT NULL
+                        AND previous_checkpoint_parent_position >= 0
+                        AND previous_checkpoint_parent_position
+                            < previous_checkpoint_position)
+                ))
+        )
 );
 
 -- Outputs a journalled block SPENT, kept so a reorg can put them back.

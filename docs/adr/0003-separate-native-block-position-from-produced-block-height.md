@@ -174,30 +174,27 @@ height-keyed retained journal row, then uses the stored position for remote RPC.
 Any later index requires a demonstrated SQL access path.
 
 PostgreSQL is one central multi-chain database. Its indexing tables coexist
-with application-owned tables and must not be dropped or recreated as a Solana
-prerequisite. Canonical schema creation and ordered migration scripts live
-under `sdk/indexing/postgres/migrations/`; deployment tooling owns applying
-them. Physical script location does not transfer logical ownership of
-application tables to indexing. The three migrations in the sibling integration
-checkout remain baseline evidence until the user places them in that canonical
-folder.
+with application-owned tables. Canonical schema creation and ordered migration
+scripts live under `sdk/indexing/postgres/migrations/`; deployment tooling owns
+applying them. Physical script location does not transfer logical ownership of
+application tables to indexing.
 
-PostgreSQL evolution is preservation-first: add the generic position columns,
-backfill verified dense-coordinate scopes, validate every row, and only then
-enforce final non-null and parent-pair constraints. A one-time
-`position = height` backfill is valid only for explicitly verified Bitcoin and
-Ethereum scopes. It is never a runtime fallback and must not be applied to an
-unknown or Solana scope. A scope rescan may replace only indexing-owned rows for
+Because the project has no persistent deployment, the current baseline creates
+the generic native-position columns and final constraints directly in one
+fresh-schema initializer. It performs no retained-data backfill and is never
+replayed over an existing schema. After the first persistent deployment,
+PostgreSQL evolution is preservation-first and every change is a new ordered
+migration. A scope rescan may replace only indexing-owned rows for
 that exact `(chain, network)` after explicit operational approval; it must not
 delete another scope, the shared database, or application-owned
 `payment_wallets`. No legacy runtime reader, compatibility alias, versioned DTO,
 or inferred fallback is introduced.
 
-Before cutover, operators must inventory scopes and row counts, verify the
-applied baseline, take a tested restore point, and pause index writers for the
-final backfill and validation. The new reader/writer starts only after every
-required position and parent pair validates. Exact commands and rollback steps
-belong to the separately approved implementation plan, not this ADR.
+Before the first deployment, operators verify an empty named schema and the
+initializer checksum. Any future retained-schema migration must inventory
+scopes and row counts, prove a restore point, fence writers, and validate the
+result before admitting a new reader/writer. Exact commands and rollback steps
+belong to the separately approved deployment plan, not this ADR.
 
 The application-owned `payment_wallets.start_height` column is outside this
 indexing schema change. Renaming or changing that custody record requires a
@@ -228,8 +225,9 @@ integration planning.
 - The change is coordinated and breaking across base values, source adapters,
   synchronization, wallet birthdays, both repositories, and HTTP block data.
 - Existing redb records and checkpoint cursors require replacement or
-  rejection. Shared PostgreSQL rows require a coordinated indexing-only
-  backfill while unrelated scopes and application tables remain intact.
+  rejection. PostgreSQL had no persistent deployment, so its predeployment
+  baseline was reset directly; any later retained schema change must preserve
+  unrelated scopes and application tables.
 - The Solana source must enumerate sparse produced slots and respect provider
   range limits while presenting one bounded generic result.
 - A Solana block whose RPC response omits `blockHeight` cannot be committed

@@ -61,10 +61,10 @@ cross-chain requirement is out of scope and blocks the next step.
   executed only as
   `postgres@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2`.
   The owned harness asserts both that immutable digest and server version
-  `18.6` before applying the existing test schema. Production
-  migrations live under `sdk/indexing/postgres/migrations/` as ordered
-  deployment inputs applied outside `apps/api`; startup performs read-only
-  compatibility validation and no DDL.
+  `18.6` before applying the canonical schema initializer. Schema history lives
+  under `sdk/indexing/postgres/migrations/` as ordered deployment inputs applied
+  outside `apps/api`; the predeployment history is one fresh-schema initializer,
+  and startup performs read-only compatibility validation and no DDL.
 - One PostgreSQL database, schema, and process-wide pool store indexing state
   for every chain and asset. Repository handles are bound to one exact
   `(chain, network)` scope; assets never select a pool, schema, or repository.
@@ -248,7 +248,7 @@ to gate implementation:
 | Solana wire probe | System transfer followed by Memo-v3 built, signed, verified, decoded, and bincode-round-tripped; address/hash/curve/Base64/Base58/randomness probes passed, 1 test |
 | Compatibility probe | Rust 1.91 formatting, locked offline workspace all-target check, strict all-target/all-feature Clippy, and 163 focused Ethereum/redb/indexing/runtime/wallet/API regressions passed; no public RPC was used |
 | Dependency metadata | Current graph had 472 packages; 367 declared a Rust version, 105 omitted it, and none declared above 1.91 |
-| PostgreSQL static baseline | Three ordered scripts and checksums, effective schema, ownership, adapter SQL, fresh/retained paths, external migration boundary, and preservation/restore requirements are recorded in `POSTGRESQL_SCHEMA_BASELINE.md`; no SQL or database access was claimed |
+| PostgreSQL static baseline | One predeployment initializer and checksum, effective schema, ownership, adapter SQL, fresh-only path, external deployment boundary, and future preservation requirements are recorded in `POSTGRESQL_SCHEMA_BASELINE.md`; no SQL or database access was claimed |
 | PostgreSQL runtime fixture | Official `postgres:18.6-alpine` is selected; pull completion, immutable digest, and non-skipping runtime evidence remain the first database implementation gate and are not claimed by research |
 | Synchronized repository | Canonical requirements, architecture, validation, indexing plan, Solana plan, and runtime ADR were synchronized; exact Rust 1.91 formatting, locked workspace check and tests, strict Clippy, no-deps documentation, and design-lint passed afterward. The eight PostgreSQL contract functions still short-circuit without a database URL and are not runtime evidence |
 
@@ -359,19 +359,19 @@ workspace evidence rather than copy a temporary path.
 This phase preserves the existing wallet-restoration and indexing-custody
 design. It does not move wallet restoration into `apps/api`, remove the
 indexing registry, remove `Wallets::adopt`/`restore`, or transfer custody
-ownership. The coordinate migration may alter only the explicitly listed
-indexing tables; `payment_wallets` and every other non-coordinate table remain
-unchanged. Wallet publication is coordinated with index commits only to close
-the existing runtime race, not to perform a custody handoff.
+ownership. The final predeployment initializer defines coordinates only on the
+explicit indexing tables; `payment_wallets` and every other non-coordinate
+table remain unchanged. Wallet publication is coordinated with index commits
+only to close the existing runtime race, not to perform a custody handoff.
 
 The phase order is:
 
 ```text
 Own PostgreSQL tests
-  -> Validate migrations and startup schema
+  -> Validate initializer and startup schema
   -> Prove shared database safety
   -> Add block-coordinate types
-  -> Create and rehearse migration 0004
+  -> Fold block coordinates into the predeployment initializer
   -> Cut over repositories and chain sources
   -> Implement sparse synchronization
   -> Coordinate wallet publication with index commits
@@ -390,14 +390,14 @@ suppression or policy weakening.
   artifact instead of returning early when an environment variable is absent.
   Keep a unique schema per test run. **Proof:** version/digest assertion and an
   intentionally wrong connection fail rather than report a skipped pass.
-- [x] **Validate baseline migrations** — apply `0001`, `0002`, and `0003` in
-  order only to the owned database; verify recorded checksums, the effective
-  schema, scope keys, indexes, and ownership classification. **Depends on:**
+- [x] **Validate schema initializer** — apply the checksum-locked initializer
+  once to an empty owned schema; verify the effective schema, scope keys,
+  indexes, constraints, and ownership classification. **Depends on:**
   **Own PostgreSQL 18 tests**. **Proof:** schema-catalog assertions and unchanged
   application sentinel.
 - [x] **Validate startup schema** — add a read-only adapter compatibility check
   for the configured schema and required relations; it performs no create,
-  alter, repair, or migration. **Depends on:** **Validate baseline migrations**.
+  alter, repair, or migration. **Depends on:** **Validate schema initializer**.
   **Proof:** compatible, missing, wrong-column, and wrong-schema tests.
 - [x] **Reject zero pool size** — return a typed invalid request before
   constructing a pool with zero connections. **Proof:** focused pool test.
@@ -427,41 +427,30 @@ suppression or policy weakening.
 - [x] **Add block coordinates** — add `BlockPosition`, `BlockParent`, checked
   successors, and the additive constructor/conversion tests without yet
   changing `BlockRef`. **Proof:** base boundary tests at zero and `u64::MAX`.
-- [x] **Specify coordinate migration** — add
-  `sdk/indexing/postgres/migrations/0004_block_positions.sql` with only these
-  eight indexing columns: checkpoint current/parent position, history block/
-  parent position, and journal current/parent plus previous-checkpoint/
-  previous-parent position. It may alter no movement, output, journal-output,
-  or application table. **Depends on:** **Validate baseline migrations**.
-  **Proof:** SQL statement and ownership review.
-- [x] **Rehearse dense backfill** — in an owned restored copy, add the columns
-  as nullable, abort on any populated unverified scope, backfill only verified
-  Bitcoin/Ethereum rows with `position = height`, validate parent pairs, and
-  prove all counts/hashes/application bytes are unchanged. **Depends on:**
-  **Specify coordinate migration**. **Proof:** before/after hashes and negative
-  unknown-scope fixture.
-- [x] **Finalize coordinate constraints** — in the same transactional
-  migration, require current positions, enforce complete optional parent pairs,
-  and remove transition nullability only after backfill validation. No runtime
-  height-to-position fallback is allowed. **Depends on:** **Rehearse dense
-  backfill**. **Proof:** fresh and retained owned-database migration tests,
-  rollback-on-invalid-row, and unchanged `payment_wallets` sentinel.
-- [x] **Write the retained transition runbook** — document the external-only
-  sequence: record applied versions/checksums and scope hashes, prove a restore,
-  stop and fence every old writer, apply the ordered migration to the explicit
-  schema, verify all position/parent constraints and preservation sentinels,
-  then admit only the position-aware binary. An old binary may not restart
-  after the migration. This step prepares commands but executes none. **Depends
-  on:** **Finalize coordinate constraints**. **Proof:** restored-copy rehearsal
-  and reviewed roll-forward/failure response.
+- [x] **Define final coordinate schema** — place checkpoint current/parent
+  position, history block/parent position, and journal current/parent plus
+  previous-checkpoint/previous-parent position directly in the fresh-schema
+  initializer. Alter no movement, output, journal-output, or application table.
+  **Depends on:** **Validate schema initializer**. **Proof:** static initializer
+  and ownership contract.
+- [x] **Enforce coordinate constraints at creation** — require non-negative
+  current positions and complete optional parent pairs directly in `CREATE
+  TABLE`; no transition nullability, retained-data backfill, or runtime
+  height-to-position fallback exists. **Depends on:** **Define final coordinate
+  schema**. **Proof:** owned fresh-schema tests reject invalid rows.
+- [x] **Document the fresh-only deployment boundary** — require an empty named
+  schema, exact initializer checksum, external application, and read-only runtime
+  validation. Freeze the initializer at the first persistent deployment and use
+  new migrations afterward. **Depends on:** **Enforce coordinate constraints at
+  creation**. **Proof:** initializer replay rejection and reviewed baseline.
 - [x] **Cut over complete block references** — intentionally broad compile
   slice: replace every base/indexing/Bitcoin/Ethereum constructor, fixture,
   cursor, redb record/key, and PostgreSQL reader/writer with
   `{ position, height, hash, parent, timestamp }`. Dense adapters set position
   equal to height only at their protocol boundaries. Reject old redb records
   and height-only cursors. **Depends on:** **Add block coordinates**,
-  **Finalize coordinate constraints**. **Proof:** immediate locked workspace
-  check and no placeholder/default positions.
+  **Enforce coordinate constraints at creation**. **Proof:** immediate locked
+  workspace check and no placeholder/default positions.
 - [x] **Round-trip both repositories** — prove sparse positions, produced
   heights, atomic parents, checkpoint/history/journal/add/remove/restart,
   rollback, and old-record rejection in redb and PostgreSQL. **Depends on:**
@@ -1266,27 +1255,27 @@ next approval boundary is **Own PostgreSQL 18 tests**.
 **Own PostgreSQL 18 tests** then removed the optional `POSTGRES_TEST_URL`
 short-circuit and made every repository contract own a disposable PostgreSQL
 18.6 container plus a unique schema. The harness executes only the recorded
-immutable image digest, asserts server version `18.6`, applies the three
-unchanged baseline scripts needed by the repository, and removes its container
+immutable image digest, asserts server version `18.6`, applies the canonical
+schema initializer needed by the repository, and removes its container
 on success or failure. A ninth contract proves intentionally wrong credentials
 fail rather than skip. The contract passed 9/9 serially and 9/9 under the
 package's normal parallel runner; package unit and documentation targets also
 passed, no owned container remained, formatting and diff checks passed, and
-design-lint reported zero findings. Migration checksums, effective catalog,
+design-lint reported zero findings. Initializer checksum, effective catalog,
 scope/index ownership, and application sentinels remain deliberately deferred
-to the next boundary, **Validate baseline migrations**.
-**Validate baseline migrations** then locked the reviewed SHA-256 for `0001`,
-`0002`, and `0003` into the owned harness and verifies each file before
-execution. The harness inserts a complete known registry sentinel after
-`0001`, applies `0002` and `0003` in order, and proves the exact
+to the next boundary, **Validate schema initializer**.
+**Validate schema initializer** then locked the reviewed SHA-256 for the
+canonical initializer into the owned harness and verifies it before execution.
+The harness applies it once to an empty schema, inserts a complete known
+registry sentinel, and proves the exact
 `payment_wallets` row remains unchanged. A catalog contract classifies six
 indexing tables and the preserved reusable SDK registry table, then asserts the
 complete effective columns, nullability, constraint families, primary/scope/
 pagination keys, final movement/output indexes, removed movement foreign key,
 and retained journal-output cascade. The focused catalog proof passed 1/1 and
-the complete PostgreSQL package passed 10/10 with no skips. Strict package
-Clippy, formatting, diff checks, and design-lint passed. No retained database
-or migration file was changed. Read-only runtime compatibility validation is
+the complete PostgreSQL package passed with no skips. Strict package Clippy,
+formatting, diff checks, and design-lint passed. No retained database was
+contacted. Read-only runtime compatibility validation is
 still absent and remains the next boundary, **Validate startup schema**.
 **Validate startup schema** then exported
 `indexing_postgres::validate_schema(&pool, expected_schema)`. It uses one
@@ -1384,84 +1373,34 @@ produced `BlockHeight` now provide checked successors and lossless `u64`
 conversions; `BlockParent` converts to/from its complete position/hash pair.
 Base boundary tests prove zero conversion/successors, `u64::MAX` overflow, and
 atomic parent round-trip. The base crate passes 26/26 tests, strict all-target
-Clippy, formatting, diff checks, and design-lint. No persistence or migration
-changed. The next boundary is **Specify coordinate migration**.
-**Specify coordinate migration** then added the unexecuted
-`0004_block_positions.sql` expansion with exactly eight nullable `bigint`
-columns: checkpoint position/parent position, history block/parent position,
-and journal current/parent plus previous-checkpoint/previous-parent position.
-One static migration contract accepts only `BEGIN`, those eight exact
-`ALTER TABLE ... ADD COLUMN` statements, and `COMMIT`; any statement touching
-movement, output, journal-output, `payment_wallets`, indexes, data, or
-constraints fails that contract. The focused migration proof passes 1/1,
-strict package all-target Clippy, formatting, diff checks, and design-lint
-pass. `0004` is not in the owned harness's applied migration list, has no final
-checksum yet, and has not run against PostgreSQL. The next boundary is
-**Rehearse dense backfill**.
-**Rehearse dense backfill** then extended the still-unfinalized
-`0004_block_positions.sql` transaction with an explicit session allowlist of
-exact Bitcoin/Ethereum `(chain, network)` scopes. The migration inventories all
-six indexing tables, aborts before backfill when any populated scope is absent
-from that allowlist, validates dense current and previous-parent relationships,
-and derives positions only for allowlisted rows. An owned PostgreSQL 18.6
-retained-state fixture proved `position = height`, complete parent positions,
-unchanged row counts and SHA-256 signatures for all six indexing tables, and
-unchanged `payment_wallets` bytes. A populated Solana negative fixture produced
-the required error and proved the transaction rolled back both data and all
-eight column additions. The static ownership contract plus both database
-contracts pass 3/3. No retained database was inspected or changed, and final
-nullability and pair constraints remain absent. The next boundary is
-**Finalize coordinate constraints**.
-**Finalize coordinate constraints** then completed the same transactional
-`0004_block_positions.sql` migration. Current checkpoint, history, and journal
-positions are non-null and non-negative. Each current parent is an atomic
-position/hash pair absent only at genesis; a journal previous checkpoint is
-either wholly absent or contains position, height, hash, and the same atomic
-parent rule. Seven check constraints are added `NOT VALID`, explicitly
-validated only after backfill validation, and only then are the three current
-position columns made `NOT NULL`. The finalized migration checksum is
-`5019860075ddc36d4aca97de660968c92b77f42efaabe70fe226b74f978696c7`.
-Owned PostgreSQL 18.6 contracts pass 5/5 for static ownership/checksum, an empty
-indexing-state baseline, retained Bitcoin/Ethereum backfill and preservation,
-populated Solana rollback, and invalid retained-parent rollback. Fresh invalid
-writes prove null current positions, half-present current parents, and an
-incomplete previous checkpoint are rejected. The exact `payment_wallets`
-sentinel remains unchanged in every database path. `0004` is deliberately not
-in the height-only repository harness's default migration list: the current
-writer cannot run after these constraints and must be fenced until the complete
-block-reference cutover. No retained database was inspected or changed. The
-next boundary is **Write the retained transition runbook**.
-**Write the retained transition runbook** then added
-`POSTGRESQL_COORDINATE_TRANSITION_RUNBOOK.md`. It requires an exact retained
-target and change record, immutable migration checksums, a reviewed dense-scope
-allowlist, deterministic per-scope and registry preservation evidence, and an
-opened disposable restore proof before the maintenance window. It closes and
-drains admission, stops every height-only writer, requires a deployment-level
-restart fence, rechecks checkpoint stability, and applies the unchanged `0004`
-bytes in one schema-pinned PostgreSQL 18 session. Post-commit verification
-covers columns, all seven validated constraints, backfill facts, every
-pre-existing indexing hash, registry bytes, and position-aware startup
-validation. Recovery is permitted back to the old release only before migration
-commit and only after exact baseline proof; after commit the transition is
-roll-forward and the old writer remains permanently fenced. No database command
-was executed and no retained target was named. Documentation checks and the
-required design-lint gate pass. The next implementation boundary is **Cut over
-complete block references**.
+Clippy, formatting, diff checks, and design-lint. No persistence changed. The
+next boundary is **Define final coordinate schema**.
+**Define final coordinate schema** then consolidated the unpublished
+PostgreSQL history into one canonical fresh-schema initializer. It directly
+creates the eight native-position columns on checkpoint, history, and journal;
+defines all seven final coordinate constraints; creates only the final movement
+and output indexes; preserves the journal-output cascade and reusable
+`payment_wallets`; and contains no `ALTER TABLE`, backfill allowlist, or retained
+data update. The checksum-locked initializer is applied once to an empty owned
+PostgreSQL 18.6 schema. Static and database contracts verify its final shape,
+invalid-write rejection, registry sentinel, and refusal to replay over an
+existing schema. No retained database was inspected or changed. The next
+implementation boundary is **Cut over complete block references**.
 **Cut over complete block references** then replaced every persisted and public
 block shape with atomic `{ position, height, hash, parent, timestamp }` facts.
 Bitcoin and Ethereum derive dense positions only while translating their native
 RPC blocks. redb records, PostgreSQL checkpoint/history/journal readers and
 writers, indexing validation, API block JSON, and checkpoint cursors now carry
-the complete coordinate; the finalized `0004` migration is in the owned
-repository harness and startup validation requires its columns and constraints.
+the complete coordinate; the canonical initializer is in the owned repository
+harness and startup validation requires its columns and constraints.
 Height-only redb records and cursors have explicit rejection tests. A locked
 workspace all-target check passed, redb passed 8/8 repository and unit tests,
-the PostgreSQL migration contract passed 5/5, and the finalized PostgreSQL
-repository contract passed 22/22 on owned PostgreSQL 18.6 containers. The
-PostgreSQL write path was split into commit and projection owners to satisfy the
-500-line production limit; formatting, diff checks, and design-lint pass. No
-retained database was contacted or changed. The next boundary is **Round-trip
-both repositories**.
+the PostgreSQL initializer contract passed separately, and the finalized
+PostgreSQL repository contract passed 22/22 on owned PostgreSQL 18.6 containers.
+The PostgreSQL write path was split into commit and projection owners to satisfy
+the 500-line production limit; formatting, diff checks, and design-lint pass.
+No retained database was contacted or changed. The next boundary is
+**Round-trip both repositories**.
 **Round-trip both repositories** then added the same sparse-coordinate contract
 to redb and PostgreSQL: native positions `100` and `103` carry produced heights
 `50` and `51`, and the second block carries the exact first position/hash as its
@@ -1469,7 +1408,7 @@ atomic parent. Each backend proves checkpoint, retained journal lookup,
 address-primary history, a newly opened repository handle, rollback to the
 first complete reference, and another reopen. redb additionally rejects the
 legacy height-only binary record, while the finalized PostgreSQL harness cannot
-start without all `0004` coordinates and constraints. The focused redb and
+start without all native coordinates and constraints. The focused redb and
 owned PostgreSQL 18.6 sparse contracts pass. The next boundary is **Cut over the
 source contract**.
 **Cut over the source contract** then replaced height-addressed single-block

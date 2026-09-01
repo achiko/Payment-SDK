@@ -1,74 +1,46 @@
 #[allow(dead_code)]
 mod support;
 
-use std::collections::BTreeMap;
-
 use sha2::{Digest, Sha256};
 use support::TestDatabase;
 
-const BLOCK_POSITIONS: &str = include_str!("../migrations/0004_block_positions.sql");
-const BLOCK_POSITIONS_SHA256: &str =
-    "5019860075ddc36d4aca97de660968c92b77f42efaabe70fe226b74f978696c7";
-const VERIFIED_SCOPES: &str = r#"[
-    {"chain":"bitcoin","network":"regtest"},
-    {"chain":"ethereum","network":"mainnet"}
-]"#;
-const BASELINE_TABLES: [&str; 7] = [
-    "checkpoint",
-    "history",
-    "movement",
-    "output",
-    "journal",
-    "journal_output",
-    "payment_wallets",
-];
-
-#[derive(Debug, Eq, PartialEq)]
-struct TableSignature {
-    rows: usize,
-    sha256: String,
-}
+const INITIALIZER: &str = include_str!("../migrations/0001_init.sql");
+const INITIALIZER_SHA256: &str = "4d45ff45eab2c718ab3eb554a818a11391fde4ca8806ff26be782d9f40676b7c";
 
 #[test]
-fn block_position_migration_changes_only_approved_relations_and_columns() {
+fn initializer_defines_the_final_schema_without_upgrade_steps() {
     assert_eq!(
-        format!("{:x}", Sha256::digest(BLOCK_POSITIONS.as_bytes())),
-        BLOCK_POSITIONS_SHA256,
-        "finalized migration checksum changed"
-    );
-    let alters = BLOCK_POSITIONS
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("ALTER TABLE") && line.contains("ADD COLUMN"))
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        alters,
-        [
-            "ALTER TABLE checkpoint ADD COLUMN position bigint;",
-            "ALTER TABLE checkpoint ADD COLUMN parent_position bigint;",
-            "ALTER TABLE history ADD COLUMN block_position bigint;",
-            "ALTER TABLE history ADD COLUMN block_parent_position bigint;",
-            "ALTER TABLE journal ADD COLUMN block_position bigint;",
-            "ALTER TABLE journal ADD COLUMN block_parent_position bigint;",
-            "ALTER TABLE journal ADD COLUMN previous_checkpoint_position bigint;",
-            "ALTER TABLE journal ADD COLUMN previous_checkpoint_parent_position bigint;",
-        ]
+        format!("{:x}", Sha256::digest(INITIALIZER.as_bytes())),
+        INITIALIZER_SHA256,
+        "canonical schema initializer checksum changed"
     );
 
-    let executable = BLOCK_POSITIONS
+    let executable = INITIALIZER
         .lines()
         .filter(|line| !line.trim_start().starts_with("--"))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(!executable.contains("ALTER TABLE movement"));
-    assert!(!executable.contains("ALTER TABLE output"));
-    assert!(!executable.contains("ALTER TABLE journal_output"));
-    assert!(!executable.contains("ALTER TABLE payment_wallets"));
-    assert!(!executable.contains("UPDATE movement"));
-    assert!(!executable.contains("UPDATE output"));
-    assert!(!executable.contains("UPDATE journal_output"));
-    assert!(!executable.contains("UPDATE payment_wallets"));
+
+    assert!(!executable.contains("ALTER TABLE"));
+    assert!(!executable.contains("DROP INDEX"));
+    assert!(!executable.contains("UPDATE "));
+    assert!(!executable.contains("payment_sdk.verified_dense_scopes"));
+
+    for table in [
+        "checkpoint",
+        "history",
+        "movement",
+        "output",
+        "journal",
+        "journal_output",
+        "payment_wallets",
+    ] {
+        assert!(
+            executable.contains(&format!("CREATE TABLE {table} (")),
+            "initializer must create {table}"
+        );
+    }
+
     for constraint in [
         "checkpoint_position_nonnegative",
         "checkpoint_parent_complete",
@@ -79,35 +51,34 @@ fn block_position_migration_changes_only_approved_relations_and_columns() {
         "journal_previous_checkpoint_complete",
     ] {
         assert!(
-            executable.contains(&format!("ADD CONSTRAINT {constraint}")),
-            "missing final constraint {constraint}"
-        );
-        assert!(
-            executable.contains(&format!("VALIDATE CONSTRAINT {constraint}")),
-            "missing validation for {constraint}"
+            executable.contains(&format!("CONSTRAINT {constraint}")),
+            "initializer must define {constraint}"
         );
     }
-    for required in [
-        "checkpoint ALTER COLUMN position SET NOT NULL",
-        "history ALTER COLUMN block_position SET NOT NULL",
-        "journal ALTER COLUMN block_position SET NOT NULL",
+
+    for index in [
+        "history_by_height",
+        "movement_by_height",
+        "output_by_address_identity",
+        "output_by_height",
+        "payment_wallets_by_scope",
     ] {
-        assert!(executable.contains(required), "missing {required}");
+        assert!(
+            executable.contains(&format!("CREATE INDEX {index}")),
+            "initializer must define {index}"
+        );
     }
-    assert!(executable.contains("payment_sdk.verified_dense_scopes"));
-    assert!(executable.contains("unverified populated scope"));
+
+    assert!(!executable.contains("REFERENCES history"));
+    assert!(executable.contains("REFERENCES journal"));
+    assert!(executable.contains("ON DELETE CASCADE"));
 }
 
 #[tokio::test]
-async fn fresh_schema_receives_final_coordinate_constraints() {
-    let database = TestDatabase::start_baseline().await;
+async fn initializer_creates_the_final_coordinate_schema() {
+    let database = TestDatabase::start().await;
     let pool = database.pool();
-    let client = pool.get().await.expect("fresh migration connection");
-
-    client
-        .batch_execute(BLOCK_POSITIONS)
-        .await
-        .expect("apply finalized migration to fresh schema");
+    let client = pool.get().await.expect("fresh initializer connection");
 
     assert_coordinate_schema(&client).await;
     assert_final_constraints_reject_invalid_writes(&client).await;
@@ -115,269 +86,22 @@ async fn fresh_schema_receives_final_coordinate_constraints() {
 }
 
 #[tokio::test]
-async fn dense_backfill_preserves_baseline_rows_and_application_bytes() {
-    let database = TestDatabase::start_baseline().await;
+async fn initializer_refuses_to_replay_over_an_existing_schema() {
+    let database = TestDatabase::start().await;
     let pool = database.pool();
-    let client = pool.get().await.expect("dense backfill connection");
-    insert_dense_fixtures(&client).await;
-    let before = baseline_signatures(&client).await;
+    let client = pool.get().await.expect("initializer replay connection");
 
     client
-        .query_one(
-            "SELECT set_config('payment_sdk.verified_dense_scopes', $1, false)",
-            &[&VERIFIED_SCOPES],
-        )
+        .batch_execute(INITIALIZER)
         .await
-        .expect("set verified dense scopes");
+        .expect_err("the fresh-schema initializer must not replay");
     client
-        .batch_execute(BLOCK_POSITIONS)
+        .batch_execute("ROLLBACK")
         .await
-        .expect("rehearse dense coordinate backfill");
+        .expect("close the aborted initializer transaction");
 
-    assert_eq!(baseline_signatures(&client).await, before);
-    assert_dense_coordinates(&client).await;
     assert_coordinate_schema(&client).await;
     assert!(database.registry_sentinel_unchanged().await);
-}
-
-#[tokio::test]
-async fn unknown_populated_scope_aborts_the_complete_migration() {
-    let database = TestDatabase::start_baseline().await;
-    let pool = database.pool();
-    let client = pool.get().await.expect("unknown-scope connection");
-    client
-        .execute(
-            "INSERT INTO checkpoint (chain, network, height, hash, parent_hash) \
-             VALUES ('solana', 'mainnet', 1, decode('01', 'hex'), decode('00', 'hex'))",
-            &[],
-        )
-        .await
-        .expect("insert unknown populated scope");
-    let before = baseline_signatures(&client).await;
-    client
-        .query_one(
-            "SELECT set_config('payment_sdk.verified_dense_scopes', $1, false)",
-            &[&VERIFIED_SCOPES],
-        )
-        .await
-        .expect("set verified dense scopes");
-
-    let error = client
-        .batch_execute(BLOCK_POSITIONS)
-        .await
-        .expect_err("unknown populated scope must abort");
-    let message = database_error_message(&error);
-    assert!(
-        message.contains("unverified populated scope"),
-        "unexpected migration error: {message}"
-    );
-    client
-        .batch_execute("ROLLBACK")
-        .await
-        .expect("close aborted migration transaction");
-
-    assert_eq!(coordinate_column_count(&client).await, 0);
-    assert_eq!(baseline_signatures(&client).await, before);
-    assert!(database.registry_sentinel_unchanged().await);
-}
-
-#[tokio::test]
-async fn invalid_retained_parent_rolls_back_the_complete_migration() {
-    let database = TestDatabase::start_baseline().await;
-    let pool = database.pool();
-    let client = pool.get().await.expect("invalid-parent connection");
-    client
-        .execute(
-            "INSERT INTO checkpoint (chain, network, height, hash, parent_hash) \
-             VALUES ('bitcoin', 'regtest', 1, decode('01', 'hex'), NULL)",
-            &[],
-        )
-        .await
-        .expect("insert invalid retained parent");
-    let before = baseline_signatures(&client).await;
-    client
-        .query_one(
-            "SELECT set_config('payment_sdk.verified_dense_scopes', $1, false)",
-            &[&VERIFIED_SCOPES],
-        )
-        .await
-        .expect("set verified dense scopes");
-
-    let error = client
-        .batch_execute(BLOCK_POSITIONS)
-        .await
-        .expect_err("invalid retained parent must abort");
-    assert!(
-        database_error_message(&error).contains("invalid dense parent relationship"),
-        "unexpected migration error: {}",
-        database_error_message(&error)
-    );
-    client
-        .batch_execute("ROLLBACK")
-        .await
-        .expect("close invalid-row migration transaction");
-
-    assert_eq!(coordinate_column_count(&client).await, 0);
-    assert_eq!(baseline_signatures(&client).await, before);
-    assert!(database.registry_sentinel_unchanged().await);
-}
-
-async fn insert_dense_fixtures(client: &tokio_postgres::Client) {
-    client
-        .batch_execute(
-            "
-            INSERT INTO checkpoint
-                (chain, network, height, hash, parent_hash, block_timestamp)
-            VALUES
-                ('bitcoin', 'regtest', 2, decode('02', 'hex'), decode('01', 'hex'), 20),
-                ('ethereum', 'mainnet', 7, decode('07', 'hex'), decode('06', 'hex'), 70);
-
-            INSERT INTO history
-                (chain, network, address, height, transaction_id, status,
-                 block_hash, block_parent, block_timestamp, fee_asset, fee_amount, fee_payer)
-            VALUES
-                ('bitcoin', 'regtest', 'btc-address', 2, 'btc-transaction', 'included',
-                 decode('02', 'hex'), decode('01', 'hex'), 20, 'btc', 2, 'btc-address'),
-                ('ethereum', 'mainnet', 'eth-address', 7, 'eth-transaction', 'included',
-                 decode('07', 'hex'), decode('06', 'hex'), 70, 'eth', 7, 'eth-address');
-
-            INSERT INTO movement
-                (chain, network, address, height, transaction_id, ordinal, kind,
-                 movement_id, asset_chain, asset, amount, from_address, to_address)
-            VALUES
-                ('bitcoin', 'regtest', 'btc-address', 2, 'btc-transaction', 0, 'output',
-                 'btc-movement', 'bitcoin', 'btc', 200, NULL, 'btc-address'),
-                ('ethereum', 'mainnet', 'eth-address', 7, 'eth-transaction', 0, 'transfer',
-                 'eth-movement', 'ethereum', 'eth', 700, 'eth-from', 'eth-address');
-
-            INSERT INTO output
-                (chain, network, transaction_id, output_index, address, asset_chain,
-                 asset, amount, evidence, created_at, coinbase)
-            VALUES
-                ('bitcoin', 'regtest', 'btc-output', 0, 'btc-address', 'bitcoin',
-                 'btc', 200, decode('51', 'hex'), 2, false);
-
-            INSERT INTO journal
-                (chain, network, height, block_hash, block_parent, block_timestamp,
-                 previous_checkpoint_height, previous_checkpoint_hash,
-                 previous_checkpoint_parent, previous_checkpoint_time)
-            VALUES
-                ('bitcoin', 'regtest', 2, decode('02', 'hex'), decode('01', 'hex'), 20,
-                 1, decode('01', 'hex'), decode('00', 'hex'), 10),
-                ('ethereum', 'mainnet', 7, decode('07', 'hex'), decode('06', 'hex'), 70,
-                 6, decode('06', 'hex'), decode('05', 'hex'), 60);
-
-            INSERT INTO journal_output
-                (chain, network, height, transaction_id, output_index, address,
-                 asset_chain, asset, amount, evidence, created_at, coinbase)
-            VALUES
-                ('bitcoin', 'regtest', 2, 'btc-spent', 0, 'btc-address',
-                 'bitcoin', 'btc', 100, decode('51', 'hex'), 1, false);
-            ",
-        )
-        .await
-        .expect("insert dense Bitcoin and Ethereum fixtures");
-}
-
-async fn baseline_signatures(
-    client: &tokio_postgres::Client,
-) -> BTreeMap<&'static str, TableSignature> {
-    let mut signatures = BTreeMap::new();
-    for table in BASELINE_TABLES {
-        let removed_keys = match table {
-            "checkpoint" => "ARRAY['position', 'parent_position']::text[]",
-            "history" => "ARRAY['block_position', 'block_parent_position']::text[]",
-            "journal" => {
-                "ARRAY['block_position', 'block_parent_position', \
-                'previous_checkpoint_position', \
-                'previous_checkpoint_parent_position']::text[]"
-            }
-            _ => "ARRAY[]::text[]",
-        };
-        let query = format!(
-            "SELECT (to_jsonb(row_value) - {removed_keys})::text AS value \
-             FROM {table} AS row_value \
-             ORDER BY (to_jsonb(row_value) - {removed_keys})::text"
-        );
-        let rows = client
-            .query(&query, &[])
-            .await
-            .unwrap_or_else(|error| panic!("read {table} signature: {error}"));
-        let mut digest = Sha256::new();
-        for row in &rows {
-            let value: String = row.get("value");
-            digest.update(value.len().to_be_bytes());
-            digest.update(value.as_bytes());
-        }
-        signatures.insert(
-            table,
-            TableSignature {
-                rows: rows.len(),
-                sha256: format!("{:x}", digest.finalize()),
-            },
-        );
-    }
-    signatures
-}
-
-async fn assert_dense_coordinates(client: &tokio_postgres::Client) {
-    let valid: bool = client
-        .query_one(
-            "
-            SELECT
-                (SELECT BOOL_AND(
-                    position = height
-                    AND (parent_hash IS NULL) = (parent_position IS NULL)
-                    AND (parent_position IS NULL OR parent_position = height - 1)
-                ) FROM checkpoint)
-                AND
-                (SELECT BOOL_AND(
-                    block_position = height
-                    AND (block_parent IS NULL) = (block_parent_position IS NULL)
-                    AND (block_parent_position IS NULL OR block_parent_position = height - 1)
-                ) FROM history)
-                AND
-                (SELECT BOOL_AND(
-                    block_position = height
-                    AND (block_parent IS NULL) = (block_parent_position IS NULL)
-                    AND (block_parent_position IS NULL OR block_parent_position = height - 1)
-                    AND previous_checkpoint_position = previous_checkpoint_height
-                    AND (previous_checkpoint_parent IS NULL)
-                        = (previous_checkpoint_parent_position IS NULL)
-                    AND (previous_checkpoint_parent_position IS NULL
-                        OR previous_checkpoint_parent_position = previous_checkpoint_height - 1)
-                ) FROM journal)
-            ",
-            &[],
-        )
-        .await
-        .expect("validate dense coordinates")
-        .get(0);
-    assert!(valid, "dense coordinate backfill produced invalid pairs");
-}
-
-async fn coordinate_column_count(client: &tokio_postgres::Client) -> i64 {
-    client
-        .query_one(
-            "
-            SELECT COUNT(*)
-            FROM information_schema.columns
-            WHERE table_schema = current_schema()
-              AND (
-                (table_name = 'checkpoint' AND column_name IN ('position', 'parent_position'))
-                OR (table_name = 'history' AND column_name IN
-                    ('block_position', 'block_parent_position'))
-                OR (table_name = 'journal' AND column_name IN
-                    ('block_position', 'block_parent_position',
-                     'previous_checkpoint_position',
-                     'previous_checkpoint_parent_position'))
-              )
-            ",
-            &[],
-        )
-        .await
-        .expect("count coordinate columns")
-        .get(0)
 }
 
 async fn assert_coordinate_schema(client: &tokio_postgres::Client) {

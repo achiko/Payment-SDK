@@ -203,6 +203,9 @@ released automatically by commit or rollback and requires no lock table.
 Deployment-owned central schema creation and migration scripts live physically
 under `sdk/indexing/postgres/migrations/`. Their physical location does not
 make the SDK registry table part of the synchronization repository contract.
+The predeployment baseline is one final-state initializer applied only to an
+empty schema. It becomes immutable at the first persistent deployment; future
+changes append ordered preservation-first migrations.
 
 `payment_wallets` remains the reusable SDK registry/restoration table even
 though it is physically colocated in the central database. The PostgreSQL

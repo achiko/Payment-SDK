@@ -176,6 +176,10 @@ standards remain compatibility contracts.
   schema serving every configured chain/network scope.
 - The deployment-owned canonical shared-schema creation and ordered migration
   scripts MUST live physically under `sdk/indexing/postgres/migrations/`.
+- Before the first persistent deployment, the canonical history MUST contain
+  one final-state initializer for an empty schema. That initializer MUST become
+  immutable at the first persistent deployment, and every later schema change
+  MUST append a new ordered migration.
 - `Repository::new` MUST bind a cloned process-wide pool to exactly one
   `(chain, network)` and MUST reject operations for another scope.
 - Its `Repository` MUST own only the indexing checkpoint, history/movement,

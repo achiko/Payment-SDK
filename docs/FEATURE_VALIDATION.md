@@ -15,10 +15,10 @@ exist in the current workspace.
 | Exact wallet history mapping, transaction-ambiguity preservation, truthful batch failure metadata, and bounded batch admission | `sdk/wallets` | history and conversion tests, four scoped `SendError` tests, direct 0/1/50/51 boundary tests, and a four-case competing-error table proving authored itemwise amount, lookup, and family precedence before sender invocation |
 | Native block coordinates and sparse synchronization | `sdk/chains/base`, `sdk/indexing` | every `BlockRef` carries native position, produced height, hash, atomic parent, and timestamp; deterministic fixtures prove sparse `100 -> 103 -> 107` traversal, strict height increments, skipped birthdays, prefix restart, retained reorg, and `ReorgTooDeep` |
 | Atomic indexing persistence | `sdk/indexing/redb` | complete-coordinate repository tests cover add/remove/reopen and legacy height-only record rejection, including pre-repository duplicate-output rejection |
-| Position-aware PostgreSQL indexing repository | `sdk/indexing/postgres` | scope-bound `Blocks`, `Transactions`, `Outputs`, reusable registry, read-only configured-schema validation, typed zero-pool rejection, address-qualified spends, duplicate-output rejection, serialized add/remove, checkpoint-stable pages, sparse-coordinate add/remove/reopen, and one-pool multi-scope isolation; the migration and repository contracts run against owned schemas on pinned PostgreSQL 18.6 |
-| Canonical coordinate migration and preservation runbook | `sdk/indexing/postgres/migrations`, deployment documentation | migration `0004` has a locked checksum and owned fresh/retained rehearsals proving dense backfill, all-table count/hash preservation, unchanged `payment_wallets`, final atomic-parent constraints, and rollback of invalid populated state; no retained database was contacted |
+| Position-aware PostgreSQL indexing repository | `sdk/indexing/postgres` | scope-bound `Blocks`, `Transactions`, `Outputs`, reusable registry, read-only configured-schema validation, typed zero-pool rejection, address-qualified spends, duplicate-output rejection, serialized add/remove, checkpoint-stable pages, sparse-coordinate add/remove/reopen, and one-pool multi-scope isolation; initializer and repository contracts run against owned schemas on pinned PostgreSQL 18.6 |
+| Canonical fresh-schema initializer | `sdk/indexing/postgres/migrations`, deployment documentation | one checksum-locked `0001_init.sql` directly creates the final catalog without upgrade/backfill DDL; owned contracts verify final coordinates and constraints, exact catalog shape, registry preservation, and refusal to replay over an existing schema |
 | Atomic runtime wallet/filter admission | `sdk/indexing`, `sdk/wallets` | one coordinator per scope serializes commit and publication permits without holding mutex guards across `.await`; deterministic coordinator and real-wallet fixtures prove both orderings, revision invalidation, cancellation recovery, checkpoint reload, and successor birthdays |
-| Reusable wallet registry and restoration ownership | `sdk/wallets`, `sdk/indexing`, `sdk/indexing/postgres` | `Registry`, `RegisteredAddress`, and `Wallets::adopt`/`restore` remain reusable SDK capabilities; owned migration and registry tests preserve the physical `payment_wallets` schema/content and its existing column mapping |
+| Reusable wallet registry and restoration ownership | `sdk/wallets`, `sdk/indexing`, `sdk/indexing/postgres` | `Registry`, `RegisteredAddress`, and `Wallets::adopt`/`restore` remain reusable SDK capabilities; owned initializer and registry tests preserve the physical `payment_wallets` schema/content and its existing column mapping |
 | Solana architecture ownership | `lint.toml`, `packages/design-lint` | `chain-solana` is mapped to an exact package/base/indexing/wallets layer consumed only by application and acceptance; `solana`/`sol` vocabulary is restricted to `apps/` and `sdk/chains/solana/`, with two reasoned line-local Alloy exceptions in Ethereum; positive/negative policy tests and the repository policy check pass |
 | Native Solana chain and runtime composition | `sdk/chains/solana`, `apps/api`, `sdk/wallets`, `sdk/indexing`, `sdk/indexing/postgres` | Canonical `SOL` metadata, native-only `AssetKind`/`WalletConfig`, Base58 values, checked lamports, Ed25519 provider/wallet adapters, exact finalized balance/history, immutable System-plus-Memo envelopes, ambiguity reconciliation, bounded sparse finalized-slot indexing, public native-SOL routes/OpenAPI, closed environment-backed configuration, identity/Memo-before-storage ordering, one central pool, tracked readiness/submission tasks, and ordered ambiguity-preserving shutdown are implemented. Focused doubles and owned PostgreSQL 18.6 contracts pass. The exact Agave end-to-end run remains unavailable until the checksum-pinned archive is present. |
 | Generic JSON-RPC/HTTP/crypto/storage mechanics | `packages/*` | package tests |
@@ -53,10 +53,11 @@ Fresh Rust 1.91 evidence recorded on 2026-08-30:
 The final boundary audit confirms that `chain-solana` is consumed only by
 `payment-api`, its direct workspace dependencies point to base, indexing,
 wallets, and generic JSON-RPC, and existing Bitcoin/Ethereum tests pass without
-depending on Solana internals. No migration file changed, application startup
-contains no DDL, the system target uses loopback endpoints and fixed unfunded
-test seeds only, Solana RPC configuration is redacted and no-retry, and OpenAPI
-publishes native SOL without SPL routes or assets.
+depending on Solana internals. Application startup contains no DDL, the system
+target uses loopback endpoints and fixed unfunded test seeds only, Solana RPC
+configuration is redacted and no-retry, and OpenAPI publishes native SOL
+without SPL routes or assets. The later predeployment schema consolidation is
+recorded in the current persistence-coordinate gate below.
 
 ## Native Solana research closeout evidence
 
@@ -82,9 +83,10 @@ publishes native SOL without SPL routes or assets.
   Alloy/redb versions remain unchanged, and no monolithic Solana client or SDK
   was added. Locked workspace all-target compilation, strict workspace Clippy,
   and the complete workspace suite pass against the integrated graph.
-- [PostgreSQL Schema Baseline](POSTGRESQL_SCHEMA_BASELINE.md) records the static
-  closeout plus owned PostgreSQL 18.6 runtime migration, catalog, sentinel, and
-  startup-validator evidence. No retained database migration has run.
+- [PostgreSQL Schema Baseline](POSTGRESQL_SCHEMA_BASELINE.md) records the single
+  predeployment initializer, final catalog, ownership, fresh-only deployment
+  boundary, registry sentinel, and startup-validator evidence. No retained
+  database migration has run.
 
 ## Current application validation
 
@@ -158,10 +160,11 @@ git diff --check
 If a gate fails, document the exact failure rather than weakening a lint or
 describing the workspace as complete.
 
-Latest persistence-coordinate gate: the uninterrupted locked workspace suite
-passes, including owned PostgreSQL 18 migration contracts 5/5, repository
-contracts 23/23, and application acceptance 18/18. Formatting, locked workspace
-all-target compilation, strict all-target/all-feature Clippy, no-deps
-documentation, design-lint, and diff checks pass. The owned migration proof
-keeps the finalized `0004` checksum, catalog, constraints, scope rows, and
-registry sentinel under verification; no retained database migration ran.
+Latest persistence-coordinate gate recorded on 2026-09-01: the uninterrupted
+locked workspace suite passes, including owned PostgreSQL 18 initializer
+contracts 3/3, repository contracts 25/25, and application acceptance 18/18.
+Formatting, locked workspace all-target compilation, strict
+all-target/all-feature Clippy, no-deps documentation, design-lint, and diff
+checks pass. The owned proof locks the single initializer checksum and verifies
+the final catalog, constraints, scope isolation, registry sentinel, and replay
+rejection; no retained database was contacted or migrated.

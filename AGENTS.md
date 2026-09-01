@@ -28,6 +28,11 @@ or exact-scope rescan must preserve unrelated scopes and application-owned
 tables unless their owner separately approves a change. External Bitcoin,
 Ethereum, Solana, JSON-RPC, and HTTP standards remain compatibility contracts.
 
+The current predeployment PostgreSQL history contains one fresh-schema
+initializer. Apply it only to an empty schema. Freeze its exact bytes and
+checksum at the first persistent deployment; every later schema change is a new
+ordered migration rather than an edit or replay of the initializer.
+
 `old/` and `reference/` are excluded research, not production dependencies or
 architecture templates. Do not edit them unless explicitly asked.
 

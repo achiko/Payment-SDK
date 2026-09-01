@@ -187,7 +187,7 @@ async fn configured_schema_overrides_url_search_path_without_ddl() {
 }
 
 #[tokio::test]
-async fn baseline_migrations_match_catalog_keys_and_ownership() {
+async fn schema_initializer_matches_catalog_keys_and_ownership() {
     let database = TestDatabase::start().await;
     let client = database
         .pool()
@@ -313,7 +313,7 @@ async fn baseline_migrations_match_catalog_keys_and_ownership() {
         .get(0);
     assert_eq!(
         movement_foreign_keys, 0,
-        "migration 0003 must remove the movement foreign key"
+        "the final schema must not create a movement foreign key"
     );
 }
 

@@ -209,6 +209,9 @@ that pool. The repository handle enforces scope isolation; the schema is not
 duplicated per chain or asset. The canonical central schema creation and
 migration history is a deployment concern stored physically under
 `sdk/indexing/postgres/migrations/`.
+Before the first persistent deployment that history is one final-state
+fresh-schema initializer. Deployment applies it exactly once to an empty schema;
+afterward it is immutable and later changes append ordered migrations.
 `sdk/indexing/postgres` owns indexing row encoding, set-based statements,
 transactions, and compare-and-swap rules. Its add/remove transaction takes a
 scope-derived advisory lock before reading the checkpoint, including when the
