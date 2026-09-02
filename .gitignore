@@ -34,3 +34,6 @@ logs/
 
 /anvil_blocks
 /tmp
+
+# Generated design-lint reports
+/lint/errors/

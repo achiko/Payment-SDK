@@ -1562,11 +1562,14 @@ name = "design-lint"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "english-pos-tagger",
  "proc-macro2",
+ "quote",
  "serde",
  "syn 2.0.119",
  "thiserror 2.0.20",
  "toml",
+ "wordnet-lemmatizer",
 ]
 
 [[package]]
@@ -1704,6 +1707,19 @@ dependencies = [
  "serdect",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "english-pos-tagger"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13190d3f5fad1f7a96851a1cd49e0326ec30d98cc5356b383d61ce50ba3bd382"
+dependencies = [
+ "once_cell",
+ "regex",
+ "serde",
+ "serde_json",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -5517,6 +5533,12 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "wordnet-lemmatizer"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "665d1d6d46d3e76785cf018b30103388fa62a4289b236b04326a832d038d4339"
 
 [[package]]
 name = "writeable"

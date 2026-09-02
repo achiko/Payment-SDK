@@ -75,6 +75,7 @@ business and endpoint code do not branch on a concrete chain.
 - [`docs/API.md`](docs/API.md) documents the public HTTP surface.
 - [`docs/INDEXING_CENTRAL_DATABASE_PLAN.md`](docs/INDEXING_CENTRAL_DATABASE_PLAN.md)
   is the flat execution plan for shared PostgreSQL and generic indexing work.
+- [`packages/design-lint/README.md`](packages/design-lint/README.md) describes SDK and adopted design checks, policy, and review commands.
 - [`docs/SOLANA_IMPLEMENTATION_PLAN.md`](docs/SOLANA_IMPLEMENTATION_PLAN.md) is
   the flat, maximum-small implementation plan for native Solana support.
 

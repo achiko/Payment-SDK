@@ -32,6 +32,59 @@ fn clean(root: std::path::PathBuf) {
 }
 
 #[test]
+fn renamed_and_target_dependencies_keep_package_identity() {
+    for declaration in [
+        "[dependencies]\nalias = { package = 'high', path = '../../sdk/high' }",
+        "[target.'cfg(unix)'.dependencies]\nhigh = { path = '../../sdk/high' }",
+    ] {
+        let manifest = format!("[package]\nname='low'\nversion='0.0.0'\n{declaration}\n");
+        let (root, workspace) = fixture(&[
+            ("packages/low/Cargo.toml", &manifest),
+            (
+                "sdk/high/Cargo.toml",
+                "[package]\nname='high'\nversion='0.0.0'\n",
+            ),
+        ]);
+        let mut policy = Policy::default();
+        policy.dependency.layers = vec![
+            Layer {
+                name: "low".into(),
+                directory: Some("packages".into()),
+                may_depend_on: vec![],
+            },
+            Layer {
+                name: "high".into(),
+                directory: Some("sdk".into()),
+                may_depend_on: vec![],
+            },
+        ];
+        let findings = repository::dependencies(&workspace, &policy).unwrap();
+        assert_eq!(findings.len(), 1, "{declaration}");
+        assert_eq!(findings[0].subject, "low -> high");
+        clean(root);
+    }
+}
+
+#[test]
+fn vocabulary_checks_production_after_test_syntax_and_marker_text() {
+    for source in [
+        "#[cfg(test)] mod tests {}\npub struct BitcoinValue { value: u8 }",
+        "const MARKER: &str = \"#[cfg(test)]\";\npub struct BitcoinValue { value: u8 }",
+    ] {
+        let (root, workspace) = fixture(&[("src/lib.rs", source)]);
+        let mut policy = Policy::default();
+        policy.vocabulary.owners.push(VocabularyOwner {
+            words: vec!["bitcoin".into()],
+            allowed_paths: vec!["sdk/chains/bitcoin/".into()],
+        });
+        let findings = repository::vocabulary(&workspace, &policy).unwrap();
+        assert_eq!(findings.len(), 1, "{source}");
+        assert_eq!(findings[0].rule, "owned-vocabulary");
+        clean(root);
+    }
+}
+
+#[test]
 fn version_suffix_is_not_a_word() {
     assert_eq!(rust::name_words("HTTPServerV2"), ["http", "server"]);
     assert_eq!(rust::name_words("RecordV1"), ["record"]);
@@ -522,6 +575,47 @@ fn crate_source_root_with_only_lib_is_allowed() {
         repository::single_file_directories(&workspace, &Policy::default())
             .unwrap()
             .is_empty()
+    );
+    clean(root);
+}
+
+#[test]
+fn unicode_test_masking_keeps_exact_production_text_and_lines() {
+    let text = "const CAFÉ: &str = \"ქართული\"; #[cfg(test)] struct BitcoinFixture;\n#[cfg(test)] mod tests {\n const TEXT: &str = \"é\";\n}\npub struct EthereumValue;\n";
+    let (root, workspace) = fixture(&[("src/lib.rs", text)]);
+    let source = &workspace.sources()[0];
+    let masked = super::production::text(source);
+    assert!(masked.contains("ქართული"));
+    assert!(!masked.contains("BitcoinFixture"));
+    assert!(!masked.contains("const TEXT"));
+    assert!(masked.contains("EthereumValue"));
+    assert_eq!(super::production::line_count(source), 2);
+    clean(root);
+}
+
+#[test]
+fn test_only_constructor_methods_and_literal_allow_markers_do_not_affect_production() {
+    let text = r##"
+struct Value(u8);
+impl Value {
+    #[cfg(test)] fn new(self) -> Self { self }
+    const NOTE: &str = "// design-lint: allow self-constructor-static -- literal";
+    fn parse(self) -> Self { self }
+}
+const RAW: &str = r#"
+// design-lint: allow empty-struct -- raw string
+"#;
+struct Empty;
+"##;
+    let (root, workspace) = fixture(&[("src/lib.rs", text)]);
+    let constructors = rust::check_kind(&workspace, &Policy::default(), "constructors").unwrap();
+    assert_eq!(constructors.len(), 1);
+    assert_eq!(constructors[0].subject, "parse");
+    assert_eq!(
+        rust::check_kind(&workspace, &Policy::default(), "empty")
+            .unwrap()
+            .len(),
+        1
     );
     clean(root);
 }

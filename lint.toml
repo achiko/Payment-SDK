@@ -131,3 +131,38 @@ chain_directories = [
 [source]
 ignored_directories = [".git", "target", "vendor", "generated", "old", "reference", "lint"]
 self_packages = ["design-lint"]
+
+# Environment access belongs to these exact configuration and local benchmark files.
+[[boundaries.environment]]
+path = "apps/api/src/config.rs"
+
+[[boundaries.environment]]
+path = "apps/api/src/config/postgres.rs"
+
+[[boundaries.environment]]
+path = "sdk/indexing/postgres/examples/bench.rs"
+
+[[boundaries.environment]]
+path = "sdk/indexing/redb/examples/bench.rs"
+
+[rust]
+forbidden_modules = ["common", "core", "shared", "util", "utils", "helper", "helpers", "misc"]
+
+[rules]
+# Original SDK checks always run. Error rules with a source backlog remain available
+# through Registry::all() and the review-adoption example at their original severity.
+enabled = [
+    "catch-all-module-name",
+    "environment-variable-access",
+    "platform-command-boundary",
+    "ignored-fallible-result",
+    "async-blocking-operation",
+    "single-use-free-function",
+    "deep-control-flow",
+    "boolean-state-cluster",
+    "string-backed-finite-state",
+    "god-object-growth",
+    "redundant-accessor",
+    "wire-domain-model-duplication",
+    "ceremonial-structure",
+]
