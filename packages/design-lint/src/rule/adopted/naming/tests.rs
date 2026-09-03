@@ -83,12 +83,7 @@ fn reasoned_sdk_exception_retains_protocol_vocabulary() {
         "src/lib.rs",
         "// design-lint: allow struct-noun-naming -- external protocol vocabulary\nstruct Selected;\n",
     )]);
-    let registry = crate::Registry::new(vec![Box::new(crate::rule::Check {
-        id: ID,
-        severity: crate::Severity::Error,
-        run: check,
-    })])
-    .expect("registry");
+    let registry = crate::Registry::new().register(super::StructNaming);
     let summaries = crate::Linter::new(Policy::default(), registry)
         .run(
             vec![fixture.path().to_owned()],

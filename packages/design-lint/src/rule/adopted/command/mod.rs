@@ -13,6 +13,27 @@ use crate::{
 
 pub(crate) const ID: &str = "platform-command-boundary";
 
+/// Checks process execution against configured ownership boundaries.
+pub struct PlatformCommand;
+
+impl crate::Rule for PlatformCommand {
+    fn id(&self) -> &'static str {
+        ID
+    }
+
+    fn severity(&self) -> crate::Severity {
+        crate::Severity::Error
+    }
+
+    fn check(
+        &self,
+        workspace: &crate::source::Workspace,
+        policy: &crate::Policy,
+    ) -> crate::Result<Vec<crate::Finding>> {
+        check(workspace, policy)
+    }
+}
+
 pub(crate) fn check(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
     let mut findings = Vec::new();
     for source in workspace.sources() {

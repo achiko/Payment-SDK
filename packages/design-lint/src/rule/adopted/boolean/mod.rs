@@ -19,6 +19,27 @@ mod tests;
 /// Reviews related boolean fields that encode one mutually exclusive state.
 pub(crate) const ID: &str = "boolean-state-cluster";
 
+/// Reports clusters of booleans that may represent one state.
+pub struct BooleanState;
+
+impl crate::Rule for BooleanState {
+    fn id(&self) -> &'static str {
+        ID
+    }
+
+    fn severity(&self) -> crate::Severity {
+        crate::Severity::Warning
+    }
+
+    fn check(
+        &self,
+        workspace: &crate::source::Workspace,
+        policy: &crate::Policy,
+    ) -> crate::Result<Vec<crate::Finding>> {
+        check(workspace, policy)
+    }
+}
+
 pub(crate) fn check(workspace: &Workspace, _policy: &Policy) -> Result<Vec<Finding>> {
     let mut findings = Vec::new();
     for source in workspace.production() {

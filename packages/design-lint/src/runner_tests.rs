@@ -2,7 +2,7 @@ use crate::{
     Cases, Finding, LintError, Linter, Policy, Registry, Reporter, Result, Review, Rule, Severity,
     Summary, source::Workspace, test_support::Fixture,
 };
-use std::fs;
+use std::{cell::RefCell, fs, rc::Rc};
 
 struct Probe {
     id: &'static str,
@@ -48,18 +48,144 @@ impl Reporter for Collected {
         Ok(())
     }
 }
+
+struct ObservedRule {
+    id: &'static str,
+    calls: Rc<RefCell<Vec<&'static str>>>,
+}
+
+impl Rule for ObservedRule {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn severity(&self) -> Severity {
+        Severity::Error
+    }
+
+    fn check(&self, _: &Workspace, _: &Policy) -> Result<Vec<Finding>> {
+        self.calls.borrow_mut().push(self.id);
+        Ok(Vec::new())
+    }
+}
+
 #[test]
-fn registry_rejects_duplicates_and_keeps_sdk_rules() {
-    let rules: Vec<Box<dyn Rule>> = (0..2)
-        .map(|_| {
-            Box::new(Probe {
-                id: "same",
-                severity: Severity::Error,
-                fail: false,
-            }) as Box<dyn Rule>
+fn registry_runs_rules_in_registration_order() {
+    let fixture = Fixture::new(&[("src/lib.rs", "const VALUE: u8 = 1;")]);
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let registry = Registry::new()
+        .register(ObservedRule {
+            id: "second",
+            calls: calls.clone(),
         })
-        .collect();
-    assert!(Registry::new(rules).is_err());
+        .register(ObservedRule {
+            id: "first",
+            calls: calls.clone(),
+        });
+    let summaries = Linter::new(Policy::default(), registry)
+        .run(vec![fixture.path().to_owned()], &mut Collected::default())
+        .unwrap();
+    assert_eq!(*calls.borrow(), ["second", "first"]);
+    assert_eq!(
+        summaries
+            .iter()
+            .map(|summary| summary.rule)
+            .collect::<Vec<_>>(),
+        ["second", "first"]
+    );
+}
+
+#[test]
+fn invalid_registry_fails_before_source_loading_or_execution() {
+    let fixture = Fixture::new(&[
+        ("valid.rs", "const VALUE: u8 = 1;"),
+        ("invalid.rs", "not Rust source"),
+    ]);
+    for ids in [["valid", "same", "same"], ["valid", "other", ""]] {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let registry = ids.into_iter().fold(Registry::new(), |registry, id| {
+            registry.register(ObservedRule {
+                id,
+                calls: calls.clone(),
+            })
+        });
+        assert!(registry.validate().is_err());
+        let linter = Linter::new(Policy::default(), registry);
+        for path in ["valid.rs", "invalid.rs"] {
+            let mut reporter = Collected::default();
+            let error = linter
+                .run(vec![fixture.path().join(path)], &mut reporter)
+                .unwrap_err();
+            assert!(error.to_string().contains("empty or duplicate rule ID"));
+            assert!(calls.borrow().is_empty());
+            assert!(!reporter.began);
+        }
+    }
+}
+
+#[test]
+fn full_and_configured_catalogs_keep_their_existing_order() {
+    let expected = [
+        "dependency-direction",
+        "owned-vocabulary",
+        "file-length",
+        "forbidden-path",
+        "empty-directory",
+        "chain-layout",
+        "single-file-directory",
+        "trait-method-count",
+        "empty-struct",
+        "struct-word-count",
+        "self-constructor-static",
+        "receiver-name-repetition",
+        "catch-all-module-name",
+        "struct-noun-naming",
+        "unclassified-free-function",
+        "single-use-free-function",
+        "deep-control-flow",
+        "environment-variable-access",
+        "platform-command-boundary",
+        "ignored-fallible-result",
+        "async-blocking-operation",
+        "boolean-state-cluster",
+        "string-backed-finite-state",
+        "god-object-growth",
+        "redundant-accessor",
+        "duplicate-entity-base",
+        "wire-domain-model-duplication",
+        "ceremonial-structure",
+    ];
+    assert_eq!(
+        Registry::all()
+            .unwrap()
+            .iter()
+            .map(Rule::id)
+            .collect::<Vec<_>>(),
+        expected
+    );
+    let policy: Policy = toml::from_str(include_str!("../../../lint.toml")).unwrap();
+    let expected = expected
+        .into_iter()
+        .filter(|id| {
+            ![
+                "receiver-name-repetition",
+                "struct-noun-naming",
+                "unclassified-free-function",
+                "duplicate-entity-base",
+            ]
+            .contains(id)
+        })
+        .collect::<Vec<_>>();
+    let linter = Linter::standard_with_policy(policy).unwrap();
+    assert_eq!(
+        linter.registry.iter().map(Rule::id).collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(linter.registry.iter().count(), 24);
+}
+
+#[test]
+fn registry_keeps_sdk_rules_and_policy_selection() {
     let policy = Policy::default();
     assert_eq!(Registry::standard(&policy).unwrap().iter().count(), 11);
     assert_eq!(Registry::all().unwrap().iter().count(), 28);
@@ -81,12 +207,11 @@ fn registry_rejects_duplicates_and_keeps_sdk_rules() {
 fn review_evidence_never_hides_errors_or_warnings() {
     let fixture = Fixture::new(&[("src/lib.rs", "const VALUE: u8 = 1;")]);
     for severity in [Severity::Error, Severity::Warning] {
-        let registry = Registry::new(vec![Box::new(Probe {
+        let registry = Registry::new().register(Probe {
             id: "probe",
             severity,
             fail: false,
-        })])
-        .unwrap();
+        });
         let mut reporter = Collected::default();
         let summary = Linter::new(Policy::default(), registry)
             .run(vec![fixture.path().to_owned()], &mut reporter)
@@ -105,12 +230,11 @@ fn failed_analysis_leaves_existing_cases_untouched() {
         ("lint/check/notes.md", "user note"),
         ("lint/errors/.gitkeep", ""),
     ]);
-    let registry = Registry::new(vec![Box::new(Probe {
+    let registry = Registry::new().register(Probe {
         id: "fail",
         severity: Severity::Error,
         fail: true,
-    })])
-    .unwrap();
+    });
     let mut cases = Cases::with_output(fixture.path().join("lint"), Vec::new());
     assert!(
         Linter::new(Policy::default(), registry)

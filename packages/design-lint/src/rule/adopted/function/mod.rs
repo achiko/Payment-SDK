@@ -14,6 +14,27 @@ use crate::{
 
 pub(crate) const ID: &str = "unclassified-free-function";
 
+/// Reviews free functions for a cohesive owner.
+pub struct FreeFunction;
+
+impl crate::Rule for FreeFunction {
+    fn id(&self) -> &'static str {
+        ID
+    }
+
+    fn severity(&self) -> crate::Severity {
+        crate::Severity::Error
+    }
+
+    fn check(
+        &self,
+        workspace: &crate::source::Workspace,
+        policy: &crate::Policy,
+    ) -> crate::Result<Vec<crate::Finding>> {
+        check(workspace, policy)
+    }
+}
+
 pub(crate) fn check(workspace: &Workspace, _policy: &Policy) -> Result<Vec<Finding>> {
     let mut candidates = Vec::new();
     let mut definitions = HashMap::<String, usize>::new();

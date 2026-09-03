@@ -109,12 +109,7 @@ fn thin_handler_can_have_a_reasoned_sdk_exception() {
         "src/lib.rs",
         "// design-lint: allow unclassified-free-function -- Axum owns this extractor signature\nasync fn create(State(wallets): State<Wallets>) { wallets.generate().await; }\n",
     )]);
-    let registry = crate::Registry::new(vec![Box::new(crate::rule::Check {
-        id: ID,
-        severity: crate::Severity::Error,
-        run: check,
-    })])
-    .expect("registry");
+    let registry = crate::Registry::new().register(super::FreeFunction);
     let summaries = crate::Linter::new(Policy::default(), registry)
         .run(
             vec![fixture.path().to_owned()],

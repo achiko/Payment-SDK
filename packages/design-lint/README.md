@@ -94,8 +94,24 @@ This example is a review harness: successful report generation returns success
 even when the explicitly selected registry finds errors. The normal CLI remains
 the enforcement command. Library callers can compose `Linter::new(policy,
 registry)`, `Registry::standard(&policy)`, `Registry::all()`, or a custom registry
-of `Rule` implementations. Duplicate IDs and inconsistent finding severity/IDs
-are rejected.
+of named `Rule` implementations:
+
+```rust
+use design_lint::{Linter, Policy, Registry, rule};
+
+let registry = Registry::new()
+    .register(rule::DependencyDirection)
+    .register(rule::FreeFunction)
+    .register(rule::DuplicateEntity)
+    .register(rule::BooleanState);
+let linter = Linter::new(Policy::default(), registry);
+```
+
+The complete built-in registration chain lives in `standard_rules()` in
+`src/lib.rs`. Standard and all-rule selections use this one ordered catalog.
+An explicit registry runs exactly the supplied rules in registration order.
+Empty or duplicate IDs are rejected before source loading or rule execution;
+inconsistent finding severity/IDs are rejected before reporting.
 
 ## Boundaries and exceptions
 

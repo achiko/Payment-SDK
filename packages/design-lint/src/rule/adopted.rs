@@ -17,98 +17,44 @@ mod result;
 mod single;
 mod state;
 
-use super::{Check, Severity};
+pub use accessor::AccessorBloat;
+pub use blocking::AsyncBlocking;
+pub use boolean::BooleanState;
+pub use catchall::CatchAllModule;
+pub use ceremony::CeremonialStructure;
+pub use command::PlatformCommand;
+pub use duplicate::DuplicateEntity;
+pub use environment::EnvironmentAccess;
+pub use function::FreeFunction;
+pub use model::ModelDuplication;
+pub use naming::StructNaming;
+pub use nesting::DeepControlFlow;
+pub use object::GodObject;
+pub use receiver::ReceiverRepetition;
+pub use result::IgnoredResult;
+pub use single::SingleUse;
+pub use state::FiniteStateString;
 
-pub(super) fn checks() -> Vec<Check> {
-    vec![
-        Check {
-            id: receiver::ID,
-            severity: Severity::Error,
-            run: receiver::check,
-        },
-        Check {
-            id: catchall::ID,
-            severity: Severity::Error,
-            run: catchall::check,
-        },
-        Check {
-            id: naming::ID,
-            severity: Severity::Error,
-            run: naming::check,
-        },
-        Check {
-            id: function::ID,
-            severity: Severity::Error,
-            run: function::check,
-        },
-        Check {
-            id: single::ID,
-            severity: Severity::Warning,
-            run: single::check,
-        },
-        Check {
-            id: nesting::ID,
-            severity: Severity::Warning,
-            run: nesting::check,
-        },
-        Check {
-            id: environment::ID,
-            severity: Severity::Error,
-            run: environment::check,
-        },
-        Check {
-            id: command::ID,
-            severity: Severity::Error,
-            run: command::check,
-        },
-        Check {
-            id: result::ID,
-            severity: Severity::Error,
-            run: result::check,
-        },
-        Check {
-            id: blocking::ID,
-            severity: Severity::Error,
-            run: blocking::check,
-        },
-        Check {
-            id: boolean::ID,
-            severity: Severity::Warning,
-            run: boolean::check,
-        },
-        Check {
-            id: state::ID,
-            severity: Severity::Warning,
-            run: state::check,
-        },
-        Check {
-            id: object::ID,
-            severity: Severity::Warning,
-            run: object::check,
-        },
-        Check {
-            id: accessor::ID,
-            severity: Severity::Warning,
-            run: accessor::check,
-        },
-        Check {
-            id: duplicate::ID,
-            severity: Severity::Error,
-            run: duplicate::check,
-        },
-        Check {
-            id: model::ID,
-            severity: Severity::Warning,
-            run: model::check,
-        },
-        Check {
-            id: ceremony::ID,
-            severity: Severity::Warning,
-            run: ceremony::check,
-        },
-    ]
-}
+pub(crate) const IDS: [&str; 17] = [
+    receiver::ID,
+    catchall::ID,
+    naming::ID,
+    function::ID,
+    single::ID,
+    nesting::ID,
+    environment::ID,
+    command::ID,
+    result::ID,
+    blocking::ID,
+    boolean::ID,
+    state::ID,
+    object::ID,
+    accessor::ID,
+    duplicate::ID,
+    model::ID,
+    ceremony::ID,
+];
 
 pub(crate) fn contains(id: &str) -> bool {
-    checks().iter().any(|rule| rule.id == id)
+    IDS.contains(&id)
 }

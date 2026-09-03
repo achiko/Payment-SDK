@@ -20,6 +20,27 @@ mod tests;
 /// Reviews likely copies of the same model across serialization boundaries.
 pub(crate) const ID: &str = "wire-domain-model-duplication";
 
+/// Reports possible duplication between wire and domain models.
+pub struct ModelDuplication;
+
+impl crate::Rule for ModelDuplication {
+    fn id(&self) -> &'static str {
+        ID
+    }
+
+    fn severity(&self) -> crate::Severity {
+        crate::Severity::Warning
+    }
+
+    fn check(
+        &self,
+        workspace: &crate::source::Workspace,
+        policy: &crate::Policy,
+    ) -> crate::Result<Vec<crate::Finding>> {
+        check(workspace, policy)
+    }
+}
+
 pub(crate) fn check(workspace: &Workspace, _policy: &Policy) -> Result<Vec<Finding>> {
     let mut database = Database {
         dependencies: workspace

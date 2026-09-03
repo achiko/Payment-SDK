@@ -10,6 +10,27 @@ use crate::rule::syntax::type_name;
 
 pub(crate) const ID: &str = "receiver-name-repetition";
 
+/// Detects method names that repeat their receiver.
+pub struct ReceiverRepetition;
+
+impl crate::Rule for ReceiverRepetition {
+    fn id(&self) -> &'static str {
+        ID
+    }
+
+    fn severity(&self) -> crate::Severity {
+        crate::Severity::Error
+    }
+
+    fn check(
+        &self,
+        workspace: &crate::source::Workspace,
+        policy: &crate::Policy,
+    ) -> crate::Result<Vec<crate::Finding>> {
+        check(workspace, policy)
+    }
+}
+
 pub(crate) fn check(workspace: &Workspace, _policy: &Policy) -> Result<Vec<Finding>> {
     let mut findings = Vec::new();
     for source in workspace.production() {

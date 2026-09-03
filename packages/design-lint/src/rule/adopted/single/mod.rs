@@ -11,6 +11,27 @@ use crate::{
 
 pub(crate) const ID: &str = "single-use-free-function";
 
+/// Reports free functions with a single local caller.
+pub struct SingleUse;
+
+impl crate::Rule for SingleUse {
+    fn id(&self) -> &'static str {
+        ID
+    }
+
+    fn severity(&self) -> crate::Severity {
+        crate::Severity::Warning
+    }
+
+    fn check(
+        &self,
+        workspace: &crate::source::Workspace,
+        policy: &crate::Policy,
+    ) -> crate::Result<Vec<crate::Finding>> {
+        check(workspace, policy)
+    }
+}
+
 pub(crate) fn check(workspace: &Workspace, _policy: &Policy) -> Result<Vec<Finding>> {
     let mut definitions = Vec::new();
     let mut references = Vec::new();

@@ -4,22 +4,13 @@ use syn::{
     TraitItem, Type, visit::Visit,
 };
 
-use super::{CheckFn, finding, production::test_only};
+use super::{finding, production::test_only};
 use crate::{
     Finding, Policy, Result,
     source::{SourceFile, Workspace},
 };
 
-pub(super) fn checks() -> [(&'static str, CheckFn); 4] {
-    [
-        ("trait-method-count", traits),
-        ("empty-struct", empty_structs),
-        ("struct-word-count", struct_names),
-        ("self-constructor-static", constructors),
-    ]
-}
-
-fn traits(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
+pub(super) fn traits(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
     let mut findings = check(workspace, policy, ApiRule::Traits)?;
     for evidence in super::adopted::contract::check(workspace, policy)? {
         if let Some(finding) = findings.iter_mut().find(|finding| {
@@ -33,13 +24,13 @@ fn traits(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
     }
     Ok(findings)
 }
-fn empty_structs(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
+pub(super) fn empty_structs(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
     check(workspace, policy, ApiRule::EmptyStructs)
 }
-fn struct_names(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
+pub(super) fn struct_names(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
     check(workspace, policy, ApiRule::StructNames)
 }
-fn constructors(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
+pub(super) fn constructors(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
     check(workspace, policy, ApiRule::Constructors)
 }
 

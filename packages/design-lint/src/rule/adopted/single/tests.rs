@@ -56,12 +56,7 @@ fn deliberate_section_boundary_uses_reasoned_sdk_exception() {
         "src/lib.rs",
         "fn main() { section(); }\n// design-lint: allow single-use-free-function -- deliberate semantic section in the startup sequence\nfn section() {}\n",
     )]);
-    let registry = crate::Registry::new(vec![Box::new(crate::rule::Check {
-        id: ID,
-        severity: crate::Severity::Warning,
-        run: check,
-    })])
-    .expect("registry");
+    let registry = crate::Registry::new().register(super::SingleUse);
     let summaries = crate::Linter::new(Policy::default(), registry)
         .run(
             vec![fixture.path().to_owned()],

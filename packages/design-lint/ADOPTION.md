@@ -68,7 +68,7 @@ The process boundary list is empty. No framework-wide allowance was added.
 
 | Check | Result |
 |---|---|
-| `cargo test --locked -p design-lint` | Pass: 188 library tests, 4 CLI argument tests, 2 CLI integration tests; 194 total |
+| `cargo test --locked -p design-lint` | Pass: 191 library tests, 4 CLI argument tests, 2 CLI integration tests, 1 public-registry doctest; 198 total |
 | `cargo fmt --all -- --check` | Pass |
 | `cargo check --locked --workspace --all-targets` | Pass |
 | `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` | Pass |
@@ -77,7 +77,7 @@ The process boundary list is empty. No framework-wide allowance was added.
 | Explicit-policy and bare `check .`; case regeneration | Pass: zero errors, 116 warnings/cases |
 | Full explicit-registry review | Completed: 287 error candidates, 116 warnings |
 | `git diff --check` and new-file whitespace/path review | Pass |
-| `cargo test --locked --workspace` | Pass: 678 tests, zero failures/ignored, including PostgreSQL migration/repository and API acceptance fixtures |
+| `cargo test --locked --workspace` | Pass: 682 tests, zero failures/ignored, including PostgreSQL migration/repository and API acceptance fixtures |
 
 The first sandboxed workspace run could not bind three Solana loopback sockets;
 rerunning with local test permissions passed all 117 Solana unit tests and the
@@ -96,12 +96,18 @@ and production masking, policy errors/precedence, warning/error exit behavior,
 registry uniqueness, reasoned comments versus string literals, and staged case
 replacement/failure recovery.
 
+Named-rule registration also verifies execution order and rejection of invalid
+registries before parsing or rule execution. The default diagnostic output and
+complete review match the previous implementation, including rule ordering,
+severities, source locations, and review evidence.
+
 `PROVENANCE.md` identifies every copied source family, license, and intentional
 semantic adaptation. SDK design examples were not changed.
 
 ## Scan measurements
 
-Three runs on the same current checkout, Rust/Cargo 1.97.1 on Apple Silicon,
+Three runs at initial adoption, before the named-rule registration follow-up,
+using Rust/Cargo 1.97.1 on Apple Silicon,
 unoptimized development profile, with build and report rendering time excluded:
 
 | Library operation | Median |

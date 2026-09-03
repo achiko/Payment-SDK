@@ -37,7 +37,7 @@ seventeen implemented reusable rules from local Husklet. Thirteen adopted
 rules are enabled; the default scan has zero errors and 116 advisory warnings.
 Four additional error rules remain explicit-review selections with 287 source
 candidates, rather than being downgraded or suppressed. The SDK business source
-and accepted design examples were not changed. All 194 linter tests and the full
+and accepted design examples were not changed. All 198 linter tests and the full
 workspace suite pass; formatting, workspace checks, strict Clippy, documentation,
 and the linter MSRV check also pass. See
 [`packages/design-lint/ADOPTION.md`](../packages/design-lint/ADOPTION.md) for

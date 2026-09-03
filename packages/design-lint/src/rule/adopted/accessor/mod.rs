@@ -21,6 +21,27 @@ use crate::rule::syntax::type_name;
 /// Detects accessors that duplicate access callers already have.
 pub(crate) const ID: &str = "redundant-accessor";
 
+/// Reports redundant accessor surfaces.
+pub struct AccessorBloat;
+
+impl crate::Rule for AccessorBloat {
+    fn id(&self) -> &'static str {
+        ID
+    }
+
+    fn severity(&self) -> crate::Severity {
+        crate::Severity::Warning
+    }
+
+    fn check(
+        &self,
+        workspace: &crate::source::Workspace,
+        policy: &crate::Policy,
+    ) -> crate::Result<Vec<crate::Finding>> {
+        check(workspace, policy)
+    }
+}
+
 pub(crate) fn check(workspace: &Workspace, _policy: &Policy) -> Result<Vec<Finding>> {
     let definitions = Definitions::collect(workspace);
     let mut findings = Vec::new();

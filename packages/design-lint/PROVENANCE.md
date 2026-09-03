@@ -41,8 +41,9 @@ Cargo aliases, transport boundaries, and exact reasoned exceptions.
 
 ## Intentional adaptations
 
-- Algorithms run on SDK's single parsed `Workspace` and `SourceFile`. Stateless
-  carrier structs become registered checking functions; no empty rule types.
+- Algorithms run on SDK's single parsed `Workspace` and `SourceFile`. Named
+  rule types implement `Rule` and use Husklet's chained registration style;
+  the existing detector functions retain their SDK policy inputs.
 - `Related`, `Review` metadata/dependencies/questions and warning severity are
   adapted to SDK's finding model. Review evidence never hides a finding.
 - `hl_design` naming/classification/visual annotations become narrowly reasoned

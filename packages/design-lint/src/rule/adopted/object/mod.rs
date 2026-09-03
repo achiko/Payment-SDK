@@ -25,6 +25,27 @@ mod tests;
 /// Reviews state-owning types whose methods span several unrelated capabilities.
 pub(crate) const ID: &str = "god-object-growth";
 
+/// Reports objects accumulating unrelated responsibilities.
+pub struct GodObject;
+
+impl crate::Rule for GodObject {
+    fn id(&self) -> &'static str {
+        ID
+    }
+
+    fn severity(&self) -> crate::Severity {
+        crate::Severity::Warning
+    }
+
+    fn check(
+        &self,
+        workspace: &crate::source::Workspace,
+        policy: &crate::Policy,
+    ) -> crate::Result<Vec<crate::Finding>> {
+        check(workspace, policy)
+    }
+}
+
 pub(crate) fn check(workspace: &Workspace, _policy: &Policy) -> Result<Vec<Finding>> {
     let mut types = definitions(workspace);
     collect_methods(workspace, &mut types);

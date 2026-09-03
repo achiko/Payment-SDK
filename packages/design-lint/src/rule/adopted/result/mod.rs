@@ -20,6 +20,27 @@ use crate::{
 /// syntactically known. Other receiver type resolution is outside this rule.
 pub(crate) const ID: &str = "ignored-fallible-result";
 
+/// Detects ignored fallible results.
+pub struct IgnoredResult;
+
+impl crate::Rule for IgnoredResult {
+    fn id(&self) -> &'static str {
+        ID
+    }
+
+    fn severity(&self) -> crate::Severity {
+        crate::Severity::Error
+    }
+
+    fn check(
+        &self,
+        workspace: &crate::source::Workspace,
+        policy: &crate::Policy,
+    ) -> crate::Result<Vec<crate::Finding>> {
+        check(workspace, policy)
+    }
+}
+
 pub(crate) fn check(workspace: &Workspace, _policy: &Policy) -> Result<Vec<Finding>> {
     let signatures = Signatures::collect(workspace);
     let mut findings = Vec::new();

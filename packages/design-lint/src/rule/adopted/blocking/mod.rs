@@ -19,6 +19,27 @@ use support::*;
 /// Rejects proven executor-blocking work and synchronous guards across suspension points.
 pub(crate) const ID: &str = "async-blocking-operation";
 
+/// Detects blocking operations in asynchronous code.
+pub struct AsyncBlocking;
+
+impl crate::Rule for AsyncBlocking {
+    fn id(&self) -> &'static str {
+        ID
+    }
+
+    fn severity(&self) -> crate::Severity {
+        crate::Severity::Error
+    }
+
+    fn check(
+        &self,
+        workspace: &crate::source::Workspace,
+        policy: &crate::Policy,
+    ) -> crate::Result<Vec<crate::Finding>> {
+        check(workspace, policy)
+    }
+}
+
 pub(crate) fn check(workspace: &Workspace, _policy: &Policy) -> Result<Vec<Finding>> {
     let mut findings = Vec::new();
     for source in workspace.sources() {

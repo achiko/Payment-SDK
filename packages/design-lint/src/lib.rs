@@ -4,7 +4,7 @@ mod error;
 mod model;
 mod policy;
 mod report;
-mod rule;
+pub mod rule;
 pub mod source;
 
 pub use error::{LintError, Result};
@@ -24,6 +24,39 @@ pub struct Linter {
     registry: Registry,
 }
 
+/// Every built-in rule in execution order; policy selects adopted rules from this catalog.
+pub(crate) fn standard_rules() -> Registry {
+    Registry::new()
+        .register(rule::DependencyDirection)
+        .register(rule::OwnedVocabulary)
+        .register(rule::FileLength)
+        .register(rule::ForbiddenPath)
+        .register(rule::EmptyDirectory)
+        .register(rule::ChainLayout)
+        .register(rule::SingleFileDirectory)
+        .register(rule::TraitMethodCount)
+        .register(rule::EmptyStruct)
+        .register(rule::StructWordCount)
+        .register(rule::SelfConstructorStatic)
+        .register(rule::ReceiverRepetition)
+        .register(rule::CatchAllModule)
+        .register(rule::StructNaming)
+        .register(rule::FreeFunction)
+        .register(rule::SingleUse)
+        .register(rule::DeepControlFlow)
+        .register(rule::EnvironmentAccess)
+        .register(rule::PlatformCommand)
+        .register(rule::IgnoredResult)
+        .register(rule::AsyncBlocking)
+        .register(rule::BooleanState)
+        .register(rule::FiniteStateString)
+        .register(rule::GodObject)
+        .register(rule::AccessorBloat)
+        .register(rule::DuplicateEntity)
+        .register(rule::ModelDuplication)
+        .register(rule::CeremonialStructure)
+}
+
 impl Linter {
     pub fn new(policy: Policy, registry: Registry) -> Self {
         Self { policy, registry }
@@ -36,6 +69,7 @@ impl Linter {
 
     pub fn run(&self, paths: Vec<PathBuf>, reporter: &mut dyn Reporter) -> Result<Vec<Summary>> {
         self.policy.validate()?;
+        self.registry.validate()?;
         let workspace = Workspace::load(paths, &self.policy.source)?;
         // Complete analysis before allowing a reporter to replace persistent output.
         let mut output = Vec::new();

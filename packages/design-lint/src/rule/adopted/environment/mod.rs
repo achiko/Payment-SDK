@@ -14,6 +14,27 @@ use crate::{
 
 pub(crate) const ID: &str = "environment-variable-access";
 
+/// Checks environment access against configured ownership boundaries.
+pub struct EnvironmentAccess;
+
+impl crate::Rule for EnvironmentAccess {
+    fn id(&self) -> &'static str {
+        ID
+    }
+
+    fn severity(&self) -> crate::Severity {
+        crate::Severity::Error
+    }
+
+    fn check(
+        &self,
+        workspace: &crate::source::Workspace,
+        policy: &crate::Policy,
+    ) -> crate::Result<Vec<crate::Finding>> {
+        check(workspace, policy)
+    }
+}
+
 pub(crate) fn check(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
     let mut findings = Vec::new();
     for source in workspace.sources() {

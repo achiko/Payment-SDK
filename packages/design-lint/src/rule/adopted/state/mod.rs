@@ -22,6 +22,27 @@ use syntax::{
 /// Finds closed state vocabularies represented as string literals.
 pub(crate) const ID: &str = "string-backed-finite-state";
 
+/// Reports strings used as closed state vocabularies.
+pub struct FiniteStateString;
+
+impl crate::Rule for FiniteStateString {
+    fn id(&self) -> &'static str {
+        ID
+    }
+
+    fn severity(&self) -> crate::Severity {
+        crate::Severity::Warning
+    }
+
+    fn check(
+        &self,
+        workspace: &crate::source::Workspace,
+        policy: &crate::Policy,
+    ) -> crate::Result<Vec<crate::Finding>> {
+        check(workspace, policy)
+    }
+}
+
 pub(crate) fn check(workspace: &Workspace, _policy: &Policy) -> Result<Vec<Finding>> {
     let mut concepts = BTreeMap::<Concept, Evidence>::new();
     for source in workspace.production() {

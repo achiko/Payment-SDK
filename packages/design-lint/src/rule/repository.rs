@@ -5,23 +5,11 @@ use std::{
 
 use proc_macro2::Span;
 
-use super::{CheckFn, finding, production};
+use super::{finding, production};
 use crate::{
     Finding, Location, Policy, Result,
     source::{Workspace, slash},
 };
-
-pub(super) fn checks() -> [(&'static str, CheckFn); 7] {
-    [
-        ("dependency-direction", dependencies),
-        ("owned-vocabulary", vocabulary),
-        ("file-length", file_length),
-        ("forbidden-path", forbidden_paths),
-        ("empty-directory", empty_directories),
-        ("chain-layout", chain_layout),
-        ("single-file-directory", single_file_directories),
-    ]
-}
 
 pub(super) fn dependencies(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
     let packages = workspace
@@ -218,7 +206,7 @@ pub(super) fn file_length(workspace: &Workspace, policy: &Policy) -> Result<Vec<
         .collect())
 }
 
-fn forbidden_paths(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
+pub(super) fn forbidden_paths(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
     let mut output = Vec::new();
     for root in &workspace.roots {
         for forbidden in &policy.repository.forbidden_paths {
@@ -237,7 +225,7 @@ fn forbidden_paths(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding
     Ok(output)
 }
 
-fn empty_directories(workspace: &Workspace, _policy: &Policy) -> Result<Vec<Finding>> {
+pub(super) fn empty_directories(workspace: &Workspace, _policy: &Policy) -> Result<Vec<Finding>> {
     Ok(workspace
         .directories
         .iter()

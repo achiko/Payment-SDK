@@ -11,6 +11,27 @@ use crate::{
 
 pub(crate) const ID: &str = "struct-noun-naming";
 
+/// Checks that struct names contain a meaningful noun.
+pub struct StructNaming;
+
+impl crate::Rule for StructNaming {
+    fn id(&self) -> &'static str {
+        ID
+    }
+
+    fn severity(&self) -> crate::Severity {
+        crate::Severity::Error
+    }
+
+    fn check(
+        &self,
+        workspace: &crate::source::Workspace,
+        policy: &crate::Policy,
+    ) -> crate::Result<Vec<crate::Finding>> {
+        check(workspace, policy)
+    }
+}
+
 pub(crate) fn check(workspace: &Workspace, _policy: &Policy) -> Result<Vec<Finding>> {
     let mut findings = Vec::new();
     let language = English::new();

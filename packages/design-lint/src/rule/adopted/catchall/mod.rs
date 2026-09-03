@@ -10,6 +10,27 @@ use crate::{
 
 pub(crate) const ID: &str = "catch-all-module-name";
 
+/// Detects catch-all module names.
+pub struct CatchAllModule;
+
+impl crate::Rule for CatchAllModule {
+    fn id(&self) -> &'static str {
+        ID
+    }
+
+    fn severity(&self) -> crate::Severity {
+        crate::Severity::Error
+    }
+
+    fn check(
+        &self,
+        workspace: &crate::source::Workspace,
+        policy: &crate::Policy,
+    ) -> crate::Result<Vec<crate::Finding>> {
+        check(workspace, policy)
+    }
+}
+
 pub(crate) fn check(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
     let mut findings = Vec::new();
     let mut file_modules = BTreeSet::new();

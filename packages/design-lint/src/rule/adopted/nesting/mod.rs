@@ -9,6 +9,27 @@ use crate::{
 
 pub(crate) const ID: &str = "deep-control-flow";
 
+/// Reports deeply nested control flow.
+pub struct DeepControlFlow;
+
+impl crate::Rule for DeepControlFlow {
+    fn id(&self) -> &'static str {
+        ID
+    }
+
+    fn severity(&self) -> crate::Severity {
+        crate::Severity::Warning
+    }
+
+    fn check(
+        &self,
+        workspace: &crate::source::Workspace,
+        policy: &crate::Policy,
+    ) -> crate::Result<Vec<crate::Finding>> {
+        check(workspace, policy)
+    }
+}
+
 pub(crate) fn check(workspace: &Workspace, _policy: &Policy) -> Result<Vec<Finding>> {
     let mut findings = Vec::new();
     for source in workspace.sources() {

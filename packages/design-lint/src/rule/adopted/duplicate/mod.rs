@@ -17,6 +17,27 @@ pub(crate) const ID: &str = "duplicate-entity-base";
 #[cfg(test)]
 mod tests;
 
+/// Reports repeated entity identity for composition review.
+pub struct DuplicateEntity;
+
+impl crate::Rule for DuplicateEntity {
+    fn id(&self) -> &'static str {
+        ID
+    }
+
+    fn severity(&self) -> crate::Severity {
+        crate::Severity::Error
+    }
+
+    fn check(
+        &self,
+        workspace: &crate::source::Workspace,
+        policy: &crate::Policy,
+    ) -> crate::Result<Vec<crate::Finding>> {
+        check(workspace, policy)
+    }
+}
+
 pub(crate) fn check(workspace: &Workspace, _policy: &Policy) -> Result<Vec<Finding>> {
     let mut definitions = Vec::new();
     for source in workspace.production() {
