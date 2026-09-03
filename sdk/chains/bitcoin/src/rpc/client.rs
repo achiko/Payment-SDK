@@ -98,4 +98,25 @@ where
             }),
         }
     }
+
+    pub(super) async fn request_result_detailed_once(
+        &self,
+        method: &'static str,
+        params: Value,
+    ) -> Result<RawJson, CallFailure> {
+        let result = self
+            .connection
+            .client
+            .request_once(method, params)
+            .await
+            .map_err(map_json_rpc_error)
+            .map_err(CallFailure::local)?;
+        match result {
+            Ok(result) => Ok(result),
+            Err(failure) => Err(CallFailure {
+                remote_code: Some(failure.code),
+                error: map_remote_failure(failure),
+            }),
+        }
+    }
 }

@@ -1,16 +1,30 @@
 mod config;
 mod readiness;
+mod shutdown;
+mod startup;
+mod submissions;
 
 use std::{collections::BTreeMap, env, future::IntoFuture, sync::Arc};
 
 use chain_bitcoin::{AddressType, FeeRate, IndexUtxos};
 use chain_ethereum::AssetKind;
 use config::{AnyError, Config};
-use indexing::BlockHeight;
+use indexing::{BlockObservation, BlockPosition, BlockRef, Observer};
 use payment_api::{State, WalletAsset};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 const USDC_DECIMALS: u8 = 6;
+const SUBMISSION_CAPACITY: usize = 64;
+
+struct CheckpointNotice(watch::Sender<Option<BlockRef>>);
+
+impl Observer for CheckpointNotice {
+    fn observed<'a>(&'a self, observation: BlockObservation) -> indexing::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            self.0.send_replace(Some(observation.block));
+        })
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), AnyError> {
@@ -21,55 +35,139 @@ async fn main() -> Result<(), AnyError> {
     let server = config.server()?;
     let bind = config.bind;
     let interval = config.indexes.interval();
+    let indexes = config.indexes;
+    let postgres = config.postgres;
+    let configured_wallets = config.wallets;
+
+    // All configured chain identities are verified before the database URL is
+    // even loaded, let alone before a pool or schema session exists.
+    let verification = async move {
+        let bitcoin = if let Some(config) = indexes.bitcoin {
+            let settings = config.settings()?;
+            let scope = settings.scope();
+            let client = settings.client().await?;
+            Some((config, settings, scope, client))
+        } else {
+            None
+        };
+        let ethereum = if let Some(config) = indexes.ethereum {
+            let usdc = config.usdc.as_ref().map(config::UsdcConfig::contract);
+            let settings = config.settings()?;
+            let scope = settings.scope();
+            let client = settings.client()?;
+            let source = settings.source(client.clone()).await?;
+            let accounts = Arc::new(chain_ethereum::AccountClient::new(
+                client.clone(),
+                config.chain_id,
+            )?);
+            if let Some(contract) = &usdc {
+                accounts.validate_token(contract, USDC_DECIMALS).await?;
+            }
+            let accounts: Arc<dyn chain_ethereum::Accounts> = accounts;
+            let transactions: Arc<dyn chain_ethereum::Transactions> = Arc::new(
+                chain_ethereum::TransactionClient::new(client, config.chain_id, config.limits()?)?,
+            );
+            let coordinator = Arc::new(chain_ethereum::TransactionCoordinator::new(
+                accounts.clone(),
+                transactions,
+            ));
+            Some((config, settings, scope, source, usdc, accounts, coordinator))
+        } else {
+            None
+        };
+        let solana = if let Some(config) = indexes.solana {
+            let wallet =
+                chain_solana::WalletConfig::new(config.network(), chain_solana::AssetKind::Native)?;
+            let scope = wallet.scope().clone();
+            let client = chain_solana::RpcClient::connect(config.rpc()?)?;
+            let expected = config.genesis_hash().parse::<chain_solana::GenesisHash>()?;
+            client.verify_genesis(&expected).await?;
+            client.verify_memo().await?;
+            Some((config, wallet, scope, client))
+        } else {
+            None
+        };
+        Ok::<_, AnyError>((bitcoin, ethereum, solana))
+    };
+    let ((bitcoin, ethereum, solana), pool) = startup::verify_then_open(verification, || {
+        let database_url = postgres.url()?;
+        Ok(indexing_postgres::pool_for_schema(
+            &database_url,
+            postgres.max_connections(),
+            postgres.schema(),
+        )?)
+    })
+    .await?;
+    indexing_postgres::validate_schema(&pool, postgres.schema()).await?;
     let mut indexers = Vec::<Arc<dyn indexing::Indexer>>::new();
 
-    let bitcoin = if let Some(config) = config.indexes.bitcoin {
-        let settings = config.settings()?;
-        let scope = settings.scope();
-        // One long-lived client per chain: the indexer gets a clone, the wallet
-        // provider below keeps the original.
-        let client = settings.client().await?;
-        let repository = Arc::new(indexing_redb::Repository::new(
-            storage_redb::Redb::open(&config.database)?,
+    let bitcoin = if let Some((config, settings, scope, client)) = bitcoin {
+        let repository = Arc::new(indexing_postgres::Repository::new(
+            pool.clone(),
             scope.clone(),
         )?);
-        indexers.push(Arc::new(settings.build(
-            client.clone(),
-            repository.as_ref().clone(),
-            None,
-        )?));
+        let service =
+            Arc::new(settings.build(client.clone(), repository.as_ref().clone(), None)?);
+        indexing::Checkpoint::checkpoint(service.as_ref(), &scope).await?;
+        indexers.push(service);
         Some((scope, config.network, repository, client))
     } else {
         None
     };
-    let ethereum = if let Some(config) = config.indexes.ethereum {
-        let usdc = config.usdc.as_ref().map(config::UsdcConfig::contract);
-        let settings = config.settings()?;
-        let scope = settings.scope();
-        let client = settings.client()?;
-        let repository = indexing_redb::Repository::new(
-            storage_redb::Redb::open(&config.database)?,
-            scope.clone(),
-        )?;
-        indexers.push(Arc::new(
-            settings.build(client.clone(), repository, None).await?,
-        ));
-        let accounts = Arc::new(chain_ethereum::AccountClient::new(
-            client.clone(),
-            config.chain_id,
-        )?);
-        if let Some(contract) = &usdc {
-            accounts.validate_token(contract, USDC_DECIMALS).await?;
-        }
-        let accounts: Arc<dyn chain_ethereum::Accounts> = accounts;
-        let transactions: Arc<dyn chain_ethereum::Transactions> = Arc::new(
-            chain_ethereum::TransactionClient::new(client, config.chain_id, config.limits()?)?,
+    let ethereum =
+        if let Some((config, settings, scope, source, usdc, accounts, coordinator)) = ethereum {
+            let repository = Arc::new(indexing_postgres::Repository::new(
+                pool.clone(),
+                scope.clone(),
+            )?);
+            let service = Arc::new(settings.build(source, repository.as_ref().clone(), None)?);
+            indexing::Checkpoint::checkpoint(service.as_ref(), &scope).await?;
+            indexers.push(service);
+            Some((
+                scope,
+                config.chain_id,
+                usdc,
+                repository,
+                accounts,
+                coordinator,
+            ))
+        } else {
+            None
+        };
+    let (submission_supervisor, submission_registrar, submission_control) =
+        submissions::Supervisor::new(SUBMISSION_CAPACITY)?;
+    let solana = if let Some((config, wallet, scope, client)) = solana {
+        let repository = indexing_postgres::Repository::new(pool.clone(), scope.clone())?;
+        let mut service = indexing::Service::new(
+            chain_solana::Source::new(client.clone()),
+            chain_solana::BlockInterpreter::new(scope.clone())?,
+            repository,
+            indexing::SyncConfig::new(
+                scope.clone(),
+                config.confirmation_depth(),
+                config.reorg_retention(),
+                config.batch_size(),
+            )?,
         );
-        let coordinator = Arc::new(chain_ethereum::TransactionCoordinator::new(
-            accounts.clone(),
-            transactions,
+        let checkpoint = indexing::Checkpoint::checkpoint(&service, &scope).await?;
+        let (progress, progress_rx) = watch::channel(checkpoint);
+        service.observe(Arc::new(CheckpointNotice(progress)));
+        let service = Arc::new(service);
+        indexers.push(service.clone());
+        let checkpoint: Arc<dyn indexing::Checkpoint> = service.clone();
+        let solana_history: Arc<dyn indexing::History> = service.clone();
+        let coordinator = Arc::new(chain_solana::Coordinator::new(
+            client.clone(),
+            Arc::new(submission_registrar.clone()),
+            checkpoint,
+            solana_history.clone(),
+            scope.clone(),
+            progress_rx,
         ));
-        Some((scope, config.chain_id, usdc, accounts, coordinator))
+        let provider =
+            chain_solana::WalletProvider::new(wallet, client, solana_history, coordinator);
+        let sender = provider.transactions();
+        Some((scope, provider, sender))
     } else {
         None
     };
@@ -80,7 +178,7 @@ async fn main() -> Result<(), AnyError> {
     let mut wallets = wallets::Wallets::new(checkpoint);
 
     if let Some((scope, network, repository, rpc)) = bitcoin {
-        let outputs: Arc<dyn indexing::Outputs> = repository;
+        let outputs: Arc<dyn indexing::Outputs> = repository.clone();
         let utxos = Arc::new(IndexUtxos::new(scope.clone(), network, outputs)?);
         let provider = chain_bitcoin::WalletProvider::new(
             chain_bitcoin::WalletConfig {
@@ -96,9 +194,10 @@ async fn main() -> Result<(), AnyError> {
             history.clone(),
         );
         let sender = provider.transactions();
-        wallets.register(WalletAsset::Btc, scope, provider, sender, None)?;
+        wallets.register(WalletAsset::Btc, scope, provider, sender, Some(repository))?;
+        wallets.restore(&WalletAsset::Btc).await?;
     }
-    if let Some((scope, chain_id, usdc, accounts, coordinator)) = ethereum {
+    if let Some((scope, chain_id, usdc, repository, accounts, coordinator)) = ethereum {
         let eth_provider = chain_ethereum::WalletProvider::new(
             chain_ethereum::WalletConfig {
                 scope: scope.clone(),
@@ -116,8 +215,9 @@ async fn main() -> Result<(), AnyError> {
             scope.clone(),
             eth_provider,
             eth_sender,
-            None,
+            Some(repository),
         )?;
+        wallets.restore(&WalletAsset::Eth).await?;
 
         if let Some(contract) = usdc {
             let usdc_provider = chain_ethereum::WalletProvider::new(
@@ -135,20 +235,19 @@ async fn main() -> Result<(), AnyError> {
             wallets.register(WalletAsset::Usdc, scope, usdc_provider, usdc_sender, None)?;
         }
     }
+    if let Some((scope, provider, sender)) = solana {
+        wallets.register(WalletAsset::Sol, scope, provider, sender, None)?;
+    }
     let mut imported_ethereum_assets = BTreeMap::new();
-    for configured in config.wallets {
-        let encoded = env::var(configured.secret_env)?;
-        let secret = hex::decode(encoded).map_err(|_| "wallet secret must be hexadecimal")?;
-        if secret.len() != 32 {
-            return Err("wallet secret must contain exactly 32 bytes".into());
-        }
+    for configured in configured_wallets {
         let asset = configured.asset;
+        let secret = configured.secret()?;
         let wallet = wallets
             .import(
                 configured.id,
                 &asset,
-                wallets::SecretBytes::new(secret),
-                BlockHeight(configured.start_height),
+                secret,
+                BlockPosition(configured.start_position),
             )
             .await?;
         if matches!(asset, WalletAsset::Eth | WalletAsset::Usdc) {
@@ -160,58 +259,151 @@ async fn main() -> Result<(), AnyError> {
         }
     }
     let wallets = Arc::new(wallets);
+    let mut submission_tasks = Some(tokio::spawn(submission_supervisor.run()));
     let (shutdown, shutdown_rx) = watch::channel(false);
     let (sync_state, sync_state_rx) = watch::channel(indexing_runtime::SyncState::CatchingUp);
     let (readiness, mut readiness_rx) = watch::channel(false);
-    let filters = wallets.clone();
-    let mut synchronization = tokio::spawn(indexing_runtime::run(
+    let readiness_control = readiness.clone();
+    let mut synchronization = Some(tokio::spawn(indexing_runtime::run(
         indexer,
-        move || filters.filters(),
+        wallets.clone(),
         interval,
         shutdown_rx,
         sync_state,
-    ));
+    )));
+    let mut readiness_task = Some(tokio::spawn(readiness::publish(sync_state_rx, readiness)));
 
-    readiness::publish(sync_state_rx, readiness);
-
-    while !*readiness_rx.borrow() {
+    let startup_result = loop {
+        if *readiness_rx.borrow() {
+            break None;
+        }
         tokio::select! {
             changed = readiness_rx.changed() => {
-                changed.map_err(|_| "index readiness channel closed")?;
+                if changed.is_err() {
+                    break Some(Err("index readiness channel closed".into()));
+                }
             }
-            result = &mut synchronization => {
-                return match result {
+            result = synchronization.as_mut().expect("synchronization task") => {
+                synchronization = None;
+                break Some(match result {
                     Ok(Ok(())) => Err("index synchronization stopped during startup".into()),
                     Ok(Err(error)) => Err(error),
                     Err(error) => Err(error.into()),
-                };
+                });
+            }
+            result = submission_tasks.as_mut().expect("submission task") => {
+                submission_tasks = None;
+                break Some(match result {
+                    Ok(Ok(())) => Err("submission supervision stopped during startup".into()),
+                    Ok(Err(error)) => Err(error.into()),
+                    Err(error) => Err(error.into()),
+                });
+            }
+            result = readiness_task.as_mut().expect("readiness task") => {
+                readiness_task = None;
+                break Some(match result {
+                    Ok(()) => Err("readiness publication stopped during startup".into()),
+                    Err(error) => Err(error.into()),
+                });
             }
             signal = tokio::signal::ctrl_c() => {
-                signal?;
-                let _ = shutdown.send(true);
-                synchronization.await??;
-                return Ok(());
+                break Some(signal.map_err(Into::into));
             }
         }
+    };
+    if let Some(result) = startup_result {
+        readiness_control.send_replace(false);
+        if let Some(task) = submission_tasks.take() {
+            submission_control
+                .close()
+                .await
+                .map_err(|_| "could not close submission registration")?;
+            task.await??;
+        }
+        if let Some(task) = synchronization.take() {
+            let _ = shutdown.send(true);
+            task.await??;
+        }
+        if let Some(task) = readiness_task.take() {
+            task.await?;
+        }
+        return result;
     }
     let state = State::new(wallets, readiness_rx);
     let router = payment_api::router(state, &server)?;
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    let serving = axum::serve(listener, router).into_future();
+    let (stop_http, stop_http_rx) = oneshot::channel();
+    let serving = axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            let _ = stop_http_rx.await;
+        })
+        .into_future();
     tokio::pin!(serving);
-    let result = tokio::select! {
-        result = &mut serving => result.map_err(Into::into),
-        result = &mut synchronization => {
-            return match result {
+    let (mut result, http_done) = tokio::select! {
+        result = &mut serving => (result.map_err(Into::into), true),
+        completed = synchronization.as_mut().expect("synchronization task") => {
+            synchronization = None;
+            (match completed {
                 Ok(Ok(())) => Err("index synchronization stopped unexpectedly".into()),
                 Ok(Err(error)) => Err(error),
                 Err(error) => Err(error.into()),
-            };
+            }, false)
         }
-        signal = tokio::signal::ctrl_c() => signal.map_err(Into::into),
+        completed = submission_tasks.as_mut().expect("submission task") => {
+            submission_tasks = None;
+            (match completed {
+                Ok(Ok(())) => Err("submission supervision stopped unexpectedly".into()),
+                Ok(Err(error)) => Err(error.into()),
+                Err(error) => Err(error.into()),
+            }, false)
+        }
+        completed = readiness_task.as_mut().expect("readiness task") => {
+            readiness_task = None;
+            (match completed {
+                Ok(()) => Err("readiness publication stopped unexpectedly".into()),
+                Err(error) => Err(error.into()),
+            }, false)
+        }
+        signal = tokio::signal::ctrl_c() => (signal.map_err(Into::into), false),
     };
-    let _ = shutdown.send(true);
-    synchronization.await??;
+    let mut shutdown_order = shutdown::ShutdownOrder::new();
+    readiness_control.send_replace(false);
+    shutdown_order.not_ready()?;
+    if !http_done {
+        let _ = stop_http.send(());
+    }
+    shutdown_order.stop_admission()?;
+    if submission_tasks.is_some() && submission_control.close().await.is_err() {
+        result = result.and(Err("could not close submission registration".into()));
+    }
+    shutdown_order.close_registrar()?;
+    if !http_done && let Err(error) = serving.await {
+        result = result.and(Err(error.into()));
+    }
+    shutdown_order.drain_handlers()?;
+    if let Some(task) = submission_tasks.take() {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => result = result.and(Err(error.into())),
+            Err(error) => result = result.and(Err(error.into())),
+        }
+    }
+    shutdown_order.drain_submissions()?;
+    if let Some(task) = synchronization.take() {
+        let _ = shutdown.send(true);
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => result = result.and(Err(error)),
+            Err(error) => result = result.and(Err(error.into())),
+        }
+    }
+    shutdown_order.stop_indexing()?;
+    if let Some(task) = readiness_task.take()
+        && let Err(error) = task.await
+    {
+        result = result.and(Err(error.into()));
+    }
+    shutdown_order.join()?;
     result
 }
 

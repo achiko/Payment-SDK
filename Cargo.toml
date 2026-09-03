@@ -4,6 +4,7 @@ members = [
     "sdk/chains/base",
     "sdk/chains/bitcoin",
     "sdk/chains/ethereum",
+    "sdk/chains/solana",
     "sdk/indexing",
     "sdk/indexing/postgres",
     "sdk/indexing/redb",
@@ -31,6 +32,7 @@ alloy-eips = "1.8"
 alloy-sol-types = "1"
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
 futures-executor = "0.3"
+futures-channel = "0.3"
 hex = "=0.4.3"
 k256 = { version = "=0.13.4", features = ["ecdsa", "schnorr"] }
 num-bigint = "=0.4.6"

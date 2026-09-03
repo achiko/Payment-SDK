@@ -1,4 +1,5 @@
 use alloy_primitives::keccak256;
+use base::{TransactionError, TransactionErrorKind, TransactionId as BaseTransactionId};
 use indexing::{BoxFuture, SourceError};
 use serde_json::{Map, Value, json};
 
@@ -11,7 +12,7 @@ use super::{
     wire::{
         CallError, address_hex, data_hex, gas_limit_with_margin, invalid_rpc_response,
         is_already_known, is_execution_revert, map_json_rpc_error, parse_fixed_data,
-        parse_quantity_u64, parse_quantity_wei, parse_transaction_id, source_error, wei_quantity,
+        parse_quantity_u64, parse_quantity_wei, parse_transaction_id, wei_quantity,
     },
 };
 use crate::{
@@ -53,15 +54,14 @@ pub trait Transactions: Send + Sync {
 
     /// Submits one exact signed envelope and verifies the returned hash.
     ///
-    /// Implementations must use one visible submission attempt. They may
-    /// return `retryable = false` only for a definitive pre-acceptance
-    /// rejection. Transport failures and malformed, missing, or mismatched
-    /// responses after attempting the envelope must remain retryable because
-    /// acceptance is ambiguous.
+    /// Implementations must use one visible submission attempt. A definitive
+    /// pre-wire or pre-acceptance rejection stays ID-free. Transport failures
+    /// and malformed, missing, or mismatched responses after attempting the
+    /// envelope must carry only the ID derived from those exact local bytes.
     fn broadcast<'a>(
         &'a self,
         transaction: SignedTransaction,
-    ) -> BoxFuture<'a, Result<TransactionId, SourceError>>;
+    ) -> BoxFuture<'a, Result<TransactionId, TransactionError>>;
 
     /// Reports whether the node exposes the exact requested transaction hash.
     fn known<'a>(
@@ -249,13 +249,13 @@ where
     fn broadcast<'a>(
         &'a self,
         transaction: SignedTransaction,
-    ) -> BoxFuture<'a, Result<TransactionId, SourceError>> {
+    ) -> BoxFuture<'a, Result<TransactionId, TransactionError>> {
         Box::pin(async move {
             let computed = TransactionId(keccak256(&transaction.envelope).0);
             if computed != transaction.id {
-                return Err(source_error(
+                return Err(transaction_error(
+                    TransactionErrorKind::InvalidTransaction,
                     "signed Ethereum envelope hash does not match its transaction ID",
-                    false,
                 ));
             }
             let result = self
@@ -270,30 +270,33 @@ where
                     match self.confirm_known_transaction(&computed).await {
                         Ok(true) => return Ok(computed),
                         Ok(false) => {}
-                        Err(error) => return Err(ambiguous_submission(error)),
+                        Err(error) => return Err(ambiguous_submission(&computed, error)),
                     }
-                    return Err(source_error(
+                    return Err(ambiguous_submission(
+                        &computed,
                         "Ethereum RPC reported an already-known transaction but did not expose the matching hash",
-                        true,
                     ));
                 }
                 Err(CallError::Remote(failure)) => {
                     return Err(ambiguous_submission(
+                        &computed,
                         CallError::Remote(failure).into_source("eth_sendRawTransaction"),
                     ));
                 }
-                Err(CallError::Local(error)) => return Err(ambiguous_submission(error)),
+                Err(CallError::Local(error)) => {
+                    return Err(ambiguous_submission(&computed, error));
+                }
             };
             let returned: String = raw
                 .deserialize()
                 .map_err(map_json_rpc_error)
-                .map_err(ambiguous_submission)?;
+                .map_err(|error| ambiguous_submission(&computed, error))?;
             let returned = parse_transaction_id(&returned, "eth_sendRawTransaction")
-                .map_err(ambiguous_submission)?;
+                .map_err(|error| ambiguous_submission(&computed, error))?;
             if returned != computed {
-                return Err(source_error(
+                return Err(ambiguous_submission(
+                    &computed,
                     "Ethereum submission response hash differs from the exact signed envelope; outcome is ambiguous",
-                    true,
                 ));
             }
             Ok(returned)
@@ -429,7 +432,7 @@ where
     fn broadcast<'a>(
         &'a self,
         transaction: SignedTransaction,
-    ) -> BoxFuture<'a, Result<TransactionId, SourceError>> {
+    ) -> BoxFuture<'a, Result<TransactionId, TransactionError>> {
         self.methods.broadcast(transaction)
     }
 
@@ -452,9 +455,17 @@ fn rpc_error(error: SourceError) -> ChainError {
     chain_error(ChainErrorKind::RpcUnavailable, error.message)
 }
 
-fn ambiguous_submission(error: impl std::fmt::Display) -> SourceError {
-    source_error(
+fn transaction_error(
+    kind: TransactionErrorKind,
+    error: impl std::fmt::Display,
+) -> TransactionError {
+    TransactionError::new(kind, error.to_string())
+}
+
+fn ambiguous_submission(id: &TransactionId, error: impl std::fmt::Display) -> TransactionError {
+    transaction_error(
+        TransactionErrorKind::Unavailable,
         format!("Ethereum submission outcome is ambiguous: {error}"),
-        true,
     )
+    .with_ambiguous_transaction_id(BaseTransactionId::new(id.to_string()))
 }

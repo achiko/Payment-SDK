@@ -55,10 +55,15 @@ impl Arguments {
         };
         let policy = self
             .policy
+            .or_else(|| {
+                std::path::Path::new("lint.toml")
+                    .is_file()
+                    .then(|| PathBuf::from("lint.toml"))
+            })
             .map(Policy::load)
             .transpose()?
             .unwrap_or_default();
-        let linter = Linter::standard_with_policy(policy);
+        let linter = Linter::standard_with_policy(policy)?;
         let summaries = linter.run(self.paths, reporter.as_mut())?;
         Ok(cases
             || !summaries

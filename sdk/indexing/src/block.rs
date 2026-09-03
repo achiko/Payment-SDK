@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    BlockHeight, BlockRef, BoxFuture, CanonicalTransaction, IndexError, IndexErrorKind, IndexScope,
-    ObservationDraft, OutputChanges, TransactionRef,
+    BlockHeight, BlockParent, BlockRef, BoxFuture, CanonicalTransaction, IndexError,
+    IndexErrorKind, IndexScope, ObservationDraft, OutputChanges, TransactionRef,
 };
 
 /// Chain-neutral facts produced by inspecting one native block.
@@ -50,7 +50,12 @@ impl BlockAddition {
                 )
             })?;
             if interpreted.block.height != BlockHeight(next)
-                || interpreted.block.parent_hash.as_ref() != Some(&checkpoint.hash)
+                || interpreted.block.position <= checkpoint.position
+                || interpreted.block.parent.as_ref()
+                    != Some(&BlockParent {
+                        position: checkpoint.position,
+                        hash: checkpoint.hash.clone(),
+                    })
             {
                 return Err(IndexError::new(
                     IndexErrorKind::CannotConnect,
@@ -178,11 +183,13 @@ mod tests {
 
     fn block(height: u64) -> BlockRef {
         BlockRef {
+            position: crate::BlockPosition(height),
             height: BlockHeight(height),
             hash: BlockHash(vec![height as u8]),
-            parent_hash: height
-                .checked_sub(1)
-                .map(|value| BlockHash(vec![value as u8])),
+            parent: height.checked_sub(1).map(|value| crate::BlockParent {
+                position: crate::BlockPosition(value),
+                hash: BlockHash(vec![value as u8]),
+            }),
             timestamp: None,
         }
     }
@@ -239,7 +246,10 @@ mod tests {
     fn rejects_a_block_that_does_not_connect_to_the_expected_checkpoint() {
         let own_scope = scope();
         let mut next = block(2);
-        next.parent_hash = Some(BlockHash(vec![99]));
+        next.parent = Some(crate::BlockParent {
+            position: crate::BlockPosition(1),
+            hash: BlockHash(vec![99]),
+        });
 
         let error = BlockAddition::new(
             own_scope,
@@ -345,6 +355,42 @@ mod tests {
             },
         )
         .expect_err("negative output");
+
+        assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+    }
+
+    #[test]
+    fn rejects_duplicate_output_identity_before_storage() {
+        let own_scope = scope();
+        let id = output_key(&own_scope, "created").output;
+        let created = |owner: &str| IndexedOutput {
+            id: id.clone(),
+            address: CanonicalAddress {
+                scope: own_scope.clone(),
+                value: owner.into(),
+            },
+            asset: asset(&own_scope),
+            amount: Decimal::from(1_u64),
+            evidence: Vec::new(),
+            created_at: BlockHeight(1),
+            coinbase: false,
+        };
+
+        let error = BlockAddition::new(
+            own_scope.clone(),
+            None,
+            10,
+            InterpretedBlock {
+                block: block(1),
+                transactions: Vec::new(),
+                outputs: OutputChanges {
+                    created: vec![created("first"), created("second")],
+                    spent: Vec::new(),
+                    tracked_spends: Vec::new(),
+                },
+            },
+        )
+        .expect_err("duplicate output identity");
 
         assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
     }

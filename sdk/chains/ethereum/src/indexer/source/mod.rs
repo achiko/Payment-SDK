@@ -1,6 +1,9 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use indexing::{BlockHash, BlockHeight, BlockRef, BlockSource, BoxFuture, IndexScope, SourceError};
+use indexing::{
+    BlockHash, BlockHeight, BlockPosition, BlockRef, BlockSource, BoxFuture, IndexScope,
+    SourceError,
+};
 use json_rpc::{Client as JsonClient, Error, Failure, RawJson};
 use serde_json::{Value, value::RawValue};
 
@@ -256,30 +259,49 @@ where
         })
     }
 
-    fn block_at<'a>(
+    fn blocks<'a>(
         &'a self,
-        height: BlockHeight,
-    ) -> BoxFuture<'a, Result<Self::Block, SourceError>> {
+        start: BlockPosition,
+        end: BlockPosition,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<Self::Block>, SourceError>> {
         Box::pin(async move {
-            let tag = format!("0x{:x}", height.0);
-            let (raw_block, parsed) = self.fetch_block(tag, Some(height), true).await?;
-            let raw_receipts = self.fetch_receipts(&parsed).await?;
-            ParsedReceipt::parse_all(&raw_receipts, &parsed)
-                .map_err(|error| source_error(error.to_string(), true))?;
-            Ok(Block {
-                reference: parsed.reference,
-                raw_block: raw_block.into_bytes(),
-                raw_receipts,
-            })
+            if limit == 0 || start > end {
+                return Err(source_error(
+                    "Ethereum block range requires ordered positions and a positive limit",
+                    false,
+                ));
+            }
+            let mut position = start.0;
+            let mut blocks = Vec::with_capacity(limit.min(64));
+            while position <= end.0 && blocks.len() < limit {
+                let height = BlockHeight(position);
+                let tag = format!("0x{:x}", height.0);
+                let (raw_block, parsed) = self.fetch_block(tag, Some(height), true).await?;
+                let raw_receipts = self.fetch_receipts(&parsed).await?;
+                ParsedReceipt::parse_all(&raw_receipts, &parsed)
+                    .map_err(|error| source_error(error.to_string(), true))?;
+                blocks.push(Block {
+                    reference: parsed.reference,
+                    raw_block: raw_block.into_bytes(),
+                    raw_receipts,
+                });
+                let Some(next) = position.checked_add(1) else {
+                    break;
+                };
+                position = next;
+            }
+            Ok(blocks)
         })
     }
 
-    fn canonical_hash<'a>(
+    fn canonical_at<'a>(
         &'a self,
-        height: BlockHeight,
-    ) -> BoxFuture<'a, Result<Option<BlockHash>, SourceError>> {
+        position: BlockPosition,
+    ) -> BoxFuture<'a, Result<Option<BlockRef>, SourceError>> {
         Box::pin(async move {
-            let tag = format!("0x{:x}", height.0);
+            let height = BlockHeight(position.0);
+            let tag = format!("0x{:x}", position.0);
             let raw = self
                 .request_result("eth_getBlockByNumber", serde_json::json!([tag, false]))
                 .await?;
@@ -288,7 +310,7 @@ where
             }
             let block = ParsedBlock::parse(raw.as_bytes(), Some(height), false)
                 .map_err(|error| source_error(error.to_string(), true))?;
-            Ok(Some(block.reference.hash))
+            Ok(Some(block.reference))
         })
     }
 }

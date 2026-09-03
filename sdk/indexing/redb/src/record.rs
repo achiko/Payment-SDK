@@ -1,16 +1,23 @@
 use bincode::{Decode, Encode};
 use indexing::{
-    AssetId, BlockHash, BlockHeight, BlockRef, CanonicalAddress, CanonicalStatus,
-    CanonicalTransaction, ChainId, IndexError, IndexScope, IndexedOutput, NetworkFee, OutputId,
-    OutputKey, TransactionRef,
+    AssetId, BlockHash, BlockHeight, BlockParent, BlockPosition, BlockRef, CanonicalAddress,
+    CanonicalStatus, CanonicalTransaction, ChainId, IndexError, IndexScope, IndexedOutput,
+    NetworkFee, OutputId, OutputKey, TransactionRef,
 };
 
 #[derive(Clone, Debug, Encode, Decode)]
 pub(super) struct BlockRecord {
+    position: u64,
     height: u64,
     hash: Vec<u8>,
-    parent_hash: Option<Vec<u8>>,
+    parent: Option<ParentRecord>,
     timestamp: Option<u64>,
+}
+
+#[derive(Clone, Debug, Encode, Decode)]
+struct ParentRecord {
+    position: u64,
+    hash: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Encode, Decode)]
@@ -108,18 +115,26 @@ pub(super) struct RestoredOutput {
 impl BlockRecord {
     pub(super) fn from_domain(value: &BlockRef) -> Self {
         Self {
+            position: value.position.0,
             height: value.height.0,
             hash: value.hash.0.clone(),
-            parent_hash: value.parent_hash.as_ref().map(|hash| hash.0.clone()),
+            parent: value.parent.as_ref().map(|parent| ParentRecord {
+                position: parent.position.0,
+                hash: parent.hash.0.clone(),
+            }),
             timestamp: value.timestamp,
         }
     }
 
     pub(super) fn into_domain(self) -> BlockRef {
         BlockRef {
+            position: BlockPosition(self.position),
             height: BlockHeight(self.height),
             hash: BlockHash(self.hash),
-            parent_hash: self.parent_hash.map(BlockHash),
+            parent: self.parent.map(|parent| BlockParent {
+                position: BlockPosition(parent.position),
+                hash: BlockHash(parent.hash),
+            }),
             timestamp: self.timestamp,
         }
     }
@@ -293,5 +308,36 @@ impl OutputRecord {
 impl JournalRecord {
     pub(super) fn block(&self) -> BlockRef {
         self.block.clone().into_domain()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bincode::{Decode, Encode, config};
+
+    use super::BlockRecord;
+
+    #[derive(Encode, Decode)]
+    struct HeightOnlyBlockRecord {
+        height: u64,
+        hash: Vec<u8>,
+        parent_hash: Option<Vec<u8>>,
+        timestamp: Option<u64>,
+    }
+
+    #[test]
+    fn rejects_height_only_block_records() {
+        let old = HeightOnlyBlockRecord {
+            height: 42,
+            hash: vec![0xab; 32],
+            parent_hash: Some(vec![0xcd; 32]),
+            timestamp: Some(1_000),
+        };
+        let bytes = bincode::encode_to_vec(old, config::standard()).expect("old record encodes");
+
+        assert!(
+            bincode::decode_from_slice::<BlockRecord, _>(&bytes, config::standard()).is_err(),
+            "height-only redb records must not decode as complete block references"
+        );
     }
 }

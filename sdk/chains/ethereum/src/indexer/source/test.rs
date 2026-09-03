@@ -246,16 +246,31 @@ fn verifies_identity_and_falls_back_to_batched_receipts() {
 
     let source = block_on(BlockClient::connect(client.clone(), config()))
         .expect("matching chain identity must connect");
-    let canonical = block_on(source.block_at(BlockHeight(10)))
-        .expect("numbered full block must load through receipt fallback");
+    let canonical = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 1))
+        .expect("numbered full block must load through receipt fallback")
+        .pop()
+        .expect("dense range contains its block");
     assert_eq!(canonical.reference.hash, BlockHash(vec![0xaa; 32]));
+    assert_eq!(canonical.reference.position, BlockPosition(10));
+    assert_eq!(canonical.reference.height, BlockHeight(10));
+    assert_eq!(
+        canonical.reference.parent,
+        Some(indexing::BlockParent {
+            position: BlockPosition(9),
+            hash: BlockHash(vec![0xbb; 32]),
+        })
+    );
     assert_eq!(canonical.raw_block, raw_full_block);
     assert_eq!(canonical.raw_receipts.len(), 1);
     assert_eq!(
-        block_on(source.canonical_hash(BlockHeight(10)))
-            .expect("canonical hash lookup must succeed"),
+        block_on(source.canonical_at(BlockPosition(10)))
+            .expect("canonical reference lookup must succeed")
+            .map(|block| block.hash),
         Some(BlockHash(vec![0xaa; 32]))
     );
+    let zero_limit = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 0))
+        .expect_err("zero returned-block limit must fail before RPC");
+    assert!(!zero_limit.retryable);
     let methods = client.methods();
     assert_eq!(
         methods,
@@ -311,8 +326,10 @@ fn block_receipt_method_preserves_each_exact_receipt_result() {
     let source = block_on(BlockClient::connect(client, config()))
         .expect("matching chain identity must connect");
 
-    let block = block_on(source.block_at(BlockHeight(10)))
-        .expect("block receipt method must retain valid receipt evidence");
+    let block = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 1))
+        .expect("block receipt method must retain valid receipt evidence")
+        .pop()
+        .expect("dense range contains its block");
 
     assert_eq!(block.raw_receipts, vec![raw_receipt]);
 }
@@ -348,8 +365,10 @@ fn batched_receipt_fallback_restores_transaction_order() {
     let source = block_on(BlockClient::connect(client, config()))
         .expect("matching chain identity must connect");
 
-    let block = block_on(source.block_at(BlockHeight(10)))
-        .expect("out-of-order batch responses must be associated by request ID");
+    let block = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 1))
+        .expect("out-of-order batch responses must be associated by request ID")
+        .pop()
+        .expect("dense range contains its block");
 
     assert_eq!(block.raw_receipts, vec![first_receipt, second_receipt]);
 }

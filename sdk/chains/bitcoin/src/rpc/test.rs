@@ -24,13 +24,38 @@ struct ScriptedClient {
 
 struct ExpectedReply {
     method: &'static str,
-    result: Result<Value, i64>,
+    result: ExpectedResult,
+}
+
+enum ExpectedResult {
+    Response(Result<Value, i64>),
+    Transport(Error),
 }
 
 impl ScriptedClient {
     fn new(replies: Vec<ExpectedReply>) -> Self {
         Self {
             replies: Arc::new(Mutex::new(replies.into())),
+        }
+    }
+
+    fn respond(&self, method: &str) -> Result<Result<RawJson, Failure>, Error> {
+        let expected = self
+            .replies
+            .lock()
+            .expect("script lock must be healthy")
+            .pop_front()
+            .expect("Core client made more calls than scripted");
+        assert_eq!(method, expected.method);
+        match expected.result {
+            ExpectedResult::Response(result) => Ok(result
+                .map(|value| RawJson::from_serializable(&value).expect("reply JSON must encode"))
+                .map_err(|code| Failure {
+                    code,
+                    message: "scripted failure".to_owned(),
+                    data: None,
+                })),
+            ExpectedResult::Transport(error) => Err(error),
         }
     }
 }
@@ -41,30 +66,21 @@ impl Transport for ScriptedClient {
         method: &'a str,
         _params: Value,
     ) -> BoxFuture<'a, Result<Result<RawJson, Failure>, Error>> {
-        let expected = self
-            .replies
-            .lock()
-            .expect("script lock must be healthy")
-            .pop_front()
-            .expect("Core client made more calls than scripted");
-        assert_eq!(method, expected.method);
-        let result = expected
-            .result
-            .map(|value| RawJson::from_serializable(&value).expect("reply JSON must encode"))
-            .map_err(|code| Failure {
-                code,
-                message: "scripted failure".to_owned(),
-                data: None,
-            });
-        Box::pin(async move { Ok(result) })
+        assert_ne!(
+            method, "sendrawtransaction",
+            "Bitcoin submission must use one transport execution"
+        );
+        let result = self.respond(method);
+        Box::pin(async move { result })
     }
 
     fn request_once<'a>(
         &'a self,
         method: &'a str,
-        params: Value,
+        _params: Value,
     ) -> BoxFuture<'a, Result<Result<RawJson, Failure>, Error>> {
-        self.request(method, params)
+        let result = self.respond(method);
+        Box::pin(async move { result })
     }
 
     fn batch<'a>(
@@ -78,7 +94,24 @@ impl Transport for ScriptedClient {
 fn success(method: &'static str, result: Value) -> ExpectedReply {
     ExpectedReply {
         method,
-        result: Ok(result),
+        result: ExpectedResult::Response(Ok(result)),
+    }
+}
+
+fn remote_failure(method: &'static str, code: i64) -> ExpectedReply {
+    ExpectedReply {
+        method,
+        result: ExpectedResult::Response(Err(code)),
+    }
+}
+
+fn transport_failure(method: &'static str, kind: json_rpc::ErrorKind) -> ExpectedReply {
+    ExpectedReply {
+        method,
+        result: ExpectedResult::Transport(Error {
+            kind,
+            message: "scripted transport failure".to_owned(),
+        }),
     }
 }
 
@@ -170,10 +203,7 @@ fn connect_rejects_pruned_node() {
 #[test]
 fn core_warmup_failure_is_retryable() {
     let error = block_on(Client::connect(
-        ScriptedClient::new(vec![ExpectedReply {
-            method: "getnetworkinfo",
-            result: Err(-28),
-        }]),
+        ScriptedClient::new(vec![remote_failure("getnetworkinfo", -28)]),
         config(),
     ))
     .err()
@@ -234,6 +264,7 @@ fn core_max_fee_rate_boundary_is_enforced_before_rpc() {
 #[test]
 fn broadcast_rejects_a_mismatched_returned_txid() {
     let signed = signed_transaction();
+    let local_id = signed.id();
     let mut replies = readiness_replies();
     replies.push(success(
         "sendrawtransaction",
@@ -245,5 +276,85 @@ fn broadcast_rejects_a_mismatched_returned_txid() {
     let error = block_on(core.transactions().broadcast(signed, FeeRate::new(10_000)))
         .expect_err("mismatched broadcast ID must fail");
 
+    assert_eq!(error.kind, base::TransactionErrorKind::Unavailable);
     assert!(error.message.contains("different transaction ID"));
+    assert_eq!(
+        error.ambiguous_transaction_id,
+        Some(base::TransactionId::new(local_id.to_string()))
+    );
+}
+
+#[test]
+fn broadcast_remote_rejection_is_definite_and_has_no_ambiguity() {
+    let signed = signed_transaction();
+    let mut replies = readiness_replies();
+    replies.push(remote_failure("sendrawtransaction", -26));
+    let core = block_on(Client::connect(ScriptedClient::new(replies), config()))
+        .expect("valid scripted Core node must connect");
+
+    let error = block_on(core.transactions().broadcast(signed, FeeRate::new(10_000)))
+        .expect_err("a remote Bitcoin rejection must fail definitively");
+
+    assert_eq!(error.kind, base::TransactionErrorKind::Rejected);
+    assert_eq!(error.ambiguous_transaction_id, None);
+}
+
+#[test]
+fn malformed_broadcast_response_keeps_the_exact_local_id_as_ambiguous() {
+    let signed = signed_transaction();
+    let local_id = signed.id();
+    let mut replies = readiness_replies();
+    replies.push(success("sendrawtransaction", Value::Bool(true)));
+    let core = block_on(Client::connect(ScriptedClient::new(replies), config()))
+        .expect("valid scripted Core node must connect");
+
+    let error = block_on(core.transactions().broadcast(signed, FeeRate::new(10_000)))
+        .expect_err("a malformed Bitcoin acknowledgement must remain ambiguous");
+
+    assert_eq!(error.kind, base::TransactionErrorKind::Unavailable);
+    assert_eq!(
+        error.ambiguous_transaction_id,
+        Some(base::TransactionId::new(local_id.to_string()))
+    );
+}
+
+#[test]
+fn broadcast_transport_failure_keeps_the_exact_local_id_as_ambiguous() {
+    let signed = signed_transaction();
+    let local_id = signed.id();
+    let mut replies = readiness_replies();
+    replies.push(transport_failure(
+        "sendrawtransaction",
+        json_rpc::ErrorKind::Timeout,
+    ));
+    let core = block_on(Client::connect(ScriptedClient::new(replies), config()))
+        .expect("valid scripted Core node must connect");
+
+    let error = block_on(core.transactions().broadcast(signed, FeeRate::new(10_000)))
+        .expect_err("a Bitcoin transport failure may follow submission");
+
+    assert_eq!(error.kind, base::TransactionErrorKind::Unavailable);
+    assert_eq!(
+        error.ambiguous_transaction_id,
+        Some(base::TransactionId::new(local_id.to_string()))
+    );
+}
+
+#[test]
+fn broadcast_fee_rejection_happens_before_wire_and_has_no_ambiguity() {
+    let signed = signed_transaction();
+    let core = block_on(Client::connect(
+        ScriptedClient::new(readiness_replies()),
+        config(),
+    ))
+    .expect("valid scripted Core node must connect");
+
+    let error = block_on(core.transactions().broadcast(
+        signed,
+        FeeRate::new(BITCOIN_CORE_MAX_FEE_RATE_SATOSHIS_PER_KVB + 1),
+    ))
+    .expect_err("an invalid Bitcoin fee ceiling must fail before submission");
+
+    assert_eq!(error.kind, base::TransactionErrorKind::Fee);
+    assert_eq!(error.ambiguous_transaction_id, None);
 }

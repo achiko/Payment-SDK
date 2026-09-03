@@ -19,9 +19,19 @@ Read this file before changing code. Use project sources in this order:
 
 Follow the higher-authority source when documents disagree and update the
 stale document. The project is pre-release: replace unpublished internal types
-and formats directly. Do not add compatibility aliases, legacy readers,
-migrations, or project-defined `V1`/`V2` DTOs. External Bitcoin, Ethereum,
-JSON-RPC, and HTTP standards remain compatibility contracts.
+and wire formats directly. Do not add compatibility aliases, legacy runtime
+readers, or project-defined `V1`/`V2` DTOs. The shared PostgreSQL database is
+durable multi-chain state, not a disposable internal format: its canonical
+deployment-owned creation and ordered migration scripts live physically under
+`sdk/indexing/postgres/migrations/` and evolve preservation-first. A migration
+or exact-scope rescan must preserve unrelated scopes and application-owned
+tables unless their owner separately approves a change. External Bitcoin,
+Ethereum, Solana, JSON-RPC, and HTTP standards remain compatibility contracts.
+
+The current predeployment PostgreSQL history contains one fresh-schema
+initializer. Apply it only to an empty schema. Freeze its exact bytes and
+checksum at the first persistent deployment; every later schema change is a new
+ordered migration rather than an edit or replay of the initializer.
 
 `old/` and `reference/` are excluded research, not production dependencies or
 architecture templates. Do not edit them unless explicitly asked.
@@ -32,14 +42,21 @@ exist, skip CodeGraph; repository indexing is the user's decision.
 
 ## Product boundary
 
-Payment-SDK is one API process that initializes Bitcoin and Ethereum RPC
-clients and embedded synchronizers; generates or imports wallets without
-returning secrets; returns canonical addresses, exact balances, and complete
-history; submits one transfer or a non-empty ordered batch; indexes
-caller-selected addresses; and survives restarts and retained reorgs.
+Payment-SDK's accepted target is one API process that initializes Bitcoin,
+Ethereum, and Solana RPC clients and embedded synchronizers; generates or
+imports wallets without returning secrets; returns canonical addresses, exact
+balances, and complete history; submits one transfer or a non-empty ordered
+batch; indexes caller-selected addresses; and survives restarts and retained
+reorgs. Current source initializes Bitcoin and Ethereum only; Solana remains an
+implementation gap.
 
 Business and HTTP code must not import a concrete chain. Concrete chains are
 selected once at composition.
+
+The accepted architecture includes Solana, but the Solana crate and `apps/api`
+runtime composition remain unimplemented and source-step gated. Do not add a
+nonexistent crate to the current ownership table or claim runtime support before
+implementation evidence exists.
 
 There is currently no deposit accounting, ledger, payment state machine,
 collection/sweep job, reservation system, hardware-wallet workflow, remote
@@ -59,7 +76,8 @@ change or claim development in-process custody is production custody.
 | `sdk/chains/ethereum` | Ethereum addresses, RPC, blocks, gas/nonces, typed transactions, receipts/logs, wallets, indexing translation |
 | `sdk/wallets` | Chain-neutral capabilities, providers, wallet registry, history presentation, batch orchestration |
 | `sdk/indexing` | Storage-independent synchronization, address filters, canonical history, checkpoints, reorg handling, repository contracts |
-| `sdk/indexing/redb` | Indexing repository implementation and all indexing record/key encoding |
+| `sdk/indexing/postgres` | Physical home for the deployment-owned shared-schema history; production indexing repository implementation |
+| `sdk/indexing/redb` | Embedded/test indexing repository implementation and all redb record/key encoding |
 | `packages/*` | Generic crypto, HTTP, JSON-RPC, and storage mechanics usable outside blockchain projects |
 | `packages/design-lint` | Architecture and Rust API checks configured by `lint.toml` |
 
@@ -68,16 +86,18 @@ Dependency rules:
 - Packages do not import SDK or application crates.
 - `sdk/chains/base` does not import concrete chains, RPC, indexing, or wallets.
   It is not a universal transaction or RPC abstraction.
-- `sdk/indexing` knows no native block, redb key, wallet registry, Axum
+- `sdk/indexing` knows no native block, backend record, wallet registry, Axum
   route, or business label.
 - Concrete chains retain chain-native semantics while implementing wallet and
   indexing contracts. Removing one chain leaves the other generic crates and
   other chain usable.
-- `sdk/indexing/redb` implements persistence only; it owns no synchronizer
-  runtime or public handle.
-- `apps/api` constructs long-lived RPC clients, repositories, synchronizers,
-  and providers once. Handlers receive abstractions and do not open storage or
-  construct dependencies per request.
+- `sdk/indexing/postgres` and `sdk/indexing/redb` implement persistence only;
+  neither owns a synchronizer runtime or public handle.
+- `apps/api` constructs one process-wide PostgreSQL pool, one scope-bound
+  repository handle per `(chain, network)`, and all long-lived RPC clients,
+  synchronizers, and providers once. An asset never gets its own database,
+  schema, pool, or repository. Handlers receive abstractions and do not open
+  storage or construct dependencies per request.
 
 Concrete chain crates keep this design-lint-enforced skeleton:
 
@@ -252,7 +272,7 @@ chain-native request
   -> indexing observes inclusion, confirmation, failure, or reorg
 ```
 
-- Never create a universal Bitcoin/Ethereum RPC or transaction model.
+- Never create a universal Bitcoin/Ethereum/Solana RPC or transaction model.
 - Bitcoin owns network checks, outpoints, scripts, UTXOs, dust, checked
   satoshi fees/weight, sighashes, witnesses, and consensus encoding. History
   preserves every input/output movement. A batch may fund one transaction from
@@ -262,6 +282,11 @@ chain-native request
   remain distinct and exact `U256` values are preserved. Batch transactions use
   consecutive per-source nonces, broadcast in input order, and report accepted
   prefix plus first failure.
+- Solana owns Base58 addresses, Ed25519 seeds, slots, account/context floors,
+  legacy System-transfer-plus-Memo messages, blockhash lifetime, fees,
+  simulation, exact signatures, ordered broadcast, and source-keyed ambiguity
+  coordination. Its singular endpoint has no transparent retry, and indexing
+  remains the confirmation authority.
 - A batch is one non-empty ordered list on one chain. Validate destinations,
   amounts, fee bounds, wallet compatibility, and chain invariants before the
   first external effect.
@@ -273,22 +298,26 @@ chain-native request
 ## Indexing invariants
 
 - `Indexer` is the complete chain-neutral indexing surface used by callers.
-  Bitcoin, Ethereum, and the multi-chain `Composer` implement the same trait;
-  callers do not change APIs when moving from one chain to several.
-- A checkpoint contains height and hash.
-- `Wallets` supplies the complete `Vec<AddressFilter>` to every `Indexer::sync`
-  call. Wallet/application runtime owns address and birthday lifecycle;
-  indexing persists no watch, watch ID, or address registry.
+  Bitcoin, Ethereum, Solana, and the multi-chain `Composer` implement the same
+  trait; callers do not change APIs when moving from one chain to several.
+- A checkpoint contains native position, produced height, hash, and one atomic
+  optional parent pairing parent position with parent hash. Native position
+  drives traversal, canonical lookup, restart, readiness, and birthdays;
+  produced height drives confirmation, ordering, journal keys, and retention.
+- `Wallets` supplies a caller-owned `FilterSource`; each read yields one complete
+  `Vec<AddressFilter>`. Wallet/application runtime owns address and birthday
+  lifecycle; indexing persists no watch, watch ID, or address registry.
 - Transactions preserve all stable movements. Never flatten a
   multi-input/multi-output UTXO transaction into a fictional transfer.
-- Confirmation derives from inclusion height and current checkpoint; it is not
-  stored as a transition. Checkpoint-bound pagination restarts if the
-  checkpoint changes.
+- Confirmation derives from inclusion produced height and checkpoint produced
+  height; it is not stored as a transition. Checkpoint-bound pagination
+  restarts if the checkpoint changes.
 - One commit atomically writes address-primary canonical history, live output
   changes, one bounded rollback-journal entry, and checkpoint movement.
 - A retained reorg atomically removes orphan canonical history, restores live
   projection state, and moves the checkpoint back. `ReorgTooDeep` requires the
-  caller to recreate the scope and rescan.
+  caller to recreate and rescan only that exact scope's indexing-owned rows;
+  unrelated scopes and application-owned tables remain untouched.
 - Persistence uses obvious domain collections. `Blocks` owns canonical
   checkpoint lookup, retained block lookup, atomic add, and atomic removal;
   `Transactions` lists canonical address history; `Outputs` lists live UTXOs.
@@ -304,9 +333,20 @@ history, and current live outputs. Do not add watches, synchronizer status,
 observation revisions, pending confirmations, spent markers, secondary address
 indexes, event feeds, or raw-block archives.
 
+The production composition uses one PostgreSQL database, one schema, and one
+process-wide pool. `Repository::new(pool.clone(), scope)` binds a handle to one
+exact `(chain, network)` and rejects another scope. The canonical ordered schema
+history is deployment-owned and lives physically under
+`sdk/indexing/postgres/migrations/`. Physical script or table colocation does
+not grant indexing runtime ownership of application data: the runtime adapter
+must not query, rewrite, truncate, delete, or issue application-table DDL for
+`payment_wallets`. An
+application-owned restart read path must be proven before the current indexing
+registry query surface is removed.
+
 ## Coding, errors, security, and concurrency
 
-- Rust 2024, resolver 3, MSRV 1.85, locked dependencies. Workspace
+- Rust 2024, resolver 3, MSRV 1.91, locked dependencies. Workspace
   `unsafe_code = "forbid"` must not be weakened.
 - Return typed errors from libraries and add actionable context at application
   and transport boundaries. Preserve retryability and ambiguous outcomes.
@@ -337,13 +377,16 @@ indexes, event feeds, or raw-block archives.
 - Prefer mature protocol libraries over local standard reimplementations.
 - Write a failing behavioral test for a defect or testable behavior. Test exact
   outcomes, edges, errors, and invariants.
-- Unit tests stay beside their owner. System tests compose the public facade,
-  RPC doubles, synchronizer, and temporary redb files in one process. Tests are
-  deterministic, own their resources, and never contact public networks.
+- Unit tests stay beside their owner. Repository contract tests cover both redb
+  and PostgreSQL. System tests compose the public facade, RPC doubles,
+  synchronizer, and one owned disposable PostgreSQL database/schema through one
+  process-wide pool. Tests are deterministic, own their resources, preserve
+  sentinel application rows, and never contact public networks.
 - Indexing coverage includes birthdays, catch-up, checkpoint/hash restart,
   duplicate commit, retained reorgs, `ReorgTooDeep`, orphan removal, Bitcoin
-  output restoration, confirmation derivation, Ethereum native/token
-  movements, and RPC outage without false terminal state.
+  output restoration, native-position restart, produced-height confirmation,
+  sparse Solana slots, Ethereum native/token movements, shared-schema scope
+  isolation, and RPC outage without false terminal state.
 - Use precise nouns and plural collections. Avoid `Manager`, `Helper`, `Util`,
   `Impl`, vague abbreviations, repeated chain prefixes, and catch-all `core`,
   `common`, `shared`, `util`, or `misc` modules.

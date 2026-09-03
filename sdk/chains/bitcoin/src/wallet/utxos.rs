@@ -222,9 +222,10 @@ mod tests {
 
     fn checkpoint(height: u64) -> BlockRef {
         BlockRef {
+            position: indexing::BlockPosition(height),
             height: indexing::BlockHeight(height),
             hash: indexing::BlockHash(vec![height as u8]),
-            parent_hash: None,
+            parent: None,
             timestamp: None,
         }
     }

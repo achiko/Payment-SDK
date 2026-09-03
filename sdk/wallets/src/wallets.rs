@@ -5,9 +5,10 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use base::{BlockHeight, Decimal, TransactionId};
+use base::{BlockPosition, Decimal, TransactionId};
 use indexing::{
-    AddressFilter, CanonicalAddress, Checkpoint, IndexScope, RegisteredAddress, Registry,
+    AddressFilter, CanonicalAddress, Checkpoint, IndexScope, PublicationPermit, RegisteredAddress,
+    Registry, ScopeAdmission,
 };
 
 use crate::{
@@ -23,6 +24,9 @@ pub struct WalletInfo<I, F> {
     pub scope: IndexScope,
     pub address: AddressText,
 }
+
+/// Maximum authored transfer occurrences accepted by one batch.
+pub const MAX_TRANSFERS: usize = 50;
 
 /// One batch item referencing a wallet already held by [`Wallets`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +59,7 @@ struct Entry<I, F> {
 pub struct Wallets<I: Ord, F: Ord> {
     checkpoint: Arc<dyn Checkpoint>,
     families: BTreeMap<F, Family>,
+    pub(crate) admissions: BTreeMap<IndexScope, Arc<ScopeAdmission>>,
     values: RwLock<BTreeMap<I, Entry<I, F>>>,
 }
 
@@ -68,6 +73,7 @@ where
         Self {
             checkpoint,
             families: BTreeMap::new(),
+            admissions: BTreeMap::new(),
             values: RwLock::new(BTreeMap::new()),
         }
     }
@@ -87,6 +93,9 @@ where
                 "a wallet family is already registered for this key",
             ));
         }
+        self.admissions
+            .entry(scope.clone())
+            .or_insert_with(|| Arc::new(ScopeAdmission::new()));
         self.families.insert(
             family,
             Family {
@@ -107,7 +116,9 @@ where
         Box::pin(async move {
             let configured = configured?;
             let wallet = configured.provider.generate().await?;
-            let (info, _) = self.store(id, family_key, configured, wallet, None).await?;
+            let (info, _, publication) =
+                self.store(id, family_key, configured, wallet, None).await?;
+            crate::selection::publication(publication)?.complete()?;
             Ok(info)
         })
     }
@@ -140,7 +151,7 @@ where
             let material = secret.as_bytes().to_vec();
             let registry = configured.registry.clone();
             let wallet = configured.provider.create(secret).await?;
-            let (info, filter) = self
+            let (info, filter, publication) = self
                 .store(id.clone(), family_key, configured, wallet, None)
                 .await?;
             if let Some(registry) = &registry
@@ -157,6 +168,7 @@ where
                 self.forget(&id);
                 return Err(error.into());
             }
+            crate::selection::publication(publication)?.complete()?;
             Ok(info)
         })
     }
@@ -189,14 +201,16 @@ where
                     .provider
                     .create(SecretBytes::new(entry.material))
                     .await?;
-                self.store(
-                    I::from(entry.id),
-                    family_key.clone(),
-                    configured.clone(),
-                    wallet,
-                    Some(entry.filter.start_height),
-                )
-                .await?;
+                let (_, _, publication) = self
+                    .store(
+                        I::from(entry.id),
+                        family_key.clone(),
+                        configured.clone(),
+                        wallet,
+                        Some(entry.filter.start_position),
+                    )
+                    .await?;
+                debug_assert!(publication.is_none());
                 restored += 1;
             }
             Ok(restored)
@@ -212,16 +226,17 @@ where
         id: I,
         family: &F,
         secret: SecretBytes,
-        start_height: BlockHeight,
+        start_position: BlockPosition,
     ) -> FutureResult<'a, WalletInfo<I, F>> {
         let family_key = family.clone();
         let configured = self.family(family);
         Box::pin(async move {
             let configured = configured?;
             let wallet = configured.provider.create(secret).await?;
-            let (info, _) = self
-                .store(id, family_key, configured, wallet, Some(start_height))
+            let (info, _, publication) = self
+                .store(id, family_key, configured, wallet, Some(start_position))
                 .await?;
+            debug_assert!(publication.is_none());
             Ok(info)
         })
     }
@@ -282,18 +297,18 @@ where
     /// Wallets sharing an address contribute the earliest birthday.
     pub fn filters(&self) -> Result<Vec<AddressFilter>, Error> {
         let values = self.values.read().map_err(|_| lock_error())?;
-        let mut filters = BTreeMap::<CanonicalAddress, BlockHeight>::new();
+        let mut filters = BTreeMap::<CanonicalAddress, BlockPosition>::new();
         for entry in values.values() {
             filters
                 .entry(entry.filter.address.clone())
-                .and_modify(|height| *height = (*height).min(entry.filter.start_height))
-                .or_insert(entry.filter.start_height);
+                .and_modify(|position| *position = (*position).min(entry.filter.start_position))
+                .or_insert(entry.filter.start_position);
         }
         Ok(filters
             .into_iter()
-            .map(|(address, start_height)| AddressFilter {
+            .map(|(address, start_position)| AddressFilter {
                 address,
-                start_height,
+                start_position,
             })
             .collect())
     }
@@ -313,10 +328,33 @@ where
         family_key: F,
         family: Family,
         wallet: Arc<dyn Wallet>,
-        start_height: Option<BlockHeight>,
-    ) -> Result<(WalletInfo<I, F>, AddressFilter), Error> {
+        start_position: Option<BlockPosition>,
+    ) -> Result<(WalletInfo<I, F>, AddressFilter, Option<PublicationPermit>), Error> {
+        let publication = if start_position.is_none() {
+            let persisted = self.checkpoint.checkpoint(&family.scope).await?;
+            Some(
+                crate::selection::admission(self, &family.scope)?
+                    .publication(persisted)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let start_position = match (start_position, publication.as_ref()) {
+            (Some(position), _) => position,
+            (None, Some(permit)) => match permit.checkpoint() {
+                Some(block) => block.position.checked_successor().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Unavailable,
+                        "checkpoint position has no successor for wallet publication",
+                    )
+                })?,
+                None => BlockPosition(0),
+            },
+            (None, None) => return Err(crate::selection::publication_error()),
+        };
         let entry = self
-            .activate(id.clone(), family_key, family, wallet, start_height)
+            .activate(id.clone(), family_key, family, wallet, start_position)
             .await?;
         let info = entry.info.clone();
         let filter = entry.filter.clone();
@@ -328,7 +366,7 @@ where
             ));
         }
         values.insert(id, entry);
-        Ok((info, filter))
+        Ok((info, filter, publication))
     }
 
     /// Drops an in-memory wallet again after a durable write failed, so the two
@@ -345,25 +383,15 @@ where
         family_key: F,
         family: Family,
         wallet: Arc<dyn Wallet>,
-        start_height: Option<BlockHeight>,
+        start_position: BlockPosition,
     ) -> Result<Entry<I, F>, Error> {
         let address = wallet.address_text(&wallet.address())?;
-        let start_height = match start_height {
-            Some(height) => height,
-            None => self
-                .checkpoint
-                .checkpoint(&family.scope)
-                .await?
-                .map_or(BlockHeight(0), |block| {
-                    BlockHeight(block.height.0.saturating_add(1))
-                }),
-        };
         let filter = AddressFilter {
             address: CanonicalAddress {
                 scope: family.scope.clone(),
                 value: address.text.clone(),
             },
-            start_height,
+            start_position,
         };
         Ok(Entry {
             info: WalletInfo {
@@ -394,20 +422,22 @@ where
         requests: Vec<WalletTransfer<I>>,
     ) -> Result<(Arc<dyn Sender>, Vec<Transfer>), SendError> {
         if requests.is_empty() {
-            return Err(SendError::at(
-                0,
-                Vec::new(),
-                Error::new(
-                    ErrorKind::InvalidAmount,
-                    "at least one transfer is required",
-                ),
+            return Err(SendError::collection(
+                ErrorKind::InvalidBatch,
+                "at least one transfer is required",
+            ));
+        }
+        if requests.len() > MAX_TRANSFERS {
+            return Err(SendError::collection(
+                ErrorKind::InvalidBatch,
+                "at most 50 transfers are allowed",
             ));
         }
         let mut family = None;
         let mut transfers = Vec::with_capacity(requests.len());
         for (index, request) in requests.into_iter().enumerate() {
             if request.amount <= Decimal::zero() {
-                return Err(SendError::at(
+                return Err(SendError::item(
                     index,
                     Vec::new(),
                     Error::new(ErrorKind::InvalidAmount, "amount must be positive"),
@@ -415,12 +445,12 @@ where
             }
             let entry = self
                 .entry(&request.wallet)
-                .map_err(|error| SendError::at(index, Vec::new(), error))?;
+                .map_err(|error| SendError::item(index, Vec::new(), error))?;
             if family
                 .as_ref()
                 .is_some_and(|expected| expected != &entry.info.family)
             {
-                return Err(SendError::at(
+                return Err(SendError::item(
                     index,
                     Vec::new(),
                     Error::new(
@@ -437,22 +467,14 @@ where
             });
         }
         let family = family.ok_or_else(|| {
-            SendError::at(
-                0,
-                Vec::new(),
-                Error::new(ErrorKind::Unsupported, "transfer family is missing"),
-            )
+            SendError::operation(ErrorKind::Unsupported, "transfer family is missing")
         })?;
         let sender = self
             .families
             .get(&family)
             .map(|configured| configured.sender.clone())
             .ok_or_else(|| {
-                SendError::at(
-                    0,
-                    Vec::new(),
-                    Error::new(ErrorKind::Unsupported, "wallet family is not configured"),
-                )
+                SendError::operation(ErrorKind::Unsupported, "wallet family is not configured")
             })?;
         Ok((sender, transfers))
     }
@@ -472,17 +494,30 @@ fn lock_error() -> Error {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{
+        cmp::Ordering,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        },
+        task::{Context, Poll, Waker},
+    };
 
     use base::{
         Address, Addresser, Broadcaster, SignFuture, SignRequest, SignedTransaction, Signer,
         Submission, TransactionBuilder, TransactionEnvelope, TransactionError, TransactionFuture,
         TransactionSnapshot,
     };
-    use indexing::{BlockHash, BlockRef, BoxFuture, ChainId, HistoryCursor, IndexError};
+    use indexing::{
+        BlockHash, BlockHeight, BlockRef, BoxFuture, ChainId, FilterSource, HistoryCursor,
+        IndexError, IndexErrorKind,
+    };
 
     use super::*;
-    use crate::{AddressEncoding, AddressFormat, BalanceReader, HistoryReader, TransactionFactory};
+    use crate::{
+        AddressEncoding, AddressFormat, BalanceReader, HistoryReader, SingleSender,
+        TransactionFactory,
+    };
 
     struct FixtureIndex(Option<BlockRef>);
 
@@ -492,6 +527,33 @@ mod tests {
             _scope: &'a IndexScope,
         ) -> BoxFuture<'a, Result<Option<BlockRef>, IndexError>> {
             Box::pin(async move { Ok(self.0.clone()) })
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct CountedId {
+        value: usize,
+        comparisons: Arc<AtomicUsize>,
+    }
+
+    impl PartialEq for CountedId {
+        fn eq(&self, other: &Self) -> bool {
+            self.value == other.value
+        }
+    }
+
+    impl Eq for CountedId {}
+
+    impl PartialOrd for CountedId {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Ord for CountedId {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.comparisons.fetch_add(1, AtomicOrdering::Relaxed);
+            self.value.cmp(&other.value)
         }
     }
 
@@ -512,6 +574,23 @@ mod tests {
         }
     }
 
+    struct RecordingSender {
+        batches: Arc<Mutex<Vec<Vec<Transfer>>>>,
+        result: Vec<TransactionId>,
+    }
+
+    impl Sender for RecordingSender {
+        fn send<'a>(&'a self, transfers: Vec<Transfer>) -> SendFuture<'a> {
+            Box::pin(async move {
+                self.batches
+                    .lock()
+                    .expect("recording sender lock")
+                    .push(transfers);
+                Ok(self.result.clone())
+            })
+        }
+    }
+
     enum FixtureProvider {
         Value,
     }
@@ -523,6 +602,23 @@ mod tests {
 
         fn generate(&self) -> FutureResult<'_, Arc<dyn Wallet>> {
             self.create(SecretBytes::new([7; 32]))
+        }
+    }
+
+    struct GenerationFailureProvider;
+
+    impl Provider for GenerationFailureProvider {
+        fn create<'a>(&'a self, _secret: SecretBytes) -> FutureResult<'a, Arc<dyn Wallet>> {
+            Box::pin(async { unreachable!("generation failure must not reach wallet creation") })
+        }
+
+        fn generate(&self) -> FutureResult<'_, Arc<dyn Wallet>> {
+            Box::pin(async {
+                Err(Error::new(
+                    ErrorKind::Generation,
+                    "fixture generation failed",
+                ))
+            })
         }
     }
 
@@ -596,6 +692,16 @@ mod tests {
         }
     }
 
+    impl crate::SingleSender for FixtureWallet {
+        fn send<'a>(
+            &'a self,
+            destination: AddressText,
+            amount: Decimal,
+        ) -> FutureResult<'a, TransactionId> {
+            crate::send_with_transaction(self, destination, amount)
+        }
+    }
+
     impl Broadcaster for FixtureWallet {
         fn broadcast<'a>(
             &'a self,
@@ -652,9 +758,10 @@ mod tests {
 
     fn block(height: u64) -> BlockRef {
         BlockRef {
+            position: base::BlockPosition(height),
             height: BlockHeight(height),
             hash: BlockHash(vec![height as u8]),
-            parent_hash: None,
+            parent: None,
             timestamp: None,
         }
     }
@@ -667,6 +774,60 @@ mod tests {
             }),
             calls,
         )
+    }
+
+    fn batch_wallets() -> (
+        Wallets<CountedId, String>,
+        CountedId,
+        Arc<AtomicUsize>,
+        Arc<Mutex<usize>>,
+    ) {
+        let comparisons = Arc::new(AtomicUsize::new(0));
+        let wallet_id = CountedId {
+            value: 1,
+            comparisons: comparisons.clone(),
+        };
+        let (sender, calls) = sender();
+        let family = "family".to_owned();
+        let mut wallets = Wallets::new(Arc::new(FixtureIndex(None)));
+        wallets
+            .register(
+                family.clone(),
+                scope("mainnet"),
+                FixtureProvider::Value,
+                sender,
+                None,
+            )
+            .expect("family registration");
+        futures_executor::block_on(wallets.import(
+            wallet_id.clone(),
+            &family,
+            SecretBytes::new([1; 32]),
+            BlockPosition(1),
+        ))
+        .expect("wallet import");
+        comparisons.store(0, AtomicOrdering::Relaxed);
+        (wallets, wallet_id, comparisons, calls)
+    }
+
+    fn batch_transfers(wallet: &CountedId, count: usize) -> Vec<WalletTransfer<CountedId>> {
+        std::iter::repeat_with(|| WalletTransfer {
+            wallet: wallet.clone(),
+            to: AddressText::new(AddressEncoding::Hex, "destination"),
+            amount: Decimal::from(1_u64),
+        })
+        .take(count)
+        .collect()
+    }
+
+    fn assert_invalid_batch(failure: SendError, message: &str) {
+        assert!(failure.accepted.is_empty());
+        assert_eq!(failure.failed_index, None);
+        assert_eq!(failure.ambiguous_transaction_id, None);
+        assert_eq!(failure.source.kind, ErrorKind::InvalidBatch);
+        assert_eq!(failure.source.message, message);
+        assert_eq!(failure.source.ambiguous_transaction_id, None);
+        assert_eq!(failure.to_string(), message);
     }
 
     #[test]
@@ -711,8 +872,136 @@ mod tests {
             "single"
         );
         assert_eq!(
-            wallets.filters().expect("filters")[0].start_height,
-            BlockHeight(8)
+            wallets.filters().expect("filters")[0].start_position,
+            BlockPosition(8)
+        );
+    }
+
+    #[test]
+    fn checkpoint_commit_wins_before_wallet_publication() {
+        let (sender, _) = sender();
+        let family = "family".to_owned();
+        let index_scope = scope("mainnet");
+        let mut wallets = Wallets::<String, String>::new(Arc::new(FixtureIndex(Some(block(7)))));
+        wallets
+            .register(
+                family.clone(),
+                index_scope.clone(),
+                FixtureProvider::Value,
+                sender,
+                None,
+            )
+            .expect("family registration");
+
+        let plan = wallets
+            .plan(&index_scope, Some(block(7)))
+            .expect("sync plan");
+        let mut commit = plan.begin().expect("commit permit");
+        commit.start();
+        let mut generation = wallets.generate("alice".to_owned(), &family);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            generation.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+
+        commit.complete(Some(block(8))).expect("checkpoint commit");
+        futures_executor::block_on(generation).expect("wallet publication");
+
+        assert_eq!(
+            wallets.filters().expect("filters")[0].start_position,
+            BlockPosition(9)
+        );
+    }
+
+    #[test]
+    fn wallet_publication_invalidates_an_older_sync_plan() {
+        let (sender, _) = sender();
+        let family = "family".to_owned();
+        let index_scope = scope("mainnet");
+        let mut wallets = Wallets::<String, String>::new(Arc::new(FixtureIndex(Some(block(7)))));
+        wallets
+            .register(
+                family.clone(),
+                index_scope.clone(),
+                FixtureProvider::Value,
+                sender,
+                None,
+            )
+            .expect("family registration");
+
+        let stale = wallets
+            .plan(&index_scope, Some(block(7)))
+            .expect("sync plan");
+        futures_executor::block_on(wallets.generate("alice".to_owned(), &family))
+            .expect("wallet publication");
+
+        let error = match stale.begin() {
+            Ok(_) => panic!("old filter revision must not commit"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, IndexErrorKind::Conflict);
+        let current = wallets
+            .plan(&index_scope, Some(block(7)))
+            .expect("replacement plan");
+        assert_eq!(current.filters().len(), 1);
+        assert_eq!(current.filters()[0].start_position, BlockPosition(8));
+    }
+
+    #[test]
+    fn generation_failure_publishes_no_wallet_or_filter() {
+        let (sender, _) = sender();
+        let family = "family".to_owned();
+        let mut wallets = Wallets::<String, String>::new(Arc::new(FixtureIndex(None)));
+        wallets
+            .register(
+                family.clone(),
+                scope("mainnet"),
+                GenerationFailureProvider,
+                sender,
+                None,
+            )
+            .expect("family registration");
+
+        let error = futures_executor::block_on(wallets.generate("alice".to_owned(), &family))
+            .expect_err("generation must fail");
+
+        assert_eq!(error.kind, ErrorKind::Generation);
+        assert_eq!(
+            wallets
+                .get("alice")
+                .expect_err("wallet must not be stored")
+                .kind,
+            ErrorKind::NotFound
+        );
+        assert!(wallets.filters().expect("filters").is_empty());
+    }
+
+    #[test]
+    fn generated_wallet_rejects_exhausted_checkpoint_position_without_publication() {
+        let (sender, _) = sender();
+        let family = "family".to_owned();
+        let mut wallets =
+            Wallets::<String, String>::new(Arc::new(FixtureIndex(Some(block(u64::MAX)))));
+        wallets
+            .register(
+                family.clone(),
+                scope("mainnet"),
+                FixtureProvider::Value,
+                sender,
+                None,
+            )
+            .expect("family registration");
+
+        let error = futures_executor::block_on(wallets.generate("alice".to_owned(), &family))
+            .expect_err("maximum checkpoint position has no safe birthday");
+
+        assert_eq!(error.kind, ErrorKind::Unavailable);
+        assert!(error.message.contains("no successor"));
+        assert!(wallets.filters().expect("filters").is_empty());
+        assert_eq!(
+            wallets.get("alice").expect_err("wallet not published").kind,
+            ErrorKind::NotFound
         );
     }
 
@@ -733,20 +1022,322 @@ mod tests {
             "newer".to_owned(),
             &"family".to_owned(),
             SecretBytes::new([1; 32]),
-            BlockHeight(20),
+            BlockPosition(20),
         ))
         .expect("newer wallet");
         futures_executor::block_on(wallets.import(
             "older".to_owned(),
             &"family".to_owned(),
             SecretBytes::new([2; 32]),
-            BlockHeight(5),
+            BlockPosition(5),
         ))
         .expect("older wallet");
 
         let filters = wallets.filters().expect("filters");
         assert_eq!(filters.len(), 1);
-        assert_eq!(filters[0].start_height, BlockHeight(5));
+        assert_eq!(filters[0].start_position, BlockPosition(5));
+    }
+
+    #[test]
+    fn batch_bounds_reject_zero_and_fifty_one_before_lookup_or_sender() {
+        assert_eq!(crate::MAX_TRANSFERS, 50);
+        let (wallets, wallet_id, comparisons, calls) = batch_wallets();
+
+        let empty =
+            futures_executor::block_on(wallets.send_all(Vec::new())).expect_err("empty batch");
+        assert_invalid_batch(empty, "at least one transfer is required");
+        assert_eq!(comparisons.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(*calls.lock().expect("sender calls"), 0);
+
+        let oversized = futures_executor::block_on(
+            wallets.send_all(batch_transfers(&wallet_id, MAX_TRANSFERS + 1)),
+        )
+        .expect_err("oversized batch");
+        assert_invalid_batch(oversized, "at most 50 transfers are allowed");
+        assert_eq!(comparisons.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(*calls.lock().expect("sender calls"), 0);
+    }
+
+    #[test]
+    fn batch_bounds_admit_one_and_fifty() {
+        let (wallets, wallet_id, comparisons, calls) = batch_wallets();
+
+        let one = futures_executor::block_on(wallets.send_all(batch_transfers(&wallet_id, 1)))
+            .expect("one transfer");
+        assert_eq!(one, vec![TransactionId::new("batch-1")]);
+        assert!(comparisons.load(AtomicOrdering::Relaxed) > 0);
+        assert_eq!(*calls.lock().expect("sender calls"), 1);
+
+        comparisons.store(0, AtomicOrdering::Relaxed);
+        let fifty = futures_executor::block_on(
+            wallets.send_all(batch_transfers(&wallet_id, MAX_TRANSFERS)),
+        )
+        .expect("fifty transfers");
+        assert_eq!(fifty, vec![TransactionId::new("batch-50")]);
+        assert!(comparisons.load(AtomicOrdering::Relaxed) > 0);
+        assert_eq!(*calls.lock().expect("sender calls"), 2);
+    }
+
+    #[test]
+    fn batch_preserves_authored_occurrences_and_sender_result() {
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let sender_result = vec![
+            TransactionId::new("sender-result-two"),
+            TransactionId::new("sender-result-one"),
+        ];
+        let sender = Arc::new(RecordingSender {
+            batches: batches.clone(),
+            result: sender_result.clone(),
+        });
+        let family = "family".to_owned();
+        let primary = "primary".to_owned();
+        let alias = "alias".to_owned();
+        let mut wallets = Wallets::<String, String>::new(Arc::new(FixtureIndex(None)));
+        wallets
+            .register(
+                family.clone(),
+                scope("mainnet"),
+                FixtureProvider::Value,
+                sender,
+                None,
+            )
+            .expect("family registration");
+        let primary_info = futures_executor::block_on(wallets.import(
+            primary.clone(),
+            &family,
+            SecretBytes::new([1; 32]),
+            BlockPosition(1),
+        ))
+        .expect("primary wallet");
+        let alias_info = futures_executor::block_on(wallets.import(
+            alias.clone(),
+            &family,
+            SecretBytes::new([2; 32]),
+            BlockPosition(1),
+        ))
+        .expect("alias wallet");
+        assert_eq!(primary_info.address, alias_info.address);
+
+        let first = AddressText::new(AddressEncoding::Hex, "first");
+        let second = AddressText::new(AddressEncoding::Hex, "second");
+        let one = Decimal::from(1_u64);
+        let two = Decimal::from(2_u64);
+        let requests = vec![
+            WalletTransfer {
+                wallet: primary.clone(),
+                to: first.clone(),
+                amount: one.clone(),
+            },
+            WalletTransfer {
+                wallet: primary.clone(),
+                to: first.clone(),
+                amount: one.clone(),
+            },
+            WalletTransfer {
+                wallet: alias.clone(),
+                to: first.clone(),
+                amount: one.clone(),
+            },
+            WalletTransfer {
+                wallet: primary.clone(),
+                to: second.clone(),
+                amount: two.clone(),
+            },
+            WalletTransfer {
+                wallet: alias,
+                to: second.clone(),
+                amount: two.clone(),
+            },
+            WalletTransfer {
+                wallet: primary,
+                to: first.clone(),
+                amount: two.clone(),
+            },
+        ];
+
+        let result = futures_executor::block_on(wallets.send_all(requests)).expect("batch send");
+        assert_eq!(result, sender_result);
+
+        let recorded = batches.lock().expect("recorded batches");
+        assert_eq!(recorded.len(), 1);
+        let transfers = &recorded[0];
+        assert_eq!(transfers.len(), 6);
+        assert!(Arc::ptr_eq(&transfers[0].wallet, &transfers[1].wallet));
+        assert!(Arc::ptr_eq(&transfers[0].wallet, &transfers[3].wallet));
+        assert!(Arc::ptr_eq(&transfers[0].wallet, &transfers[5].wallet));
+        assert!(Arc::ptr_eq(&transfers[2].wallet, &transfers[4].wallet));
+        assert!(!Arc::ptr_eq(&transfers[0].wallet, &transfers[2].wallet));
+        assert_eq!(
+            transfers
+                .iter()
+                .map(|transfer| (
+                    transfer.wallet.address(),
+                    transfer.to.clone(),
+                    transfer.amount.clone(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (Address::from([1]), first.clone(), one.clone()),
+                (Address::from([1]), first.clone(), one.clone()),
+                (Address::from([1]), first.clone(), one.clone()),
+                (Address::from([1]), second.clone(), two.clone()),
+                (Address::from([1]), second, two.clone()),
+                (Address::from([1]), first, two),
+            ]
+        );
+    }
+
+    #[test]
+    fn batch_failure_keeps_original_authored_index() {
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let sender = Arc::new(RecordingSender {
+            batches: batches.clone(),
+            result: Vec::new(),
+        });
+        let family = "family".to_owned();
+        let primary = "primary".to_owned();
+        let alias = "alias".to_owned();
+        let mut wallets = Wallets::<String, String>::new(Arc::new(FixtureIndex(None)));
+        wallets
+            .register(
+                family.clone(),
+                scope("mainnet"),
+                FixtureProvider::Value,
+                sender,
+                None,
+            )
+            .expect("family registration");
+        futures_executor::block_on(wallets.import(
+            primary.clone(),
+            &family,
+            SecretBytes::new([1; 32]),
+            BlockPosition(1),
+        ))
+        .expect("primary wallet");
+        futures_executor::block_on(wallets.import(
+            alias.clone(),
+            &family,
+            SecretBytes::new([2; 32]),
+            BlockPosition(1),
+        ))
+        .expect("alias wallet");
+
+        let transfer = |wallet: String| WalletTransfer {
+            wallet,
+            to: AddressText::new(AddressEncoding::Hex, "destination"),
+            amount: Decimal::from(1_u64),
+        };
+        let failure = futures_executor::block_on(wallets.send_all(vec![
+            transfer(primary.clone()),
+            transfer(alias.clone()),
+            transfer(primary.clone()),
+            transfer(alias),
+            transfer("missing".to_owned()),
+            transfer(primary),
+        ]))
+        .expect_err("missing wallet");
+
+        assert!(failure.accepted.is_empty());
+        assert_eq!(failure.failed_index, Some(4));
+        assert_eq!(failure.ambiguous_transaction_id, None);
+        assert_eq!(failure.source.kind, ErrorKind::NotFound);
+        assert_eq!(failure.source.message, "wallet does not exist");
+        assert_eq!(failure.source.ambiguous_transaction_id, None);
+        assert!(batches.lock().expect("recorded batches").is_empty());
+    }
+
+    #[test]
+    fn batch_common_validation_uses_authored_itemwise_precedence() {
+        let (first_sender, first_calls) = sender();
+        let (second_sender, second_calls) = sender();
+        let first_family = "first".to_owned();
+        let second_family = "second".to_owned();
+        let mut wallets = Wallets::<String, String>::new(Arc::new(FixtureIndex(None)));
+        wallets
+            .register(
+                first_family.clone(),
+                scope("firstnet"),
+                FixtureProvider::Value,
+                first_sender,
+                None,
+            )
+            .expect("first family");
+        wallets
+            .register(
+                second_family.clone(),
+                scope("secondnet"),
+                FixtureProvider::Value,
+                second_sender,
+                None,
+            )
+            .expect("second family");
+        futures_executor::block_on(wallets.import(
+            "first".to_owned(),
+            &first_family,
+            SecretBytes::new([1; 32]),
+            BlockPosition(1),
+        ))
+        .expect("first wallet");
+        futures_executor::block_on(wallets.import(
+            "second".to_owned(),
+            &second_family,
+            SecretBytes::new([2; 32]),
+            BlockPosition(1),
+        ))
+        .expect("second wallet");
+
+        let transfer = |wallet: &str, amount: u64| WalletTransfer {
+            wallet: wallet.to_owned(),
+            to: AddressText::new(AddressEncoding::Hex, "destination"),
+            amount: Decimal::from(amount),
+        };
+        let cases = [
+            (
+                "amount before same-item lookup",
+                vec![transfer("first", 1), transfer("missing", 0)],
+                ErrorKind::InvalidAmount,
+                "amount must be positive",
+            ),
+            (
+                "amount before same-item family compatibility",
+                vec![transfer("first", 1), transfer("second", 0)],
+                ErrorKind::InvalidAmount,
+                "amount must be positive",
+            ),
+            (
+                "lookup before later amount and family defects",
+                vec![
+                    transfer("first", 1),
+                    transfer("missing", 1),
+                    transfer("second", 0),
+                ],
+                ErrorKind::NotFound,
+                "wallet does not exist",
+            ),
+            (
+                "family compatibility before later amount and lookup defects",
+                vec![
+                    transfer("first", 1),
+                    transfer("second", 1),
+                    transfer("missing", 0),
+                ],
+                ErrorKind::Unsupported,
+                "all transfers must use the same wallet family",
+            ),
+        ];
+
+        for (name, requests, kind, message) in cases {
+            let failure = futures_executor::block_on(wallets.send_all(requests)).expect_err(name);
+
+            assert!(failure.accepted.is_empty(), "{name}");
+            assert_eq!(failure.failed_index, Some(1), "{name}");
+            assert_eq!(failure.ambiguous_transaction_id, None, "{name}");
+            assert_eq!(failure.source.kind, kind, "{name}");
+            assert_eq!(failure.source.message, message, "{name}");
+            assert_eq!(failure.source.ambiguous_transaction_id, None, "{name}");
+        }
+        assert_eq!(*first_calls.lock().expect("first calls"), 0);
+        assert_eq!(*second_calls.lock().expect("second calls"), 0);
     }
 
     #[test]
@@ -776,14 +1367,14 @@ mod tests {
             "alice".to_owned(),
             &"first".to_owned(),
             SecretBytes::new([1; 32]),
-            BlockHeight(1),
+            BlockPosition(1),
         ))
         .expect("alice");
         futures_executor::block_on(wallets.import(
             "bob".to_owned(),
             &"second".to_owned(),
             SecretBytes::new([2; 32]),
-            BlockHeight(1),
+            BlockPosition(1),
         ))
         .expect("bob");
 
@@ -801,7 +1392,7 @@ mod tests {
         ]))
         .expect_err("mixed family batch");
 
-        assert_eq!(error.failed_index, 1);
+        assert_eq!(error.failed_index, Some(1));
         assert_eq!(*first_calls.lock().expect("first calls"), 0);
         assert_eq!(*second_calls.lock().expect("second calls"), 0);
     }
@@ -820,7 +1411,9 @@ mod tests {
         ));
 
         assert_eq!(conflict.kind, ErrorKind::Conflict);
+        assert_eq!(conflict.ambiguous_transaction_id, None);
         assert_eq!(unavailable.kind, ErrorKind::Unavailable);
+        assert_eq!(unavailable.ambiguous_transaction_id, None);
     }
 
     #[test]

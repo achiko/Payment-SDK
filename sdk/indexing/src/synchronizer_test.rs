@@ -1,5 +1,5 @@
 use crate::{
-    AddressFilter, BlockHeight, CanonicalAddress, ChainId, IndexErrorKind, IndexScope, SyncConfig,
+    AddressFilter, BlockPosition, CanonicalAddress, ChainId, IndexErrorKind, IndexScope, SyncConfig,
 };
 
 fn scope() -> IndexScope {
@@ -10,31 +10,28 @@ fn scope() -> IndexScope {
 }
 
 #[test]
-fn fresh_sync_anchors_at_tip_or_immediately_before_the_first_birthday() {
+fn fresh_sync_uses_the_earliest_native_position_without_inventing_a_parent() {
     let filters = |starts: &[u64]| {
         starts
             .iter()
-            .map(|height| AddressFilter {
+            .map(|position| AddressFilter {
                 address: CanonicalAddress {
                     scope: scope(),
-                    value: format!("address-{height}"),
+                    value: format!("address-{position}"),
                 },
-                start_height: BlockHeight(*height),
+                start_position: BlockPosition(*position),
             })
             .collect::<Vec<_>>()
     };
 
+    assert_eq!(super::synchronizer::earliest_position(&filters(&[])), None);
     assert_eq!(
-        super::synchronizer::anchor_height(&filters(&[]), BlockHeight(1_000)),
-        Some(BlockHeight(1_000))
+        super::synchronizer::earliest_position(&filters(&[900, 950])),
+        Some(crate::BlockPosition(900))
     );
     assert_eq!(
-        super::synchronizer::anchor_height(&filters(&[900, 950]), BlockHeight(1_000)),
-        Some(BlockHeight(899))
-    );
-    assert_eq!(
-        super::synchronizer::anchor_height(&filters(&[0]), BlockHeight(1_000)),
-        None
+        super::synchronizer::earliest_position(&filters(&[0])),
+        Some(crate::BlockPosition(0))
     );
 }
 

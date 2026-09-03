@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use futures_util::{StreamExt, stream};
 use indexing::{
-    BlockHash, BlockHeight, BlockRef, BlockSource, BoxFuture, ChainId, IndexScope, SourceError,
+    BlockHash, BlockHeight, BlockPosition, BlockRef, BlockSource, BoxFuture, ChainId, IndexScope,
+    SourceError,
 };
 use json_rpc::Client;
 use serde_json::Value;
@@ -433,38 +434,61 @@ where
         })
     }
 
-    fn block_at<'a>(
+    fn blocks<'a>(
         &'a self,
-        height: BlockHeight,
-    ) -> BoxFuture<'a, Result<Self::Block, SourceError>> {
+        start: BlockPosition,
+        end: BlockPosition,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<Self::Block>, SourceError>> {
         Box::pin(async move {
-            let first_hash = self.hash_at(height).await?;
-            let block = self
-                .fetch_block(&first_hash, Some(height))
-                .await?
-                .ok_or_else(|| {
-                    source_error("Bitcoin Core no longer exposes the requested block", true)
-                })?;
-            let second_hash = self.hash_at(height).await?;
-            if first_hash != second_hash {
+            if limit == 0 || start > end {
                 return Err(source_error(
-                    "Bitcoin canonical block changed while it was being fetched",
-                    true,
+                    "Bitcoin block range requires ordered positions and a positive limit",
+                    false,
                 ));
             }
-            Ok(block)
+            let mut position = start.0;
+            let end = end.0;
+            let mut blocks = Vec::with_capacity(limit.min(64));
+            while position <= end && blocks.len() < limit {
+                let height = BlockHeight(position);
+                let first_hash = self.hash_at(height).await?;
+                let block = self
+                    .fetch_block(&first_hash, Some(height))
+                    .await?
+                    .ok_or_else(|| {
+                        source_error("Bitcoin Core no longer exposes the requested block", true)
+                    })?;
+                let second_hash = self.hash_at(height).await?;
+                if first_hash != second_hash {
+                    return Err(source_error(
+                        "Bitcoin canonical block changed while it was being fetched",
+                        true,
+                    ));
+                }
+                blocks.push(block);
+                let Some(next) = position.checked_add(1) else {
+                    break;
+                };
+                position = next;
+            }
+            Ok(blocks)
         })
     }
 
-    fn canonical_hash<'a>(
+    fn canonical_at<'a>(
         &'a self,
-        height: BlockHeight,
-    ) -> BoxFuture<'a, Result<Option<BlockHash>, SourceError>> {
+        position: BlockPosition,
+    ) -> BoxFuture<'a, Result<Option<BlockRef>, SourceError>> {
         Box::pin(async move {
+            let height = BlockHeight(position.0);
             if height > self.block_count().await? {
                 return Ok(None);
             }
-            self.optional_hash_at(height).await
+            let Some(hash) = self.optional_hash_at(height).await? else {
+                return Ok(None);
+            };
+            self.header(&hash, height).await.map(Some)
         })
     }
 }

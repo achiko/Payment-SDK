@@ -8,8 +8,8 @@ use std::{
 
 use crate::{
     AddressFilter, BlockAddition, BlockHeight, BlockInterpreter, BlockObservation, BlockOutcome,
-    BlockRef, BlockSelector, BlockSource, Blocks, IndexError, IndexErrorKind, IndexedBlock,
-    Observer, SyncPhase, SyncStatus,
+    BlockParent, BlockPosition, BlockRef, BlockSelector, BlockSource, Blocks, IndexError,
+    IndexErrorKind, IndexedBlock, Observer, SyncPhase, SyncStatus,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,12 +57,23 @@ impl Drop for RunningGuard<'_> {
     }
 }
 
-pub(super) fn anchor_height(filters: &[AddressFilter], target: BlockHeight) -> Option<BlockHeight> {
-    match filters.iter().map(|filter| filter.start_height).min() {
-        None => Some(target),
-        Some(BlockHeight(0)) => None,
-        Some(BlockHeight(height)) => Some(target.min(BlockHeight(height - 1))),
-    }
+pub(super) fn earliest_position(filters: &[AddressFilter]) -> Option<BlockPosition> {
+    filters.iter().map(|filter| filter.start_position).min()
+}
+
+fn active_addresses(
+    filters: &[AddressFilter],
+    position: BlockPosition,
+) -> Vec<crate::CanonicalAddress> {
+    filters
+        .iter()
+        .filter(|item| item.start_position <= position)
+        .map(|item| item.address.clone())
+        .collect()
+}
+
+fn cannot_connect(message: impl Into<String>) -> IndexError {
+    IndexError::new(IndexErrorKind::CannotConnect, message, true)
 }
 
 /// Synchronizes caller-selected addresses without owning their lifecycle.
@@ -118,64 +129,88 @@ where
         // this pass is about to apply; indexing them against the earlier set
         // would skip that address for blocks it was registered to cover, and
         // the checkpoint moves past them for good.
-        let filters = selection.filters()?;
-        self.validate(&filters)?;
         let mut checkpoint = self
             .repository
             .get(BlockSelector::Tip(self.config.scope.clone()))
             .await?;
+        let mut plan = selection.plan(&self.config.scope, checkpoint.clone())?;
+        self.validate(plan.filters())?;
         if let Some(local) = checkpoint.clone()
             && self
                 .source
-                .canonical_hash(local.height)
+                .canonical_at(local.position)
                 .await
                 .map_err(IndexError::from)?
                 .as_ref()
-                != Some(&local.hash)
+                != Some(&local)
         {
-            checkpoint = self.reconcile(local).await?;
+            checkpoint = self.reconcile(local, &mut plan).await?;
+        }
+        let filters = plan.filters().to_vec();
+
+        let mut applied = 0_usize;
+        if checkpoint.is_none() {
+            let birthday = earliest_position(&filters);
+            if birthday.is_none_or(|position| position > observed_tip.position) {
+                let anchor = self
+                    .one_block(observed_tip.position, observed_tip.position)
+                    .await?;
+                checkpoint = Some(self.apply(anchor, &[], None, &mut plan).await?);
+                applied += 1;
+            } else if let Some(start) = birthday {
+                let first = self.one_block(start, observed_tip.position).await?;
+                let first_ref = first.block_ref();
+                if let Some(parent) = &first_ref.parent {
+                    let anchor = self.one_block(parent.position, parent.position).await?;
+                    let anchor_ref = anchor.block_ref();
+                    if anchor_ref.position != parent.position || anchor_ref.hash != parent.hash {
+                        return Err(cannot_connect(
+                            "birthday anchor does not match the first block parent",
+                        ));
+                    }
+                    checkpoint = Some(self.apply(anchor, &[], None, &mut plan).await?);
+                    applied += 1;
+                }
+                if applied < self.config.batch_size {
+                    let addresses = active_addresses(&filters, first_ref.position);
+                    checkpoint = Some(self.apply(first, &addresses, checkpoint, &mut plan).await?);
+                    applied += 1;
+                }
+            }
         }
 
-        let target = observed_tip.height;
-        let mut applied = 0_usize;
-        if checkpoint.is_none()
-            && let Some(height) = anchor_height(&filters, target)
-            && applied < self.config.batch_size
+        if applied < self.config.batch_size
+            && let Some(tip) = &checkpoint
+            && tip.position < observed_tip.position
         {
-            checkpoint = Some(self.apply(height, &[], None).await?);
-            applied += 1;
-        }
-        while applied < self.config.batch_size {
-            let height = match &checkpoint {
-                Some(value) => BlockHeight(value.height.0.checked_add(1).ok_or_else(|| {
-                    IndexError::new(
-                        IndexErrorKind::InvalidBlock,
-                        "checkpoint height is exhausted",
-                        false,
-                    )
-                })?),
-                None => BlockHeight(0),
-            };
-            if height > target {
-                break;
+            let start = tip.position.checked_successor().ok_or_else(|| {
+                IndexError::new(
+                    IndexErrorKind::InvalidBlock,
+                    "checkpoint position is exhausted",
+                    false,
+                )
+            })?;
+            let remaining = self.config.batch_size - applied;
+            let blocks = self
+                .fetch_blocks(start, observed_tip.position, remaining)
+                .await?;
+            if blocks.is_empty() {
+                return Err(cannot_connect(
+                    "source returned no produced block before its observed tip",
+                ));
             }
-            let addresses = filters
-                .iter()
-                .filter(|item| item.start_height <= height)
-                .map(|item| item.address.clone())
-                .collect::<Vec<_>>();
-            checkpoint = Some(self.apply(height, &addresses, checkpoint).await?);
-            applied += 1;
+            for source_block in blocks {
+                let position = source_block.block_ref().position;
+                let addresses = active_addresses(&filters, position);
+                checkpoint = Some(
+                    self.apply(source_block, &addresses, checkpoint, &mut plan)
+                        .await?,
+                );
+            }
         }
         let caught_up = checkpoint
             .as_ref()
-            .is_some_and(|value| value.height >= observed_tip.height)
-            || checkpoint.is_none()
-                && filters
-                    .iter()
-                    .map(|filter| filter.start_height)
-                    .min()
-                    .is_some_and(|height| observed_tip.height < height);
+            .is_some_and(|value| value.position >= observed_tip.position);
         Ok(SyncStatus {
             scope: self.config.scope.clone(),
             checkpoint,
@@ -226,38 +261,93 @@ where
         Ok(())
     }
 
-    async fn apply(
+    async fn one_block(
         &self,
-        height: BlockHeight,
-        addresses: &[crate::CanonicalAddress],
-        checkpoint: Option<BlockRef>,
-    ) -> Result<BlockRef, IndexError> {
-        let source_block = self
+        start: BlockPosition,
+        end: BlockPosition,
+    ) -> Result<I::Block, IndexError> {
+        let blocks = self.fetch_blocks(start, end, 1).await?;
+        let [block]: [I::Block; 1] = blocks
+            .try_into()
+            .map_err(|_| cannot_connect("source did not return the required produced block"))?;
+        Ok(block)
+    }
+
+    async fn fetch_blocks(
+        &self,
+        start: BlockPosition,
+        end: BlockPosition,
+        limit: usize,
+    ) -> Result<Vec<I::Block>, IndexError> {
+        let blocks = self
             .source
-            .block_at(height)
+            .blocks(start, end, limit)
             .await
             .map_err(IndexError::from)?;
+        if blocks.len() > limit {
+            return Err(cannot_connect("source exceeded the returned-block limit"));
+        }
+        let mut previous = None;
+        for block in &blocks {
+            let position = block.block_ref().position;
+            if position < start
+                || position > end
+                || previous.is_some_and(|previous| position <= previous)
+            {
+                return Err(cannot_connect(
+                    "source blocks are outside the range or not strictly increasing",
+                ));
+            }
+            previous = Some(position);
+        }
+        Ok(blocks)
+    }
+
+    async fn apply(
+        &self,
+        source_block: I::Block,
+        addresses: &[crate::CanonicalAddress],
+        checkpoint: Option<BlockRef>,
+        plan: &mut crate::SyncPlan,
+    ) -> Result<BlockRef, IndexError> {
         let block = source_block.block_ref();
-        if block.height != height
-            || checkpoint
-                .as_ref()
-                .is_some_and(|tip| block.parent_hash.as_ref() != Some(&tip.hash))
-        {
-            return Err(IndexError::new(
-                IndexErrorKind::CannotConnect,
-                "source block does not connect to the checkpoint",
-                true,
-            ));
+        if block.position == BlockPosition(0) {
+            if block.parent.is_some() {
+                return Err(cannot_connect("genesis block must not have a parent"));
+            }
+        } else if block.parent.is_none() {
+            return Err(cannot_connect("non-genesis block is missing its parent"));
+        }
+        if let Some(tip) = &checkpoint {
+            let expected_height = tip.height.checked_successor().ok_or_else(|| {
+                IndexError::new(
+                    IndexErrorKind::InvalidBlock,
+                    "checkpoint height is exhausted",
+                    false,
+                )
+            })?;
+            if block.position <= tip.position
+                || block.height != expected_height
+                || block.parent.as_ref()
+                    != Some(&BlockParent {
+                        position: tip.position,
+                        hash: tip.hash.clone(),
+                    })
+            {
+                return Err(cannot_connect(
+                    "source block does not connect to the checkpoint",
+                ));
+            }
         }
         let interpreted = self.interpreter.inspect(&source_block, addresses)?;
         self.validate_block(&block, &interpreted)?;
         if self
             .source
-            .canonical_hash(height)
+            .canonical_at(block.position)
             .await
             .map_err(IndexError::from)?
             .as_ref()
-            != Some(&block.hash)
+            != Some(&block)
         {
             return Err(IndexError::new(
                 IndexErrorKind::CannotConnect,
@@ -277,7 +367,11 @@ where
             .observer
             .as_ref()
             .map(|_| addition.transactions().to_vec());
+        let mut permit = plan.begin()?;
+        permit.start();
         let outcome = self.repository.add(addition).await?;
+        permit.complete(Some(block.clone()))?;
+        plan.advance(block.clone());
         if outcome == BlockOutcome::Applied
             && let (Some(observer), Some(transactions)) = (&self.observer, observed)
         {
@@ -307,7 +401,11 @@ where
         Ok(())
     }
 
-    async fn reconcile(&self, tip: BlockRef) -> Result<Option<BlockRef>, IndexError> {
+    async fn reconcile(
+        &self,
+        tip: BlockRef,
+        plan: &mut crate::SyncPlan,
+    ) -> Result<Option<BlockRef>, IndexError> {
         let oldest = BlockHeight(tip.height.0.saturating_sub(self.config.reorg_retention));
         let mut height = tip.height;
         let ancestor = loop {
@@ -318,13 +416,16 @@ where
                     height,
                 })
                 .await?;
-            let remote = self
-                .source
-                .canonical_hash(height)
-                .await
-                .map_err(IndexError::from)?;
+            let remote = match &local {
+                Some(block) => self
+                    .source
+                    .canonical_at(block.position)
+                    .await
+                    .map_err(IndexError::from)?,
+                None => None,
+            };
             if let (Some(local), Some(remote)) = (local, remote)
-                && local.hash == remote
+                && local == remote
             {
                 break Some(local);
             }
@@ -341,6 +442,8 @@ where
             )
         })?;
 
+        let mut permit = plan.begin()?;
+        permit.start();
         let mut current = Some(tip);
         while current
             .as_ref()
@@ -353,6 +456,11 @@ where
                 .repository
                 .remove(self.config.scope.clone(), expected_tip)
                 .await?;
+            permit.persist(current.clone())?;
+        }
+        permit.complete(current.clone())?;
+        if let Some(checkpoint) = &current {
+            plan.advance(checkpoint.clone());
         }
         Ok(current)
     }

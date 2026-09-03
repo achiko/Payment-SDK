@@ -4,12 +4,14 @@ use indexing::{BlockRef, IndexError, IndexErrorKind, IndexScope};
 
 use crate::{
     Repository, prepare_in, row,
-    write::{locked_checkpoint, move_checkpoint, optional_block},
+    write::{lock_scope, locked_checkpoint, move_checkpoint, optional_block},
 };
 
 const JOURNAL_ENTRY: &str = "\
-SELECT block_hash, previous_checkpoint_height AS previous_height,
+SELECT block_hash, previous_checkpoint_position AS previous_position,
+       previous_checkpoint_height AS previous_height,
        previous_checkpoint_hash AS previous_hash,
+       previous_checkpoint_parent_position AS previous_parent_position,
        previous_checkpoint_parent AS previous_parent,
        previous_checkpoint_time AS previous_timestamp
 FROM journal WHERE chain = $1 AND network = $2 AND height = $3";
@@ -47,6 +49,7 @@ impl Repository {
         let mut client = self.client().await?;
         let transaction = client.transaction().await.map_err(crate::store)?;
 
+        lock_scope(&transaction, scope).await?;
         let current = locked_checkpoint(&transaction, scope).await?;
         if current.as_ref() != Some(expected_tip) {
             return Err(IndexError::new(

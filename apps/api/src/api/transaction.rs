@@ -1,7 +1,7 @@
 use axum::{
     Json,
-    extract::{Path, Query, State, rejection::JsonRejection},
-    http::StatusCode,
+    extract::{FromRequestParts, Path, Query, State, rejection::JsonRejection},
+    http::{StatusCode, request::Parts},
 };
 use serde::{Deserialize, Serialize};
 use utoipa::IntoParams;
@@ -19,6 +19,26 @@ pub fn routes() -> OpenApiRouter<HttpState> {
         .routes(routes!(read))
         .routes(routes!(send))
         .routes(routes!(send_all))
+}
+
+enum TransactionQuery {
+    AbsentOrEmpty,
+}
+
+impl<S> FromRequestParts<S> for TransactionQuery
+where
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        if parts.uri.query().is_some_and(|query| !query.is_empty()) {
+            return Err(ApiError::invalid_request(
+                "transaction query parameters are not supported",
+            ));
+        }
+        Ok(Self::AbsentOrEmpty)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
@@ -136,17 +156,28 @@ impl From<wallets::HistoryFee> for Fee {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct Block {
+    pub position: u64,
     pub height: u64,
     pub hash: String,
-    pub parent_hash: Option<String>,
+    pub parent: Option<ParentBlock>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct ParentBlock {
+    pub position: u64,
+    pub hash: String,
 }
 
 impl From<base::BlockRef> for Block {
     fn from(value: base::BlockRef) -> Self {
         Self {
+            position: value.position.0,
             height: value.height.0,
             hash: hex::encode(value.hash.0),
-            parent_hash: value.parent_hash.map(|hash| hex::encode(hash.0)),
+            parent: value.parent.map(|parent| ParentBlock {
+                position: parent.position.0,
+                hash: hex::encode(parent.hash.0),
+            }),
         }
     }
 }
@@ -327,6 +358,7 @@ pub struct Submission {
 #[utoipa::path(
     post,
     path = "/v1/wallets/{id}/transactions",
+    description = "Submits one transfer through the wallet's configured asset family. The native SOL integration is reserved for this shared route; no Solana-only transaction route is defined. A 202 response means submitted, not confirmed.",
     params(WalletPath),
     request_body = SendFunds,
     responses(
@@ -334,13 +366,14 @@ pub struct Submission {
         (status = 400, body = ErrorBody),
         (status = 404, body = ErrorBody),
         (status = 422, body = ErrorBody),
-        (status = 503, description = "Transaction unavailable or submission outcome ambiguous", body = ErrorBody)
+        (status = 503, description = "Transaction unavailable or exact-envelope submission outcome ambiguous; ambiguous_transaction_id is present only for an unknown outcome", body = ErrorBody)
     ),
     tag = "transactions"
 )]
 async fn send(
     State(state): State<HttpState>,
     Path(path): Path<WalletPath>,
+    _query: TransactionQuery,
     request: Result<Json<SendFunds>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Submission>), ApiError> {
     let Json(request) = request.map_err(ApiError::invalid_json)?;
@@ -366,6 +399,7 @@ pub struct WalletTransfer {
 #[serde(deny_unknown_fields)]
 pub struct TransferRequest {
     /// Transfers for one configured asset family, in execution order.
+    #[schema(min_items = 1, max_items = 50)]
     pub transfers: Vec<WalletTransfer>,
 }
 
@@ -373,6 +407,12 @@ impl TryFrom<TransferRequest> for Vec<wallets::WalletTransfer<String>> {
     type Error = ApiError;
 
     fn try_from(request: TransferRequest) -> Result<Self, Self::Error> {
+        if request.transfers.len() > wallets::MAX_TRANSFERS {
+            return Err(ApiError::invalid_request(format!(
+                "at most {} transfers are allowed",
+                wallets::MAX_TRANSFERS
+            )));
+        }
         request
             .transfers
             .into_iter()
@@ -400,19 +440,20 @@ pub struct TransferResponse {
 #[utoipa::path(
     post,
     path = "/v1/transactions",
-    description = "Submits one exact-asset batch. Requests mixing BTC, ETH, or USDC wallet families are rejected before any transaction is submitted. Bitcoin may group transfers into one transaction. Ethereum reserves nonces per sender and prepares the whole batch before submitting exact envelopes in request order. A failure response preserves accepted transaction IDs and the failed request index.",
+    description = "Submits one ordered exact-asset batch through the configured wallet family. The native SOL integration is reserved for this shared route; no Solana-only transaction route is defined. Requests mixing wallet families are rejected before any transaction is submitted. Bitcoin may group occurrences into one transaction. Ethereum reserves consecutive nonces per sender and prepares the whole batch before submitting exact envelopes in request order. Definitely acknowledged transaction IDs are returned only when a non-empty prefix was accepted, and a failed index is returned only when one original occurrence truthfully failed.",
     request_body = TransferRequest,
     responses(
         (status = 202, description = "Asset batch submitted", body = TransferResponse),
         (status = 400, body = ErrorBody),
         (status = 404, body = ErrorBody),
-        (status = 422, description = "Batch failed; accepted transaction IDs identify partial submission", body = ErrorBody),
-        (status = 503, description = "Batch unavailable or submission outcome ambiguous; accepted transaction IDs identify any partial submission", body = ErrorBody)
+        (status = 422, description = "Definite batch failure; transaction_ids is present only for a definitely acknowledged prefix and failed_index only for a truthful item-scoped failure", body = ErrorBody),
+        (status = 503, description = "Batch unavailable or exact-envelope submission outcome ambiguous; transaction_ids is present only for a definitely acknowledged prefix, failed_index only for a truthful item-scoped failure, and ambiguous_transaction_id only for an unknown outcome", body = ErrorBody)
     ),
     tag = "transactions"
 )]
 async fn send_all(
     State(state): State<HttpState>,
+    _query: TransactionQuery,
     request: Result<Json<TransferRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<TransferResponse>), ApiError> {
     let Json(request) = request.map_err(ApiError::invalid_json)?;

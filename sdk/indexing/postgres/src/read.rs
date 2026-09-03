@@ -1,25 +1,27 @@
 //! Checkpoint-consistent read projections over the committed lifecycle.
 //!
-//! A page costs a fixed four round trips: the checkpoint, the page itself, the
-//! page's movements, and the checkpoint again to prove it did not move. All
-//! four share one pooled connection.
+//! A history page costs four round trips and an output page costs three. Each
+//! page executes all of its checkpoint and projection reads in one read-only
+//! repeatable-read transaction so they share one snapshot.
 
 use std::collections::HashMap;
 
+use deadpool_postgres::Transaction;
 use indexing::{
     AssetId, CanonicalPage, CanonicalStatus, CanonicalTransaction, ChainId, HistoryCursor,
     HistoryPosition, HistoryQuery, IndexError, IndexErrorKind, MovementId, MovementKind,
     NetworkFee, OutputCursor, OutputPage, OutputRequest, TransactionRef, Transactions,
     ValueMovement,
 };
-use tokio_postgres::Row;
+use tokio_postgres::{IsolationLevel, Row};
 
-use crate::{Repository, prepare, row};
+use crate::{Repository, prepare_in, row};
 
 const MAX_PAGE: usize = 1_000;
 
 const HISTORY_PAGE: &str = "\
-SELECT height, transaction_id, status, failure_reason, block_hash AS hash, block_parent AS parent,
+SELECT height, transaction_id, status, failure_reason, block_position AS position,
+       block_hash AS hash, block_parent_position AS parent_position, block_parent AS parent,
        block_timestamp AS timestamp, fee_asset, fee_amount::text AS fee_amount, fee_payer
 FROM history WHERE chain = $1 AND network = $2 AND address = $3
   AND (height, transaction_id) > ($4, $5)
@@ -59,8 +61,15 @@ impl Repository {
         self.check_scope(&request.scope)?;
         self.check_address(&request.address)?;
         validate_limit(request.limit)?;
-        let client = self.client().await?;
-        let checkpoint = self.checkpoint_on(&client).await?;
+        let mut client = self.client().await?;
+        let transaction = client
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .await
+            .map_err(crate::store)?;
+        let checkpoint = self.checkpoint_in(&transaction).await?;
         if request
             .after
             .as_ref()
@@ -79,8 +88,8 @@ impl Repository {
             ),
             None => (-1, String::new()),
         };
-        let statement = prepare(&client, HISTORY_PAGE).await?;
-        let rows = client
+        let statement = prepare_in(&transaction, HISTORY_PAGE).await?;
+        let rows = transaction
             .query(
                 &statement,
                 &[
@@ -97,7 +106,7 @@ impl Repository {
 
         let has_more = rows.len() > request.limit;
         let page = &rows[..rows.len().min(request.limit)];
-        let mut movements = self.page_movements(&client, &request, page).await?;
+        let mut movements = self.page_movements(&transaction, &request, page).await?;
 
         let mut transactions = Vec::with_capacity(page.len());
         for entry in page {
@@ -111,7 +120,7 @@ impl Repository {
 
         // The checkpoint must not have moved while the page was assembled, or
         // the page would mix two views of canonical history.
-        if self.checkpoint_on(&client).await? != checkpoint {
+        if self.checkpoint_in(&transaction).await? != checkpoint {
             return Err(conflict("history changed during pagination"));
         }
         let next = has_more
@@ -125,18 +134,20 @@ impl Repository {
                 })
             })
             .flatten();
-        Ok(CanonicalPage {
+        let page = CanonicalPage {
             checkpoint,
             transactions,
             next,
-        })
+        };
+        transaction.commit().await.map_err(crate::store)?;
+        Ok(page)
     }
 
     /// Reads the movements of every transaction on a page in one query, keyed
     /// by the transaction they belong to.
     async fn page_movements(
         &self,
-        client: &deadpool_postgres::Client,
+        transaction: &Transaction<'_>,
         request: &HistoryQuery,
         page: &[Row],
     ) -> Result<HashMap<Position, Vec<ValueMovement>>, IndexError> {
@@ -148,8 +159,8 @@ impl Repository {
         let last_height: i64 = last.try_get("height").map_err(crate::store)?;
         let last_transaction: String = last.try_get("transaction_id").map_err(crate::store)?;
 
-        let statement = prepare(client, PAGE_MOVEMENTS).await?;
-        let rows = client
+        let statement = prepare_in(transaction, PAGE_MOVEMENTS).await?;
+        let rows = transaction
             .query(
                 &statement,
                 &[
@@ -285,8 +296,15 @@ impl Repository {
         self.check_scope(&request.scope)?;
         self.check_address(&request.address)?;
         validate_limit(request.limit)?;
-        let client = self.client().await?;
-        let checkpoint = self.checkpoint_on(&client).await?;
+        let mut client = self.client().await?;
+        let transaction = client
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .await
+            .map_err(crate::store)?;
+        let checkpoint = self.checkpoint_in(&transaction).await?;
         if request
             .after
             .as_ref()
@@ -300,8 +318,8 @@ impl Repository {
         };
         let limit = i64::try_from(request.limit.saturating_add(1))
             .map_err(|_| row::store("page limit exceeds the query range"))?;
-        let statement = prepare(&client, OUTPUT_PAGE).await?;
-        let rows = client
+        let statement = prepare_in(&transaction, OUTPUT_PAGE).await?;
+        let rows = transaction
             .query(
                 &statement,
                 &[
@@ -322,7 +340,7 @@ impl Repository {
             .take(request.limit)
             .map(|entry| row::output(&request.scope, entry))
             .collect::<Result<Vec<_>, _>>()?;
-        if self.checkpoint_on(&client).await? != checkpoint {
+        if self.checkpoint_in(&transaction).await? != checkpoint {
             return Err(conflict("outputs changed during pagination"));
         }
         let next = has_more
@@ -333,11 +351,13 @@ impl Repository {
                 })
             })
             .flatten();
-        Ok(OutputPage {
+        let page = OutputPage {
             checkpoint,
             outputs,
             next,
-        })
+        };
+        transaction.commit().await.map_err(crate::store)?;
+        Ok(page)
     }
 }
 

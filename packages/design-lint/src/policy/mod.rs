@@ -1,3 +1,6 @@
+mod selection;
+pub use selection::{Boundaries, Rules, Rust, SourceSelector};
+
 use std::{fs, path::Path};
 
 use serde::Deserialize;
@@ -7,6 +10,12 @@ use crate::{LintError, Result};
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
+    #[serde(default)]
+    pub rules: Rules,
+    #[serde(default)]
+    pub rust: Rust,
+    #[serde(default)]
+    pub boundaries: Boundaries,
     #[serde(default)]
     pub dependency: Dependency,
     #[serde(default)]
@@ -157,9 +166,11 @@ impl Policy {
         let path = path.as_ref();
         let text =
             fs::read_to_string(path).map_err(|error| LintError::io("read policy", path, error))?;
-        toml::from_str(&text).map_err(|error| {
+        let policy: Self = toml::from_str(&text).map_err(|error| {
             LintError::configuration(format!("failed to parse {}: {error}", path.display()))
-        })
+        })?;
+        policy.validate()?;
+        Ok(policy)
     }
 }
 

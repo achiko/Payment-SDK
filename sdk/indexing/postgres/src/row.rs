@@ -1,8 +1,9 @@
 //! Row decoding shared by the read and write paths.
 
 use indexing::{
-    AssetId, BlockHash, BlockHeight, BlockRef, CanonicalAddress, ChainId, Decimal, IndexError,
-    IndexErrorKind, IndexScope, IndexedOutput, OutputId, TransactionRef,
+    AssetId, BlockHash, BlockHeight, BlockParent, BlockPosition, BlockRef, CanonicalAddress,
+    ChainId, Decimal, IndexError, IndexErrorKind, IndexScope, IndexedOutput, OutputId,
+    TransactionRef,
 };
 use tokio_postgres::Row;
 
@@ -27,6 +28,12 @@ pub(crate) fn height(value: i64) -> Result<BlockHeight, IndexError> {
     ))
 }
 
+pub(crate) fn position(value: i64) -> Result<BlockPosition, IndexError> {
+    Ok(BlockPosition(
+        u64::try_from(value).map_err(|_| store("stored block position is negative"))?,
+    ))
+}
+
 pub(crate) fn as_i64(value: u64, what: &'static str) -> Result<i64, IndexError> {
     i64::try_from(value).map_err(|_| {
         IndexError::new(
@@ -38,11 +45,23 @@ pub(crate) fn as_i64(value: u64, what: &'static str) -> Result<i64, IndexError> 
 }
 
 pub(crate) fn block(row: &Row, prefix: &str) -> Result<BlockRef, IndexError> {
-    let raw: i64 = get(row, &format!("{prefix}height"))?;
+    let raw_height: i64 = get(row, &format!("{prefix}height"))?;
+    let raw_position: i64 = get(row, &format!("{prefix}position"))?;
+    let parent_position: Option<i64> = get(row, &format!("{prefix}parent_position"))?;
+    let parent_hash: Option<Vec<u8>> = get(row, &format!("{prefix}parent"))?;
+    let parent = match (parent_position, parent_hash) {
+        (Some(position), Some(hash)) => Some(BlockParent {
+            position: self::position(position)?,
+            hash: BlockHash(hash),
+        }),
+        (None, None) => None,
+        _ => return Err(store("stored block parent is incomplete")),
+    };
     Ok(BlockRef {
-        height: height(raw)?,
+        position: position(raw_position)?,
+        height: height(raw_height)?,
         hash: BlockHash(get(row, &format!("{prefix}hash"))?),
-        parent_hash: get::<Option<Vec<u8>>>(row, &format!("{prefix}parent"))?.map(BlockHash),
+        parent,
         timestamp: get::<Option<i64>>(row, &format!("{prefix}timestamp"))?
             .map(u64::try_from)
             .transpose()

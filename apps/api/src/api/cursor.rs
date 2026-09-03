@@ -15,10 +15,18 @@ pub(super) struct HistoryCursor {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CursorBlock {
+    position: u64,
     height: u64,
     hash: String,
-    parent_hash: Option<String>,
+    parent: Option<CursorParent>,
     timestamp: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CursorParent {
+    position: u64,
+    hash: String,
 }
 
 impl HistoryCursor {
@@ -31,9 +39,13 @@ impl HistoryCursor {
             transaction: cursor.position.transaction.value.clone(),
             height: cursor.position.height.0,
             checkpoint: cursor.checkpoint.as_ref().map(|block| CursorBlock {
+                position: block.position.0,
                 height: block.height.0,
                 hash: hex::encode(&block.hash.0),
-                parent_hash: block.parent_hash.as_ref().map(|hash| hex::encode(&hash.0)),
+                parent: block.parent.as_ref().map(|parent| CursorParent {
+                    position: parent.position.0,
+                    hash: hex::encode(&parent.hash.0),
+                }),
                 timestamp: block.timestamp,
             }),
         })
@@ -60,11 +72,17 @@ impl HistoryCursor {
             .checkpoint
             .map(|block| {
                 Ok::<_, ApiError>(base::BlockRef {
+                    position: base::BlockPosition(block.position),
                     height: base::BlockHeight(block.height),
                     hash: base::BlockHash(block.decoded_hash()?),
-                    parent_hash: block
-                        .parent_hash
-                        .map(|hash| CursorBlock::decode_hash(&hash).map(base::BlockHash))
+                    parent: block
+                        .parent
+                        .map(|parent| {
+                            CursorBlock::decode_hash(&parent.hash).map(|hash| base::BlockParent {
+                                position: base::BlockPosition(parent.position),
+                                hash: base::BlockHash(hash),
+                            })
+                        })
                         .transpose()?,
                     timestamp: block.timestamp,
                 })

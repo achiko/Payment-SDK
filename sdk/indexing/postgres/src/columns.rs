@@ -70,9 +70,10 @@ impl OutputRows {
     }
 }
 
-/// The `(transaction_id, output_index)` pairs one spend statement removes.
+/// The address-qualified output identities one spend statement removes.
 #[derive(Default)]
 pub(crate) struct SpendKeys {
+    pub(crate) address: Vec<String>,
     pub(crate) transaction_id: Vec<String>,
     pub(crate) output_index: Vec<i32>,
 }
@@ -87,6 +88,7 @@ impl SpendKeys {
     }
 
     fn push(&mut self, key: &OutputKey) -> Result<(), IndexError> {
+        self.address.push(key.address.value.clone());
         self.transaction_id
             .push(key.output.transaction.value.clone());
         self.output_index.push(index(key.output.index)?);

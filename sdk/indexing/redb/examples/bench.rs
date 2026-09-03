@@ -14,10 +14,10 @@ use std::{env, time::Instant};
 
 use futures_executor::block_on;
 use indexing::{
-    AssetId, BlockAddition, BlockHash, BlockHeight, BlockRef, Blocks, CanonicalAddress, ChainId,
-    Decimal, HistoryQuery, IndexScope, IndexedOutput, InterpretedBlock, MovementId,
-    ObservationDraft, ObservationDraftStatus, OutputChanges, OutputId, OutputKey, OutputRequest,
-    Outputs, TransactionRef, Transactions, ValueMovement,
+    AssetId, BlockAddition, BlockHash, BlockHeight, BlockParent, BlockPosition, BlockRef, Blocks,
+    CanonicalAddress, ChainId, Decimal, HistoryQuery, IndexScope, IndexedOutput, InterpretedBlock,
+    MovementId, ObservationDraft, ObservationDraftStatus, OutputChanges, OutputId, OutputKey,
+    OutputRequest, Outputs, TransactionRef, Transactions, ValueMovement,
 };
 use indexing_redb::Repository;
 
@@ -95,9 +95,13 @@ fn amount(units: u64) -> Decimal {
 
 fn block_ref(height: u64, parent: Option<&BlockRef>) -> BlockRef {
     BlockRef {
+        position: BlockPosition(height),
         height: BlockHeight(height),
         hash: BlockHash(format!("hash-{height:010}").into_bytes()),
-        parent_hash: parent.map(|block| block.hash.clone()),
+        parent: parent.map(|block| BlockParent {
+            position: block.position,
+            hash: block.hash.clone(),
+        }),
         timestamp: Some(1_700_000_000 + height),
     }
 }

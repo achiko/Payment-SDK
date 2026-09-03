@@ -5,23 +5,11 @@ use std::{
 
 use proc_macro2::Span;
 
-use super::{CheckFn, finding, production};
+use super::{finding, production};
 use crate::{
     Finding, Location, Policy, Result,
     source::{Workspace, slash},
 };
-
-pub(super) fn checks() -> [(&'static str, CheckFn); 7] {
-    [
-        ("dependency-direction", dependencies),
-        ("owned-vocabulary", vocabulary),
-        ("file-length", file_length),
-        ("forbidden-path", forbidden_paths),
-        ("empty-directory", empty_directories),
-        ("chain-layout", chain_layout),
-        ("single-file-directory", single_file_directories),
-    ]
-}
 
 pub(super) fn dependencies(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
     let packages = workspace
@@ -90,7 +78,7 @@ fn concrete_chain(
             .chain_exclusions
             .iter()
             .any(|excluded| excluded == name)
-    }) && workspace.roots.iter().any(|root| {
+    }) && workspace.policy_roots.iter().any(|root| {
         package.root.parent() == Some(root.join(&policy.repository.chain_root).as_path())
     })
 }
@@ -113,7 +101,7 @@ fn cycle(packages: &[crate::source::Package], ignored: &[String]) -> Option<Vec<
         }
         let package = map.get(name)?;
         active.push(name.to_owned());
-        for dependency in &package.dependencies {
+        for dependency in &package.build_dependencies {
             if map.contains_key(dependency.as_str())
                 && let Some(found) = visit(dependency, map, ignored, active, done)
             {
@@ -148,7 +136,7 @@ fn manifest_location(package: &crate::source::Package) -> Location {
 
 pub(super) fn vocabulary(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
     let mut output = Vec::new();
-    for source in &workspace.sources {
+    for source in workspace.production() {
         let path = slash(&source.path).to_ascii_lowercase();
         for owner in &policy.vocabulary.owners {
             if owner
@@ -158,7 +146,7 @@ pub(super) fn vocabulary(workspace: &Workspace, policy: &Policy) -> Result<Vec<F
             {
                 continue;
             }
-            for (line, text) in production_lines(&source.text).enumerate() {
+            for (line, text) in production_lines(&production::text(source)).enumerate() {
                 for word in words(text) {
                     if owner
                         .words
@@ -190,14 +178,12 @@ fn words(text: &str) -> Vec<String> {
 }
 
 fn production_lines(text: &str) -> impl Iterator<Item = &str> {
-    let end = text.find("#[cfg(test)]").unwrap_or(text.len());
-    text[..end].lines()
+    text.lines()
 }
 
 pub(super) fn file_length(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
     Ok(workspace
-        .sources
-        .iter()
+        .production()
         .filter_map(|source| {
             let count = production::line_count(source);
             (count > policy.repository.maximum_rust_lines).then(|| {
@@ -220,7 +206,7 @@ pub(super) fn file_length(workspace: &Workspace, policy: &Policy) -> Result<Vec<
         .collect())
 }
 
-fn forbidden_paths(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
+pub(super) fn forbidden_paths(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
     let mut output = Vec::new();
     for root in &workspace.roots {
         for forbidden in &policy.repository.forbidden_paths {
@@ -239,7 +225,7 @@ fn forbidden_paths(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding
     Ok(output)
 }
 
-fn empty_directories(workspace: &Workspace, _policy: &Policy) -> Result<Vec<Finding>> {
+pub(super) fn empty_directories(workspace: &Workspace, _policy: &Policy) -> Result<Vec<Finding>> {
     Ok(workspace
         .directories
         .iter()

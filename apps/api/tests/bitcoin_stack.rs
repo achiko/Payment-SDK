@@ -259,7 +259,7 @@ impl RpcFixture {
 
     fn header(&self, hash: &str) -> Value {
         let (height, parent) = block_identity(hash);
-        let mut header = json!({"hash": hash, "height": height, "time": 99 + height});
+        let mut header = json!({"hash": hash, "height": height, "time": 100});
         if let Some(parent) = parent {
             header["previousblockhash"] = json!(parent);
         }
