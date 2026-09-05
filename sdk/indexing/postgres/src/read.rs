@@ -385,6 +385,7 @@ fn encode_position(transaction: &str, index: u32) -> Vec<u8> {
     format!("{transaction}\u{0}{index}").into_bytes()
 }
 
+// design-lint: allow single-use-free-function -- decodes the private PostgreSQL output cursor format paired with encode_position, keeping parsing separate from page queries
 fn decode_position(position: &[u8]) -> Result<(String, i32), IndexError> {
     let text =
         std::str::from_utf8(position).map_err(|_| row::store("output cursor is not valid"))?;
@@ -422,4 +423,53 @@ const fn kinds() -> [MovementKind; 5] {
         MovementKind::Mint,
         MovementKind::Burn,
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_position_keeps_its_existing_wire_format() {
+        assert_eq!(encode_position("tx:abc", 12), b"tx:abc\x0012");
+        assert_eq!(
+            decode_position(b"tx:abc\x0012").expect("valid output cursor"),
+            ("tx:abc".to_owned(), 12)
+        );
+    }
+
+    #[test]
+    fn output_position_round_trips_bounds_and_transaction_ids() {
+        for transaction in ["tx-1", "tx:with:delimiters", "交易"] {
+            for index in [0, i32::MAX] {
+                let encoded = encode_position(
+                    transaction,
+                    u32::try_from(index).expect("nonnegative output index"),
+                );
+
+                assert_eq!(
+                    decode_position(&encoded).expect("encodable SQL output position"),
+                    (transaction.to_owned(), index)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn output_position_rejects_malformed_encodings_without_retrying() {
+        for position in [
+            b"\xff\x001".as_slice(),
+            b"tx-without-separator",
+            b"tx\x00",
+            b"tx\x00not-an-integer",
+            b"tx\x002147483648",
+            b"tx\x00-2147483649",
+        ] {
+            let error = decode_position(position).expect_err("malformed output cursor");
+
+            assert_eq!(error.kind, IndexErrorKind::Store);
+            assert_eq!(error.message, "output cursor is not valid");
+            assert!(!error.retryable);
+        }
+    }
 }

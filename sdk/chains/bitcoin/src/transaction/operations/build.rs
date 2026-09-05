@@ -204,6 +204,7 @@ pub(in crate::transaction) fn build_grouped(
     }
 }
 
+// design-lint: allow single-use-free-function -- isolates deterministic source-ordered fee allocation from grouped transaction assembly
 fn allocate_fee(surplus: &[u64], fee: u64) -> Result<Vec<u64>, ChainError> {
     let mut remaining_fee = fee;
     let remaining = surplus
@@ -294,4 +295,63 @@ fn fee_for_vsize(fee_rate: FeeRate, virtual_size: u64) -> Result<u64, ChainError
         .ok_or_else(|| invalid_transaction("Bitcoin transaction fee overflowed u128"))?;
     u64::try_from(numerator / 1_000)
         .map_err(|_| invalid_transaction("Bitcoin transaction fee overflowed u64"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fee_allocation_charges_sources_in_input_order() {
+        let surplus = [4, 0, 9, 7];
+
+        assert_eq!(
+            allocate_fee(&surplus, 10).expect("sufficient surplus"),
+            [0, 0, 3, 7]
+        );
+        assert_eq!(
+            allocate_fee(&[7, 0, 9, 4], 10).expect("reordered surplus"),
+            [0, 0, 6, 4]
+        );
+    }
+
+    #[test]
+    fn zero_fee_preserves_every_sources_surplus() {
+        assert_eq!(allocate_fee(&[5, 0, 9], 0).expect("zero fee"), [5, 0, 9]);
+        assert!(allocate_fee(&[], 0).expect("empty zero fee").is_empty());
+    }
+
+    #[test]
+    fn fee_equal_to_total_surplus_leaves_no_change() {
+        assert_eq!(allocate_fee(&[5, 0, 9], 14).expect("exact fee"), [0, 0, 0]);
+    }
+
+    #[test]
+    fn uncovered_fee_returns_insufficient_funds() {
+        for (surplus, fee) in [(&[5, 0, 9][..], 15), (&[][..], 1)] {
+            let error = allocate_fee(surplus, fee).expect_err("fee exceeds surplus");
+
+            assert_eq!(error.kind, ChainErrorKind::InsufficientFunds);
+            assert_eq!(
+                error.message,
+                "Bitcoin grouped sources cannot cover the network fee"
+            );
+        }
+    }
+
+    #[test]
+    fn fee_allocation_handles_u64_extrema_without_summing_surplus() {
+        assert_eq!(
+            allocate_fee(&[u64::MAX, u64::MAX], u64::MAX).expect("fee fits first source"),
+            [0, u64::MAX]
+        );
+        assert_eq!(
+            allocate_fee(&[1, u64::MAX], u64::MAX).expect("fee spans sources"),
+            [0, 1]
+        );
+        assert_eq!(
+            allocate_fee(&[0, u64::MAX], u64::MAX).expect("exact maximum fee"),
+            [0, 0]
+        );
+    }
 }

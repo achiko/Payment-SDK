@@ -48,15 +48,13 @@ async fn create(
         .wallets
         .generate(id, &request.asset)
         .await
-        .map_err(create_error)?;
+        .map_err(|error| {
+            if error.kind == wallets::ErrorKind::Unsupported {
+                return ApiError::not_found("wallet asset is not configured");
+            }
+            error.into()
+        })?;
     Ok((StatusCode::CREATED, Json(wallet.into())))
-}
-
-fn create_error(error: wallets::Error) -> ApiError {
-    if error.kind == wallets::ErrorKind::Unsupported {
-        return ApiError::not_found("wallet asset is not configured");
-    }
-    error.into()
 }
 
 #[utoipa::path(
