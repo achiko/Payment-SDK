@@ -101,30 +101,6 @@ fn transaction(scope: &IndexScope, height: u64, index: usize) -> TransactionRef 
     }
 }
 
-fn asset(scope: &IndexScope) -> AssetId {
-    AssetId {
-        chain: scope.chain.clone(),
-        asset: "native".into(),
-    }
-}
-
-fn amount(units: u64) -> Decimal {
-    units.to_string().parse().expect("amount parses")
-}
-
-fn block_ref(height: u64, parent: Option<&BlockRef>) -> BlockRef {
-    BlockRef {
-        position: BlockPosition(height),
-        height: BlockHeight(height),
-        hash: BlockHash(format!("hash-{height:010}").into_bytes()),
-        parent: parent.map(|block| BlockParent {
-            position: block.position,
-            hash: block.hash.clone(),
-        }),
-        timestamp: Some(1_700_000_000 + height),
-    }
-}
-
 /// One block's worth of interpreted facts, spending outputs handed in from the
 /// previous block so the spend path is exercised the way a real chain does.
 fn interpret(
@@ -134,7 +110,20 @@ fn interpret(
     parent: Option<&BlockRef>,
     spend: Vec<OutputKey>,
 ) -> (InterpretedBlock, Vec<OutputKey>) {
-    let block = block_ref(height, parent);
+    let block = BlockRef {
+        position: BlockPosition(height),
+        height: BlockHeight(height),
+        hash: BlockHash(format!("hash-{height:010}").into_bytes()),
+        parent: parent.map(|block| BlockParent {
+            position: block.position,
+            hash: block.hash.clone(),
+        }),
+        timestamp: Some(1_700_000_000 + height),
+    };
+    let asset = AssetId {
+        chain: scope.chain.clone(),
+        asset: "native".into(),
+    };
     let mut transactions = Vec::with_capacity(profile.txs);
     for index in 0..profile.txs {
         let from = profile.address(scope, index);
@@ -142,8 +131,8 @@ fn interpret(
         let movements = (0..profile.movements)
             .map(|ordinal| ValueMovement::Transfer {
                 id: MovementId(format!("{height}-{index}-{ordinal}")),
-                asset: asset(scope),
-                amount: amount(1_000 + ordinal as u64),
+                asset: asset.clone(),
+                amount: Decimal::from(1_000 + ordinal as u64),
                 from: from.clone(),
                 to: to.clone(),
             })
@@ -166,8 +155,8 @@ fn interpret(
                 index: index as u32,
             },
             address: owner,
-            asset: asset(scope),
-            amount: amount(50_000 + index as u64),
+            asset: asset.clone(),
+            amount: Decimal::from(50_000 + index as u64),
             // A P2WPKH script is 22 bytes; a P2WSH witness script is larger.
             evidence: vec![0x51; 22],
             created_at: BlockHeight(height),

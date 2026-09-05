@@ -355,8 +355,9 @@ mod tests {
     };
     use futures_executor::block_on;
     use indexing::{
-        BoxFuture, ChainId, HistoryQuery, IndexError, OutputPage, OutputRequest, Outputs,
-        SourceError, TransactionPage,
+        AssetId, BlockHash, BlockHeight, BlockPosition, BlockRef, BoxFuture, ChainId, HistoryQuery,
+        IndexError, MovementId, ObservedTransaction, OutputPage, OutputRequest, Outputs,
+        SourceError, TransactionPage, TransactionRef, TransactionStatus, ValueMovement,
     };
     use std::sync::Mutex;
 
@@ -406,6 +407,17 @@ mod tests {
             _request: HistoryQuery,
         ) -> BoxFuture<'a, Result<TransactionPage, IndexError>> {
             Box::pin(async { unreachable!("wallet generation must not read indexed history") })
+        }
+    }
+
+    struct RecordedHistory(TransactionPage);
+
+    impl IndexHistory for RecordedHistory {
+        fn history<'a>(
+            &'a self,
+            _request: HistoryQuery,
+        ) -> BoxFuture<'a, Result<TransactionPage, IndexError>> {
+            Box::pin(async { Ok(self.0.clone()) })
         }
     }
 
@@ -506,6 +518,79 @@ mod tests {
             transactions,
             history,
         )
+    }
+
+    #[test]
+    fn history_preserves_native_precision_and_rejects_unsupported_assets() {
+        for (chain, name, expected_error) in [
+            (crate::CHAIN, "native", None),
+            (
+                crate::CHAIN,
+                "token",
+                Some("Bitcoin history contains an unsupported asset"),
+            ),
+            (
+                "ethereum",
+                "native",
+                Some("indexed asset does not belong to the transaction chain"),
+            ),
+        ] {
+            let mut factory = factory(AddressType::SegwitV0);
+            let scope = factory.config.scope.clone();
+            let asset = AssetId {
+                chain: ChainId(chain.to_owned()),
+                asset: name.to_owned(),
+            };
+            let block = BlockRef {
+                position: BlockPosition(0),
+                height: BlockHeight(0),
+                hash: BlockHash(vec![1; 32]),
+                parent: None,
+                timestamp: None,
+            };
+            factory.history = Arc::new(RecordedHistory(TransactionPage {
+                checkpoint: Some(block.clone()),
+                transactions: vec![ObservedTransaction {
+                    scope: scope.clone(),
+                    transaction_id: TransactionRef {
+                        scope,
+                        value: "transaction".to_owned(),
+                    },
+                    status: TransactionStatus::Included {
+                        block,
+                        confirmations: 1,
+                    },
+                    movements: vec![ValueMovement::Output {
+                        id: MovementId("output".to_owned()),
+                        asset: asset.clone(),
+                        amount: base::Decimal::from(123_456_789_u64),
+                        owner: None,
+                    }],
+                    fee: None,
+                }],
+                next: None,
+            }));
+            let wallet = block_on(factory.create(SecretBytes::new([1_u8; 32])))
+                .expect("fixture wallet must be valid");
+            let result = block_on(wallet.history(wallets::HistoryRequest {
+                after: None,
+                limit: 10,
+            }));
+
+            if let Some(message) = expected_error {
+                let error = result.expect_err("unsupported history asset must fail");
+                assert_eq!(error.kind, WalletErrorKind::History);
+                assert_eq!(error.message, message);
+            } else {
+                let history = result.expect("native history must be presented");
+                let movement = &history.transactions[0].movements[0];
+                assert_eq!(movement.asset.id, asset);
+                assert_eq!(movement.asset.name.as_deref(), Some("Bitcoin"));
+                assert_eq!(movement.asset.ticker.as_deref(), Some("BTC"));
+                assert_eq!(movement.asset.decimals, 8);
+                assert_eq!(movement.amount.to_string(), "1.23456789");
+            }
+        }
     }
 
     fn prepared_transaction() -> (base::SignedTransaction, crate::TransactionId) {

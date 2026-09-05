@@ -7,8 +7,8 @@ use super::{
     error::BuildError,
     transport::Client as Transport,
     wire::{
-        block_parameter, data_hex, invalid_rpc_response, map_json_rpc_error, parse_data,
-        parse_fixed_data, source_error,
+        data_hex, invalid_rpc_response, map_json_rpc_error, parse_data, parse_fixed_data,
+        source_error,
     },
 };
 use crate::{Address, AssetKind, Wei, erc20};
@@ -69,7 +69,21 @@ where
         at: Option<BlockRef>,
     ) -> BoxFuture<'a, Result<Wei, SourceError>> {
         Box::pin(async move {
-            let block = block_parameter(at)?;
+            let block = match at {
+                None => json!("pending"),
+                Some(block) => {
+                    if block.hash.0.len() != 32 {
+                        return Err(source_error(
+                            "Ethereum balance block hash must contain exactly 32 bytes",
+                            false,
+                        ));
+                    }
+                    json!({
+                        "blockHash": data_hex(&block.hash.0),
+                        "requireCanonical": true,
+                    })
+                }
+            };
             match asset {
                 AssetKind::Native => {
                     self.rpc_wei("eth_getBalance", json!([address.to_string(), block]))

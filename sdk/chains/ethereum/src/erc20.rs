@@ -13,6 +13,7 @@ sol! {
     }
 }
 
+// design-lint: allow unclassified-free-function -- shared ERC-20 balanceOf ABI encoding adapts SDK addresses through Alloy without adding token-call behavior to Address
 pub(crate) fn balance_of(address: &Address) -> Vec<u8> {
     Erc20::balanceOfCall {
         account: AlloyAddress::from(address.0),

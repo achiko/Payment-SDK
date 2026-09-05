@@ -80,6 +80,7 @@ pub struct Balance {
     pub observed_height: Option<u64>,
 }
 
+// design-lint: allow unclassified-free-function -- Axum owns the extractor signature; this handler delegates one wallet balance read and encodes the HTTP response
 #[utoipa::path(
     get,
     path = "/v1/wallets/{id}/balance",

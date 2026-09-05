@@ -342,6 +342,18 @@ impl BaseBuilder for Builder {
                 "transfer is not configured",
             )
         })?;
+        let asset = match &self.config.asset {
+            AssetKind::Native => serde_json::json!({
+                "kind": "native",
+                "ticker": crate::ETH.ticker,
+                "decimals": self.config.decimals,
+            }),
+            AssetKind::Erc20(token) => serde_json::json!({
+                "kind": "erc20",
+                "token": token.to_string(),
+                "decimals": self.config.decimals,
+            }),
+        };
         Ok(TransactionSnapshot::new(
             SNAPSHOT_KIND,
             serde_json::json!({
@@ -352,7 +364,7 @@ impl BaseBuilder for Builder {
                 "source": self.from.to_string(),
                 "destination": destination.to_string(),
                 "amount": amount.to_string(),
-                "asset": asset_snapshot(&self.config.asset, self.config.decimals),
+                "asset": asset,
             }),
         ))
     }
@@ -377,21 +389,6 @@ impl BaseBuilder for Builder {
                 TransactionEnvelope::new(signed.envelope),
             ))
         })
-    }
-}
-
-fn asset_snapshot(asset: &AssetKind, decimals: u32) -> serde_json::Value {
-    match asset {
-        AssetKind::Native => serde_json::json!({
-            "kind": "native",
-            "ticker": crate::ETH.ticker,
-            "decimals": decimals,
-        }),
-        AssetKind::Erc20(token) => serde_json::json!({
-            "kind": "erc20",
-            "token": token.to_string(),
-            "decimals": decimals,
-        }),
     }
 }
 
@@ -717,5 +714,50 @@ mod tests {
             .expect_err("zero-value transfers must fail before RPC");
 
         assert_eq!(error.kind, TransactionErrorKind::InvalidAmount);
+    }
+
+    #[test]
+    fn builder_snapshots_preserve_native_and_token_asset_identity() {
+        for (asset, decimals, expected) in [
+            (
+                AssetKind::Native,
+                18,
+                serde_json::json!({"kind": "native", "ticker": "ETH", "decimals": 18}),
+            ),
+            (
+                AssetKind::Erc20(Address([0xab; 20])),
+                6,
+                serde_json::json!({
+                    "kind": "erc20",
+                    "token": "0xabababababababababababababababababababab",
+                    "decimals": 6,
+                }),
+            ),
+        ] {
+            let provider = provider();
+            let wallet = Wallet {
+                config: config(asset, decimals),
+                address: Address([0x11; 20]),
+                signer: Arc::new(
+                    KeyPair::new(Address([0x11; 20]), vec![1_u8; 32])
+                        .expect("fixed valid secret must create a signer"),
+                ),
+                accounts: provider.accounts,
+                coordinator: provider.coordinator,
+                history: provider.history,
+            };
+            let mut builder = wallet.transaction();
+            builder
+                .transfer(
+                    Address([0x22; 20]).address(),
+                    "1.25".parse().expect("amount must parse"),
+                )
+                .expect("transfer must be valid");
+
+            let snapshot = builder.snapshot().expect("transfer must have a snapshot");
+            assert_eq!(snapshot.value()["asset"], expected);
+            let restored = wallet.restore(&snapshot).expect("snapshot must restore");
+            assert_eq!(restored.snapshot().unwrap(), snapshot);
+        }
     }
 }

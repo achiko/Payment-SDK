@@ -281,6 +281,35 @@ mod tests {
     }
 
     #[test]
+    fn balance_rejects_invalid_block_hash_before_token_validation_or_rpc() {
+        for (length, asset) in [
+            (31, AssetKind::Native),
+            (33, AssetKind::Native),
+            (31, AssetKind::Erc20(Address([0; 20]))),
+            (33, AssetKind::Erc20(Address([0; 20]))),
+        ] {
+            let client = ScriptedClient::new(Vec::new());
+            let rpc = account_rpc(client.clone());
+            let block = BlockRef {
+                position: BlockPosition(9),
+                height: BlockHeight(9),
+                hash: BlockHash(vec![0xaa; length]),
+                parent: None,
+                timestamp: None,
+            };
+            let error = block_on(rpc.balance(Address([0x11; 20]), &asset, Some(block)))
+                .expect_err("invalid block hash must fail before any token check or RPC");
+
+            assert_eq!(
+                error.message,
+                "Ethereum balance block hash must contain exactly 32 bytes"
+            );
+            assert!(!error.retryable);
+            assert!(client.requests().is_empty());
+        }
+    }
+
+    #[test]
     fn validates_erc20_code_and_typed_probes_at_one_canonical_block() {
         let client = ScriptedClient::new(vec![
             success("eth_chainId", json!("0x7a69")),

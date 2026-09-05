@@ -152,6 +152,62 @@ fn indexed_address(address: &Address) -> CanonicalAddress {
 }
 
 #[test]
+fn rejects_non_object_values_at_each_block_parsing_boundary() {
+    let transaction = coinbase(TxOut {
+        value: Amount::from_sat(10_000),
+        script_pubkey: p2wpkh_address(0x02).script_pubkey(),
+    });
+    let native_hash = bitcoin::BlockHash::from_byte_array([0xaa; 32]);
+    let expected_hash = BlockHash(native_hash.to_byte_array().to_vec());
+    let valid = json!({
+        "hash": native_hash.to_string(),
+        "height": 10,
+        "previousblockhash": bitcoin::BlockHash::from_byte_array([0xbb; 32]).to_string(),
+        "time": 100,
+        "nTx": 1,
+        "tx": [transaction_json(&transaction, &[None])]
+    });
+    Block::parse(
+        &serde_json::to_vec(&valid).expect("test block JSON must encode"),
+        Some(BlockHeight(10)),
+        Some(&expected_hash),
+        Network::Regtest,
+    )
+    .expect("unmodified block must parse");
+
+    for (path, message) in [
+        ("", "Bitcoin block result must be an object"),
+        ("/tx/0", "Bitcoin transaction must be an object"),
+        ("/tx/0/vin/0", "Bitcoin transaction input must be an object"),
+        (
+            "/tx/0/vout/0",
+            "Bitcoin transaction output must be an object",
+        ),
+    ] {
+        for invalid in [
+            Value::Null,
+            json!(false),
+            json!(1),
+            json!("invalid"),
+            json!([]),
+        ] {
+            let mut value = valid.clone();
+            *value.pointer_mut(path).expect("test path must exist") = invalid;
+            let error = Block::parse(
+                &serde_json::to_vec(&value).expect("test block JSON must encode"),
+                Some(BlockHeight(10)),
+                Some(&expected_hash),
+                Network::Regtest,
+            )
+            .expect_err("non-object value must fail while parsing the block");
+
+            assert_eq!(error.kind, crate::ChainErrorKind::InvalidTransaction);
+            assert_eq!(error.message, message, "object boundary {path}");
+        }
+    }
+}
+
+#[test]
 fn ignores_transactions_unrelated_to_the_address_filter() {
     let destination = p2wpkh_address(0x02);
     let unrelated = p2tr_address();

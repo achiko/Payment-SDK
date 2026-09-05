@@ -34,6 +34,7 @@ pub(crate) fn position(value: i64) -> Result<BlockPosition, IndexError> {
     ))
 }
 
+// design-lint: allow unclassified-free-function -- checked PostgreSQL BIGINT boundary conversion shared by multiple numeric fields; preserves caller-specific range errors
 pub(crate) fn as_i64(value: u64, what: &'static str) -> Result<i64, IndexError> {
     i64::try_from(value).map_err(|_| {
         IndexError::new(
@@ -44,6 +45,7 @@ pub(crate) fn as_i64(value: u64, what: &'static str) -> Result<i64, IndexError> 
     })
 }
 
+// design-lint: allow unclassified-free-function -- PostgreSQL row-to-block boundary conversion owns column aliases and stored-value validation without adding database concerns to BlockRef
 pub(crate) fn block(row: &Row, prefix: &str) -> Result<BlockRef, IndexError> {
     let raw_height: i64 = get(row, &format!("{prefix}height"))?;
     let raw_position: i64 = get(row, &format!("{prefix}position"))?;
@@ -106,4 +108,34 @@ fn get<'a, T: tokio_postgres::types::FromSql<'a>>(
 
 pub(crate) fn store(message: impl Into<String>) -> IndexError {
     IndexError::new(IndexErrorKind::Store, message, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn as_i64_preserves_values_at_the_storage_boundaries() {
+        assert_eq!(as_i64(0, "block height"), Ok(0));
+        assert_eq!(as_i64(i64::MAX as u64, "block position"), Ok(i64::MAX));
+    }
+
+    #[test]
+    fn as_i64_rejects_overflow_with_the_callers_context() {
+        for (context, message) in [
+            ("block height", "block height exceeds the storage range"),
+            (
+                "parent block position",
+                "parent block position exceeds the storage range",
+            ),
+            ("start position", "start position exceeds the storage range"),
+        ] {
+            for value in [i64::MAX as u64 + 1, u64::MAX] {
+                let error = as_i64(value, context).expect_err("overflow must be rejected");
+                assert_eq!(error.kind, IndexErrorKind::InvalidRequest);
+                assert_eq!(error.message, message);
+                assert!(!error.retryable);
+            }
+        }
+    }
 }

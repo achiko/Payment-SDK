@@ -90,8 +90,13 @@ fn asset() -> AssetId {
     }
 }
 
-fn block_ref(height: u64, parent: Option<&BlockRef>) -> BlockRef {
-    BlockRef {
+fn interpret(
+    profile: &Profile,
+    height: u64,
+    parent: Option<&BlockRef>,
+    spend: Vec<OutputKey>,
+) -> (InterpretedBlock, Vec<OutputKey>) {
+    let block = BlockRef {
         position: BlockPosition(height),
         height: BlockHeight(height),
         hash: BlockHash(format!("hash-{height:010}").into_bytes()),
@@ -100,16 +105,7 @@ fn block_ref(height: u64, parent: Option<&BlockRef>) -> BlockRef {
             hash: block.hash.clone(),
         }),
         timestamp: Some(1_700_000_000 + height),
-    }
-}
-
-fn interpret(
-    profile: &Profile,
-    height: u64,
-    parent: Option<&BlockRef>,
-    spend: Vec<OutputKey>,
-) -> (InterpretedBlock, Vec<OutputKey>) {
-    let block = block_ref(height, parent);
+    };
     let mut transactions = Vec::with_capacity(profile.txs);
     for index in 0..profile.txs {
         let from = profile.address(index);

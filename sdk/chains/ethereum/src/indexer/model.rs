@@ -345,8 +345,25 @@ impl ParsedLog {
         let data = object
             .get("data")
             .and_then(Value::as_str)
-            .ok_or_else(|| ParseError::new("Ethereum log data must be a hex byte string"))
-            .and_then(|data| parse_hex_bytes(data, "log data"))?;
+            .ok_or_else(|| ParseError::new("Ethereum log data must be a hex byte string"))?;
+        let digits = data
+            .strip_prefix("0x")
+            .ok_or_else(|| ParseError::new("Ethereum log data is not hex encoded"))?;
+        if digits.len() % 2 != 0 {
+            return Err(ParseError::new(
+                "Ethereum log data has an odd number of hex digits",
+            ));
+        }
+        let data = digits
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair)
+                    .map_err(|_| ParseError::new("Ethereum log data is not valid hex"))?;
+                u8::from_str_radix(pair, 16)
+                    .map_err(|_| ParseError::new("Ethereum log data is not valid hex"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let log_index = required_quantity_u64(object, "logIndex", "log index")?;
 
         Ok(Self {
@@ -446,27 +463,6 @@ pub(super) fn parse_quantity(value: &str, label: &str) -> Result<U256, ParseErro
     }
     U256::from_str_radix(digits, 16)
         .map_err(|_| ParseError::new(format!("Ethereum {label} exceeds 256 bits")))
-}
-
-fn parse_hex_bytes(value: &str, label: &str) -> Result<Vec<u8>, ParseError> {
-    let digits = value
-        .strip_prefix("0x")
-        .ok_or_else(|| ParseError::new(format!("Ethereum {label} is not hex encoded")))?;
-    if digits.len() % 2 != 0 {
-        return Err(ParseError::new(format!(
-            "Ethereum {label} has an odd number of hex digits"
-        )));
-    }
-    digits
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let pair = std::str::from_utf8(pair)
-                .map_err(|_| ParseError::new(format!("Ethereum {label} is not valid hex")))?;
-            u8::from_str_radix(pair, 16)
-                .map_err(|_| ParseError::new(format!("Ethereum {label} is not valid hex")))
-        })
-        .collect()
 }
 
 pub(super) fn encode_hex(bytes: &[u8]) -> String {
@@ -571,5 +567,79 @@ mod tests {
             error.to_string(),
             "Ethereum receipt count does not match transaction count"
         );
+    }
+
+    #[test]
+    fn log_parsing_preserves_accepted_data_bytes() {
+        let mut value = json!({
+            "blockHash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "blockNumber": "0xa",
+            "transactionHash": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "transactionIndex": "0x0",
+            "removed": false,
+            "address": "0x1111111111111111111111111111111111111111",
+            "topics": [],
+            "logIndex": "0x2"
+        });
+        for (data, expected) in [
+            ("0x", vec![]),
+            ("0x00aBfF", vec![0, 0xab, 0xff]),
+            // Preserve the existing decoder's acceptance of a plus-prefixed pair.
+            ("0x+1+a", vec![1, 10]),
+        ] {
+            value["data"] = json!(data);
+            let parsed = ParsedLog::parse(&value, BlockHeight(10), [0xaa; 32], [0xcc; 32], 0)
+                .expect("previously accepted log data must still decode");
+            assert_eq!(parsed.data, expected, "data: {data}");
+            assert_eq!(parsed.log_index, 2);
+        }
+    }
+
+    #[test]
+    fn log_parsing_preserves_data_errors_before_log_index_validation() {
+        let mut value = json!({
+            "blockHash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "blockNumber": "0xa",
+            "transactionHash": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "transactionIndex": "0x0",
+            "removed": false,
+            "address": "0x1111111111111111111111111111111111111111",
+            "topics": []
+        });
+        for (data, message) in [
+            (json!(null), "Ethereum log data must be a hex byte string"),
+            (json!(17), "Ethereum log data must be a hex byte string"),
+            (json!("00"), "Ethereum log data is not hex encoded"),
+            (json!("0X00"), "Ethereum log data is not hex encoded"),
+            (
+                json!("0x0"),
+                "Ethereum log data has an odd number of hex digits",
+            ),
+            (
+                json!("0x€"),
+                "Ethereum log data has an odd number of hex digits",
+            ),
+            (json!("0xgg"), "Ethereum log data is not valid hex"),
+            (json!("0xé"), "Ethereum log data is not valid hex"),
+            (json!("0x€a"), "Ethereum log data is not valid hex"),
+        ] {
+            value["data"] = data;
+            let error = ParsedLog::parse(&value, BlockHeight(10), [0xaa; 32], [0xcc; 32], 0)
+                .expect_err("invalid log data must fail before the missing log index");
+            assert_eq!(error.to_string(), message, "data: {}", value["data"]);
+        }
+
+        value.as_object_mut().unwrap().remove("data");
+        let error = ParsedLog::parse(&value, BlockHeight(10), [0xaa; 32], [0xcc; 32], 0)
+            .expect_err("missing log data must fail before the missing log index");
+        assert_eq!(
+            error.to_string(),
+            "Ethereum log data must be a hex byte string"
+        );
+
+        value["data"] = json!("0x");
+        let error = ParsedLog::parse(&value, BlockHeight(10), [0xaa; 32], [0xcc; 32], 0)
+            .expect_err("valid data must allow log index validation to run");
+        assert_eq!(error.to_string(), "Ethereum log index is missing");
     }
 }

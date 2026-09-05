@@ -1,7 +1,6 @@
 use std::fmt;
 
-use indexing::{BlockRef, SourceError};
-use serde_json::{Value, json};
+use indexing::SourceError;
 
 use crate::{TransactionId, Wei};
 
@@ -56,22 +55,6 @@ pub(super) fn is_already_known(failure: &Failure) -> bool {
 pub(super) fn is_execution_revert(failure: &Failure) -> bool {
     let message = failure.message.to_ascii_lowercase();
     message.contains("execution reverted") || message.contains("execution revert")
-}
-
-pub(super) fn block_parameter(at: Option<BlockRef>) -> Result<Value, SourceError> {
-    let Some(block) = at else {
-        return Ok(Value::String("pending".to_owned()));
-    };
-    if block.hash.0.len() != 32 {
-        return Err(source_error(
-            "Ethereum balance block hash must contain exactly 32 bytes",
-            false,
-        ));
-    }
-    Ok(json!({
-        "blockHash": data_hex(&block.hash.0),
-        "requireCanonical": true,
-    }))
 }
 
 pub(super) fn parse_quantity_u64(value: &str) -> Result<u64, &'static str> {

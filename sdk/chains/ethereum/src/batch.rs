@@ -67,7 +67,7 @@ impl Sender for Batch {
             let mut accepted = Vec::with_capacity(prepared.len());
             loop {
                 let id = prepared.next().await.map_err(|error| {
-                    SendError::item(accepted.len(), accepted.clone(), broadcast_error(error))
+                    SendError::item(accepted.len(), accepted.clone(), error.into())
                 })?;
                 let Some(id) = id else {
                     return Ok(accepted);
@@ -94,10 +94,6 @@ fn preparation_failure(error: PreparationError) -> SendError {
         Vec::new(),
         preparation_error(error.source).into(),
     )
-}
-
-fn broadcast_error(error: base::TransactionError) -> Error {
-    error.into()
 }
 
 #[cfg(test)]
@@ -345,6 +341,11 @@ mod tests {
             Some("provider-candidate")
         );
         assert_eq!(failure.source.ambiguous_transaction_id, None);
+        assert_eq!(failure.source.kind, ErrorKind::Unavailable);
+        assert_eq!(
+            failure.source.message,
+            "provider claimed transaction provider-candidate"
+        );
     }
 
     #[test]
@@ -372,11 +373,11 @@ mod tests {
 
     #[test]
     fn broadcast_failure_preserves_transaction_classification_for_http_mapping() {
-        let unavailable = broadcast_error(base::TransactionError::new(
+        let unavailable = Error::from(base::TransactionError::new(
             base::TransactionErrorKind::Unavailable,
             "submission outcome is ambiguous",
         ));
-        let rejected = broadcast_error(base::TransactionError::new(
+        let rejected = Error::from(base::TransactionError::new(
             base::TransactionErrorKind::Rejected,
             "node rejected the transaction",
         ));
