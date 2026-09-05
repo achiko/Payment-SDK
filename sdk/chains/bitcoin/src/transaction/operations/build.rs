@@ -205,6 +205,7 @@ pub(in crate::transaction) fn build_grouped(
 }
 
 // design-lint: allow single-use-free-function -- isolates deterministic source-ordered fee allocation from grouped transaction assembly
+// design-lint: allow unclassified-free-function -- deterministic allocation across source-ordered surpluses; no individual source or fee-rate value owns the aggregate policy
 fn allocate_fee(surplus: &[u64], fee: u64) -> Result<Vec<u64>, ChainError> {
     let mut remaining_fee = fee;
     let remaining = surplus

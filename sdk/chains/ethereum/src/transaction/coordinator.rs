@@ -466,6 +466,7 @@ fn definite_submission_error(error: SourceError) -> TransactionError {
     TransactionError::new(kind, error.message)
 }
 
+// design-lint: allow unclassified-free-function -- shared coordinator uncertainty mapping preserves the original error message and exact local envelope ID without changing claim state
 fn ambiguous_submission_error(
     id: &TransactionId,
     error: impl std::fmt::Display,

@@ -3,7 +3,7 @@ use std::fmt;
 use indexing::{BlockRef, SourceError};
 use serde_json::{Value, json};
 
-use crate::{Address, TransactionId, Wei};
+use crate::{TransactionId, Wei};
 
 use super::{
     BASIS_POINTS_DENOMINATOR,
@@ -205,10 +205,6 @@ pub(super) fn wei_quantity(value: &Wei) -> String {
         encoded.push(hex_digit(byte & 0x0f));
     }
     encoded
-}
-
-pub(super) fn address_hex(address: &Address) -> String {
-    data_hex(&address.0)
 }
 
 pub(super) fn transaction_id_hex(id: &TransactionId) -> String {

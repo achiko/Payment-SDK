@@ -375,6 +375,7 @@ async fn ambiguous_submission_reconciles_and_replays_the_exact_envelope() {
         .await
         .expect_err("first submission must be ambiguous");
     assert_eq!(first.kind, base::TransactionErrorKind::Unavailable);
+    assert_eq!(first.message, "ambiguous submission");
     assert_eq!(
         first.ambiguous_transaction_id,
         Some(base::TransactionId::new(signed.id.to_string()))
@@ -399,6 +400,67 @@ async fn ambiguous_submission_reconciles_and_replays_the_exact_envelope() {
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn recovery_lookup_failure_preserves_the_message_local_id_and_exact_replay() {
+    let signer = signer(4);
+    let accounts = Arc::new(AccountStub::default());
+    let transactions = Arc::new(TransactionStub::default());
+    transactions.actions([BroadcastAction::Ambiguous, BroadcastAction::Accept]);
+    transactions.known([
+        Err(SourceError {
+            message: "recovery lookup failed".to_owned(),
+            retryable: false,
+        }),
+        Ok(false),
+    ]);
+    let coordinator = coordinator(accounts, transactions.clone());
+    let signed = coordinator
+        .prepare_one(Preparation::signer(
+            transfer(&signer.address, 1),
+            CHAIN_ID,
+            &signer,
+        ))
+        .await
+        .expect("transaction must prepare");
+    coordinator
+        .broadcast(signed.clone())
+        .await
+        .expect_err("first submission must be ambiguous");
+
+    let error = coordinator
+        .broadcast(signed.clone())
+        .await
+        .expect_err("failed lookup must leave the original submission unresolved");
+    assert_eq!(error.kind, base::TransactionErrorKind::Unavailable);
+    assert_eq!(error.message, "recovery lookup failed");
+    assert_eq!(
+        error.ambiguous_transaction_id,
+        Some(base::TransactionId::new(signed.id.to_string()))
+    );
+    assert_eq!(
+        transactions
+            .broadcasts
+            .lock()
+            .expect("broadcast lock must be healthy")
+            .len(),
+        1,
+        "a failed lookup must not issue another broadcast"
+    );
+
+    assert_eq!(
+        coordinator
+            .broadcast(signed.clone())
+            .await
+            .expect("a later lookup must allow the retained exact envelope to replay"),
+        signed.id
+    );
+    let broadcasts = transactions
+        .broadcasts
+        .lock()
+        .expect("broadcast lock must be healthy");
+    assert_eq!(broadcasts.as_slice(), [signed.clone(), signed]);
 }
 
 #[tokio::test]

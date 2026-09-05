@@ -222,10 +222,11 @@ mod tests {
     }
 
     #[test]
-    fn reads_native_and_erc20_balances_with_exact_block_behavior() {
+    fn reads_balances_and_nonce_with_canonical_addresses_and_exact_blocks() {
         let client = ScriptedClient::new(vec![
             success("eth_getBalance", json!("0x2a")),
             success("eth_call", json!(format!("0x{}", "00".repeat(31) + "2b"))),
+            success("eth_getTransactionCount", json!("0x3")),
         ]);
         let rpc = account_rpc(client.clone());
         let block = BlockRef {
@@ -237,22 +238,31 @@ mod tests {
         };
 
         assert_eq!(
-            block_on(rpc.balance(Address([0x11; 20]), &AssetKind::Native, None))
+            block_on(rpc.balance(Address([0x0a; 20]), &AssetKind::Native, None))
                 .expect("native balance must parse"),
             Wei::from_u128(42)
         );
         assert_eq!(
             block_on(rpc.balance(
-                Address([0x11; 20]),
-                &AssetKind::Erc20(Address([0x33; 20])),
+                Address([0x0a; 20]),
+                &AssetKind::Erc20(Address([0x0b; 20])),
                 Some(block),
             ))
             .expect("token balance must parse"),
             Wei::from_u128(43)
         );
+        assert_eq!(
+            block_on(rpc.nonce(Address([0x0a; 20]))).expect("nonce must parse"),
+            3
+        );
 
         let requests = client.requests();
+        assert_eq!(requests[0].1[0], json!(format!("0x{}", "0a".repeat(20))));
         assert_eq!(requests[0].1[1], json!("pending"));
+        assert_eq!(
+            requests[1].1[0]["to"],
+            json!(format!("0x{}", "0b".repeat(20)))
+        );
         assert_eq!(
             requests[1].1[1],
             json!({
@@ -262,7 +272,11 @@ mod tests {
         );
         assert_eq!(
             requests[1].1[0]["data"],
-            json!(format!("0x70a08231{}{}", "00".repeat(12), "11".repeat(20)))
+            json!(format!("0x70a08231{}{}", "00".repeat(12), "0a".repeat(20)))
+        );
+        assert_eq!(
+            requests[2].1,
+            json!([format!("0x{}", "0a".repeat(20)), "pending"])
         );
     }
 
@@ -279,7 +293,7 @@ mod tests {
             success("eth_call", abi_word(0)),
         ]);
         let rpc = account_rpc(client.clone());
-        let token = Address([0x33; 20]);
+        let token = Address([0x0b; 20]);
 
         block_on(rpc.validate_token(&token, 6)).expect("canonical ERC-20 probes must pass");
 
@@ -288,6 +302,10 @@ mod tests {
             "requireCanonical": true,
         });
         let requests = client.requests();
+        let encoded_token = json!(format!("0x{}", "0b".repeat(20)));
+        assert_eq!(requests[2].1[0], encoded_token);
+        assert_eq!(requests[3].1[0]["to"], encoded_token);
+        assert_eq!(requests[4].1[0]["to"], encoded_token);
         assert_eq!(requests[2].1[1], expected_block);
         assert_eq!(requests[3].1[1], expected_block);
         assert_eq!(requests[4].1[1], expected_block);
@@ -362,8 +380,13 @@ mod tests {
         ]);
         let rpc = rpc(client.clone());
 
-        let context = block_on(rpc.build_context(&native_transfer(), 4))
-            .expect("bounded build context must succeed");
+        let request = TransferRequest::native_atomic(
+            Address([0x0a; 20]),
+            Address([0x0b; 20]),
+            Wei::from_u128(7),
+        );
+        let context =
+            block_on(rpc.build_context(&request, 4)).expect("bounded build context must succeed");
 
         assert_eq!(context.chain_id, 31_337);
         assert_eq!(context.nonce, 4);
@@ -374,6 +397,14 @@ mod tests {
         );
         assert_eq!(context.max_fee_per_gas, Wei::from_u128(5_000_000_000));
         let requests = client.requests();
+        assert_eq!(
+            requests[1].1[0]["from"],
+            json!(format!("0x{}", "0a".repeat(20)))
+        );
+        assert_eq!(
+            requests[1].1[0]["to"],
+            json!(format!("0x{}", "0b".repeat(20)))
+        );
         assert_eq!(requests[1].1[0]["data"], json!("0x"));
         assert_eq!(requests[1].1[0]["value"], json!("0x7"));
     }
@@ -631,7 +662,10 @@ mod tests {
 
         assert_eq!(error.kind, base::TransactionErrorKind::Unavailable);
         assert_eq!(error.ambiguous_transaction_id, Some(local_id));
-        assert!(error.message.contains("outcome is ambiguous"));
+        assert_eq!(
+            error.message,
+            "Ethereum submission outcome is ambiguous: Ethereum JSON-RPC eth_sendRawTransaction failed with code -32000"
+        );
         assert!(!error.message.contains("Bearer secret"));
     }
 

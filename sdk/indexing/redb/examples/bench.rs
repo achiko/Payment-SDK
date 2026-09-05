@@ -90,10 +90,6 @@ fn asset() -> AssetId {
     }
 }
 
-fn amount(units: u64) -> Decimal {
-    units.to_string().parse().expect("amount parses")
-}
-
 fn block_ref(height: u64, parent: Option<&BlockRef>) -> BlockRef {
     BlockRef {
         position: BlockPosition(height),
@@ -122,7 +118,7 @@ fn interpret(
             .map(|ordinal| ValueMovement::Transfer {
                 id: MovementId(format!("{height}-{index}-{ordinal}")),
                 asset: asset(),
-                amount: amount(1_000 + ordinal as u64),
+                amount: Decimal::from(1_000 + ordinal as u64),
                 from: from.clone(),
                 to: to.clone(),
             })
@@ -145,7 +141,7 @@ fn interpret(
             },
             address: profile.address(index),
             asset: asset(),
-            amount: amount(50_000 + index as u64),
+            amount: Decimal::from(50_000 + index as u64),
             evidence: vec![0x51; 22],
             created_at: BlockHeight(height),
             coinbase: index == 0,
