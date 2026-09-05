@@ -70,6 +70,14 @@ impl Profile {
         let movements = history * self.movements;
         history + movements + self.created + self.spent * 2
     }
+
+    fn address(&self, scope: &IndexScope, index: usize) -> CanonicalAddress {
+        let index = index % self.addresses;
+        CanonicalAddress {
+            scope: scope.clone(),
+            value: format!("addr-{index:04}"),
+        }
+    }
 }
 
 fn scope() -> IndexScope {
@@ -83,13 +91,6 @@ fn scope() -> IndexScope {
     IndexScope {
         chain: ChainId("benchmark".into()),
         network,
-    }
-}
-
-fn address(scope: &IndexScope, index: usize) -> CanonicalAddress {
-    CanonicalAddress {
-        scope: scope.clone(),
-        value: format!("addr-{index:04}"),
     }
 }
 
@@ -136,8 +137,8 @@ fn interpret(
     let block = block_ref(height, parent);
     let mut transactions = Vec::with_capacity(profile.txs);
     for index in 0..profile.txs {
-        let from = address(scope, index % profile.addresses);
-        let to = address(scope, (index + 1) % profile.addresses);
+        let from = profile.address(scope, index);
+        let to = profile.address(scope, index + 1);
         let movements = (0..profile.movements)
             .map(|ordinal| ValueMovement::Transfer {
                 id: MovementId(format!("{height}-{index}-{ordinal}")),
@@ -158,7 +159,7 @@ fn interpret(
 
     let mut created = Vec::with_capacity(profile.created);
     for index in 0..profile.created {
-        let owner = address(scope, index % profile.addresses);
+        let owner = profile.address(scope, index);
         created.push(IndexedOutput {
             id: OutputId {
                 transaction: transaction(scope, height, index),
@@ -255,7 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &repository,
             HistoryQuery {
                 scope: scope.clone(),
-                address: address(&scope, index % profile.addresses),
+                address: profile.address(&scope, index),
                 after: None,
                 limit: 100,
             },
@@ -277,7 +278,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &repository,
             OutputRequest {
                 scope: scope.clone(),
-                address: address(&scope, index % profile.addresses),
+                address: profile.address(&scope, index),
                 after: None,
                 limit: 100,
             },

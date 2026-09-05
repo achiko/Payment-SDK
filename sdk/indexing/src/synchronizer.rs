@@ -61,17 +61,6 @@ pub(super) fn earliest_position(filters: &[AddressFilter]) -> Option<BlockPositi
     filters.iter().map(|filter| filter.start_position).min()
 }
 
-fn active_addresses(
-    filters: &[AddressFilter],
-    position: BlockPosition,
-) -> Vec<crate::CanonicalAddress> {
-    filters
-        .iter()
-        .filter(|item| item.start_position <= position)
-        .map(|item| item.address.clone())
-        .collect()
-}
-
 fn cannot_connect(message: impl Into<String>) -> IndexError {
     IndexError::new(IndexErrorKind::CannotConnect, message, true)
 }
@@ -146,11 +135,9 @@ where
         {
             checkpoint = self.reconcile(local, &mut plan).await?;
         }
-        let filters = plan.filters().to_vec();
-
         let mut applied = 0_usize;
         if checkpoint.is_none() {
-            let birthday = earliest_position(&filters);
+            let birthday = earliest_position(plan.filters());
             if birthday.is_none_or(|position| position > observed_tip.position) {
                 let anchor = self
                     .one_block(observed_tip.position, observed_tip.position)
@@ -172,7 +159,7 @@ where
                     applied += 1;
                 }
                 if applied < self.config.batch_size {
-                    let addresses = active_addresses(&filters, first_ref.position);
+                    let addresses = plan.active_addresses(first_ref.position);
                     checkpoint = Some(self.apply(first, &addresses, checkpoint, &mut plan).await?);
                     applied += 1;
                 }
@@ -201,7 +188,7 @@ where
             }
             for source_block in blocks {
                 let position = source_block.block_ref().position;
-                let addresses = active_addresses(&filters, position);
+                let addresses = plan.active_addresses(position);
                 checkpoint = Some(
                     self.apply(source_block, &addresses, checkpoint, &mut plan)
                         .await?,

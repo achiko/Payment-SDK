@@ -11,7 +11,7 @@ use crate::{Address, Network, TransactionId};
 use super::{
     IndexedOutput, Outpoint, UtxoKey,
     interpreter::{NATIVE_ASSET, ValidatedAddresses, invalid_block},
-    model::{Input, Output, PreviousOutput, Transaction, address_for_script},
+    model::{Input, Output, PreviousOutput, Transaction},
 };
 
 pub(super) trait Canonicalize {
@@ -238,7 +238,7 @@ impl<'a> TransactionFacts<'a> {
             .checked_add(output.value.0)
             .ok_or_else(|| invalid_block("Bitcoin transaction output value overflowed u64"))?;
         let script = ScriptBuf::from_bytes(output.script_pubkey.clone());
-        let address = address_for_script(&script, self.network);
+        let address = Address::from_script_for_network(&script, self.network);
         self.movements.push(ValueMovement::Output {
             id: MovementId(format!("{}:vout:{index}", self.transaction_id)),
             asset: (*NATIVE_ASSET).clone(),

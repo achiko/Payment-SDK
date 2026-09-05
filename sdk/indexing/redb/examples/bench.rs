@@ -59,19 +59,20 @@ impl Profile {
         let movements = history * self.movements;
         history + movements + self.created + self.spent * 2
     }
+
+    fn address(&self, index: usize) -> CanonicalAddress {
+        let index = index % self.addresses;
+        CanonicalAddress {
+            scope: scope(),
+            value: format!("addr-{index:04}"),
+        }
+    }
 }
 
 fn scope() -> IndexScope {
     IndexScope {
         chain: ChainId(CHAIN.into()),
         network: NETWORK.into(),
-    }
-}
-
-fn address(index: usize) -> CanonicalAddress {
-    CanonicalAddress {
-        scope: scope(),
-        value: format!("addr-{index:04}"),
     }
 }
 
@@ -115,8 +116,8 @@ fn interpret(
     let block = block_ref(height, parent);
     let mut transactions = Vec::with_capacity(profile.txs);
     for index in 0..profile.txs {
-        let from = address(index % profile.addresses);
-        let to = address((index + 1) % profile.addresses);
+        let from = profile.address(index);
+        let to = profile.address(index + 1);
         let movements = (0..profile.movements)
             .map(|ordinal| ValueMovement::Transfer {
                 id: MovementId(format!("{height}-{index}-{ordinal}")),
@@ -142,7 +143,7 @@ fn interpret(
                 transaction: transaction(height, index),
                 index: index as u32,
             },
-            address: address(index % profile.addresses),
+            address: profile.address(index),
             asset: asset(),
             amount: amount(50_000 + index as u64),
             evidence: vec![0x51; 22],
@@ -220,7 +221,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &repository,
             HistoryQuery {
                 scope: scope(),
-                address: address(index % profile.addresses),
+                address: profile.address(index),
                 after: None,
                 limit: 100,
             },
@@ -241,7 +242,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &repository,
             OutputRequest {
                 scope: scope(),
-                address: address(index % profile.addresses),
+                address: profile.address(index),
                 after: None,
                 limit: 100,
             },

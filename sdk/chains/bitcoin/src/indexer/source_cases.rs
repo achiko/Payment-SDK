@@ -103,7 +103,10 @@ fn external_prevouts_are_resolved_once_into_bounded_parsed_facts() {
                         output_index: u32::try_from(index).expect("test index must fit u32"),
                     },
                     value: Satoshi(output.value.to_sat()),
-                    address: address_for_script(&output.script_pubkey, Network::Regtest),
+                    address: crate::Address::from_script_for_network(
+                        &output.script_pubkey,
+                        Network::Regtest,
+                    ),
                 })
             })
             .collect::<Vec<_>>()
@@ -113,7 +116,10 @@ fn external_prevouts_are_resolved_once_into_bounded_parsed_facts() {
     for output in &previous.output {
         let compact = ResolvedOutput {
             value_satoshis: output.value.to_sat(),
-            address: address_for_script(&output.script_pubkey, Network::Regtest),
+            address: crate::Address::from_script_for_network(
+                &output.script_pubkey,
+                Network::Regtest,
+            ),
         }
         .compact_json()
         .expect("resolved output must fit its compact boundary");

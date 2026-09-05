@@ -216,6 +216,7 @@ impl TryFrom<AccountWire> for AccountSnapshot {
     }
 }
 
+// design-lint: allow unclassified-free-function -- shared private account-read RPC encoding; independent of client state and commitment semantics
 fn account_config(commitment: Commitment, minimum: Option<u64>) -> serde_json::Value {
     match minimum {
         Some(floor) => {

@@ -150,7 +150,7 @@ impl BlockData {
                             output_index,
                         },
                         value: output.value,
-                        address: address_for_script(&script, network),
+                        address: crate::Address::from_script_for_network(&script, network),
                     },
                 );
             }
@@ -385,13 +385,7 @@ impl PreviousOutput {
         Ok(Self {
             outpoint,
             value,
-            address: address_for_script(&script, network),
+            address: crate::Address::from_script_for_network(&script, network),
         })
     }
-}
-
-pub(super) fn address_for_script(script: &ScriptBuf, network: Network) -> Option<crate::Address> {
-    bitcoin::Address::from_script(script, network.native())
-        .ok()
-        .map(|address| crate::Address::from_encoded(address.to_string()))
 }
