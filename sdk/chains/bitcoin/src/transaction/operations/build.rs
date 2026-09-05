@@ -285,16 +285,7 @@ fn predicted_fee(
         .checked_add(SEGWIT_MARKER_FLAG_WEIGHT)
         .and_then(|weight| weight.checked_add(satisfaction_weight))
         .ok_or_else(|| invalid_transaction("Bitcoin transaction weight overflowed u64"))?;
-    fee_for_vsize(fee_rate, weight.div_ceil(4))
-}
-
-fn fee_for_vsize(fee_rate: FeeRate, virtual_size: u64) -> Result<u64, ChainError> {
-    let numerator = u128::from(fee_rate.satoshis_per_kvb())
-        .checked_mul(u128::from(virtual_size))
-        .and_then(|value| value.checked_add(999))
-        .ok_or_else(|| invalid_transaction("Bitcoin transaction fee overflowed u128"))?;
-    u64::try_from(numerator / 1_000)
-        .map_err(|_| invalid_transaction("Bitcoin transaction fee overflowed u64"))
+    fee_rate.for_vsize(weight.div_ceil(4))
 }
 
 #[cfg(test)]

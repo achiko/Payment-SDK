@@ -146,6 +146,7 @@ impl Backend {
     }
 }
 
+// design-lint: allow single-use-free-function -- isolates redb-specific Missing and Version checks before any batch mutation in the same write transaction
 fn evaluate_condition(
     data: &impl ReadableTable<&'static [u8], &'static [u8]>,
     condition: &Condition,

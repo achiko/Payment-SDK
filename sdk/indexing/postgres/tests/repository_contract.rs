@@ -1832,6 +1832,96 @@ async fn replaying_the_tip_is_not_a_second_commit() {
     assert_eq!(history(&repository, &scope, "receiver").await, ["funding"]);
 }
 
+#[tokio::test]
+async fn replaying_the_tip_requires_its_matching_journal() {
+    let scope = unique_scope();
+    let (database, repository) = repository(&scope).await;
+    let candidate = addition(
+        &scope,
+        block(1, 1, 0),
+        None,
+        one(&scope, "funding"),
+        OutputChanges::default(),
+    );
+    repository
+        .add(candidate.clone())
+        .await
+        .expect("first block");
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("journal fixture connection");
+
+    for (case, statement) in [
+        (
+            "mismatched journal hash",
+            "UPDATE journal SET block_hash = decode('ff', 'hex') \
+             WHERE chain = $1 AND network = $2 AND height = $3",
+        ),
+        (
+            "missing journal",
+            "DELETE FROM journal WHERE chain = $1 AND network = $2 AND height = $3",
+        ),
+    ] {
+        assert_eq!(
+            client
+                .execute(statement, &[&scope.chain.0, &scope.network, &1_i64])
+                .await
+                .expect("alter owned journal fixture"),
+            1,
+            "{case}"
+        );
+        let before = scope_signature(&database, &scope).await;
+        let error = repository.add(candidate.clone()).await.expect_err(case);
+
+        assert_eq!(error.kind, IndexErrorKind::Store, "{case}");
+        assert!(!error.retryable, "{case}");
+        assert_eq!(
+            error.message, "canonical checkpoint is missing its rollback journal",
+            "{case}"
+        );
+        assert_eq!(scope_signature(&database, &scope).await, before, "{case}");
+    }
+    assert!(database.registry_sentinel_unchanged().await);
+}
+
+#[tokio::test]
+async fn retained_height_conflict_does_not_change_committed_state() {
+    let scope = unique_scope();
+    let (database, repository) = repository(&scope).await;
+    repository
+        .add(addition(
+            &scope,
+            block(1, 1, 0),
+            None,
+            one(&scope, "funding"),
+            OutputChanges::default(),
+        ))
+        .await
+        .expect("first block");
+    let before = scope_signature(&database, &scope).await;
+    let error = repository
+        .add(addition(
+            &scope,
+            block(1, 99, 0),
+            None,
+            one(&scope, "replacement"),
+            OutputChanges::default(),
+        ))
+        .await
+        .expect_err("retained height must be rejected before the stale checkpoint");
+
+    assert_eq!(error.kind, IndexErrorKind::CannotConnect);
+    assert!(error.retryable);
+    assert_eq!(
+        error.message,
+        "another retained block exists at this height"
+    );
+    assert_eq!(scope_signature(&database, &scope).await, before);
+    assert!(database.registry_sentinel_unchanged().await);
+}
+
 /// The registry stores an address once and refuses a second registration of
 /// either the identity or the address.
 #[tokio::test]

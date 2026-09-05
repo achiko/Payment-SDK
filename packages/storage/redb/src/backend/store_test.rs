@@ -264,6 +264,80 @@ async fn stale_condition_rejects_the_complete_batch() -> Result<(), Error> {
 }
 
 #[tokio::test]
+async fn absent_or_present_condition_conflicts_preserve_batch_and_version() -> Result<(), Error> {
+    let directory = TempDir::new().map_err(|error| other(error.to_string()))?;
+    let storage = Redb::open(database_path(&directory))?;
+    let records = namespace("records");
+    let other_namespace = namespace("other");
+    let primary = key("primary");
+    let missing = key("missing");
+    let side_effect = key("side-effect");
+    storage
+        .commit(WriteBatch {
+            conditions: vec![],
+            operations: vec![put(&records, &primary, "original")],
+        })
+        .await?;
+
+    for (condition, message) in [
+        (
+            Condition::Missing {
+                namespace: records.clone(),
+                key: primary.clone(),
+            },
+            "missing condition failed in namespace `records` because the key exists",
+        ),
+        (
+            Condition::Version {
+                namespace: records.clone(),
+                key: missing.clone(),
+                expected: Version(2),
+            },
+            "version condition failed in namespace `records` because the key is missing",
+        ),
+    ] {
+        let error = storage
+            .commit(WriteBatch {
+                conditions: vec![condition],
+                operations: vec![
+                    Operation::Delete {
+                        namespace: records.clone(),
+                        key: primary.clone(),
+                    },
+                    put(&records, &missing, "must-not-commit"),
+                    put(&other_namespace, &side_effect, "must-not-commit"),
+                ],
+            })
+            .await
+            .expect_err("conditions must inspect the state before any batch operation");
+
+        assert_eq!(error.kind, ErrorKind::Conflict);
+        assert_eq!(error.message, message);
+        assert_eq!(storage.get(&records, &missing).await?, None);
+        assert_eq!(storage.get(&other_namespace, &side_effect).await?, None);
+        assert_eq!(
+            storage.get(&records, &primary).await?,
+            Some(StoredValue {
+                value: value("original"),
+                version: Version(1),
+            })
+        );
+    }
+
+    let next = storage
+        .commit(WriteBatch {
+            conditions: vec![Condition::Missing {
+                namespace: records.clone(),
+                key: missing.clone(),
+            }],
+            operations: vec![put(&records, &missing, "committed")],
+        })
+        .await?;
+    assert_eq!(next.version, Version(2));
+    Ok(())
+}
+
+#[tokio::test]
 async fn concurrent_compare_and_swap_has_one_winner() -> Result<(), Error> {
     let directory = TempDir::new().map_err(|error| other(error.to_string()))?;
     let storage = Redb::open(database_path(&directory))?;

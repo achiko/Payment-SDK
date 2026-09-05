@@ -9,7 +9,7 @@ use std::{
 };
 
 use axum::{
-    Router,
+    Extension, Router,
     extract::{DefaultBodyLimit, Request, State},
     http::StatusCode,
     middleware::{self, Next},
@@ -18,7 +18,7 @@ use axum::{
 };
 use tokio::net::TcpListener;
 
-use super::{AuthenticationMode, BearerToken, Config, ConfigError};
+use super::{BearerToken, Config, ConfigError};
 
 pub const LIVENESS_PATH: &str = "/health/live";
 pub const READINESS_PATH: &str = "/health/ready";
@@ -60,10 +60,6 @@ struct ReadinessState {
     health: HealthState,
 }
 
-async fn liveness() -> Response {
-    StatusCode::NO_CONTENT.into_response()
-}
-
 async fn readiness(State(state): State<ReadinessState>) -> Response {
     if state.health.is_ready() {
         StatusCode::NO_CONTENT.into_response()
@@ -89,15 +85,6 @@ async fn require_bearer(
     }
 }
 
-async fn inject_authentication_mode(
-    State(mode): State<AuthenticationMode>,
-    mut request: Request,
-    next: Next,
-) -> Response {
-    request.extensions_mut().insert(mode);
-    next.run(request).await
-}
-
 /// Applies request limits and authentication to application routes, then adds
 /// unauthenticated, detail-free health endpoints.
 pub fn service_router(
@@ -108,7 +95,7 @@ pub fn service_router(
     let protected = protected_router(protected, config)?;
 
     let health_routes = Router::new()
-        .route(LIVENESS_PATH, get(liveness))
+        .route(LIVENESS_PATH, get(|| async { StatusCode::NO_CONTENT }))
         .route(READINESS_PATH, get(readiness))
         .with_state(ReadinessState { health });
 
@@ -122,10 +109,7 @@ pub fn protected_router(protected: Router, config: &Config) -> Result<Router, Co
     config.validate()?;
 
     let mut protected = protected
-        .layer(middleware::from_fn_with_state(
-            config.authentication_mode,
-            inject_authentication_mode,
-        ))
+        .layer(Extension(config.authentication_mode))
         .layer(DefaultBodyLimit::max(config.limits.max_body_bytes()));
     if config.authentication_mode.is_strict()
         && let Some(token) = config.bearer_token.clone()

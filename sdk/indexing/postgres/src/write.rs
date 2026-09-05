@@ -68,7 +68,17 @@ impl Repository {
         lock_scope(&transaction, &self.scope).await?;
         let current = locked_checkpoint(&transaction, &self.scope).await?;
         let height = row::as_i64(addition.block().height.0, "block height")?;
-        let journalled = journalled_block(&transaction, &self.scope, height).await?;
+        let statement = prepare_in(&transaction, JOURNALLED_HASH).await?;
+        let journalled = transaction
+            .query_opt(
+                &statement,
+                &[&self.scope.chain.0, &self.scope.network, &height],
+            )
+            .await
+            .map_err(crate::store)?
+            .map(|row| row.try_get::<_, Vec<u8>>("block_hash"))
+            .transpose()
+            .map_err(crate::store)?;
 
         // Re-presenting the block that is already the checkpoint is not an
         // error: a restart replays the tip, and the caller must be able to tell
@@ -130,21 +140,6 @@ pub(crate) async fn locked_checkpoint(
         .await
         .map_err(crate::store)?;
     row.as_ref().map(|row| row::block(row, "")).transpose()
-}
-
-async fn journalled_block(
-    transaction: &Transaction<'_>,
-    scope: &IndexScope,
-    height: i64,
-) -> Result<Option<Vec<u8>>, IndexError> {
-    let statement = prepare_in(transaction, JOURNALLED_HASH).await?;
-    let row = transaction
-        .query_opt(&statement, &[&scope.chain.0, &scope.network, &height])
-        .await
-        .map_err(crate::store)?;
-    row.map(|row| row.try_get::<_, Vec<u8>>("block_hash"))
-        .transpose()
-        .map_err(crate::store)
 }
 
 pub(crate) fn optional_block(

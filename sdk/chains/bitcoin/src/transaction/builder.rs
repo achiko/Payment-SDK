@@ -27,6 +27,18 @@ impl FeeRate {
     pub const fn satoshis_per_kvb(self) -> u64 {
         self.0
     }
+
+    pub(super) fn for_vsize(self, virtual_size: u64) -> Result<u64, ChainError> {
+        let numerator = u128::from(self.satoshis_per_kvb())
+            .checked_mul(u128::from(virtual_size))
+            .and_then(|value| value.checked_add(999))
+            .ok_or_else(|| {
+                super::operations::invalid_transaction("Bitcoin transaction fee overflowed u128")
+            })?;
+        u64::try_from(numerator / 1_000).map_err(|_| {
+            super::operations::invalid_transaction("Bitcoin transaction fee overflowed u64")
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -201,6 +213,58 @@ mod tests {
     use bitcoin::{Address as NativeAddress, CompressedPublicKey, PublicKey, secp256k1::Secp256k1};
 
     use super::*;
+
+    #[test]
+    fn fee_rate_applies_exact_and_fractional_virtual_sizes() {
+        for (rate, size, expected) in [
+            (2_000, 250, 500),
+            (1_250, 101, 127),
+            (1, 1, 1),
+            (1, 1_001, 2),
+        ] {
+            assert_eq!(
+                FeeRate::new(rate)
+                    .for_vsize(size)
+                    .expect("representable fee"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn zero_fee_rate_or_virtual_size_produces_zero_fee() {
+        for (rate, size) in [(0, 0), (0, u64::MAX), (u64::MAX, 0)] {
+            assert_eq!(FeeRate::new(rate).for_vsize(size).expect("zero fee"), 0);
+        }
+    }
+
+    #[test]
+    fn fee_rate_accepts_the_maximum_representable_fee() {
+        assert_eq!(
+            FeeRate::new(u64::MAX)
+                .for_vsize(1_000)
+                .expect("maximum fee"),
+            u64::MAX
+        );
+        assert_eq!(
+            FeeRate::new(1_000)
+                .for_vsize(u64::MAX)
+                .expect("maximum size"),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn fee_rate_rejects_fees_above_u64() {
+        for size in [1_001, u64::MAX] {
+            let error = FeeRate::new(u64::MAX)
+                .for_vsize(size)
+                .expect_err("fee exceeds u64");
+
+            assert_eq!(error.kind, ChainErrorKind::InvalidTransaction);
+            assert_eq!(error.message, "Bitcoin transaction fee overflowed u64");
+        }
+    }
 
     fn address_and_script() -> (Address, Vec<u8>) {
         let public_key = PublicKey::from_slice(&[
