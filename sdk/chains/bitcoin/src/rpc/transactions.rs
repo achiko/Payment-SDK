@@ -127,6 +127,7 @@ fn transaction_error(
     TransactionError::new(kind, error.to_string())
 }
 
+// design-lint: allow unclassified-free-function -- shared Bitcoin RPC uncertainty mapping attaches the verified local transaction ID independently of client state
 fn ambiguous_submission(id: TransactionId, error: impl std::fmt::Display) -> TransactionError {
     transaction_error(TransactionErrorKind::Unavailable, error)
         .with_ambiguous_transaction_id(BaseTransactionId::new(id.to_string()))

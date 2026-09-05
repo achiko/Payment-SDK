@@ -10,9 +10,9 @@ use super::{
     error::BuildError,
     transport::Client as Transport,
     wire::{
-        CallError, address_hex, data_hex, gas_limit_with_margin, invalid_rpc_response,
-        is_already_known, is_execution_revert, map_json_rpc_error, parse_fixed_data,
-        parse_quantity_u64, parse_quantity_wei, parse_transaction_id, wei_quantity,
+        CallError, data_hex, gas_limit_with_margin, invalid_rpc_response, is_already_known,
+        is_execution_revert, map_json_rpc_error, parse_fixed_data, parse_quantity_u64,
+        parse_quantity_wei, parse_transaction_id, wei_quantity,
     },
 };
 use crate::{
@@ -91,8 +91,8 @@ where
 
             self.verify_transaction_chain_id().await?;
             let mut transaction = Map::new();
-            transaction.insert("from".to_owned(), json!(address_hex(request.from())));
-            transaction.insert("to".to_owned(), json!(address_hex(request.to())));
+            transaction.insert("from".to_owned(), json!(request.from().to_string()));
+            transaction.insert("to".to_owned(), json!(request.to().to_string()));
             transaction.insert("value".to_owned(), json!(wei_quantity(&request.value())));
             transaction.insert("data".to_owned(), json!(data_hex(&input)));
 
@@ -462,6 +462,7 @@ fn transaction_error(
     TransactionError::new(kind, error.to_string())
 }
 
+// design-lint: allow unclassified-free-function -- RPC boundary adapter adds Ethereum ambiguity context and the exact local transaction ID to uncertain submission failures without client state
 fn ambiguous_submission(id: &TransactionId, error: impl std::fmt::Display) -> TransactionError {
     transaction_error(
         TransactionErrorKind::Unavailable,

@@ -18,13 +18,6 @@ pub(super) fn parse_script(object: &Map<String, Value>) -> Result<ScriptBuf, Par
     Ok(ScriptBuf::from_bytes(bytes))
 }
 
-pub(super) fn as_object<'a>(
-    value: &'a Value,
-    message: &'static str,
-) -> Result<&'a Map<String, Value>, ParseError> {
-    value.as_object().ok_or_else(|| ParseError::new(message))
-}
-
 pub(super) fn required_string<'a>(
     object: &'a Map<String, Value>,
     field: &'static str,

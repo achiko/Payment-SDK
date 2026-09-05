@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::{Network, TransactionId};
 
-use super::{Block, Outpoint, model::address_for_script};
+use super::{Block, Outpoint};
 use crate::rpc::{
     Client as RpcClient, CoreConfig, format_bitcoin_block_hash, parse_bitcoin_block_hash,
     parse_header, source_error,
@@ -235,7 +235,8 @@ where
                     true,
                 )
             })?;
-            let address = address_for_script(&output.script_pubkey, self.config.network);
+            let address =
+                crate::Address::from_script_for_network(&output.script_pubkey, self.config.network);
             validate_compact_address(address.as_ref())?;
             outputs.insert(
                 *output_index,

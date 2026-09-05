@@ -4,8 +4,8 @@ use std::{
 };
 
 use indexing::{
-    AssetId, BlockRef, CanonicalAddress, ChainId, IndexError, IndexScope, OutputCursor,
-    OutputRequest, Outputs, SourceError,
+    AssetId, BlockRef, CanonicalAddress, ChainId, IndexScope, OutputCursor, OutputRequest, Outputs,
+    SourceError,
 };
 
 use crate::{Address, Network, Satoshi, TransactionId, UnspentOutput, UtxoSet};
@@ -70,7 +70,7 @@ impl IndexUtxos {
                     limit: PAGE_SIZE,
                 })
                 .await
-                .map_err(index_error)?;
+                .map_err(|error| source_error(error.message, error.retryable))?;
             let checkpoint = page.checkpoint.as_ref().ok_or_else(|| {
                 source_error("indexed outputs have no canonical checkpoint", true)
             })?;
@@ -193,10 +193,6 @@ fn validate_cursor(
     Ok(())
 }
 
-fn index_error(error: IndexError) -> SourceError {
-    source_error(error.message, error.retryable)
-}
-
 /// Indexing persists Bitcoin amounts in chain-native atomic units. Unlike the
 /// public wallet API, this boundary must not interpret the decimal as BTC and
 /// multiply it by `10^8` a second time.
@@ -217,8 +213,48 @@ fn source_error(message: impl Into<String>, retryable: bool) -> SourceError {
 #[cfg(test)]
 mod tests {
     use base::{Decimal, DecimalErrorKind};
+    use futures_executor::block_on;
+    use indexing::{BoxFuture, IndexError, IndexErrorKind, OutputPage};
 
     use super::*;
+
+    struct FailingOutputs(IndexError);
+
+    impl Outputs for FailingOutputs {
+        fn list<'a>(
+            &'a self,
+            _request: OutputRequest,
+        ) -> BoxFuture<'a, Result<OutputPage, IndexError>> {
+            Box::pin(async { Err(self.0.clone()) })
+        }
+    }
+
+    #[test]
+    fn indexed_output_errors_preserve_message_and_retryability() {
+        for retryable in [false, true] {
+            let expected = IndexError::new(
+                IndexErrorKind::Store,
+                " indexing store failed: request 7\nretained context ",
+                retryable,
+            );
+            let outputs = IndexUtxos::new(
+                IndexScope {
+                    chain: ChainId(crate::CHAIN.to_owned()),
+                    network: "mainnet".to_owned(),
+                },
+                Network::Mainnet,
+                Arc::new(FailingOutputs(expected.clone())),
+            )
+            .expect("matching scope");
+            let address = Address::from_encoded("1BitcoinEaterAddressDontSendf59kuE");
+
+            let error = block_on(outputs.utxos(vec![address]))
+                .expect_err("indexed output failure must reach the wallet caller");
+
+            assert_eq!(error.message, expected.message);
+            assert_eq!(error.retryable, retryable);
+        }
+    }
 
     fn checkpoint(height: u64) -> BlockRef {
         BlockRef {

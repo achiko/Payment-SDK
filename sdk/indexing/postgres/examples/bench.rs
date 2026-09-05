@@ -70,6 +70,14 @@ impl Profile {
         let movements = history * self.movements;
         history + movements + self.created + self.spent * 2
     }
+
+    fn address(&self, scope: &IndexScope, index: usize) -> CanonicalAddress {
+        let index = index % self.addresses;
+        CanonicalAddress {
+            scope: scope.clone(),
+            value: format!("addr-{index:04}"),
+        }
+    }
 }
 
 fn scope() -> IndexScope {
@@ -86,41 +94,10 @@ fn scope() -> IndexScope {
     }
 }
 
-fn address(scope: &IndexScope, index: usize) -> CanonicalAddress {
-    CanonicalAddress {
-        scope: scope.clone(),
-        value: format!("addr-{index:04}"),
-    }
-}
-
 fn transaction(scope: &IndexScope, height: u64, index: usize) -> TransactionRef {
     TransactionRef {
         scope: scope.clone(),
         value: format!("{height:010}-{index:05}"),
-    }
-}
-
-fn asset(scope: &IndexScope) -> AssetId {
-    AssetId {
-        chain: scope.chain.clone(),
-        asset: "native".into(),
-    }
-}
-
-fn amount(units: u64) -> Decimal {
-    units.to_string().parse().expect("amount parses")
-}
-
-fn block_ref(height: u64, parent: Option<&BlockRef>) -> BlockRef {
-    BlockRef {
-        position: BlockPosition(height),
-        height: BlockHeight(height),
-        hash: BlockHash(format!("hash-{height:010}").into_bytes()),
-        parent: parent.map(|block| BlockParent {
-            position: block.position,
-            hash: block.hash.clone(),
-        }),
-        timestamp: Some(1_700_000_000 + height),
     }
 }
 
@@ -133,16 +110,29 @@ fn interpret(
     parent: Option<&BlockRef>,
     spend: Vec<OutputKey>,
 ) -> (InterpretedBlock, Vec<OutputKey>) {
-    let block = block_ref(height, parent);
+    let block = BlockRef {
+        position: BlockPosition(height),
+        height: BlockHeight(height),
+        hash: BlockHash(format!("hash-{height:010}").into_bytes()),
+        parent: parent.map(|block| BlockParent {
+            position: block.position,
+            hash: block.hash.clone(),
+        }),
+        timestamp: Some(1_700_000_000 + height),
+    };
+    let asset = AssetId {
+        chain: scope.chain.clone(),
+        asset: "native".into(),
+    };
     let mut transactions = Vec::with_capacity(profile.txs);
     for index in 0..profile.txs {
-        let from = address(scope, index % profile.addresses);
-        let to = address(scope, (index + 1) % profile.addresses);
+        let from = profile.address(scope, index);
+        let to = profile.address(scope, index + 1);
         let movements = (0..profile.movements)
             .map(|ordinal| ValueMovement::Transfer {
                 id: MovementId(format!("{height}-{index}-{ordinal}")),
-                asset: asset(scope),
-                amount: amount(1_000 + ordinal as u64),
+                asset: asset.clone(),
+                amount: Decimal::from(1_000 + ordinal as u64),
                 from: from.clone(),
                 to: to.clone(),
             })
@@ -158,15 +148,15 @@ fn interpret(
 
     let mut created = Vec::with_capacity(profile.created);
     for index in 0..profile.created {
-        let owner = address(scope, index % profile.addresses);
+        let owner = profile.address(scope, index);
         created.push(IndexedOutput {
             id: OutputId {
                 transaction: transaction(scope, height, index),
                 index: index as u32,
             },
             address: owner,
-            asset: asset(scope),
-            amount: amount(50_000 + index as u64),
+            asset: asset.clone(),
+            amount: Decimal::from(50_000 + index as u64),
             // A P2WPKH script is 22 bytes; a P2WSH witness script is larger.
             evidence: vec![0x51; 22],
             created_at: BlockHeight(height),
@@ -255,7 +245,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &repository,
             HistoryQuery {
                 scope: scope.clone(),
-                address: address(&scope, index % profile.addresses),
+                address: profile.address(&scope, index),
                 after: None,
                 limit: 100,
             },
@@ -277,7 +267,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &repository,
             OutputRequest {
                 scope: scope.clone(),
-                address: address(&scope, index % profile.addresses),
+                address: profile.address(&scope, index),
                 after: None,
                 limit: 100,
             },

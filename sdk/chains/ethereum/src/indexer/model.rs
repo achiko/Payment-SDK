@@ -178,7 +178,13 @@ impl ParsedReceipt {
             ));
         }
 
-        let block_hash = fixed_hash(&block.reference.hash)?;
+        let block_hash: [u8; 32] = block
+            .reference
+            .hash
+            .0
+            .as_slice()
+            .try_into()
+            .map_err(|_| ParseError::new("Ethereum block hash is not 32 bytes"))?;
         let mut receipts = Vec::with_capacity(raw_receipts.len());
         let mut seen_log_indexes = BTreeSet::new();
         let mut previous_log_index = None;
@@ -339,8 +345,25 @@ impl ParsedLog {
         let data = object
             .get("data")
             .and_then(Value::as_str)
-            .ok_or_else(|| ParseError::new("Ethereum log data must be a hex byte string"))
-            .and_then(|data| parse_hex_bytes(data, "log data"))?;
+            .ok_or_else(|| ParseError::new("Ethereum log data must be a hex byte string"))?;
+        let digits = data
+            .strip_prefix("0x")
+            .ok_or_else(|| ParseError::new("Ethereum log data is not hex encoded"))?;
+        if digits.len() % 2 != 0 {
+            return Err(ParseError::new(
+                "Ethereum log data has an odd number of hex digits",
+            ));
+        }
+        let data = digits
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair)
+                    .map_err(|_| ParseError::new("Ethereum log data is not valid hex"))?;
+                u8::from_str_radix(pair, 16)
+                    .map_err(|_| ParseError::new("Ethereum log data is not valid hex"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let log_index = required_quantity_u64(object, "logIndex", "log index")?;
 
         Ok(Self {
@@ -442,34 +465,6 @@ pub(super) fn parse_quantity(value: &str, label: &str) -> Result<U256, ParseErro
         .map_err(|_| ParseError::new(format!("Ethereum {label} exceeds 256 bits")))
 }
 
-fn parse_hex_bytes(value: &str, label: &str) -> Result<Vec<u8>, ParseError> {
-    let digits = value
-        .strip_prefix("0x")
-        .ok_or_else(|| ParseError::new(format!("Ethereum {label} is not hex encoded")))?;
-    if digits.len() % 2 != 0 {
-        return Err(ParseError::new(format!(
-            "Ethereum {label} has an odd number of hex digits"
-        )));
-    }
-    digits
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let pair = std::str::from_utf8(pair)
-                .map_err(|_| ParseError::new(format!("Ethereum {label} is not valid hex")))?;
-            u8::from_str_radix(pair, 16)
-                .map_err(|_| ParseError::new(format!("Ethereum {label} is not valid hex")))
-        })
-        .collect()
-}
-
-fn fixed_hash(hash: &BlockHash) -> Result<[u8; 32], ParseError> {
-    hash.0
-        .as_slice()
-        .try_into()
-        .map_err(|_| ParseError::new("Ethereum block hash is not 32 bytes"))
-}
-
 pub(super) fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -480,4 +475,171 @@ pub(super) fn encode_hex(bytes: &[u8]) -> String {
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn block(hash: Vec<u8>) -> ParsedBlock {
+        ParsedBlock {
+            reference: BlockRef {
+                position: BlockPosition(10),
+                height: BlockHeight(10),
+                hash: BlockHash(hash),
+                parent: Some(BlockParent {
+                    position: BlockPosition(9),
+                    hash: BlockHash(vec![0xbb; 32]),
+                }),
+                timestamp: Some(100),
+            },
+            transactions: vec![ParsedTransaction {
+                hash: [0xcc; 32],
+                from: [0x11; 20],
+                to: Some([0x22; 20]),
+                value: U256::from(42_u8),
+                index: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn receipt_parsing_preserves_all_32_block_hash_bytes() {
+        let mut block = block((0_u8..32).collect());
+        let raw = serde_json::to_vec(&json!({
+            "transactionHash": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "transactionIndex": "0x0",
+            "blockHash": "0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+            "blockNumber": "0xa",
+            "from": "0x1111111111111111111111111111111111111111",
+            "to": "0x2222222222222222222222222222222222222222",
+            "contractAddress": null,
+            "status": "0x1",
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x3",
+            "logs": []
+        }))
+        .expect("receipt fixture must serialize");
+
+        let receipts = ParsedReceipt::parse_all(std::slice::from_ref(&raw), &block)
+            .expect("receipt identity must match the exact block hash");
+        assert_eq!(
+            receipts,
+            vec![ParsedReceipt {
+                transaction_hash: [0xcc; 32],
+                transaction_index: 0,
+                succeeded: true,
+                gas_used: 21_000,
+                effective_gas_price: U256::from(3_u8),
+                contract_address: None,
+                logs: Vec::new(),
+            }]
+        );
+
+        block.reference.hash.0.reverse();
+        let error = ParsedReceipt::parse_all(&[raw], &block)
+            .expect_err("changing block hash byte order must invalidate receipt identity");
+        assert_eq!(
+            error.to_string(),
+            "Ethereum receipt block hash does not match its block"
+        );
+    }
+
+    #[test]
+    fn receipt_parsing_checks_hash_length_before_receipt_json() {
+        for length in [31, 33] {
+            let block = block(vec![0xaa; length]);
+            let error = ParsedReceipt::parse_all(&[b"not-json".to_vec()], &block)
+                .expect_err("invalid block hash length must fail before receipt decoding");
+
+            assert_eq!(error.to_string(), "Ethereum block hash is not 32 bytes");
+        }
+    }
+
+    #[test]
+    fn receipt_parsing_checks_count_before_hash_length() {
+        let block = block(vec![0xaa; 31]);
+        let error = ParsedReceipt::parse_all(&[], &block)
+            .expect_err("missing receipt must fail before block hash validation");
+
+        assert_eq!(
+            error.to_string(),
+            "Ethereum receipt count does not match transaction count"
+        );
+    }
+
+    #[test]
+    fn log_parsing_preserves_accepted_data_bytes() {
+        let mut value = json!({
+            "blockHash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "blockNumber": "0xa",
+            "transactionHash": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "transactionIndex": "0x0",
+            "removed": false,
+            "address": "0x1111111111111111111111111111111111111111",
+            "topics": [],
+            "logIndex": "0x2"
+        });
+        for (data, expected) in [
+            ("0x", vec![]),
+            ("0x00aBfF", vec![0, 0xab, 0xff]),
+            // Preserve the existing decoder's acceptance of a plus-prefixed pair.
+            ("0x+1+a", vec![1, 10]),
+        ] {
+            value["data"] = json!(data);
+            let parsed = ParsedLog::parse(&value, BlockHeight(10), [0xaa; 32], [0xcc; 32], 0)
+                .expect("previously accepted log data must still decode");
+            assert_eq!(parsed.data, expected, "data: {data}");
+            assert_eq!(parsed.log_index, 2);
+        }
+    }
+
+    #[test]
+    fn log_parsing_preserves_data_errors_before_log_index_validation() {
+        let mut value = json!({
+            "blockHash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "blockNumber": "0xa",
+            "transactionHash": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "transactionIndex": "0x0",
+            "removed": false,
+            "address": "0x1111111111111111111111111111111111111111",
+            "topics": []
+        });
+        for (data, message) in [
+            (json!(null), "Ethereum log data must be a hex byte string"),
+            (json!(17), "Ethereum log data must be a hex byte string"),
+            (json!("00"), "Ethereum log data is not hex encoded"),
+            (json!("0X00"), "Ethereum log data is not hex encoded"),
+            (
+                json!("0x0"),
+                "Ethereum log data has an odd number of hex digits",
+            ),
+            (
+                json!("0x€"),
+                "Ethereum log data has an odd number of hex digits",
+            ),
+            (json!("0xgg"), "Ethereum log data is not valid hex"),
+            (json!("0xé"), "Ethereum log data is not valid hex"),
+            (json!("0x€a"), "Ethereum log data is not valid hex"),
+        ] {
+            value["data"] = data;
+            let error = ParsedLog::parse(&value, BlockHeight(10), [0xaa; 32], [0xcc; 32], 0)
+                .expect_err("invalid log data must fail before the missing log index");
+            assert_eq!(error.to_string(), message, "data: {}", value["data"]);
+        }
+
+        value.as_object_mut().unwrap().remove("data");
+        let error = ParsedLog::parse(&value, BlockHeight(10), [0xaa; 32], [0xcc; 32], 0)
+            .expect_err("missing log data must fail before the missing log index");
+        assert_eq!(
+            error.to_string(),
+            "Ethereum log data must be a hex byte string"
+        );
+
+        value["data"] = json!("0x");
+        let error = ParsedLog::parse(&value, BlockHeight(10), [0xaa; 32], [0xcc; 32], 0)
+            .expect_err("valid data must allow log index validation to run");
+        assert_eq!(error.to_string(), "Ethereum log index is missing");
+    }
 }

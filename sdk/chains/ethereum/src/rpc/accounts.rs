@@ -7,8 +7,8 @@ use super::{
     error::BuildError,
     transport::Client as Transport,
     wire::{
-        address_hex, block_parameter, data_hex, invalid_rpc_response, map_json_rpc_error,
-        parse_data, parse_fixed_data, source_error,
+        data_hex, invalid_rpc_response, map_json_rpc_error, parse_data, parse_fixed_data,
+        source_error,
     },
 };
 use crate::{Address, AssetKind, Wei, erc20};
@@ -69,10 +69,24 @@ where
         at: Option<BlockRef>,
     ) -> BoxFuture<'a, Result<Wei, SourceError>> {
         Box::pin(async move {
-            let block = block_parameter(at)?;
+            let block = match at {
+                None => json!("pending"),
+                Some(block) => {
+                    if block.hash.0.len() != 32 {
+                        return Err(source_error(
+                            "Ethereum balance block hash must contain exactly 32 bytes",
+                            false,
+                        ));
+                    }
+                    json!({
+                        "blockHash": data_hex(&block.hash.0),
+                        "requireCanonical": true,
+                    })
+                }
+            };
             match asset {
                 AssetKind::Native => {
-                    self.rpc_wei("eth_getBalance", json!([address_hex(&address), block]))
+                    self.rpc_wei("eth_getBalance", json!([address.to_string(), block]))
                         .await
                 }
                 AssetKind::Erc20(token) => {
@@ -86,7 +100,7 @@ where
                         .request_result(
                             "eth_call",
                             json!([{
-                                "to": address_hex(token),
+                                "to": token.to_string(),
                                 "data": data_hex(&erc20::balance_of(&address)),
                             }, block]),
                         )
@@ -105,7 +119,7 @@ where
         Box::pin(async move {
             self.rpc_u64(
                 "eth_getTransactionCount",
-                json!([address_hex(&address), "pending"]),
+                json!([address.to_string(), "pending"]),
             )
             .await
         })
@@ -131,7 +145,7 @@ where
         let block = self.latest_canonical_parameter().await?;
 
         let raw = self
-            .request_result("eth_getCode", json!([address_hex(token), block.clone()]))
+            .request_result("eth_getCode", json!([token.to_string(), block.clone()]))
             .await?;
         let code: String = raw.deserialize().map_err(map_json_rpc_error)?;
         if parse_data(&code)
@@ -180,7 +194,7 @@ where
             .request_result(
                 "eth_call",
                 json!([{
-                    "to": address_hex(token),
+                    "to": token.to_string(),
                     "data": data_hex(&input),
                 }, block]),
             )

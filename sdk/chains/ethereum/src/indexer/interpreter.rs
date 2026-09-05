@@ -272,6 +272,7 @@ fn parse_canonical_address(address: &CanonicalAddress) -> Result<[u8; 20], Index
         })
 }
 
+// design-lint: allow unclassified-free-function -- lossless Ethereum indexer boundary conversion from Alloy U256 to shared scale-zero Decimal for native amounts, token units, and fees
 fn atomic_decimal(value: U256) -> Decimal {
     Decimal::from_atomic(BigUint::from_bytes_be(&value.to_be_bytes::<32>()), 0)
 }

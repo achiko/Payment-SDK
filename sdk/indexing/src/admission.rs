@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use futures_channel::oneshot;
 
-use crate::{AddressFilter, BlockRef, IndexError, IndexErrorKind};
+use crate::{AddressFilter, BlockPosition, BlockRef, CanonicalAddress, IndexError, IndexErrorKind};
 
 #[derive(Default)]
 struct State {
@@ -156,6 +156,14 @@ impl SyncPlan {
         &self.filters
     }
 
+    pub(crate) fn active_addresses(&self, position: BlockPosition) -> Vec<CanonicalAddress> {
+        self.filters
+            .iter()
+            .filter(|filter| filter.start_position <= position)
+            .map(|filter| filter.address.clone())
+            .collect()
+    }
+
     #[must_use]
     pub fn checkpoint(&self) -> Option<&BlockRef> {
         self.checkpoint.as_ref()
@@ -297,7 +305,7 @@ mod tests {
     use futures_executor::block_on;
 
     use super::*;
-    use crate::{BlockHash, BlockHeight, BlockParent, BlockPosition};
+    use crate::{BlockHash, BlockHeight, BlockParent, ChainId, IndexScope};
 
     fn block(position: u64) -> BlockRef {
         BlockRef {
@@ -316,6 +324,82 @@ mod tests {
         match result {
             Ok(_) => panic!("{message}"),
             Err(error) => error,
+        }
+    }
+
+    fn filter(value: &str, position: u64) -> AddressFilter {
+        AddressFilter {
+            address: CanonicalAddress {
+                scope: IndexScope {
+                    chain: ChainId("test".into()),
+                    network: "testing".into(),
+                },
+                value: value.into(),
+            },
+            start_position: BlockPosition(position),
+        }
+    }
+
+    #[test]
+    fn empty_plan_has_no_active_addresses() {
+        let plan = SyncPlan::detached(Vec::new(), None);
+
+        assert!(plan.active_addresses(BlockPosition(0)).is_empty());
+        assert!(plan.active_addresses(BlockPosition(u64::MAX)).is_empty());
+    }
+
+    #[test]
+    fn active_addresses_use_inclusive_native_birthdays_and_preserve_input_order() {
+        let filters = vec![
+            filter("future", 107),
+            filter("birthday", 103),
+            filter("earlier", 100),
+            filter("skipped", 102),
+        ];
+        let checkpoint = BlockRef {
+            height: BlockHeight(2),
+            ..block(103)
+        };
+        let plan = SyncPlan::detached(filters.clone(), Some(checkpoint));
+
+        assert!(plan.active_addresses(BlockPosition(99)).is_empty());
+        assert_eq!(
+            plan.active_addresses(BlockPosition(103)),
+            vec![
+                filters[1].address.clone(),
+                filters[2].address.clone(),
+                filters[3].address.clone(),
+            ]
+        );
+        assert_eq!(
+            plan.active_addresses(BlockPosition(107)),
+            filters
+                .iter()
+                .map(|filter| filter.address.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(plan.filters(), filters);
+    }
+
+    #[test]
+    fn checkpoint_movement_keeps_the_captured_address_selection() {
+        let admission = Arc::new(ScopeAdmission::new());
+        let mut filters = vec![filter("selected", 103), filter("future", 107)];
+        let selected = filters[0].address.clone();
+        let mut plan = admission
+            .plan(Some(block(100)), || Ok(filters.clone()))
+            .expect("captured plan");
+        filters[0].start_position = BlockPosition(0);
+        filters.push(filter("registered-later", 101));
+
+        for position in [107, 100] {
+            plan.advance(block(position));
+            assert_eq!(plan.checkpoint(), Some(&block(position)));
+            assert!(plan.active_addresses(BlockPosition(102)).is_empty());
+            assert_eq!(
+                plan.active_addresses(BlockPosition(103)),
+                vec![selected.clone()]
+            );
         }
     }
 

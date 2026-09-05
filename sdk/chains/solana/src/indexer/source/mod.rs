@@ -251,7 +251,20 @@ async fn within<T>(
     timeout_at(deadline, future)
         .await
         .map_err(|_| source_error("Solana source exceeded its 30-second deadline", true))?
-        .map_err(map_rpc)
+        .map_err(|error| {
+            let retryable = !matches!(
+                error.kind(),
+                ErrorKind::InvalidRpcConfiguration
+                    | ErrorKind::InvalidIdentity
+                    | ErrorKind::InvalidBatch
+                    | ErrorKind::InvalidBudget
+                    | ErrorKind::InvalidSecret
+                    | ErrorKind::Generation
+                    | ErrorKind::Signing
+                    | ErrorKind::UnsupportedDestination
+            );
+            source_error(error.to_string(), retryable)
+        })
 }
 
 fn ensure_before(deadline: Instant) -> Result<(), SourceError> {
@@ -303,21 +316,6 @@ fn require_connection(previous: &Block, current: &Block) -> Result<(), SourceErr
         ));
     }
     Ok(())
-}
-
-fn map_rpc(error: Error) -> SourceError {
-    let retryable = !matches!(
-        error.kind(),
-        ErrorKind::InvalidRpcConfiguration
-            | ErrorKind::InvalidIdentity
-            | ErrorKind::InvalidBatch
-            | ErrorKind::InvalidBudget
-            | ErrorKind::InvalidSecret
-            | ErrorKind::Generation
-            | ErrorKind::Signing
-            | ErrorKind::UnsupportedDestination
-    );
-    source_error(error.to_string(), retryable)
 }
 
 fn unavailable(message: &'static str) -> SourceError {

@@ -60,7 +60,10 @@ mod tests {
     async fn protected_routes_require_the_exact_bearer_token() {
         let token = BearerToken::new("correct-secret").expect("test token must be valid");
         let router = service_router(
-            Router::new().route("/private", get(|| async { "ok" })),
+            Router::new().route(
+                "/private",
+                get(|Extension(mode): Extension<AuthenticationMode>| async move { mode.as_str() }),
+            ),
             &loopback_config(Some(token), RequestLimits::default()),
             HealthState::new(true),
         )
@@ -110,6 +113,44 @@ mod tests {
             .await
             .expect("router must respond");
         assert_eq!(accepted.status(), StatusCode::OK);
+        let body = to_bytes(accepted.into_body(), 1024)
+            .await
+            .expect("response body must be readable");
+        assert_eq!(body.as_ref(), b"strict");
+    }
+
+    #[tokio::test]
+    async fn configured_authentication_mode_replaces_existing_request_extension() {
+        use AuthenticationMode::{GlobalTrusted, Strict};
+
+        let routes = Router::new().route(
+            "/private",
+            get(|Extension(mode): Extension<AuthenticationMode>| async move { mode.as_str() }),
+        );
+        for (configured, previous) in [(Strict, GlobalTrusted), (GlobalTrusted, Strict)] {
+            let token = BearerToken::new("correct-secret").expect("test token must be valid");
+            let config = loopback_config(Some(token), RequestLimits::default())
+                .with_authentication_mode(configured);
+            let router = protected_router(routes.clone(), &config)
+                .expect("test router configuration must be valid");
+
+            let response = router
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/private")
+                        .extension(previous)
+                        .header(axum::http::header::AUTHORIZATION, "Bearer correct-secret")
+                        .body(Body::empty())
+                        .expect("test request must build"),
+                )
+                .await
+                .expect("router must respond");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 1024)
+                .await
+                .expect("response body must be readable");
+            assert_eq!(body.as_ref(), configured.as_str().as_bytes());
+        }
     }
 
     #[tokio::test]
@@ -171,37 +212,39 @@ mod tests {
         )
         .expect("test router configuration must be valid");
 
-        let live = router
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri(LIVENESS_PATH)
-                    .body(Body::empty())
-                    .expect("test request must build"),
-            )
-            .await
-            .expect("router must respond");
-        assert_eq!(live.status(), StatusCode::NO_CONTENT);
-        let live_body = to_bytes(live.into_body(), 1024)
-            .await
-            .expect("health body must be readable");
-        assert!(live_body.is_empty());
-
-        let not_ready = router
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri(READINESS_PATH)
-                    .body(Body::empty())
-                    .expect("test request must build"),
-            )
-            .await
-            .expect("router must respond");
-        assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = to_bytes(not_ready.into_body(), 1024)
-            .await
-            .expect("health body must be readable");
-        assert!(body.is_empty());
+        for (path, status, authorization) in [
+            (LIVENESS_PATH, StatusCode::NO_CONTENT, None),
+            (
+                LIVENESS_PATH,
+                StatusCode::NO_CONTENT,
+                Some("Bearer wrong-secret"),
+            ),
+            (READINESS_PATH, StatusCode::SERVICE_UNAVAILABLE, None),
+            (
+                READINESS_PATH,
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("Bearer wrong-secret"),
+            ),
+        ] {
+            let mut request = axum::http::Request::builder().uri(path);
+            if let Some(value) = authorization {
+                request = request.header(axum::http::header::AUTHORIZATION, value);
+            }
+            let response = router
+                .clone()
+                .oneshot(
+                    request
+                        .body(Body::empty())
+                        .expect("test request must build"),
+                )
+                .await
+                .expect("router must respond");
+            assert_eq!(response.status(), status);
+            let body = to_bytes(response.into_body(), 1024)
+                .await
+                .expect("health body must be readable");
+            assert!(body.is_empty());
+        }
 
         health.set_ready(true);
         let ready = router

@@ -230,8 +230,13 @@ fn ambiguous_outcome(
     guarded: GuardedSources,
 ) -> Outcome {
     guarded.retain_ambiguity(envelope.source());
+    let error = TransactionError::new(
+        TransactionErrorKind::Unknown,
+        "Solana submission outcome is unknown",
+    )
+    .with_ambiguous_transaction_id(envelope.id().clone());
     Outcome::Ambiguous {
-        error: ambiguous(&envelope, accepted),
+        error: SendError::item(envelope.index(), accepted, WalletError::from(error)),
         envelope: Box::new(envelope),
     }
 }
@@ -242,15 +247,6 @@ fn definite(index: usize, accepted: Vec<TransactionId>, message: &'static str) -
         accepted,
         WalletError::new(WalletErrorKind::Unavailable, message),
     )
-}
-
-fn ambiguous(envelope: &Envelope, accepted: Vec<TransactionId>) -> SendError {
-    let error = TransactionError::new(
-        TransactionErrorKind::Unknown,
-        "Solana submission outcome is unknown",
-    )
-    .with_ambiguous_transaction_id(envelope.id().clone());
-    SendError::item(envelope.index(), accepted, WalletError::from(error))
 }
 
 #[cfg(test)]
@@ -292,7 +288,7 @@ mod tests {
 
     #[derive(Default)]
     struct Resolution {
-        ids: Mutex<Vec<TransactionId>>,
+        envelopes: Mutex<Vec<Envelope>>,
     }
 
     impl Resolver for Resolution {
@@ -301,10 +297,10 @@ mod tests {
             envelope: Envelope,
         ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
             Box::pin(async move {
-                self.ids
+                self.envelopes
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(envelope.id().clone());
+                    .push(envelope);
             })
         }
     }
@@ -424,8 +420,27 @@ mod tests {
     #[tokio::test]
     async fn bounds_identical_replay_and_hands_ambiguity_to_reconciliation() {
         let coordinator = SourceCoordinator::default();
-        let prepared = prepared(&coordinator);
-        let envelope = prepared.envelopes()[0].clone();
+        let (floor, mut envelopes, leases) = prepared(&coordinator).into_parts();
+        let first = envelopes[0].clone();
+        let message = Message::native_transfer(
+            first.source(),
+            &Address::from_bytes([8; 32]),
+            Lamport::from_atomic(3),
+            Memo::from_bytes([4; Memo::LENGTH]),
+            first.lifetime(),
+        )
+        .expect("second distinct message");
+        let envelope = Envelope::sign(
+            first.source().clone(),
+            7,
+            message,
+            floor,
+            first.lifetime().clone(),
+            &key(),
+        )
+        .expect("second envelope retains its original occurrence index");
+        envelopes.push(envelope.clone());
+        let prepared = PreparedBatch::fixture(floor, envelopes, leases);
         let local = envelope.id().clone();
         let mismatch = Signature::from([8; 64]).to_string();
         let send = || {
@@ -450,6 +465,12 @@ mod tests {
             )
         };
         let rpc = Scripted::new([
+            height(),
+            (
+                "sendTransaction",
+                json!([STANDARD.encode(first.signed_bytes()), {"encoding":"base64","skipPreflight":false,"preflightCommitment":"confirmed","minContextSlot":11,"maxRetries":0}]),
+                json!(first.id().as_str()),
+            ),
             height(),
             send(),
             status(),
@@ -481,15 +502,32 @@ mod tests {
             .expect("registered task");
         task.run().await;
         let error = waiter.await.expect("waiter").expect_err("ambiguous");
-        assert_eq!(error.failed_index, Some(0));
+        assert_eq!(error.failed_index, Some(7));
+        assert_eq!(error.accepted, [first.id().clone()]);
         assert_eq!(error.ambiguous_transaction_id, Some(local.clone()));
+        assert_eq!(error.source.kind, WalletErrorKind::Unavailable);
+        assert_eq!(error.source.message, "Solana submission outcome is unknown");
+        assert_eq!(error.source.ambiguous_transaction_id, None);
         assert_eq!(
             *resolution
-                .ids
+                .envelopes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-            [local]
+            [envelope]
         );
+        let retained = coordinator
+            .lease(
+                &[ResolvedTransfer::new(
+                    7,
+                    first.source().clone(),
+                    String::new(),
+                    Lamport::from_atomic(1),
+                )],
+                false,
+            )
+            .err()
+            .expect("ambiguous source must remain guarded for reconciliation");
+        assert_eq!(retained.source.kind, WalletErrorKind::SourceBusy);
         rpc.assert_finished();
     }
 

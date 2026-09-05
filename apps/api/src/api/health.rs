@@ -9,6 +9,7 @@ pub fn routes() -> OpenApiRouter<HttpState> {
         .routes(routes!(ready))
 }
 
+// design-lint: allow single-use-free-function -- named Utoipa liveness endpoint binds its GET route and OpenAPI response contract through routes!(live)
 #[utoipa::path(
     get,
     path = "/health/live",

@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use base::Decimal;
-use indexing::{IndexError, IndexErrorKind};
+use indexing::IndexError;
 
 /// Stable storage representation for an exact monetary value.
 ///
@@ -14,22 +14,22 @@ pub(super) fn encode(value: &Decimal) -> String {
 
 pub(super) fn decode(encoded: &str) -> Result<Decimal, IndexError> {
     let value = Decimal::from_str(encoded)
-        .map_err(|_| amount_error("stored amount is not a valid decimal"))?;
+        .map_err(|_| crate::Repository::record_error("stored amount is not a valid decimal"))?;
     if value.to_string() != encoded {
-        return Err(amount_error("stored amount is not canonical"));
+        return Err(crate::Repository::record_error(
+            "stored amount is not canonical",
+        ));
     }
-    value
-        .to_atomic(value.scale())
-        .map_err(|_| amount_error("stored monetary amount must not be negative"))?;
+    value.to_atomic(value.scale()).map_err(|_| {
+        crate::Repository::record_error("stored monetary amount must not be negative")
+    })?;
     Ok(value)
-}
-
-fn amount_error(message: &'static str) -> IndexError {
-    IndexError::new(IndexErrorKind::Store, message, false)
 }
 
 #[cfg(test)]
 mod tests {
+    use indexing::IndexErrorKind;
+
     use super::*;
 
     #[test]
@@ -43,8 +43,17 @@ mod tests {
 
     #[test]
     fn rejects_negative_and_noncanonical_values() {
-        for encoded in ["-1", "+1", "01", "1.0", "not-a-number"] {
-            assert!(decode(encoded).is_err(), "{encoded} must be rejected");
+        for (encoded, message) in [
+            ("-1", "stored monetary amount must not be negative"),
+            ("+1", "stored amount is not canonical"),
+            ("01", "stored amount is not canonical"),
+            ("1.0", "stored amount is not canonical"),
+            ("not-a-number", "stored amount is not a valid decimal"),
+        ] {
+            let error = decode(encoded).expect_err("invalid stored amount must be rejected");
+            assert_eq!(error.kind, IndexErrorKind::Store, "{encoded}");
+            assert_eq!(error.message, message, "{encoded}");
+            assert!(!error.retryable, "{encoded}");
         }
     }
 }

@@ -15,8 +15,8 @@ use super::Outpoint;
 mod value;
 
 use value::{
-    as_object, parse_block_hash, parse_btc_amount, parse_script, parse_txid, required_bool,
-    required_string, required_u32, required_u64,
+    parse_block_hash, parse_btc_amount, parse_script, parse_txid, required_bool, required_string,
+    required_u32, required_u64,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,7 +79,9 @@ impl BlockData {
     ) -> Result<Self, ParseError> {
         let value: Value = serde_json::from_slice(raw)
             .map_err(|_| ParseError::new("Bitcoin block result is not valid JSON"))?;
-        let object = as_object(&value, "Bitcoin block result must be an object")?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| ParseError::new("Bitcoin block result must be an object"))?;
         let height = BlockHeight(required_u64(object, "height", "Bitcoin block height")?);
         if expected_height.is_some_and(|expected| expected != height) {
             return Err(ParseError::new(
@@ -150,7 +152,7 @@ impl BlockData {
                             output_index,
                         },
                         value: output.value,
-                        address: address_for_script(&script, network),
+                        address: crate::Address::from_script_for_network(&script, network),
                     },
                 );
             }
@@ -177,7 +179,9 @@ impl Transaction {
         network: Network,
         same_block_outputs: &BTreeMap<Outpoint, PreviousOutput>,
     ) -> Result<Self, ParseError> {
-        let object = as_object(value, "Bitcoin transaction must be an object")?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| ParseError::new("Bitcoin transaction must be an object"))?;
         let txid = parse_txid(required_string(object, "txid", "Bitcoin transaction ID")?)?;
         let raw = Vec::<u8>::from_hex(required_string(object, "hex", "Bitcoin raw transaction")?)
             .map_err(|_| ParseError::new("Bitcoin transaction hex is invalid"))?;
@@ -201,7 +205,9 @@ impl Transaction {
         }
         let mut inputs = Vec::with_capacity(input_values.len());
         for (index, (input, native_input)) in input_values.iter().zip(&native.input).enumerate() {
-            let object = as_object(input, "Bitcoin transaction input must be an object")?;
+            let object = input
+                .as_object()
+                .ok_or_else(|| ParseError::new("Bitcoin transaction input must be an object"))?;
             if native_input.previous_output.is_null() {
                 if !coinbase || object.get("coinbase").and_then(Value::as_str).is_none() {
                     return Err(ParseError::new(
@@ -270,7 +276,9 @@ impl Transaction {
         for (position, (output, native_output)) in
             output_values.iter().zip(&native.output).enumerate()
         {
-            let object = as_object(output, "Bitcoin transaction output must be an object")?;
+            let object = output
+                .as_object()
+                .ok_or_else(|| ParseError::new("Bitcoin transaction output must be an object"))?;
             let output_index = required_u64(object, "n", "Bitcoin output index")?;
             if usize::try_from(output_index).ok() != Some(position) {
                 return Err(ParseError::new(
@@ -385,13 +393,7 @@ impl PreviousOutput {
         Ok(Self {
             outpoint,
             value,
-            address: address_for_script(&script, network),
+            address: crate::Address::from_script_for_network(&script, network),
         })
     }
-}
-
-pub(super) fn address_for_script(script: &ScriptBuf, network: Network) -> Option<crate::Address> {
-    bitcoin::Address::from_script(script, network.native())
-        .ok()
-        .map(|address| crate::Address::from_encoded(address.to_string()))
 }

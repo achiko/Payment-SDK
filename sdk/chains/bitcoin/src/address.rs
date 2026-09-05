@@ -1,7 +1,7 @@
 use std::{fmt, str::FromStr};
 
 use base::{Address as BaseAddress, AddressError, AddressErrorKind, AddressValidator, Addresser};
-use bitcoin::{Address as NativeAddress, ScriptBuf, address::NetworkUnchecked};
+use bitcoin::{Address as NativeAddress, Script, ScriptBuf, address::NetworkUnchecked};
 
 use crate::{ChainError, ChainErrorKind, Network};
 
@@ -52,6 +52,13 @@ impl Address {
                 message: format!("Bitcoin address is for the wrong network: {error}"),
             })?;
         Ok(Self::from_encoded(address.to_string()))
+    }
+
+    /// Returns a network-encoded address when the output script has one.
+    pub(crate) fn from_script_for_network(script: &Script, network: Network) -> Option<Self> {
+        NativeAddress::from_script(script, network.native())
+            .ok()
+            .map(|address| Self::from_encoded(address.to_string()))
     }
 
     /// Returns the script for a canonical, network-checked address.
@@ -160,5 +167,86 @@ mod tests {
     #[test]
     fn from_str_rejects_unrecognized_address_encoding() {
         assert!("not-a-bitcoin-address".parse::<Address>().is_err());
+    }
+
+    #[test]
+    fn script_constructor_preserves_legacy_address_encodings() {
+        for (script, expected) in [
+            (
+                "76a914162c5ea71c0b23f5b9022ef047c4a86470a5b07088ac",
+                "132F25rTsvBdp9JzLLBHP5mvGY66i1xdiM",
+            ),
+            (
+                "a914162c5ea71c0b23f5b9022ef047c4a86470a5b07087",
+                "33iFwdLuRpW1uK1RTRqsoi8rR4NpDzk66k",
+            ),
+        ] {
+            let script = ScriptBuf::from_hex(script).expect("fixture script must decode");
+            let converted = Address::from_script_for_network(&script, Network::Mainnet)
+                .expect("legacy payment script must have an address");
+
+            assert_eq!(converted.encoded(), expected);
+        }
+    }
+
+    #[test]
+    fn script_constructor_uses_requested_witness_network() {
+        let script = Address::parse_for_network(&address(Network::Mainnet), Network::Mainnet)
+            .expect("fixture address must parse")
+            .script_pubkey_for_network(Network::Mainnet)
+            .expect("fixture address must have a script");
+
+        for network in [
+            Network::Mainnet,
+            Network::Testnet3,
+            Network::Testnet4,
+            Network::Signet,
+            Network::Regtest,
+        ] {
+            let converted = Address::from_script_for_network(&script, network)
+                .expect("witness payment script must have an address");
+
+            assert_eq!(converted.encoded(), address(network));
+            assert_eq!(
+                converted
+                    .script_pubkey_for_network(network)
+                    .expect("converted address must retain its script"),
+                script
+            );
+        }
+    }
+
+    #[test]
+    fn script_constructor_preserves_future_witness_programs() {
+        // Witness version 13 with a 40-byte program has an address even though
+        // the SDK has no corresponding spending implementation.
+        let script = ScriptBuf::from_bytes([vec![0x5d, 0x28], vec![0x11; 40]].concat());
+        let converted = Address::from_script_for_network(&script, Network::Regtest)
+            .expect("future witness program must retain its address");
+
+        assert!(converted.encoded().starts_with("bcrt1"));
+        assert_eq!(
+            converted
+                .script_pubkey_for_network(Network::Regtest)
+                .expect("future witness address must round-trip"),
+            script
+        );
+    }
+
+    #[test]
+    fn script_constructor_returns_none_when_no_address_exists() {
+        for bytes in [
+            vec![],
+            vec![0x6a, 0x01, 0x01],
+            vec![0x00, 0x01, 0x2a],
+            vec![0x51],
+        ] {
+            let script = ScriptBuf::from_bytes(bytes);
+
+            assert_eq!(
+                Address::from_script_for_network(&script, Network::Regtest),
+                None
+            );
+        }
     }
 }

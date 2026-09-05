@@ -147,16 +147,69 @@ fn interprets_successful_native_transfer_and_actual_fee() {
         draft.movements[0].id(),
         &MovementId(format!("{TX_HASH}:value"))
     );
-    assert_eq!(
-        draft.movements[0].amount(),
-        &atomic_decimal(U256::from(42_u8))
-    );
+    assert_eq!(draft.movements[0].amount(), &Decimal::from(42_u64));
     assert_eq!(
         draft.fee.as_ref().expect("fee must exist").amount,
-        atomic_decimal(U256::from(21_000_u64 * 3))
+        Decimal::from(63_000_u64)
     );
     assert_eq!(draft.movements[0].amount().scale(), 0);
+    assert_eq!(
+        draft.fee.as_ref().expect("fee must exist").amount.scale(),
+        0
+    );
     assert_eq!(draft.status, ObservationDraftStatus::Included);
+}
+
+#[test]
+fn preserves_full_width_atomic_native_token_and_fee_amounts() {
+    let maximum = format!("0x{}", "ff".repeat(32));
+    let zero = "0x0000000000000000000000000000000000000000";
+    let block = ethereum_block(
+        transaction(Some(TO), &maximum),
+        receipt(
+            true,
+            Some(TO),
+            None,
+            &format!("0x1{}", "0".repeat(60)),
+            vec![
+                log(0, FROM, TO, &maximum),
+                log(1, zero, TO, &maximum),
+                log(2, FROM, zero, &maximum),
+            ],
+        ),
+    );
+    let interpreted = inspect(&block, &[canonical_address(FROM)])
+        .expect("full-width amounts with a non-overflowing fee must interpret");
+    let draft = &interpreted.transactions[0];
+    let expected = "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+        .parse::<Decimal>()
+        .expect("maximum U256 decimal literal must parse");
+    assert_eq!(
+        draft
+            .movements
+            .iter()
+            .map(ValueMovement::kind)
+            .collect::<Vec<_>>(),
+        [
+            MovementKind::Transfer,
+            MovementKind::Transfer,
+            MovementKind::Mint,
+            MovementKind::Burn
+        ]
+    );
+    for movement in &draft.movements {
+        assert_eq!(movement.amount(), &expected);
+        assert_eq!(movement.amount().scale(), 0);
+    }
+
+    // The fixture charges 21,000 gas at 2^240 atomic units per gas.
+    let expected_fee =
+        "37103788360346070921249247515601288832377161834387998120553730227145015296000"
+            .parse::<Decimal>()
+            .expect("full-width fee decimal literal must parse");
+    let fee = draft.fee.as_ref().expect("fee must exist");
+    assert_eq!(fee.amount, expected_fee);
+    assert_eq!(fee.amount.scale(), 0);
 }
 
 #[test]
@@ -255,6 +308,10 @@ fn interprets_transfer_mint_and_burn_logs() {
     assert_eq!(movements[2].kind(), MovementKind::Burn);
     assert_eq!(movements[2].to(), None);
     assert_eq!(movements[2].id(), &MovementId(format!("{TX_HASH}:2")));
+    for (movement, amount) in movements.iter().zip([1_u64, 2, 3]) {
+        assert_eq!(movement.amount(), &Decimal::from(amount));
+        assert_eq!(movement.amount().scale(), 0);
+    }
 }
 
 #[test]
