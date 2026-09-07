@@ -401,3 +401,53 @@ fn canonical_lookup_distinguishes_json_null_from_non_null_values() {
         assert!(error.retryable);
     }
 }
+
+#[test]
+fn remote_failure_retains_code_with_indexer_retry_policy_and_redaction() {
+    for (code, retryable) in [
+        (-32100, false),
+        (-32099, true),
+        (-32000, true),
+        (-31999, false),
+        (-32601, false),
+        (429, false),
+        (3, false),
+    ] {
+        let failure = CallFailure::remote(Failure {
+            code,
+            message: "rate limit execution reverted secret provider details".to_owned(),
+            data: Some(RawJson::from_serializable(&json!({"secret": "private response"})).unwrap()),
+        });
+        assert_eq!(failure.remote_code, Some(code));
+        assert_eq!(failure.error.retryable, retryable);
+        assert_eq!(
+            failure.error.message,
+            format!("Ethereum JSON-RPC request failed with code {code}")
+        );
+    }
+}
+
+#[test]
+fn json_rpc_adapter_preserves_transport_retryability_and_message() {
+    use json_rpc::ErrorKind;
+    for (kind, retryable) in [
+        (ErrorKind::InvalidConfiguration, false),
+        (ErrorKind::InvalidRequest, false),
+        (ErrorKind::Timeout, true),
+        (ErrorKind::Unavailable, true),
+        (ErrorKind::HttpStatus(429), true),
+        (ErrorKind::HttpStatus(502), true),
+        (ErrorKind::HttpStatus(503), true),
+        (ErrorKind::HttpStatus(504), true),
+        (ErrorKind::HttpStatus(500), false),
+        (ErrorKind::ResponseTooLarge, false),
+        (ErrorKind::InvalidResponse, false),
+    ] {
+        let error = map_json_rpc_error(Error {
+            kind,
+            message: "bounded transport context".into(),
+        });
+        assert_eq!(error.retryable, retryable, "{kind:?}");
+        assert_eq!(error.message, "bounded transport context");
+    }
+}

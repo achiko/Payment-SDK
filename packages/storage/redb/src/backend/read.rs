@@ -3,7 +3,7 @@ use storage::{Error, ErrorKind, Key, Namespace, ScanPage, ScanRequest, StoredVal
 
 use crate::codec::{StoredRecord, decode_physical_key, encode_physical_key, namespace_prefix};
 
-use super::{Backend, DATA_TABLE, operation_error, table_error, transaction_error};
+use super::{Backend, DATA_TABLE, storage_error, table_error, transaction_error};
 
 impl Backend {
     pub(super) fn get(
@@ -25,7 +25,7 @@ impl Backend {
             .map_err(|error| table_error(error, "failed to open redb data table"))?;
         let raw = table
             .get(physical_key)
-            .map_err(|error| operation_error(error, "redb point read failed"))?;
+            .map_err(|error| storage_error(error, "redb point read failed"))?;
         raw.map(|value| StoredRecord::try_from(value.value()).map(StoredValue::from))
             .transpose()
     }
@@ -78,11 +78,11 @@ impl Backend {
             .map_err(|error| table_error(error, "failed to open redb data table"))?;
         let iterator = table
             .range(start..)
-            .map_err(|error| operation_error(error, "failed to start redb prefix scan"))?;
+            .map_err(|error| storage_error(error, "failed to start redb prefix scan"))?;
         let mut entries = Vec::with_capacity(request.limit.min(256));
         for item in iterator {
             let (physical_key, raw_value) =
-                item.map_err(|error| operation_error(error, "redb prefix scan failed"))?;
+                item.map_err(|error| storage_error(error, "redb prefix scan failed"))?;
             if !physical_key.value().starts_with(physical_prefix) {
                 break;
             }

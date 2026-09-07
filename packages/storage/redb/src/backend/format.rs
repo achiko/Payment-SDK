@@ -26,7 +26,7 @@ impl Backend {
                 .map_err(|error| table_error(error, "failed to create redb metadata table"))?;
             meta.insert(DATABASE_FORMAT_KEY, DATABASE_FORMAT)
                 .map_err(|error| {
-                    super::operation_error(error, "failed to write redb format marker")
+                    super::storage_error(error, "failed to write redb format marker")
                 })?;
         }
         transaction.commit().map_err(commit_error)
@@ -45,7 +45,7 @@ impl Backend {
             .map_err(|error| table_error(error, "redb metadata table is incompatible"))?;
         let marker = meta
             .get(DATABASE_FORMAT_KEY)
-            .map_err(|error| super::operation_error(error, "failed to read redb format marker"))?
+            .map_err(|error| super::storage_error(error, "failed to read redb format marker"))?
             .ok_or_else(|| Error::corrupt_data("redb database has no physical format marker"))?;
         validate_database_format(marker.value())
     }

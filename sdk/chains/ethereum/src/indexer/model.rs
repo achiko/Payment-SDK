@@ -131,7 +131,9 @@ impl ParsedTransaction {
         block_height: BlockHeight,
         block_hash: [u8; 32],
     ) -> Result<Self, ParseError> {
-        let object = object(value, "Ethereum transaction must be an object")?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| ParseError::new("Ethereum transaction must be an object"))?;
         let hash = required_hash(object, "hash", "transaction hash")?;
         let from = required_address(object, "from", "transaction sender")?;
         let to = optional_address(object, "to", "transaction recipient")?;
@@ -193,7 +195,9 @@ impl ParsedReceipt {
         {
             let value: Value = serde_json::from_slice(raw)
                 .map_err(|_| ParseError::new("Ethereum receipt result is not valid JSON"))?;
-            let object = object(&value, "Ethereum receipt must be an object")?;
+            let object = value
+                .as_object()
+                .ok_or_else(|| ParseError::new("Ethereum receipt must be an object"))?;
             let transaction_hash = required_hash(object, "transactionHash", "receipt transaction")?;
             if transaction_hash != transaction.hash {
                 return Err(ParseError::new(
@@ -313,7 +317,9 @@ impl ParsedLog {
         transaction_hash: [u8; 32],
         transaction_index: u64,
     ) -> Result<Self, ParseError> {
-        let object = object(value, "Ethereum receipt log must be an object")?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| ParseError::new("Ethereum receipt log must be an object"))?;
         if required_hash(object, "blockHash", "log block hash")? != block_hash
             || required_quantity_u64(object, "blockNumber", "log block number")? != block_height.0
             || required_hash(object, "transactionHash", "log transaction hash")? != transaction_hash
@@ -373,10 +379,6 @@ impl ParsedLog {
             log_index,
         })
     }
-}
-
-fn object<'a>(value: &'a Value, message: &str) -> Result<&'a Map<String, Value>, ParseError> {
-    value.as_object().ok_or_else(|| ParseError::new(message))
 }
 
 fn required_hash(
@@ -489,6 +491,31 @@ mod tests {
                 value: U256::from(42_u8),
                 index: 0,
             }],
+        }
+    }
+
+    #[test]
+    fn object_shape_errors_precede_identity_field_validation() {
+        let block = block(vec![0xaa; 32]);
+        for value in [
+            json!(null),
+            json!([]),
+            json!("object"),
+            json!(42),
+            json!(false),
+        ] {
+            let transaction = ParsedTransaction::parse(&value, 0, BlockHeight(10), [0xaa; 32])
+                .expect_err("transaction requires an object");
+            assert_eq!(
+                transaction.to_string(),
+                "Ethereum transaction must be an object"
+            );
+            let receipt = ParsedReceipt::parse_all(&[serde_json::to_vec(&value).unwrap()], &block)
+                .expect_err("receipt requires an object");
+            assert_eq!(receipt.to_string(), "Ethereum receipt must be an object");
+            let log = ParsedLog::parse(&value, BlockHeight(10), [0xaa; 32], [0xcc; 32], 0)
+                .expect_err("log requires an object");
+            assert_eq!(log.to_string(), "Ethereum receipt log must be an object");
         }
     }
 

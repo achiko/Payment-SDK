@@ -44,9 +44,9 @@ impl Batch {
     }
 
     fn parse(&self, transfer: Transfer) -> Result<(Arc<dyn Wallet>, Address, Output), Error> {
-        let source = native_address(&transfer.wallet.address(), self.network)?;
+        let source = Address::from_wallet_address(&transfer.wallet.address(), self.network)?;
         let destination = transfer.wallet.parse_address(&transfer.to)?;
-        let destination = native_address(&destination, self.network)?;
+        let destination = Address::from_wallet_address(&destination, self.network)?;
         let output = Output::new(destination, transfer.amount).map_err(transaction_error)?;
         Ok((transfer.wallet, source, output))
     }
@@ -160,10 +160,12 @@ impl Sender for Batch {
     }
 }
 
-fn native_address(address: &base::Address, network: Network) -> Result<Address, Error> {
-    let value = std::str::from_utf8(address.as_bytes())
-        .map_err(|_| transaction_error("Bitcoin address is not UTF-8"))?;
-    Address::parse_for_network(value, network).map_err(transaction_error)
+impl Address {
+    fn from_wallet_address(address: &base::Address, network: Network) -> Result<Self, Error> {
+        let value = std::str::from_utf8(address.as_bytes())
+            .map_err(|_| transaction_error("Bitcoin address is not UTF-8"))?;
+        Self::parse_for_network(value, network).map_err(transaction_error)
+    }
 }
 
 fn operation_failure(message: &'static str) -> SendError {
@@ -388,5 +390,28 @@ mod tests {
         assert_eq!(failure.failed_index, None);
         assert_eq!(failure.ambiguous_transaction_id, None);
         assert_eq!(failure.source.ambiguous_transaction_id, None);
+    }
+
+    #[test]
+    fn batch_address_conversion_keeps_utf8_and_network_errors() {
+        let invalid_utf8 = base::Address::new([0xff]);
+        let error = Address::from_wallet_address(&invalid_utf8, Network::Regtest).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Transaction);
+        assert_eq!(error.message, "Bitcoin address is not UTF-8");
+        assert_eq!(error.ambiguous_transaction_id, None);
+
+        let value = "1BitcoinEaterAddressDontSendf59kuE";
+        let encoded = base::Address::new(value.as_bytes());
+        let expected = Address::parse_for_network(value, Network::Regtest).unwrap_err();
+        let error = Address::from_wallet_address(&encoded, Network::Regtest).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Transaction);
+        assert_eq!(error.message, expected.to_string());
+        assert_eq!(error.ambiguous_transaction_id, None);
+        assert_eq!(
+            Address::from_wallet_address(&encoded, Network::Mainnet)
+                .unwrap()
+                .encoded(),
+            value
+        );
     }
 }

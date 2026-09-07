@@ -43,15 +43,14 @@ struct Profile {
     spent: usize,
 }
 
-fn number(key: &str, fallback: usize) -> usize {
-    env::var(key)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(fallback)
-}
-
 impl Profile {
     fn from_env() -> Self {
+        let number = |key: &str, fallback: usize| {
+            env::var(key)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(fallback)
+        };
         Self {
             blocks: number("BENCH_BLOCKS", 200) as u64,
             txs: number("BENCH_TXS", 40),

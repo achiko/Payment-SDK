@@ -15,6 +15,14 @@ struct State {
     waiters: Vec<oneshot::Sender<()>>,
 }
 
+impl State {
+    fn notify(&mut self) {
+        for waiter in std::mem::take(&mut self.waiters) {
+            let _ = waiter.send(());
+        }
+    }
+}
+
 /// Serializes checkpoint commits with forward-only address publication.
 #[derive(Default)]
 pub struct ScopeAdmission {
@@ -232,7 +240,7 @@ impl CommitPermit {
             let mut state = admission.lock()?;
             state.persisted = checkpoint;
             state.commit = false;
-            notify(&mut state);
+            state.notify();
         }
         self.finished = true;
         Ok(())
@@ -250,7 +258,7 @@ impl Drop for CommitPermit {
         if let Ok(mut state) = admission.state.lock() {
             state.commit = false;
             state.recovery |= self.started;
-            notify(&mut state);
+            state.notify();
         }
     }
 }
@@ -275,7 +283,7 @@ impl PublicationPermit {
             .checked_add(1)
             .ok_or_else(|| unavailable("address filter revision is exhausted"))?;
         state.publication = false;
-        notify(&mut state);
+        state.notify();
         drop(state);
         self.finished = true;
         Ok(())
@@ -289,14 +297,8 @@ impl Drop for PublicationPermit {
         }
         if let Ok(mut state) = self.admission.state.lock() {
             state.publication = false;
-            notify(&mut state);
+            state.notify();
         }
-    }
-}
-
-fn notify(state: &mut State) {
-    for waiter in std::mem::take(&mut state.waiters) {
-        let _ = waiter.send(());
     }
 }
 
@@ -347,6 +349,25 @@ mod tests {
             },
             start_position: BlockPosition(position),
         }
+    }
+
+    #[test]
+    fn notifying_drains_all_waiters_even_when_one_receiver_was_dropped() {
+        let (first_send, first_receive) = oneshot::channel();
+        let (cancelled_send, cancelled_receive) = oneshot::channel();
+        let (last_send, last_receive) = oneshot::channel();
+        drop(cancelled_receive);
+        let mut state = State {
+            waiters: vec![first_send, cancelled_send, last_send],
+            revision: 42,
+            ..State::default()
+        };
+        state.notify();
+        assert!(state.waiters.is_empty());
+        assert_eq!(block_on(first_receive), Ok(()));
+        assert_eq!(block_on(last_receive), Ok(()));
+        state.notify();
+        assert_eq!(state.revision, 42);
     }
 
     #[test]

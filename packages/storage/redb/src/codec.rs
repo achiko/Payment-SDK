@@ -21,6 +21,7 @@ pub(crate) struct GlobalVersion {
     version: u64,
 }
 
+// design-lint: allow unclassified-free-function -- shared redb namespace-prefix encoding preserves checked length framing for physical keys and scans without adding backend byte policy to Namespace
 pub(crate) fn namespace_prefix(namespace: &Namespace) -> Result<Vec<u8>, Error> {
     let namespace_bytes = namespace.0.as_bytes();
     let namespace_len = u32::try_from(namespace_bytes.len()).map_err(|_| {

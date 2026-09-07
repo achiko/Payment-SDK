@@ -45,10 +45,6 @@ pub(super) fn table_error(error: TableError, context: &str) -> Error {
     }
 }
 
-pub(super) fn operation_error(error: StorageError, context: &str) -> Error {
-    storage_error(error, context)
-}
-
 // design-lint: allow unclassified-free-function -- shared redb commit-error adapter between foreign types preserves unknown persistence outcomes for format and batch commits
 pub(super) fn commit_error(error: CommitError) -> Error {
     // A failed commit can have persisted before the error became observable.
@@ -56,7 +52,7 @@ pub(super) fn commit_error(error: CommitError) -> Error {
     unavailable(format!("redb atomic commit outcome is unknown: {error}"))
 }
 
-fn storage_error(error: StorageError, context: &str) -> Error {
+pub(super) fn storage_error(error: StorageError, context: &str) -> Error {
     match error {
         StorageError::Corrupted(detail) => Error::corrupt_data(format!("{context}: {detail}")),
         StorageError::ValueTooLarge(size) => Error::invalid_request(format!(
@@ -93,7 +89,7 @@ mod tests {
 
     #[test]
     fn oversized_native_values_keep_invalid_request_classification_and_context() {
-        let error = operation_error(StorageError::ValueTooLarge(42), "write failed");
+        let error = storage_error(StorageError::ValueTooLarge(42), "write failed");
         assert_eq!(error.kind, ErrorKind::InvalidRequest);
         assert_eq!(
             error.message,
@@ -169,11 +165,30 @@ mod tests {
 
     #[test]
     fn storage_corruption_outside_commit_remains_definite_corrupt_data() {
-        let error = operation_error(
+        let error = storage_error(
             StorageError::Corrupted("fixture damage".to_owned()),
             "read failed",
         );
         assert_eq!(error.kind, ErrorKind::CorruptData);
         assert_eq!(error.message, "read failed: fixture damage");
+    }
+
+    #[test]
+    fn native_io_classification_preserves_corruption_and_unavailability() {
+        let corruption = storage_error(
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "fixture damage",
+            )),
+            "read failed",
+        );
+        assert_eq!(corruption.kind, ErrorKind::CorruptData);
+        assert_eq!(corruption.message, "read failed: fixture damage");
+        let outage = storage_error(
+            StorageError::Io(std::io::Error::other("fixture outage")),
+            "read failed",
+        );
+        assert_eq!(outage.kind, ErrorKind::Unavailable);
+        assert_eq!(outage.message, "read failed: fixture outage");
     }
 }

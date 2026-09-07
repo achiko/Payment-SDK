@@ -17,7 +17,8 @@ pub struct Client<C> {
 
 impl Client<json_rpc::Http> {
     pub fn connect(config: Config) -> Result<Self, Error> {
-        let transport = json_rpc::Http::new(config.into_transport()).map_err(map_transport)?;
+        let transport =
+            json_rpc::Http::new(config.into_transport()).map_err(Error::from_transport)?;
         Ok(Self::new(transport))
     }
 }
@@ -34,7 +35,7 @@ where
             .inner
             .request_once(method, params)
             .await
-            .map_err(map_transport)?;
+            .map_err(Error::from_transport)?;
         let raw = result.map_err(|failure| {
             Error::new(
                 ErrorKind::RpcRemote(failure.code),
@@ -73,18 +74,20 @@ where
     }
 }
 
-fn map_transport(error: json_rpc::Error) -> Error {
-    let kind = match error.kind {
-        json_rpc::ErrorKind::InvalidConfiguration | json_rpc::ErrorKind::InvalidRequest => {
-            ErrorKind::InvalidRpcConfiguration
-        }
-        json_rpc::ErrorKind::Timeout => ErrorKind::RpcTimeout,
-        json_rpc::ErrorKind::Unavailable => ErrorKind::RpcUnavailable,
-        json_rpc::ErrorKind::HttpStatus(status) => ErrorKind::RpcHttpStatus(status),
-        json_rpc::ErrorKind::ResponseTooLarge => ErrorKind::ResponseTooLarge,
-        json_rpc::ErrorKind::InvalidResponse => ErrorKind::MalformedRpc,
-    };
-    Error::new(kind, "Solana RPC request failed")
+impl Error {
+    fn from_transport(error: json_rpc::Error) -> Self {
+        let kind = match error.kind {
+            json_rpc::ErrorKind::InvalidConfiguration | json_rpc::ErrorKind::InvalidRequest => {
+                ErrorKind::InvalidRpcConfiguration
+            }
+            json_rpc::ErrorKind::Timeout => ErrorKind::RpcTimeout,
+            json_rpc::ErrorKind::Unavailable => ErrorKind::RpcUnavailable,
+            json_rpc::ErrorKind::HttpStatus(status) => ErrorKind::RpcHttpStatus(status),
+            json_rpc::ErrorKind::ResponseTooLarge => ErrorKind::ResponseTooLarge,
+            json_rpc::ErrorKind::InvalidResponse => ErrorKind::MalformedRpc,
+        };
+        Self::new(kind, "Solana RPC request failed")
+    }
 }
 
 impl<C> Client<C> {
@@ -196,7 +199,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(error.kind(), expected);
-            assert!(!error.to_string().contains("secret"));
+            assert_eq!(error.to_string(), "Solana RPC request failed");
         }
     }
 
@@ -218,7 +221,12 @@ mod tests {
     #[tokio::test]
     async fn post_dispatch_failures_preserve_only_the_local_ambiguous_id() {
         for outcome in [
+            Outcome::Local(json_rpc::ErrorKind::InvalidConfiguration),
+            Outcome::Local(json_rpc::ErrorKind::InvalidRequest),
             Outcome::Local(json_rpc::ErrorKind::Timeout),
+            Outcome::Local(json_rpc::ErrorKind::Unavailable),
+            Outcome::Local(json_rpc::ErrorKind::HttpStatus(503)),
+            Outcome::Local(json_rpc::ErrorKind::ResponseTooLarge),
             Outcome::Local(json_rpc::ErrorKind::InvalidResponse),
             Outcome::Remote(-32_002),
         ] {
@@ -229,7 +237,7 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.kind, base::TransactionErrorKind::Unknown);
             assert_eq!(error.ambiguous_transaction_id, Some(local));
-            assert!(!error.to_string().contains("provider"));
+            assert_eq!(error.to_string(), "Solana submission outcome is unknown");
         }
     }
 }

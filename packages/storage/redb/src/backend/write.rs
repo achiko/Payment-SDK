@@ -6,7 +6,7 @@ use storage::{
 use crate::codec::{GlobalVersion, StoredRecord, encode_physical_key};
 
 use super::{
-    Backend, DATA_TABLE, GLOBAL_VERSION_KEY, META_TABLE, commit_error, operation_error, other,
+    Backend, DATA_TABLE, GLOBAL_VERSION_KEY, META_TABLE, commit_error, other, storage_error,
     table_error, transaction_error,
 };
 
@@ -54,7 +54,7 @@ impl Backend {
 
             let current_version = match meta
                 .get(GLOBAL_VERSION_KEY)
-                .map_err(|error| operation_error(error, "failed to read redb global version"))?
+                .map_err(|error| storage_error(error, "failed to read redb global version"))?
             {
                 Some(raw) => Version::from(GlobalVersion::try_from(raw.value())?),
                 None => Version(0),
@@ -78,14 +78,14 @@ impl Backend {
                         drop(
                             data.insert(physical_key.as_slice(), frame.as_slice())
                                 .map_err(|error| {
-                                    operation_error(error, "failed to write redb data record")
+                                    storage_error(error, "failed to write redb data record")
                                 })?,
                         );
                     }
                     Operation::Delete { namespace, key } => {
                         let physical_key = encode_physical_key(&namespace, &key)?;
                         drop(data.remove(physical_key.as_slice()).map_err(|error| {
-                            operation_error(error, "failed to delete redb data record")
+                            storage_error(error, "failed to delete redb data record")
                         })?);
                     }
                 }
@@ -93,9 +93,7 @@ impl Backend {
             let encoded_version = GlobalVersion::new(next_version)?.encode()?;
             drop(
                 meta.insert(GLOBAL_VERSION_KEY, encoded_version.as_slice())
-                    .map_err(|error| {
-                        operation_error(error, "failed to write redb global version")
-                    })?,
+                    .map_err(|error| storage_error(error, "failed to write redb global version"))?,
             );
         }
 
@@ -123,7 +121,7 @@ impl Backend {
             .map_err(|error| table_error(error, "redb metadata table is incompatible"))?;
         if let Some(raw) = meta
             .get(GLOBAL_VERSION_KEY)
-            .map_err(|error| operation_error(error, "failed to read redb global version"))?
+            .map_err(|error| storage_error(error, "failed to read redb global version"))?
         {
             return GlobalVersion::try_from(raw.value()).map(Version::from);
         }
@@ -134,7 +132,7 @@ impl Backend {
             .map_err(|error| table_error(error, "redb data table is incompatible"))?;
         if data
             .first()
-            .map_err(|error| operation_error(error, "failed to inspect redb data table"))?
+            .map_err(|error| storage_error(error, "failed to inspect redb data table"))?
             .is_some()
         {
             return Err(Error::corrupt_data(
@@ -156,7 +154,7 @@ fn evaluate_condition(
             let physical_key = encode_physical_key(namespace, key)?;
             if data
                 .get(physical_key.as_slice())
-                .map_err(|error| operation_error(error, "failed to evaluate redb condition"))?
+                .map_err(|error| storage_error(error, "failed to evaluate redb condition"))?
                 .is_some()
             {
                 return Err(Error::conflict(format!(
@@ -173,7 +171,7 @@ fn evaluate_condition(
             let physical_key = encode_physical_key(namespace, key)?;
             let raw = data
                 .get(physical_key.as_slice())
-                .map_err(|error| operation_error(error, "failed to evaluate redb condition"))?
+                .map_err(|error| storage_error(error, "failed to evaluate redb condition"))?
                 .ok_or_else(|| {
                     Error::conflict(format!(
                         "version condition failed in namespace `{}` because the key is missing",

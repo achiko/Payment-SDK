@@ -3,20 +3,19 @@ use base::{
     SignatureScheme, Signer,
 };
 use bitcoin::{
-    Address as NativeAddress, Amount, CompressedPublicKey, OutPoint, ScriptBuf, Sequence,
-    Transaction, TxIn, TxOut, Txid, Witness, absolute, consensus,
+    Address as NativeAddress, Amount, CompressedPublicKey, ScriptBuf, Transaction, TxOut, Witness,
+    consensus,
     hashes::Hash,
     key::{TapTweak, XOnlyPublicKey},
     secp256k1::{Message, Secp256k1, ecdsa, schnorr},
     sighash::{Prevouts, SighashCache},
-    transaction::Version,
 };
 
 use crate::{ChainError, Network};
 
 use super::{
-    Input, SighashType, SignedTransaction, TransactionId, UnsignedTransaction, native_network,
-    signer_error, signer_error_message, taproot_sighash_type,
+    Input, SighashType, SignedTransaction, TransactionId, UnsignedTransaction, signer_error,
+    signer_error_message, taproot_sighash_type,
 };
 
 struct InputSigner<'a, S: ?Sized> {
@@ -50,7 +49,7 @@ pub(in crate::transaction) async fn sign_each<S: Signer + ?Sized>(
             "Bitcoin transaction needs exactly one signer per input",
         ));
     }
-    let mut native = native_transaction(network, &transaction)?;
+    let mut native = transaction.native(network)?;
     let prevouts = transaction
         .inputs
         .iter()
@@ -85,41 +84,6 @@ pub(in crate::transaction) async fn sign_each<S: Signer + ?Sized>(
 
     let id = TransactionId::from(native.compute_txid());
     SignedTransaction::from_consensus_bytes(id, consensus::serialize(&native))
-}
-
-fn native_transaction(
-    network: Network,
-    transaction: &UnsignedTransaction,
-) -> Result<Transaction, ChainError> {
-    let input = transaction
-        .inputs
-        .iter()
-        .map(|input| TxIn {
-            previous_output: OutPoint::new(
-                Txid::from_byte_array(input.utxo.transaction_id),
-                input.utxo.output_index,
-            ),
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence(input.sequence),
-            witness: Witness::new(),
-        })
-        .collect();
-    let output = transaction
-        .outputs
-        .iter()
-        .map(|output| {
-            Ok(TxOut {
-                value: Amount::from_sat(output.value.0),
-                script_pubkey: output.address.script_pubkey_for_network(network)?,
-            })
-        })
-        .collect::<Result<Vec<_>, ChainError>>()?;
-    Ok(Transaction {
-        version: Version(transaction.version),
-        lock_time: absolute::LockTime::from_consensus(transaction.lock_time),
-        input,
-        output,
-    })
 }
 
 impl<S: Signer + ?Sized> InputSigner<'_, S> {
@@ -159,9 +123,7 @@ impl<S: Signer + ?Sized> InputSigner<'_, S> {
             CompressedPublicKey::from_slice(&signed.public_key.bytes).map_err(|error| {
                 signer_error_message(format!("invalid compressed Bitcoin public key: {error}"))
             })?;
-        if NativeAddress::p2wpkh(&public_key, native_network(self.network)).script_pubkey()
-            != *script
-        {
+        if NativeAddress::p2wpkh(&public_key, self.network.native()).script_pubkey() != *script {
             return Err(signer_error_message(format!(
                 "Bitcoin input {input_index} does not belong to its signing key"
             )));
@@ -232,8 +194,8 @@ impl<S: Signer + ?Sized> InputSigner<'_, S> {
             signer_error_message(format!("invalid x-only Bitcoin public key: {error}"))
         })?;
         let secp = Secp256k1::verification_only();
-        let expected = NativeAddress::p2tr(&secp, public_key, None, native_network(self.network))
-            .script_pubkey();
+        let expected =
+            NativeAddress::p2tr(&secp, public_key, None, self.network.native()).script_pubkey();
         if expected != self.prevouts[input_index].script_pubkey {
             return Err(signer_error_message(format!(
                 "Bitcoin Taproot input {input_index} does not belong to its signing key"

@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use super::provider::{Config, SNAPSHOT_KIND, network_name, transaction_error};
+use super::provider::{Config, SNAPSHOT_KIND, transaction_error};
 use crate::{Address, Satoshi};
 use base::{Decimal, TransactionError, TransactionErrorKind, TransactionSnapshot};
 
@@ -46,7 +46,7 @@ pub(super) fn decode(
     }
     let data: Data = serde_json::from_value(snapshot.value().clone())
         .map_err(|error| invalid(format!("invalid Bitcoin snapshot: {error}")))?;
-    let network = network_name(config.network);
+    let network = config.network.canonical_name();
     if data.scope.chain != config.scope.chain.0
         || data.scope.network != config.scope.network
         || data.scope.chain != "bitcoin"

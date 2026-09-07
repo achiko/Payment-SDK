@@ -40,7 +40,7 @@ pub struct Config {
 
 impl Config {
     fn validate(&self) -> Result<(), WalletError> {
-        if self.scope.chain.0 != "bitcoin" || self.scope.network != network_name(self.network) {
+        if self.scope.chain.0 != "bitcoin" || self.scope.network != self.network.canonical_name() {
             return Err(WalletError::new(
                 WalletErrorKind::Unsupported,
                 "Bitcoin wallet chain and network must agree",
@@ -281,16 +281,6 @@ impl wallets::SingleSender for Wallet {
     }
 }
 
-pub(super) const fn network_name(network: Network) -> &'static str {
-    match network {
-        Network::Mainnet => "mainnet",
-        Network::Testnet3 => "testnet3",
-        Network::Testnet4 => "testnet4",
-        Network::Signet => "signet",
-        Network::Regtest => "regtest",
-    }
-}
-
 impl Broadcaster for Wallet {
     fn broadcast<'a>(
         &'a self,
@@ -501,7 +491,7 @@ mod tests {
         let network = Network::Regtest;
         let scope = IndexScope {
             chain: ChainId(crate::CHAIN.to_owned()),
-            network: network_name(network).to_owned(),
+            network: network.canonical_name().to_owned(),
         };
         let dependencies = Arc::new(InactiveDependencies);
         let outputs: Arc<dyn Outputs> = dependencies.clone();

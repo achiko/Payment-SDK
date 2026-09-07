@@ -12,7 +12,7 @@ pub(in crate::transaction) async fn sign(
     transaction: UnsignedTransaction,
     signer: &dyn Signer,
 ) -> Result<SignedTransaction, ChainError> {
-    let native = native_transaction(&transaction)?;
+    let native = transaction.eip1559()?;
     let signature_hash = native.signature_hash();
     let signed = signer
         .sign(SignRequest {
@@ -58,39 +58,38 @@ pub(in crate::transaction) async fn sign(
     })
 }
 
-fn native_transaction(transaction: &UnsignedTransaction) -> Result<TxEip1559, ChainError> {
-    let max_fee_per_gas = transaction
-        .max_fee_per_gas
-        .checked_to_u128()
-        .ok_or_else(|| {
+impl UnsignedTransaction {
+    fn eip1559(&self) -> Result<TxEip1559, ChainError> {
+        let max_fee_per_gas = self.max_fee_per_gas.checked_to_u128().ok_or_else(|| {
             ChainError::new(
                 ChainErrorKind::InvalidTransaction,
                 "Ethereum max fee per gas exceeds u128",
             )
         })?;
-    let max_priority_fee_per_gas = transaction
-        .max_priority_fee_per_gas
-        .checked_to_u128()
-        .ok_or_else(|| {
-            ChainError::new(
-                ChainErrorKind::InvalidTransaction,
-                "Ethereum priority fee exceeds u128",
-            )
-        })?;
+        let max_priority_fee_per_gas =
+            self.max_priority_fee_per_gas
+                .checked_to_u128()
+                .ok_or_else(|| {
+                    ChainError::new(
+                        ChainErrorKind::InvalidTransaction,
+                        "Ethereum priority fee exceeds u128",
+                    )
+                })?;
 
-    Ok(TxEip1559 {
-        chain_id: transaction.chain_id,
-        nonce: transaction.nonce,
-        gas_limit: transaction.gas_limit,
-        max_fee_per_gas,
-        max_priority_fee_per_gas,
-        to: transaction.to.as_ref().map_or(TxKind::Create, |address| {
-            TxKind::Call(Address::from(address.0))
-        }),
-        value: U256::from_be_bytes(transaction.value.0),
-        access_list: Default::default(),
-        input: Bytes::from(transaction.input.clone()),
-    })
+        Ok(TxEip1559 {
+            chain_id: self.chain_id,
+            nonce: self.nonce,
+            gas_limit: self.gas_limit,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+            to: self.to.as_ref().map_or(TxKind::Create, |address| {
+                TxKind::Call(Address::from(address.0))
+            }),
+            value: U256::from_be_bytes(self.value.0),
+            access_list: Default::default(),
+            input: Bytes::from(self.input.clone()),
+        })
+    }
 }
 
 fn signer_error(error: base::SignerError) -> ChainError {
@@ -114,6 +113,39 @@ mod tests {
     impl Signer for MustNotSign {
         fn sign<'a>(&'a self, _: SignRequest) -> base::SignFuture<'a> {
             panic!("out-of-range fees must fail before signing")
+        }
+    }
+
+    #[test]
+    fn eip1559_preserves_call_creation_and_full_width_value() {
+        for to in [None, Some(crate::Address([2; 20]))] {
+            let transaction = UnsignedTransaction {
+                chain_id: u64::MAX,
+                nonce: 42,
+                from: crate::Address([1; 20]),
+                to,
+                value: Wei([255; 32]),
+                input: vec![0, 127, 255],
+                gas_limit: 123_456,
+                max_fee_per_gas: Wei::from_u128(u128::MAX),
+                max_priority_fee_per_gas: Wei::from_u128(u128::MAX - 1),
+            };
+            let native = transaction.eip1559().expect("representable fees");
+            assert_eq!(native.chain_id, u64::MAX);
+            assert_eq!(native.nonce, 42);
+            assert_eq!(native.gas_limit, 123_456);
+            assert_eq!(native.max_fee_per_gas, u128::MAX);
+            assert_eq!(native.max_priority_fee_per_gas, u128::MAX - 1);
+            assert_eq!(native.value, U256::MAX);
+            assert_eq!(native.input.as_ref(), [0, 127, 255]);
+            assert!(native.access_list.0.is_empty());
+            assert_eq!(
+                native.to,
+                match transaction.to {
+                    Some(address) => TxKind::Call(Address::from(address.0)),
+                    None => TxKind::Create,
+                }
+            );
         }
     }
 

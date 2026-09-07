@@ -208,7 +208,10 @@ fn check_sufficiency(
             .insert(transfer.source().clone(), *balance)
             .is_some_and(|previous| previous != *balance)
         {
-            return Err(operation("Solana source balance witness is inconsistent"));
+            return Err(SendError::operation(
+                WalletErrorKind::Unavailable,
+                "Solana source balance witness is inconsistent",
+            ));
         }
         let needed = transfer.amount().checked_add(*fee).ok_or_else(|| {
             item(
@@ -246,8 +249,8 @@ async fn race<T>(
     future: impl std::future::Future<Output = Result<T, Error>>,
 ) -> Result<T, SendError> {
     tokio::select! {
-        result = future => result.map_err(|_| operation("Solana transaction preparation failed")),
-        () = cancellation.cancelled() => Err(operation("Solana transaction preparation was cancelled")),
+        result = future => result.map_err(|_| SendError::operation(WalletErrorKind::Unavailable, "Solana transaction preparation failed")),
+        () = cancellation.cancelled() => Err(SendError::operation(WalletErrorKind::Unavailable, "Solana transaction preparation was cancelled")),
     }
 }
 
@@ -268,18 +271,14 @@ where
                 WalletErrorKind::Transaction,
                 "Solana transaction simulation failed",
             )),
-            Err(_) => Err(operation("Solana transaction simulation is unavailable")),
+            Err(_) => Err(SendError::operation(WalletErrorKind::Unavailable, "Solana transaction simulation is unavailable")),
         },
-        () = cancellation.cancelled() => Err(operation("Solana transaction preparation was cancelled")),
+        () = cancellation.cancelled() => Err(SendError::operation(WalletErrorKind::Unavailable, "Solana transaction preparation was cancelled")),
     }
 }
 
 fn item(index: usize, kind: WalletErrorKind, message: &'static str) -> SendError {
     SendError::item(index, Vec::new(), WalletError::new(kind, message))
-}
-
-fn operation(message: &'static str) -> SendError {
-    SendError::operation(WalletErrorKind::Unavailable, message)
 }
 
 #[cfg(test)]
@@ -298,6 +297,64 @@ mod tests {
         Arc::new(
             Key::from_seed(hex::encode([value; 32]).parse::<Seed>().expect("seed")).expect("key"),
         )
+    }
+
+    #[tokio::test]
+    async fn preparation_rpc_failure_and_cancellation_have_no_submission_metadata() {
+        let failure = race::<()>(&Cancellation::default(), async {
+            Err(Error::new(ErrorKind::RpcTimeout, "provider secret"))
+        })
+        .await
+        .unwrap_err();
+        let cancellation = Cancellation::default();
+        cancellation.cancel();
+        let cancelled = race::<()>(&cancellation, std::future::pending())
+            .await
+            .unwrap_err();
+        for (error, message) in [
+            (failure, "Solana transaction preparation failed"),
+            (cancelled, "Solana transaction preparation was cancelled"),
+        ] {
+            assert_eq!(error.source.kind, WalletErrorKind::Unavailable);
+            assert_eq!(error.to_string(), message);
+            assert!(error.accepted.is_empty());
+            assert_eq!(error.failed_index, None);
+            assert_eq!(error.ambiguous_transaction_id, None);
+            assert_eq!(error.source.ambiguous_transaction_id, None);
+        }
+    }
+
+    #[test]
+    fn inconsistent_balance_witness_is_operation_wide_before_amount_validation() {
+        let source = Address::from_bytes([1; 32]);
+        let transfers = [
+            ResolvedTransfer::new(
+                0,
+                source.clone(),
+                Address::from_bytes([2; 32]).to_string(),
+                Lamport::from_atomic(1),
+            ),
+            ResolvedTransfer::new(
+                1,
+                source,
+                Address::from_bytes([3; 32]).to_string(),
+                Lamport::from_atomic(u64::MAX),
+            ),
+        ];
+        let error = check_sufficiency(
+            &transfers,
+            &[Lamport::from_atomic(10), Lamport::from_atomic(11)],
+            &[Lamport::from_atomic(1), Lamport::from_atomic(1)],
+        )
+        .unwrap_err();
+        assert_eq!(error.source.kind, WalletErrorKind::Unavailable);
+        assert_eq!(
+            error.to_string(),
+            "Solana source balance witness is inconsistent"
+        );
+        assert!(error.accepted.is_empty());
+        assert_eq!(error.failed_index, None);
+        assert_eq!(error.ambiguous_transaction_id, None);
     }
 
     #[test]

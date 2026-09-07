@@ -216,7 +216,7 @@ where
             .map(|result| {
                 let raw = match result {
                     Ok(raw) => raw,
-                    Err(failure) => return Err(map_remote_failure(failure)),
+                    Err(failure) => return Err(CallFailure::remote(failure).error),
                 };
                 if raw
                     .deserialize::<Value>()
@@ -251,10 +251,7 @@ where
         match self.client.call(method, params).await {
             Ok(result) => Ok(result),
             Err(CallError::Local(error)) => Err(CallFailure::local(error)),
-            Err(CallError::Remote(failure)) => Err(CallFailure {
-                remote_code: Some(failure.code),
-                error: map_remote_failure(failure),
-            }),
+            Err(CallError::Remote(failure)) => Err(CallFailure::remote(failure)),
         }
     }
 }
@@ -339,6 +336,19 @@ struct CallFailure {
 }
 
 impl CallFailure {
+    fn remote(failure: Failure) -> Self {
+        Self {
+            remote_code: Some(failure.code),
+            error: source_error(
+                format!(
+                    "Ethereum JSON-RPC request failed with code {}",
+                    failure.code
+                ),
+                failure.is_server_error(),
+            ),
+        }
+    }
+
     fn local(error: SourceError) -> Self {
         Self {
             remote_code: None,
@@ -347,18 +357,9 @@ impl CallFailure {
     }
 }
 
+// design-lint: allow unclassified-free-function -- Ethereum indexing RPC translation between foreign JSON-RPC and SourceError types preserves transport retryability and display context at the chain boundary
 fn map_json_rpc_error(error: Error) -> SourceError {
     source_error(error.to_string(), error.is_retryable())
-}
-
-fn map_remote_failure(failure: Failure) -> SourceError {
-    source_error(
-        format!(
-            "Ethereum JSON-RPC request failed with code {}",
-            failure.code
-        ),
-        failure.is_server_error(),
-    )
 }
 
 fn source_error(message: impl Into<String>, retryable: bool) -> SourceError {

@@ -54,69 +54,71 @@ impl<R: Transactions> History for Index<R> {
                     true,
                 ));
             }
-            observe(page, self.confirmations)
+            self.observe(page)
         })
     }
 }
 
-fn observe(page: CanonicalPage, minimum_confirmations: u64) -> Result<TransactionPage, IndexError> {
-    let transactions = page
-        .transactions
-        .into_iter()
-        .map(|transaction| {
-            let status = match transaction.status {
-                CanonicalStatus::Included { block } => {
-                    let confirmations = match page.checkpoint.as_ref() {
-                        Some(tip) => tip
-                            .height
-                            .0
-                            .checked_sub(block.height.0)
-                            .and_then(|value| value.checked_add(1))
-                            .ok_or_else(|| {
-                                IndexError::new(
+impl<R> Index<R> {
+    fn observe(&self, page: CanonicalPage) -> Result<TransactionPage, IndexError> {
+        let transactions = page
+            .transactions
+            .into_iter()
+            .map(|transaction| {
+                let status = match transaction.status {
+                    CanonicalStatus::Included { block } => {
+                        let confirmations = match page.checkpoint.as_ref() {
+                            Some(tip) => tip
+                                .height
+                                .0
+                                .checked_sub(block.height.0)
+                                .and_then(|value| value.checked_add(1))
+                                .ok_or_else(|| {
+                                    IndexError::new(
+                                        IndexErrorKind::Store,
+                                        "history contains a transaction beyond its checkpoint",
+                                        false,
+                                    )
+                                })?,
+                            None => {
+                                return Err(IndexError::new(
                                     IndexErrorKind::Store,
-                                    "history contains a transaction beyond its checkpoint",
+                                    "history exists without a checkpoint",
                                     false,
-                                )
-                            })?,
-                        None => {
-                            return Err(IndexError::new(
-                                IndexErrorKind::Store,
-                                "history exists without a checkpoint",
-                                false,
-                            ));
-                        }
-                    };
-                    if confirmations >= minimum_confirmations {
-                        TransactionStatus::Confirmed {
-                            block,
-                            confirmations,
-                        }
-                    } else {
-                        TransactionStatus::Included {
-                            block,
-                            confirmations,
+                                ));
+                            }
+                        };
+                        if confirmations >= self.confirmations {
+                            TransactionStatus::Confirmed {
+                                block,
+                                confirmations,
+                            }
+                        } else {
+                            TransactionStatus::Included {
+                                block,
+                                confirmations,
+                            }
                         }
                     }
-                }
-                CanonicalStatus::Failed { block, reason } => {
-                    TransactionStatus::Failed { block, reason }
-                }
-            };
-            Ok(ObservedTransaction {
-                scope: transaction.scope,
-                transaction_id: transaction.transaction_id,
-                status,
-                movements: transaction.movements,
-                fee: transaction.fee,
+                    CanonicalStatus::Failed { block, reason } => {
+                        TransactionStatus::Failed { block, reason }
+                    }
+                };
+                Ok(ObservedTransaction {
+                    scope: transaction.scope,
+                    transaction_id: transaction.transaction_id,
+                    status,
+                    movements: transaction.movements,
+                    fee: transaction.fee,
+                })
             })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(TransactionPage {
+            checkpoint: page.checkpoint,
+            transactions,
+            next: page.next,
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(TransactionPage {
-        checkpoint: page.checkpoint,
-        transactions,
-        next: page.next,
-    })
+    }
 }
 
 pub trait Checkpoint: Send + Sync {
@@ -209,11 +211,97 @@ mod tests {
             transactions: vec![transaction(&scope, 2)],
             next: None,
         };
-        let result = observe(page, 2).expect("canonical history");
+        let result = Index::new((), 2).observe(page).expect("canonical history");
         assert!(matches!(
             result.transactions[0].status,
             TransactionStatus::Confirmed { .. }
         ));
+    }
+
+    #[test]
+    fn confirmation_threshold_uses_produced_height_instead_of_native_position() {
+        let checkpoint = BlockRef {
+            position: crate::BlockPosition(1_000),
+            ..block(3)
+        };
+        let page = CanonicalPage {
+            checkpoint: Some(checkpoint),
+            transactions: vec![transaction(&scope(), 2)],
+            next: None,
+        };
+        let included = Index::new((), 3)
+            .observe(page.clone())
+            .expect("below threshold");
+        assert!(matches!(
+            included.transactions[0].status,
+            TransactionStatus::Included {
+                confirmations: 2,
+                ..
+            }
+        ));
+        let confirmed = Index::new((), 2).observe(page).expect("at threshold");
+        assert!(matches!(
+            confirmed.transactions[0].status,
+            TransactionStatus::Confirmed {
+                confirmations: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn observation_rejects_missing_checkpoint_and_invalid_confirmation_arithmetic() {
+        for (checkpoint, height, message) in [
+            (None, 0, "history exists without a checkpoint"),
+            (
+                Some(block(2)),
+                3,
+                "history contains a transaction beyond its checkpoint",
+            ),
+            (
+                Some(block(u64::MAX)),
+                0,
+                "history contains a transaction beyond its checkpoint",
+            ),
+        ] {
+            let page = CanonicalPage {
+                checkpoint,
+                transactions: vec![transaction(&scope(), height)],
+                next: None,
+            };
+            let error = Index::new((), 1)
+                .observe(page)
+                .expect_err("invalid included history");
+            assert_eq!(error.kind, IndexErrorKind::Store);
+            assert_eq!(error.message, message);
+            assert!(!error.retryable);
+        }
+    }
+
+    #[test]
+    fn failed_history_keeps_its_existing_passthrough_semantics() {
+        let mut failed = transaction(&scope(), 2);
+        failed.status = CanonicalStatus::Failed {
+            block: block(2),
+            reason: Some("reverted".into()),
+        };
+        let page = CanonicalPage {
+            checkpoint: None,
+            transactions: vec![failed],
+            next: None,
+        };
+        let observed = Index::new((), u64::MAX)
+            .observe(page)
+            .expect("failed observation");
+        assert_eq!(
+            observed.transactions[0].status,
+            TransactionStatus::Failed {
+                block: block(2),
+                reason: Some("reverted".into())
+            }
+        );
+        assert_eq!(observed.checkpoint, None);
+        assert_eq!(observed.next, None);
     }
 
     #[test]

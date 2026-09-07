@@ -4,7 +4,7 @@ use base::{
     TransactionSnapshot,
 };
 
-use super::provider::{PREPARED_KIND, SNAPSHOT_KIND, Wallet, network_name, transaction_error};
+use super::provider::{PREPARED_KIND, SNAPSHOT_KIND, Wallet, transaction_error};
 use crate::{Address, BuildRequest, Output, SpendSource, TransactionBuilder, TransactionId};
 
 pub(super) struct Builder {
@@ -47,7 +47,7 @@ impl Builder {
     }
 
     fn validate(&self) -> Result<(), TransactionError> {
-        if self.scope.chain.0 != "bitcoin" || self.scope.network != network_name(self.network) {
+        if self.scope.chain.0 != "bitcoin" || self.scope.network != self.network.canonical_name() {
             return Err(transaction_error(
                 TransactionErrorKind::InvalidSnapshot,
                 "Bitcoin transaction identity, chain, and network do not agree",

@@ -1,6 +1,4 @@
-use bitcoin::Network as NativeNetwork;
-
-use crate::{ChainError, ChainErrorKind, Network};
+use crate::{ChainError, ChainErrorKind};
 
 use super::{
     BuildRequest, Funding, Input, Output, SighashType, SignedTransaction, SpendSource,
@@ -15,16 +13,6 @@ pub(super) use build::build_grouped;
 pub(super) use sign::{sign, sign_each};
 
 use rules::{checked_output, sum_utxos, taproot_sighash_type, validate_unique_utxos};
-
-pub(crate) const fn native_network(network: Network) -> NativeNetwork {
-    match network {
-        Network::Mainnet => NativeNetwork::Bitcoin,
-        Network::Testnet3 => NativeNetwork::Testnet,
-        Network::Testnet4 => NativeNetwork::Testnet4,
-        Network::Signet => NativeNetwork::Signet,
-        Network::Regtest => NativeNetwork::Regtest,
-    }
-}
 
 fn signer_error(error: base::SignerError) -> ChainError {
     signer_error_message(format!("Bitcoin signing failed: {error}"))
