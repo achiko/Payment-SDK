@@ -261,6 +261,7 @@ impl Blocks for Repository {
     }
 }
 
+// design-lint: allow unclassified-free-function -- shared PostgreSQL pool, schema and repository input validation maps caller context to nonretryable InvalidRequest before storage access
 fn invalid(message: impl Into<String>) -> IndexError {
     IndexError::new(IndexErrorKind::InvalidRequest, message, false)
 }
@@ -299,6 +300,35 @@ mod tests {
                 error.message,
                 "PostgreSQL schema must be a canonical application identifier"
             );
+            assert!(!error.retryable);
         }
+    }
+
+    #[test]
+    fn repository_rejects_empty_scope_before_acquiring_a_connection() {
+        let pool = pool("postgres://localhost/unused", 1).expect("lazy pool configuration");
+        for (chain, network) in [
+            ("", "test"),
+            (" \t", "test"),
+            ("chain", ""),
+            ("chain", " \t"),
+        ] {
+            let error = Repository::new(
+                pool.clone(),
+                IndexScope {
+                    chain: indexing::ChainId(chain.into()),
+                    network: network.into(),
+                },
+            )
+            .err()
+            .expect("empty repository scope");
+            assert_eq!(error.kind, IndexErrorKind::InvalidRequest);
+            assert_eq!(
+                error.message,
+                "persistent index scope must contain a chain and network"
+            );
+            assert!(!error.retryable);
+        }
+        assert_eq!(pool.status().size, 0, "validation must not open storage");
     }
 }

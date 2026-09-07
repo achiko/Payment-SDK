@@ -102,7 +102,7 @@ impl IndexUtxos {
                             false,
                         )
                     })?;
-                let value = indexed_satoshis(&output.amount)?;
+                let value = Satoshi::from_indexed_amount(&output.amount)?;
                 let confirmations = checkpoint
                     .height
                     .0
@@ -193,14 +193,16 @@ fn validate_cursor(
     Ok(())
 }
 
-/// Indexing persists Bitcoin amounts in chain-native atomic units. Unlike the
-/// public wallet API, this boundary must not interpret the decimal as BTC and
-/// multiply it by `10^8` a second time.
-fn indexed_satoshis(amount: &base::Decimal) -> Result<Satoshi, SourceError> {
-    amount
-        .to_atomic_u64(0)
-        .map(Satoshi)
-        .map_err(|error| source_error(error.to_string(), false))
+impl Satoshi {
+    /// Indexing persists Bitcoin amounts in chain-native atomic units. Unlike the
+    /// public wallet API, this boundary must not interpret the decimal as BTC and
+    /// multiply it by `10^8` a second time.
+    fn from_indexed_amount(amount: &base::Decimal) -> Result<Self, SourceError> {
+        amount
+            .to_atomic_u64(0)
+            .map(Self)
+            .map_err(|error| source_error(error.to_string(), false))
+    }
 }
 
 fn source_error(message: impl Into<String>, retryable: bool) -> SourceError {
@@ -308,7 +310,7 @@ mod tests {
         let amount = Decimal::from(100_000_u64);
 
         assert_eq!(
-            indexed_satoshis(&amount).expect("atomic indexed amount must convert"),
+            Satoshi::from_indexed_amount(&amount).expect("atomic indexed amount must convert"),
             Satoshi(100_000)
         );
     }
@@ -324,12 +326,33 @@ mod tests {
             .expect_err("fractional satoshis must be rejected");
 
         assert_eq!(error.kind, DecimalErrorKind::ExcessPrecision);
-        let boundary_error =
-            indexed_satoshis(&amount).expect_err("index adapter must reject fractional satoshis");
+        let boundary_error = Satoshi::from_indexed_amount(&amount)
+            .expect_err("index adapter must reject fractional satoshis");
         assert_eq!(
             boundary_error.message,
             "amount has more than 0 fractional digits"
         );
         assert!(!boundary_error.retryable);
+    }
+
+    #[test]
+    fn indexed_amount_preserves_zero_maximum_and_rejects_invalid_integers() {
+        for amount in [0, u64::MAX] {
+            assert_eq!(
+                Satoshi::from_indexed_amount(&Decimal::from(amount)).unwrap(),
+                Satoshi(amount)
+            );
+        }
+        for (amount, message) in [
+            ("-1", "currency amount must not be negative"),
+            (
+                "18446744073709551616",
+                "atomic amount exceeds the u64 range",
+            ),
+        ] {
+            let error = Satoshi::from_indexed_amount(&amount.parse().unwrap()).unwrap_err();
+            assert_eq!(error.message, message);
+            assert!(!error.retryable);
+        }
     }
 }

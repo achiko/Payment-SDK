@@ -105,6 +105,26 @@ impl Config {
             retry: Retry::default(),
         }
     }
+
+    fn parsed_headers(&self) -> std::result::Result<HeaderMap, Error> {
+        let mut headers = HeaderMap::new();
+        for (name, value) in &self.headers {
+            let name = name.parse::<http_types::HeaderName>().map_err(|_| {
+                Error::new(
+                    ErrorKind::InvalidConfiguration,
+                    "JSON-RPC header name is invalid",
+                )
+            })?;
+            let value = HeaderValue::from_str(value).map_err(|_| {
+                Error::new(
+                    ErrorKind::InvalidConfiguration,
+                    "JSON-RPC header value is invalid",
+                )
+            })?;
+            headers.insert(name, value);
+        }
+        Ok(headers)
+    }
 }
 
 #[derive(Clone)]
@@ -128,7 +148,7 @@ impl fmt::Debug for Http {
 impl Http {
     pub fn new(config: Config) -> std::result::Result<Self, Error> {
         validate(&config)?;
-        let headers = headers(&config.headers)?;
+        let headers = config.parsed_headers()?;
         let max_request = u32::try_from(config.max_request_bytes).map_err(|_| invalid_limit())?;
         let max_response = u32::try_from(config.max_response_bytes).map_err(|_| invalid_limit())?;
         let clients = config
@@ -341,26 +361,6 @@ fn map_error(error: RpcError) -> Error {
     }
 }
 
-fn headers(values: &[(String, String)]) -> std::result::Result<HeaderMap, Error> {
-    let mut headers = HeaderMap::new();
-    for (name, value) in values {
-        let name = name.parse::<http_types::HeaderName>().map_err(|_| {
-            Error::new(
-                ErrorKind::InvalidConfiguration,
-                "JSON-RPC header name is invalid",
-            )
-        })?;
-        let value = HeaderValue::from_str(value).map_err(|_| {
-            Error::new(
-                ErrorKind::InvalidConfiguration,
-                "JSON-RPC header value is invalid",
-            )
-        })?;
-        headers.insert(name, value);
-    }
-    Ok(headers)
-}
-
 fn validate(config: &Config) -> std::result::Result<(), Error> {
     if config.endpoints.is_empty() || config.endpoints.iter().any(|value| value.trim().is_empty()) {
         return Err(Error::new(
@@ -385,4 +385,67 @@ fn invalid_limit() -> Error {
         ErrorKind::InvalidConfiguration,
         "JSON-RPC size limit exceeds the supported range",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_headers_preserve_last_value_and_original_configuration() {
+        let mut config = Config::new("http://example.invalid", Duration::from_secs(1));
+        config.headers = vec![
+            ("X-Token".to_owned(), "first".to_owned()),
+            ("authorization".to_owned(), "Bearer hidden".to_owned()),
+            ("x-token".to_owned(), "last".to_owned()),
+        ];
+        let original = config.headers.clone();
+        let parsed = config
+            .parsed_headers()
+            .expect("configured headers must parse");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed.get_all("x-token").iter().count(), 1);
+        assert_eq!(parsed["x-token"], "last");
+        assert_eq!(parsed["authorization"], "Bearer hidden");
+        assert_eq!(config.headers, original);
+    }
+
+    #[test]
+    fn configured_headers_validate_in_order_without_exposing_values() {
+        for (headers, message) in [
+            (
+                vec![("invalid name", "hidden\nvalue")],
+                "JSON-RPC header name is invalid",
+            ),
+            (
+                vec![("x-token", "hidden\nvalue"), ("invalid name", "value")],
+                "JSON-RPC header value is invalid",
+            ),
+        ] {
+            let mut config = Config::new("http://example.invalid", Duration::from_secs(1));
+            config.headers = headers
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                .collect();
+            config.max_request_bytes = usize::MAX;
+            let error = Http::new(config)
+                .expect_err("headers must validate before size conversion and client building");
+            assert_eq!(error.kind, ErrorKind::InvalidConfiguration);
+            assert_eq!(error.message, message);
+            assert!(!error.is_retryable());
+        }
+    }
+
+    #[test]
+    fn endpoint_and_zero_bound_checks_still_precede_header_parsing() {
+        let mut config = Config::new("", Duration::ZERO);
+        config
+            .headers
+            .push(("invalid name".to_owned(), "hidden".to_owned()));
+        let error = Http::new(config.clone()).expect_err("empty endpoint must fail first");
+        assert_eq!(error.message, "JSON-RPC requires at least one endpoint");
+        config.endpoints[0] = "http://example.invalid".to_owned();
+        let error = Http::new(config).expect_err("zero bounds must fail before headers");
+        assert_eq!(error.message, "JSON-RPC bounds must be greater than zero");
+    }
 }

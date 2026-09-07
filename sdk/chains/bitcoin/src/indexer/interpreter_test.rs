@@ -410,3 +410,74 @@ fn missing_resolved_prevout_fails_before_commit() {
     assert_eq!(error.kind, crate::ChainErrorKind::InvalidTransaction);
     assert!(error.message.contains("resolved previous output"));
 }
+
+#[test]
+fn invalid_address_filters_keep_nonretryable_request_errors() {
+    let canonical = p2wpkh_address(0x02).to_string();
+    for (value, message) in [
+        (
+            "not-an-address".to_owned(),
+            "Bitcoin indexed address is invalid or wrong-network",
+        ),
+        (
+            "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn".to_owned(),
+            "Bitcoin indexing supports P2WPKH and P2TR addresses only",
+        ),
+        (
+            canonical.to_uppercase(),
+            "Bitcoin indexed address is not canonical",
+        ),
+    ] {
+        let error = BlockInterpreter::new(scope(), Network::Regtest)
+            .unwrap()
+            .inspect(
+                &block(Vec::new()),
+                &[CanonicalAddress {
+                    scope: scope(),
+                    value,
+                }],
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, IndexErrorKind::InvalidRequest);
+        assert_eq!(error.message, message);
+        assert!(!error.retryable);
+    }
+}
+
+#[test]
+fn outputs_exceeding_resolved_inputs_remain_nonretryable_invalid_blocks() {
+    let address = p2wpkh_address(0x02);
+    let transaction = Transaction {
+        version: Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(Txid::from_byte_array([3; 32]), 0),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(2_000),
+            script_pubkey: address.script_pubkey(),
+        }],
+    };
+    let block = block(vec![transaction_json(
+        &transaction,
+        &[Some(PreviousEvidence {
+            value: 1_000,
+            script: address.script_pubkey(),
+            height: 9,
+            coinbase: false,
+        })],
+    )]);
+    let error = BlockInterpreter::new(scope(), Network::Regtest)
+        .unwrap()
+        .inspect(&block, &[indexed_address(&address)])
+        .unwrap_err();
+    assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+    assert_eq!(
+        error.message,
+        "Bitcoin transaction outputs exceed its resolved inputs"
+    );
+    assert!(!error.retryable);
+}

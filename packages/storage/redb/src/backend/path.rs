@@ -6,7 +6,7 @@ use std::{
 
 use storage::Error;
 
-use super::support::{invalid_request, unavailable};
+use super::support::unavailable;
 
 pub(super) struct DatabasePath {
     pub(super) path: PathBuf,
@@ -17,18 +17,20 @@ pub(super) fn validated_database_path(path: &Path) -> Result<DatabasePath, Error
     let normalized = normalized_absolute_path(path)?;
     let file_name = normalized
         .file_name()
-        .ok_or_else(|| invalid_request("redb path must identify a database file"))?;
+        .ok_or_else(|| Error::invalid_request("redb path must identify a database file"))?;
     let parent = normalized
         .parent()
-        .ok_or_else(|| invalid_request("redb database file must have a parent directory"))?;
+        .ok_or_else(|| Error::invalid_request("redb database file must have a parent directory"))?;
     let parent_metadata = fs::metadata(parent).map_err(|error| match error.kind() {
-        ErrorKind::NotFound => invalid_request("redb database parent directory does not exist"),
+        ErrorKind::NotFound => {
+            Error::invalid_request("redb database parent directory does not exist")
+        }
         _ => unavailable(format!(
             "failed to inspect redb database parent directory: {error}"
         )),
     })?;
     if !parent_metadata.is_dir() {
-        return Err(invalid_request(
+        return Err(Error::invalid_request(
             "redb database parent path must be a directory",
         ));
     }
@@ -41,12 +43,12 @@ pub(super) fn validated_database_path(path: &Path) -> Result<DatabasePath, Error
 
     let initialize = match fs::metadata(&resolved) {
         Ok(metadata) if metadata.is_dir() => {
-            return Err(invalid_request(
+            return Err(Error::invalid_request(
                 "redb database path must be a file, not a directory",
             ));
         }
         Ok(metadata) if !metadata.is_file() => {
-            return Err(invalid_request(
+            return Err(Error::invalid_request(
                 "redb database path must identify a regular file",
             ));
         }
@@ -68,10 +70,10 @@ pub(super) fn validated_database_path(path: &Path) -> Result<DatabasePath, Error
 // design-lint: allow single-use-free-function -- complete lexical path normalization with root-escape checks stays separate from filesystem canonicalization and database-file validation
 fn normalized_absolute_path(path: &Path) -> Result<PathBuf, Error> {
     if path.as_os_str().is_empty() {
-        return Err(invalid_request("redb path must not be empty"));
+        return Err(Error::invalid_request("redb path must not be empty"));
     }
     if !path.is_absolute() {
-        return Err(invalid_request(
+        return Err(Error::invalid_request(
             "redb path must be absolute; resolve application paths at composition",
         ));
     }
@@ -85,7 +87,9 @@ fn normalized_absolute_path(path: &Path) -> Result<PathBuf, Error> {
             Component::CurDir => {}
             Component::ParentDir => {
                 if !normalized.pop() {
-                    return Err(invalid_request("redb path escapes the filesystem root"));
+                    return Err(Error::invalid_request(
+                        "redb path escapes the filesystem root",
+                    ));
                 }
             }
         }

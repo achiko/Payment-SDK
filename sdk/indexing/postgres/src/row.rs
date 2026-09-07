@@ -23,6 +23,7 @@ pub(crate) fn decimal(encoded: &str) -> Result<Decimal, IndexError> {
     Ok(value)
 }
 
+// design-lint: allow unclassified-free-function -- PostgreSQL signed height decoding is shared by block and output rows and maps negative stored values to adapter-owned corruption errors
 pub(crate) fn height(value: i64) -> Result<BlockHeight, IndexError> {
     Ok(BlockHeight(
         u64::try_from(value).map_err(|_| store("stored height is negative"))?,
@@ -115,6 +116,19 @@ pub(crate) fn store(message: impl Into<String>) -> IndexError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_heights_preserve_nonnegative_values_and_reject_negative_data() {
+        for value in [0, 1, i64::MAX] {
+            assert_eq!(height(value), Ok(BlockHeight(value as u64)));
+        }
+        for value in [-1, i64::MIN] {
+            let error = height(value).expect_err("negative stored height");
+            assert_eq!(error.kind, IndexErrorKind::Store);
+            assert_eq!(error.message, "stored height is negative");
+            assert!(!error.retryable);
+        }
+    }
 
     #[test]
     fn decimal_preserves_canonical_exact_values() {

@@ -1,10 +1,10 @@
 use std::collections::BTreeSet;
 
 use deadpool_postgres::Pool;
-use indexing::{IndexError, IndexErrorKind};
+use indexing::IndexError;
 use tokio_postgres::IsolationLevel;
 
-use crate::{store, unavailable};
+use crate::{row, store, unavailable};
 
 const COLUMNS: &str = r#"
 SELECT STRING_AGG(
@@ -199,9 +199,9 @@ pub async fn validate_schema(pool: &Pool, expected_schema: &str) -> Result<(), I
         .map_err(store)?
         .try_get(0)
         .map_err(store)?;
-    let schema = schema.ok_or_else(|| incompatible("PostgreSQL search path has no schema"))?;
+    let schema = schema.ok_or_else(|| row::store("PostgreSQL search path has no schema"))?;
     if schema != expected_schema {
-        return Err(incompatible(format!(
+        return Err(row::store(format!(
             "PostgreSQL pool resolved schema {schema}, expected {expected_schema}"
         )));
     }
@@ -213,9 +213,7 @@ pub async fn validate_schema(pool: &Pool, expected_schema: &str) -> Result<(), I
         .try_get(0)
         .map_err(store)?;
     if read_only != "on" {
-        return Err(incompatible(
-            "PostgreSQL schema validation is not read-only",
-        ));
+        return Err(row::store("PostgreSQL schema validation is not read-only"));
     }
 
     require_signature(&transaction, COLUMNS, EXPECTED_COLUMNS, "columns").await?;
@@ -240,7 +238,7 @@ pub async fn validate_schema(pool: &Pool, expected_schema: &str) -> Result<(), I
         .lines()
         .all(|required| actual_indexes.contains(required))
     {
-        return Err(incompatible(format!(
+        return Err(row::store(format!(
             "PostgreSQL schema {schema} has incompatible indexes"
         )));
     }
@@ -253,7 +251,7 @@ pub async fn validate_schema(pool: &Pool, expected_schema: &str) -> Result<(), I
         .transpose()
         .map_err(store)?;
     if cascade != Some(true) {
-        return Err(incompatible(format!(
+        return Err(row::store(format!(
             "PostgreSQL schema {schema} has incompatible journal cascade"
         )));
     }
@@ -276,11 +274,7 @@ async fn require_signature(
     if actual.as_deref() == Some(expected) {
         return Ok(());
     }
-    Err(incompatible(format!(
+    Err(row::store(format!(
         "PostgreSQL schema has incompatible {component}"
     )))
-}
-
-fn incompatible(message: impl Into<String>) -> IndexError {
-    IndexError::new(IndexErrorKind::Store, message, false)
 }

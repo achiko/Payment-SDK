@@ -378,3 +378,25 @@ fn canonical_identities_preserve_scope_leading_zeroes_and_lowercase_hex() {
         "0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
     );
 }
+
+#[test]
+fn malformed_block_and_receipt_errors_remain_terminal_before_projection() {
+    let mut block = ethereum_block(
+        transaction(Some(TO), "0x2a"),
+        receipt(true, Some(TO), None, "0x3", Vec::new()),
+    );
+    block.raw_receipts[0] = b"not-json".to_vec();
+    let error = inspect(&block, &[]).expect_err("invalid receipt must fail even without filters");
+    assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+    assert_eq!(error.message, "Ethereum receipt result is not valid JSON");
+    assert!(!error.retryable);
+
+    block.raw_block = b"not-json".to_vec();
+    let error = inspect(&block, &[]).expect_err("invalid block must fail before receipt parsing");
+    assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+    assert_eq!(
+        error.message,
+        "Ethereum block result does not match the RPC block shape"
+    );
+    assert!(!error.retryable);
+}

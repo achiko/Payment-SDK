@@ -59,7 +59,7 @@ pub(super) fn commit_error(error: CommitError) -> Error {
 fn storage_error(error: StorageError, context: &str) -> Error {
     match error {
         StorageError::Corrupted(detail) => Error::corrupt_data(format!("{context}: {detail}")),
-        StorageError::ValueTooLarge(size) => invalid_request(format!(
+        StorageError::ValueTooLarge(size) => Error::invalid_request(format!(
             "{context}: redb rejected a key or value with {size} bytes"
         )),
         StorageError::Io(error) if error.kind() == std::io::ErrorKind::InvalidData => {
@@ -80,13 +80,6 @@ pub(super) fn unavailable(message: impl Into<String>) -> Error {
     }
 }
 
-pub(super) fn invalid_request(message: impl Into<String>) -> Error {
-    Error {
-        kind: ErrorKind::InvalidRequest,
-        message: message.into(),
-    }
-}
-
 pub(super) fn other(message: impl Into<String>) -> Error {
     Error {
         kind: ErrorKind::Other,
@@ -97,6 +90,16 @@ pub(super) fn other(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_native_values_keep_invalid_request_classification_and_context() {
+        let error = operation_error(StorageError::ValueTooLarge(42), "write failed");
+        assert_eq!(error.kind, ErrorKind::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "write failed: redb rejected a key or value with 42 bytes"
+        );
+    }
 
     #[test]
     fn database_open_errors_preserve_classification_and_context() {

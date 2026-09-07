@@ -7,7 +7,7 @@ use crate::{ChainError, ChainErrorKind, FeeRate, Network, Satoshi};
 
 use super::{
     BuildRequest, Funding, Input, Output, SpendSource, UnsignedTransaction, checked_output,
-    insufficient_funds, invalid_transaction, sum_utxos, validate_unique_utxos,
+    invalid_transaction, sum_utxos, validate_unique_utxos,
 };
 
 const SEGWIT_MARKER_FLAG_WEIGHT: u64 = 2;
@@ -18,7 +18,7 @@ impl BuildRequest {
         network: Network,
     ) -> Result<UnsignedTransaction, ChainError> {
         if self.available.is_empty() {
-            return Err(insufficient_funds(
+            return Err(ChainError::insufficient_funds(
                 "Bitcoin transfer has no available UTXOs",
             ));
         }
@@ -58,11 +58,13 @@ impl BuildRequest {
             let selected_total = sum_utxos(&self.available)?;
             let fee = predicted_fee(&self.available, &recipient_scripts, self.fee_rate)?;
             let value = selected_total.checked_sub(fee).ok_or_else(|| {
-                insufficient_funds("Bitcoin UTXOs cannot cover the drain transaction fee")
+                ChainError::insufficient_funds(
+                    "Bitcoin UTXOs cannot cover the drain transaction fee",
+                )
             })?;
             let minimum = recipient_scripts[0].minimal_non_dust().to_sat();
             if value < minimum {
-                return Err(insufficient_funds(format!(
+                return Err(ChainError::insufficient_funds(format!(
                     "Bitcoin drain output is dust: minimum is {minimum} satoshis"
                 )));
             }
@@ -121,7 +123,7 @@ impl BuildRequest {
         }
 
         let outputs = final_outputs.ok_or_else(|| {
-            insufficient_funds(format!(
+            ChainError::insufficient_funds(format!(
                 "insufficient Bitcoin funds for {recipient_total} satoshis plus network fee"
             ))
         })?;
@@ -156,7 +158,9 @@ pub(in crate::transaction) fn build_grouped(
                 .ok_or_else(|| invalid_transaction("Bitcoin recipient amount overflowed u64"))
         })?;
         surplus.push(input.checked_sub(output).ok_or_else(|| {
-            insufficient_funds("a Bitcoin grouped source cannot fund its requested outputs")
+            ChainError::insufficient_funds(
+                "a Bitcoin grouped source cannot fund its requested outputs",
+            )
         })?);
         change.push(group.change_address.script_pubkey_for_network(network)?);
         available.append(&mut group.available);
@@ -217,7 +221,7 @@ fn allocate_fee(surplus: &[u64], fee: u64) -> Result<Vec<u64>, ChainError> {
         })
         .collect::<Vec<_>>();
     if remaining_fee != 0 {
-        return Err(insufficient_funds(
+        return Err(ChainError::insufficient_funds(
             "Bitcoin grouped sources cannot cover the network fee",
         ));
     }

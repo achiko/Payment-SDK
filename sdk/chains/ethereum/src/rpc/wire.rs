@@ -106,15 +106,9 @@ pub(super) fn parse_data(value: &str) -> Result<Vec<u8>, &'static str> {
     if digits.len() % 2 != 0 {
         return Err("hex data has an invalid length");
     }
-    digits
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let high = hex_nibble(pair[0]).ok_or("hex data contains invalid data")?;
-            let low = hex_nibble(pair[1]).ok_or("hex data contains invalid data")?;
-            Ok((high << 4) | low)
-        })
-        .collect()
+    // The decoder removes one prefix, so pass the original input to keep a
+    // second prefix invalid rather than accepting it as another optional prefix.
+    hex::decode(value).map_err(|_| "hex data contains invalid data")
 }
 
 pub(super) fn parse_transaction_id(
@@ -127,41 +121,11 @@ pub(super) fn parse_transaction_id(
 }
 
 pub(super) fn wei_quantity(value: &Wei) -> String {
-    let Some(first_non_zero) = value.0.iter().position(|byte| *byte != 0) else {
-        return "0x0".to_owned();
-    };
-    let bytes = &value.0[first_non_zero..];
-    let mut encoded = String::with_capacity(2 + bytes.len() * 2);
-    encoded.push_str("0x");
-    if bytes[0] < 16 {
-        encoded.push(hex_digit(bytes[0]));
-    } else {
-        encoded.push(hex_digit(bytes[0] >> 4));
-        encoded.push(hex_digit(bytes[0] & 0x0f));
-    }
-    for byte in &bytes[1..] {
-        encoded.push(hex_digit(byte >> 4));
-        encoded.push(hex_digit(byte & 0x0f));
-    }
-    encoded
+    format!("{:#x}", U256::from_be_bytes(value.0))
 }
 
 pub(super) fn transaction_id_hex(id: &TransactionId) -> String {
     hex::encode_prefixed(id.0)
-}
-
-pub(super) fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-pub(super) fn hex_digit(nibble: u8) -> char {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    char::from(HEX[usize::from(nibble & 0x0f)])
 }
 
 pub(super) fn map_json_rpc_error(error: Error) -> SourceError {
@@ -188,6 +152,54 @@ pub(super) fn source_error(message: impl Into<String>, retryable: bool) -> Sourc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quantities_encode_zero_odd_nibbles_and_the_entire_256_bit_range() {
+        for (value, expected) in [
+            (Wei::ZERO, "0x0".to_owned()),
+            (Wei::from_u128(15), "0xf".to_owned()),
+            (Wei::from_u128(16), "0x10".to_owned()),
+            (Wei::from_u128(0xabc), "0xabc".to_owned()),
+            (Wei::from_u128(u128::MAX), format!("0x{}", "f".repeat(32))),
+            (Wei([255; 32]), format!("0x{}", "f".repeat(64))),
+        ] {
+            assert_eq!(wei_quantity(&value), expected);
+            assert_eq!(parse_quantity_wei(&expected), Ok(value));
+        }
+        let mut value = [0; 32];
+        value[0] = 1;
+        value[31] = 0xab;
+        assert_eq!(
+            wei_quantity(&Wei(value)),
+            format!("0x1{}ab", "00".repeat(30))
+        );
+    }
+
+    #[test]
+    fn variable_data_preserves_bytes_and_exact_validation_errors() {
+        assert_eq!(parse_data("0x"), Ok(Vec::new()));
+        assert_eq!(parse_data("0x000aBcFF"), Ok(vec![0, 10, 188, 255]));
+        let every_byte: Vec<u8> = (0..=255).collect();
+        assert_eq!(
+            parse_data(&hex::encode_prefixed(&every_byte)),
+            Ok(every_byte)
+        );
+        for (input, message) in [
+            ("", "hex data has no 0x prefix"),
+            ("0X00", "hex data has no 0x prefix"),
+            ("0xg", "hex data has an invalid length"),
+            ("0x€", "hex data has an invalid length"),
+            ("0xé", "hex data contains invalid data"),
+            ("0x0x", "hex data contains invalid data"),
+            ("0x0x12", "hex data contains invalid data"),
+            ("0x0X12", "hex data contains invalid data"),
+            ("0x+1", "hex data contains invalid data"),
+            ("0x 1", "hex data contains invalid data"),
+            ("0xzz", "hex data contains invalid data"),
+        ] {
+            assert_eq!(parse_data(input), Err(message));
+        }
+    }
 
     #[test]
     fn quantities_preserve_big_endian_values_and_strict_wire_syntax() {

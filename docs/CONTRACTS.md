@@ -590,6 +590,14 @@ prove singular endpoint configuration and redaction, genesis/Memo probes,
 tracked registration before dispatch, shutdown races and indefinite ambiguity,
 the pinned/checksummed owned validator, and the explicit `solana_stack` target.
 
+## Storage input errors
+
+`storage::Error::invalid_request(message)` constructs the existing
+`ErrorKind::InvalidRequest` with the caller's exact message, alongside the
+existing `conflict` and `corrupt_data` constructors. Backend adapters retain
+their validation rules and supply the context; the constructor performs no
+storage access.
+
 ## JSON-RPC failures
 
 `json_rpc::Failure::from(jsonrpsee::types::ErrorObjectOwned)` preserves the

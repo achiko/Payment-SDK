@@ -70,7 +70,7 @@ impl Redb {
         command_queue_capacity: usize,
     ) -> Result<Self, Error> {
         if command_queue_capacity == 0 {
-            return Err(invalid_request(
+            return Err(Error::invalid_request(
                 "redb command queue capacity must be greater than zero",
             ));
         }

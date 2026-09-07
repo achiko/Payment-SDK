@@ -154,7 +154,7 @@ impl Sender for Batch {
                 &prepared,
             )
             .await
-            .map_err(grouped_failure)?;
+            .map_err(|error| SendError::grouped(Vec::new(), error.into()))?;
             Ok(vec![submitted.id])
         })
     }
@@ -172,10 +172,6 @@ fn operation_failure(message: &'static str) -> SendError {
 
 fn operation_failure_with(error: impl std::fmt::Display) -> SendError {
     SendError::operation(ErrorKind::Transaction, error.to_string())
-}
-
-fn grouped_failure(error: base::TransactionError) -> SendError {
-    SendError::grouped(Vec::new(), error.into())
 }
 
 fn transaction_error(error: impl std::fmt::Display) -> Error {
@@ -361,12 +357,14 @@ mod tests {
     #[test]
     fn grouped_broadcast_failure_preserves_exact_ambiguity_without_an_index() {
         let ambiguous = exact_envelope_id();
-        let failure = grouped_failure(
+        let failure = SendError::grouped(
+            Vec::new(),
             base::TransactionError::new(
                 base::TransactionErrorKind::Timeout,
                 "grouped submission outcome is unknown",
             )
-            .with_ambiguous_transaction_id(ambiguous.clone()),
+            .with_ambiguous_transaction_id(ambiguous.clone())
+            .into(),
         );
 
         assert!(failure.accepted.is_empty());
@@ -377,10 +375,14 @@ mod tests {
 
     #[test]
     fn grouped_broadcast_failure_does_not_parse_provider_prose_as_ambiguity() {
-        let failure = grouped_failure(base::TransactionError::new(
-            base::TransactionErrorKind::Unavailable,
-            format!("provider claimed transaction {:064x}", 9),
-        ));
+        let failure = SendError::grouped(
+            Vec::new(),
+            base::TransactionError::new(
+                base::TransactionErrorKind::Unavailable,
+                format!("provider claimed transaction {:064x}", 9),
+            )
+            .into(),
+        );
 
         assert!(failure.accepted.is_empty());
         assert_eq!(failure.failed_index, None);

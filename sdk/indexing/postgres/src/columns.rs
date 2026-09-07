@@ -184,6 +184,7 @@ pub(crate) fn spends(keys: &[OutputKey]) -> Result<SpendKeys, IndexError> {
     Ok(spends)
 }
 
+// design-lint: allow unclassified-free-function -- checked PostgreSQL INT4 output-index conversion is shared by created and spent column arrays and preserves the same storage-range error
 fn index(value: u32) -> Result<i32, IndexError> {
     i32::try_from(value).map_err(|_| row::store("output index exceeds the storage range"))
 }
@@ -271,6 +272,26 @@ mod tests {
             let error = OutputRows::try_from(outputs.as_slice())
                 .err()
                 .expect("out-of-range output index");
+            assert_eq!(error.kind, IndexErrorKind::Store);
+            assert_eq!(error.message, "output index exceeds the storage range");
+            assert!(!error.retryable);
+        }
+    }
+
+    #[test]
+    fn spend_keys_preserve_sql_index_boundaries_and_reject_overflow() {
+        let keys = [
+            output("zero", 0, "1").key(),
+            output("max", i32::MAX as u32, "1").key(),
+        ];
+        let rows = spends(&keys).expect("valid spent output identities");
+        assert_eq!(rows.transaction_id, ["zero", "max"]);
+        assert_eq!(rows.output_index, [0, i32::MAX]);
+        assert_eq!(rows.address, ["address-zero", "address-max"]);
+
+        for index in [i32::MAX as u32 + 1, u32::MAX] {
+            let keys = [output("invalid", index, "1").key()];
+            let error = spends(&keys).err().expect("unrepresentable spent index");
             assert_eq!(error.kind, IndexErrorKind::Store);
             assert_eq!(error.message, "output index exceeds the storage range");
             assert!(!error.retryable);

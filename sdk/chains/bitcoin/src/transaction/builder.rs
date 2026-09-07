@@ -605,4 +605,20 @@ mod tests {
 
         assert_eq!(error.kind, ChainErrorKind::InsufficientFunds);
     }
+
+    #[test]
+    fn no_available_inputs_retains_insufficient_funds_before_recipient_validation() {
+        let (address, _) = address_and_script();
+        let request = BuildRequest {
+            available: Vec::new(),
+            recipients: Vec::new(),
+            change_address: address,
+            fee_rate: FeeRate::new(0),
+            drain_wallet: false,
+        };
+        let error = futures_executor::block_on(Builder::new(Network::Regtest, request).build())
+            .unwrap_err();
+        assert_eq!(error.kind, ChainErrorKind::InsufficientFunds);
+        assert_eq!(error.message, "Bitcoin transfer has no available UTXOs");
+    }
 }

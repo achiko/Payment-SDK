@@ -177,32 +177,46 @@ impl ValidatedAddresses {
         network: Network,
     ) -> Result<(), IndexError> {
         if !address.belongs_to(scope) {
-            return Err(invalid_address(
+            return Err(IndexError::new(
+                IndexErrorKind::InvalidRequest,
                 "Bitcoin indexed address belongs to a different scope",
+                false,
             ));
         }
-        let canonical = Address::parse_for_network(&address.value, network)
-            .map_err(|_| invalid_address("Bitcoin indexed address is invalid or wrong-network"))?;
-        let script = canonical
-            .script_pubkey_for_network(network)
-            .map_err(|_| invalid_address("Bitcoin indexed address cannot produce a script"))?;
+        let canonical = Address::parse_for_network(&address.value, network).map_err(|_| {
+            IndexError::new(
+                IndexErrorKind::InvalidRequest,
+                "Bitcoin indexed address is invalid or wrong-network",
+                false,
+            )
+        })?;
+        let script = canonical.script_pubkey_for_network(network).map_err(|_| {
+            IndexError::new(
+                IndexErrorKind::InvalidRequest,
+                "Bitcoin indexed address cannot produce a script",
+                false,
+            )
+        })?;
         if !script.is_p2wpkh() && !script.is_p2tr() {
-            return Err(invalid_address(
+            return Err(IndexError::new(
+                IndexErrorKind::InvalidRequest,
                 "Bitcoin indexing supports P2WPKH and P2TR addresses only",
+                false,
             ));
         }
         if address.value != canonical.encoded() {
-            return Err(invalid_address("Bitcoin indexed address is not canonical"));
+            return Err(IndexError::new(
+                IndexErrorKind::InvalidRequest,
+                "Bitcoin indexed address is not canonical",
+                false,
+            ));
         }
         self.addresses.insert(canonical.encoded().to_owned());
         Ok(())
     }
 }
 
-fn invalid_address(message: impl Into<String>) -> IndexError {
-    IndexError::new(IndexErrorKind::InvalidRequest, message, false)
-}
-
+// design-lint: allow unclassified-free-function -- shared Bitcoin block and transaction interpretation boundary classifies multiple native invariant failures as nonretryable foreign IndexError::InvalidBlock
 pub(super) fn invalid_block(message: impl ToString) -> IndexError {
     IndexError::new(IndexErrorKind::InvalidBlock, message.to_string(), false)
 }

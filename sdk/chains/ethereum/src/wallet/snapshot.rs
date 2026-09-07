@@ -95,6 +95,7 @@ fn decode(
     Ok((destination, amount))
 }
 
+// design-lint: allow unclassified-free-function -- shared Ethereum snapshot adapter maps heterogeneous validation failures to InvalidSnapshot without changing their messages or inventing transaction ambiguity
 fn invalid(error: impl std::fmt::Display) -> TransactionError {
     transaction_error(TransactionErrorKind::InvalidSnapshot, error)
 }
@@ -128,6 +129,51 @@ mod tests {
                 "asset": { "kind": "native", "ticker": "ETH", "decimals": 18 },
             }),
         )
+    }
+
+    #[test]
+    fn invalid_snapshot_adapter_preserves_validation_order_and_exact_errors() {
+        let wallet = Address([0x11; 20]);
+        let unsupported = TransactionSnapshot::new("unsupported", serde_json::json!({}));
+        let error = decode(&config(), &wallet, &unsupported)
+            .expect_err("kind must be checked before malformed content");
+        assert_eq!(error.kind, TransactionErrorKind::InvalidSnapshot);
+        assert_eq!(
+            error.message,
+            "snapshot is not a supported Ethereum transfer"
+        );
+        assert_eq!(error.ambiguous_transaction_id, None);
+
+        for (destination, amount, message) in [
+            (
+                "invalid".to_owned(),
+                "invalid",
+                "Ethereum address is missing its 0x prefix",
+            ),
+            (
+                Address([0x22; 20]).to_string(),
+                "invalid",
+                "decimal must use canonical base-10 notation",
+            ),
+            (
+                Address([0x22; 20]).to_string(),
+                "-1",
+                "currency amount must not be negative",
+            ),
+        ] {
+            let mut value = snapshot(&wallet).value().clone();
+            value["destination"] = serde_json::json!(destination);
+            value["amount"] = serde_json::json!(amount);
+            let error = decode(
+                &config(),
+                &wallet,
+                &TransactionSnapshot::new(SNAPSHOT_KIND, value),
+            )
+            .expect_err("invalid snapshot contents must be classified before restoration");
+            assert_eq!(error.kind, TransactionErrorKind::InvalidSnapshot);
+            assert_eq!(error.message, message);
+            assert_eq!(error.ambiguous_transaction_id, None);
+        }
     }
 
     #[test]

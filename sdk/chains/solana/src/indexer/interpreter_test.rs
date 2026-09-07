@@ -407,3 +407,31 @@ fn rejects_duplicate_first_signature_identity() {
     assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
     assert!(error.message.contains("duplicate first signatures"));
 }
+
+#[test]
+fn shared_interpretation_errors_preserve_exact_context_and_nonretryability() {
+    for (path, invalid, message) in [
+        (
+            "/meta",
+            Value::Null,
+            "Solana transaction metadata is missing",
+        ),
+        (
+            "/meta/innerInstructions",
+            Value::Null,
+            "successful selected Solana transaction has incomplete inner instructions",
+        ),
+        (
+            "/transaction/message/instructions/0/data",
+            json!("0"),
+            "Solana System instruction data is not canonical Base58",
+        ),
+    ] {
+        let mut transaction = baseline(41);
+        *transaction.pointer_mut(path).unwrap() = invalid;
+        let error = inspect(vec![baseline(40), transaction], &[selected(2)]).unwrap_err();
+        assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+        assert_eq!(error.message, message);
+        assert!(!error.retryable);
+    }
+}

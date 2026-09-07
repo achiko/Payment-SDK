@@ -11,7 +11,7 @@ use num_bigint::BigUint;
 
 use super::{
     Block,
-    model::{ParsedBlock, ParsedLog, ParsedReceipt, ParsedTransaction},
+    model::{ParseError, ParsedBlock, ParsedLog, ParsedReceipt, ParsedTransaction},
 };
 
 const TRANSFER_TOPIC: [u8; 32] = [
@@ -191,7 +191,7 @@ impl IndexBlockInterpreter for BlockInterpreter {
         addresses: &[CanonicalAddress],
     ) -> Result<InterpretedBlock, IndexError> {
         let parsed = ParsedBlock::parse(&block.raw_block, Some(block.reference.height), true)
-            .map_err(invalid_block)?;
+            .map_err(ParseError::into_invalid_block)?;
         if parsed.reference != block.reference {
             return Err(IndexError::new(
                 IndexErrorKind::InvalidBlock,
@@ -199,8 +199,8 @@ impl IndexBlockInterpreter for BlockInterpreter {
                 false,
             ));
         }
-        let receipts =
-            ParsedReceipt::parse_all(&block.raw_receipts, &parsed).map_err(invalid_block)?;
+        let receipts = ParsedReceipt::parse_all(&block.raw_receipts, &parsed)
+            .map_err(ParseError::into_invalid_block)?;
         let mut transactions = Vec::new();
         for (transaction, receipt) in parsed.transactions.iter().zip(&receipts) {
             let fee_amount = receipt
@@ -305,8 +305,10 @@ impl Canonicalize for [u8; 32] {
     }
 }
 
-fn invalid_block(error: impl ToString) -> IndexError {
-    IndexError::new(IndexErrorKind::InvalidBlock, error.to_string(), false)
+impl ParseError {
+    fn into_invalid_block(self) -> IndexError {
+        IndexError::new(IndexErrorKind::InvalidBlock, self.to_string(), false)
+    }
 }
 
 #[cfg(test)]

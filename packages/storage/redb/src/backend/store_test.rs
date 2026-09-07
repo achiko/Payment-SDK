@@ -29,6 +29,50 @@ fn put(namespace: &Namespace, key: &Key, value: &str) -> Operation {
 }
 
 #[tokio::test]
+async fn invalid_scan_bounds_preserve_errors_and_leave_the_store_usable() -> Result<(), Error> {
+    let directory = TempDir::new().map_err(|error| other(error.to_string()))?;
+    let storage = Redb::open(database_path(&directory))?;
+    let records = namespace("records");
+    for (limit, after, message) in [
+        (0, None, "scan limit must be greater than zero"),
+        (usize::MAX, None, "scan limit is too large"),
+        (
+            1,
+            Some(key("other")),
+            "scan continuation key does not match the requested prefix",
+        ),
+    ] {
+        let error = storage
+            .scan(ScanRequest {
+                namespace: records.clone(),
+                prefix: b"entry/".to_vec(),
+                after,
+                limit,
+            })
+            .await
+            .expect_err("invalid scan bounds");
+        assert_eq!(error.kind, ErrorKind::InvalidRequest);
+        assert_eq!(error.message, message);
+    }
+    let committed = storage
+        .commit(WriteBatch {
+            conditions: Vec::new(),
+            operations: vec![put(&records, &key("entry/1"), "stored")],
+        })
+        .await?;
+    assert_eq!(committed.version, Version(1));
+    assert_eq!(
+        storage
+            .get(&records, &key("entry/1"))
+            .await?
+            .map(|stored| stored.value),
+        Some(value("stored"))
+    );
+    assert_eq!(storage.reopen_count_for_test().await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancellation_after_enqueue_does_not_cancel_the_accepted_commit() -> Result<(), Error> {
     let directory = TempDir::new().map_err(|error| other(error.to_string()))?;
     let storage = Redb::open(database_path(&directory))?;

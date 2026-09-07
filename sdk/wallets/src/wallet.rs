@@ -115,7 +115,7 @@ impl History {
             .as_ref()
             .is_some_and(|next| !next.position.transaction.belongs_to(expected_scope))
         {
-            return Err(history_error(
+            return Err(Error::history(
                 "indexed history cursor does not belong to the requested scope",
             ));
         }
@@ -142,12 +142,12 @@ impl HistoryEntry {
         F: Fn(&AssetId) -> Result<HistoryAsset, Error>,
     {
         if &transaction.scope != expected_scope {
-            return Err(history_error(
+            return Err(Error::history(
                 "indexed transaction does not belong to the requested scope",
             ));
         }
         if !transaction.transaction_id.belongs_to(expected_scope) {
-            return Err(history_error(
+            return Err(Error::history(
                 "indexed transaction identity does not belong to its observation scope",
             ));
         }
@@ -166,7 +166,7 @@ impl HistoryEntry {
                     .as_ref()
                     .is_some_and(|payer| !payer.belongs_to(&scope))
                 {
-                    return Err(history_error(
+                    return Err(Error::history(
                         "indexed fee payer does not belong to the transaction scope",
                     ));
                 }
@@ -255,7 +255,7 @@ impl HistoryMovement {
             .chain(to.iter())
             .any(|address| !address.belongs_to(scope))
         {
-            return Err(history_error(
+            return Err(Error::history(
                 "indexed movement address does not belong to the transaction scope",
             ));
         }
@@ -277,7 +277,7 @@ where
 {
     let metadata = asset(asset_id)?;
     if metadata.id != *asset_id {
-        return Err(history_error(
+        return Err(Error::history(
             "wallet asset metadata does not match the indexed asset identity",
         ));
     }
@@ -286,15 +286,17 @@ where
 
 fn validate_asset_scope(asset: &AssetId, scope: &IndexScope) -> Result<(), Error> {
     if asset.chain != scope.chain {
-        return Err(history_error(
+        return Err(Error::history(
             "indexed asset does not belong to the transaction chain",
         ));
     }
     Ok(())
 }
 
-fn history_error(message: impl Into<String>) -> Error {
-    Error::new(crate::ErrorKind::History, message)
+impl Error {
+    fn history(message: impl Into<String>) -> Self {
+        Self::new(crate::ErrorKind::History, message)
+    }
 }
 
 pub trait BalanceReader: Send + Sync {
@@ -437,6 +439,69 @@ mod tests {
             },
             movements,
             fee: None,
+        }
+    }
+
+    #[test]
+    fn history_scope_failures_preserve_error_order_before_metadata_resolution() {
+        let mut foreign_scope = scope();
+        foreign_scope.network = "other".to_owned();
+        let mut foreign_transaction = transaction(Vec::new());
+        foreign_transaction.scope = foreign_scope.clone();
+        foreign_transaction.transaction_id.scope = foreign_scope.clone();
+        let first = TransactionPage {
+            checkpoint: Some(block(7)),
+            transactions: vec![foreign_transaction],
+            next: Some(HistoryCursor {
+                checkpoint: Some(block(7)),
+                position: HistoryPosition {
+                    height: BlockHeight(7),
+                    transaction: TransactionRef {
+                        scope: foreign_scope.clone(),
+                        value: "cursor".to_owned(),
+                    },
+                },
+            }),
+        };
+        let mut second = first.clone();
+        second.next = None;
+        let mut third = second.clone();
+        third.transactions[0].scope = scope();
+        let mut fourth = third.clone();
+        fourth.transactions[0].transaction_id.scope = scope();
+        fourth.transactions[0].fee = Some(NetworkFee {
+            asset: asset("native", 18).id,
+            amount: Decimal::from(1),
+            payer: Some(CanonicalAddress {
+                scope: foreign_scope,
+                value: "payer".to_owned(),
+            }),
+        });
+        for (page, message) in [
+            (
+                first,
+                "indexed history cursor does not belong to the requested scope",
+            ),
+            (
+                second,
+                "indexed transaction does not belong to the requested scope",
+            ),
+            (
+                third,
+                "indexed transaction identity does not belong to its observation scope",
+            ),
+            (
+                fourth,
+                "indexed fee payer does not belong to the transaction scope",
+            ),
+        ] {
+            let error = History::from_index(page, &scope(), |_| {
+                panic!("scope validation must precede metadata resolution")
+            })
+            .expect_err("scope mismatch must reject the entire page");
+            assert_eq!(error.kind, crate::ErrorKind::History);
+            assert_eq!(error.message, message);
+            assert_eq!(error.ambiguous_transaction_id, None);
         }
     }
 

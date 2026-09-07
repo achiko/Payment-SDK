@@ -144,6 +144,7 @@ impl IndexBlockInterpreter for Interpreter {
     }
 }
 
+// design-lint: allow unclassified-free-function -- shared Solana block, transaction and movement validation maps native invariant failures to nonretryable foreign IndexError::InvalidBlock
 fn invalid_block(message: impl Into<String>) -> IndexError {
     IndexError::new(IndexErrorKind::InvalidBlock, message, false)
 }

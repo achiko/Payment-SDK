@@ -76,6 +76,7 @@ pub(super) fn decode(
         .collect()
 }
 
+// design-lint: allow unclassified-free-function -- shared Bitcoin snapshot boundary maps heterogeneous decode and validation errors to foreign TransactionError::InvalidSnapshot without submission ambiguity
 fn invalid(error: impl std::fmt::Display) -> TransactionError {
     transaction_error(TransactionErrorKind::InvalidSnapshot, error)
 }
@@ -163,5 +164,32 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn invalid_transfers_remain_snapshot_errors_without_ambiguity() {
+        for (transfers, message) in [
+            (serde_json::json!([]), "Bitcoin snapshot has no transfers"),
+            (
+                serde_json::json!([{ "destination": ADDRESS, "amount": "-1" }]),
+                "currency amount must not be negative",
+            ),
+            (
+                serde_json::json!([{ "destination": ADDRESS, "amount": "0.000000001" }]),
+                "amount has more than 8 fractional digits",
+            ),
+        ] {
+            let mut value = snapshot(ADDRESS).value().clone();
+            value["transfers"] = transfers;
+            let error = decode(
+                &config(),
+                &Address::from_encoded(ADDRESS),
+                &TransactionSnapshot::new(SNAPSHOT_KIND, value),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind, TransactionErrorKind::InvalidSnapshot);
+            assert_eq!(error.message, message);
+            assert_eq!(error.ambiguous_transaction_id, None);
+        }
     }
 }

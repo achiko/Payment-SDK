@@ -26,6 +26,7 @@ pub(super) fn journal(scope: &IndexScope, height: BlockHeight) -> Key {
     Key(key)
 }
 
+// design-lint: allow unclassified-free-function -- shared redb history-key framing keeps persisted scope and address bytes identical for address-primary writes and prefix scans without leaking storage policy into domain values
 pub(super) fn history_prefix(scope: &IndexScope, address: &CanonicalAddress) -> Vec<u8> {
     let mut key = prefix(scope, HISTORY);
     component(&mut key, address.value.as_bytes());
@@ -133,5 +134,46 @@ mod tests {
             assert!(key.starts_with(&prefix(&scope, JOURNAL)));
             assert_eq!(&key[key.len() - 8..], &height.to_be_bytes());
         }
+    }
+
+    #[test]
+    fn history_prefix_preserves_persisted_scope_and_address_bytes() {
+        let scope = IndexScope {
+            chain: ChainId("a".into()),
+            network: "b".into(),
+        };
+        let address = CanonicalAddress {
+            scope: scope.clone(),
+            value: "é".into(),
+        };
+        let expected = b"\x01\x03\0\0\0\0\0\0\0\x01a\0\0\0\0\0\0\0\x01b\0\0\0\0\0\0\0\x02\xc3\xa9";
+        assert_eq!(history_prefix(&scope, &address), expected);
+        let transaction = TransactionRef {
+            scope: scope.clone(),
+            value: "tx".into(),
+        };
+        assert!(
+            history(&scope, &address, BlockHeight(42), &transaction)
+                .0
+                .starts_with(expected)
+        );
+
+        for other_scope in [
+            IndexScope {
+                chain: ChainId("other".into()),
+                ..scope.clone()
+            },
+            IndexScope {
+                network: "other".into(),
+                ..scope.clone()
+            },
+        ] {
+            assert_ne!(history_prefix(&other_scope, &address), expected);
+        }
+        let longer_address = CanonicalAddress {
+            value: "éx".into(),
+            ..address
+        };
+        assert!(!history_prefix(&scope, &longer_address).starts_with(expected));
     }
 }

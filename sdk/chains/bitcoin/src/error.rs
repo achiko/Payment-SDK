@@ -19,6 +19,15 @@ pub enum ChainErrorKind {
     Other,
 }
 
+impl ChainError {
+    pub(crate) fn insufficient_funds(message: impl Into<String>) -> Self {
+        Self {
+            kind: ChainErrorKind::InsufficientFunds,
+            message: message.into(),
+        }
+    }
+}
+
 impl fmt::Display for ChainError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.message)

@@ -3,9 +3,7 @@ use storage::{Error, ErrorKind, Key, Namespace, ScanPage, ScanRequest, StoredVal
 
 use crate::codec::{StoredRecord, decode_physical_key, encode_physical_key, namespace_prefix};
 
-use super::{
-    Backend, DATA_TABLE, invalid_request, operation_error, table_error, transaction_error,
-};
+use super::{Backend, DATA_TABLE, operation_error, table_error, transaction_error};
 
 impl Backend {
     pub(super) fn get(
@@ -34,18 +32,20 @@ impl Backend {
 
     pub(super) fn scan(&mut self, request: ScanRequest) -> Result<ScanPage, Error> {
         if request.limit == 0 {
-            return Err(invalid_request("scan limit must be greater than zero"));
+            return Err(Error::invalid_request(
+                "scan limit must be greater than zero",
+            ));
         }
         let read_limit = request
             .limit
             .checked_add(1)
-            .ok_or_else(|| invalid_request("scan limit is too large"))?;
+            .ok_or_else(|| Error::invalid_request("scan limit is too large"))?;
         if request
             .after
             .as_ref()
             .is_some_and(|after| !after.0.starts_with(&request.prefix))
         {
-            return Err(invalid_request(
+            return Err(Error::invalid_request(
                 "scan continuation key does not match the requested prefix",
             ));
         }

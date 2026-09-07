@@ -33,13 +33,6 @@ pub(super) fn invalid_transaction(message: impl Into<String>) -> ChainError {
     }
 }
 
-fn insufficient_funds(message: impl Into<String>) -> ChainError {
-    ChainError {
-        kind: ChainErrorKind::InsufficientFunds,
-        message: message.into(),
-    }
-}
-
 fn signer_error(error: base::SignerError) -> ChainError {
     signer_error_message(format!("Bitcoin signing failed: {error}"))
 }
