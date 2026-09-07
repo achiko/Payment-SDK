@@ -130,9 +130,6 @@ mod tests {
 
         assert_eq!(transaction.to, Some(token));
         assert_eq!(transaction.value, Wei::ZERO);
-        assert_eq!(
-            transaction.input,
-            crate::erc20::transfer(&recipient, &amount)
-        );
+        assert_eq!(transaction.input, request.input());
     }
 }

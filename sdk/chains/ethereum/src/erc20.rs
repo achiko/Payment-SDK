@@ -2,7 +2,7 @@ use alloy_primitives::{Address as AlloyAddress, U256};
 // design-lint: allow owned-vocabulary -- Alloy's standard Solidity ABI macro import belongs to this Ethereum adapter
 use alloy_sol_types::{SolCall, sol};
 
-use crate::{Address, Wei};
+use crate::{Address, TransferIntent, TransferRequest, Wei};
 
 // design-lint: allow owned-vocabulary -- Alloy's standard Solidity ABI declaration macro belongs to this Ethereum adapter
 sol! {
@@ -25,12 +25,19 @@ pub(crate) fn decimals() -> Vec<u8> {
     Erc20::decimalsCall {}.abi_encode()
 }
 
-pub(crate) fn transfer(recipient: &Address, amount: &Wei) -> Vec<u8> {
-    Erc20::transferCall {
-        recipient: AlloyAddress::from(recipient.0),
-        amount: U256::from_be_bytes(amount.0),
+impl TransferRequest {
+    pub(crate) fn input(&self) -> Vec<u8> {
+        match self.intent() {
+            TransferIntent::Native { .. } => Vec::new(),
+            TransferIntent::Erc20 {
+                recipient, amount, ..
+            } => Erc20::transferCall {
+                recipient: AlloyAddress::from(recipient.0),
+                amount: U256::from_be_bytes(amount.0),
+            }
+            .abi_encode(),
+        }
     }
-    .abi_encode()
 }
 
 // design-lint: allow unclassified-free-function -- strict ERC-20 balanceOf return decoding bridges Alloy ABI words and Wei for balance reads and token admission without adding token-call policy to amounts
@@ -75,7 +82,13 @@ mod tests {
         );
         assert_eq!(decimals(), hex("313ce567"));
         assert_eq!(
-            transfer(&Address([0x22; 20]), &Wei::from_u128(7)),
+            TransferRequest::erc20(
+                Address([1; 20]),
+                Address([2; 20]),
+                Address([0x22; 20]),
+                Wei::from_u128(7)
+            )
+            .input(),
             [
                 hex("a9059cbb"),
                 vec![0; 12],
@@ -85,6 +98,31 @@ mod tests {
             ]
             .concat()
         );
+    }
+
+    #[test]
+    fn transfer_input_preserves_all_amount_bits_and_native_input_is_empty() {
+        for amount in [Wei::ZERO, Wei([255; 32])] {
+            let request = TransferRequest::erc20(
+                Address([1; 20]),
+                Address([2; 20]),
+                Address([0xab; 20]),
+                amount.clone(),
+            );
+            assert_eq!(
+                request.input(),
+                [
+                    hex("a9059cbb"),
+                    vec![0; 12],
+                    vec![0xab; 20],
+                    amount.0.to_vec()
+                ]
+                .concat()
+            );
+        }
+        let native =
+            TransferRequest::native_atomic(Address([1; 20]), Address([2; 20]), Wei([255; 32]));
+        assert!(native.input().is_empty());
     }
 
     #[test]

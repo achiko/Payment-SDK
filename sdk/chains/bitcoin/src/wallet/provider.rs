@@ -300,7 +300,7 @@ pub(crate) async fn broadcast_prepared(
     prepared: &base::SignedTransaction,
 ) -> Result<BroadcastReceipt, TransactionError> {
     if prepared.version() != base::SignedTransaction::VERSION || prepared.kind() != PREPARED_KIND {
-        return Err(transaction_error(
+        return Err(TransactionError::new(
             TransactionErrorKind::InvalidTransaction,
             "prepared transaction is not a Bitcoin signed envelope",
         ));
@@ -308,25 +308,31 @@ pub(crate) async fn broadcast_prepared(
     let id = prepared
         .id()
         .as_str()
-        .parse()
-        .map_err(|error| transaction_error(TransactionErrorKind::InvalidTransaction, error))?;
+        .parse::<crate::TransactionId>()
+        .map_err(|error| {
+            TransactionError::new(TransactionErrorKind::InvalidTransaction, error.to_string())
+        })?;
     let signed =
         SignedTransaction::from_consensus_bytes(id, prepared.envelope().as_bytes().to_vec())
-            .map_err(|error| transaction_error(TransactionErrorKind::InvalidTransaction, error))?;
+            .map_err(|error| {
+                TransactionError::new(TransactionErrorKind::InvalidTransaction, error.to_string())
+            })?;
     let native_id = signed.id();
     let preflight = transactions
         .preflight(&signed, max_fee_rate)
         .await
-        .map_err(|error| transaction_error(TransactionErrorKind::Unavailable, error))?;
+        .map_err(|error| {
+            TransactionError::new(TransactionErrorKind::Unavailable, error.to_string())
+        })?;
     if !preflight.allowed {
-        return Err(transaction_error(
+        return Err(TransactionError::new(
             TransactionErrorKind::Rejected,
             "Bitcoin node rejected transaction preflight",
         ));
     }
     let submitted = transactions.broadcast(signed, max_fee_rate).await?;
     if submitted != native_id {
-        return Err(transaction_error(
+        return Err(TransactionError::new(
             TransactionErrorKind::Unavailable,
             "Bitcoin transaction capability returned a different transaction ID",
         ));
@@ -334,12 +340,6 @@ pub(crate) async fn broadcast_prepared(
     Ok(BroadcastReceipt {
         id: BaseTransactionId::new(native_id.to_string()),
     })
-}
-pub(super) fn transaction_error(
-    kind: TransactionErrorKind,
-    error: impl std::fmt::Display,
-) -> TransactionError {
-    TransactionError::new(kind, error.to_string())
 }
 
 #[cfg(test)]
@@ -632,7 +632,7 @@ mod tests {
         let local_id = BaseTransactionId::new(native_id.to_string());
         let transactions = Arc::new(InspectingTransactions::new(
             Ok(allowed_preflight()),
-            Err(transaction_error(
+            Err(TransactionError::new(
                 TransactionErrorKind::Unavailable,
                 format!("provider claimed transaction {provider_candidate}"),
             )
@@ -724,6 +724,7 @@ mod tests {
         .expect_err("preflight failure must stop before broadcast");
 
         assert_eq!(error.kind, TransactionErrorKind::Unavailable);
+        assert_eq!(error.message, "Bitcoin preflight is unavailable");
         assert_eq!(error.ambiguous_transaction_id, None);
         assert_eq!(
             transactions.calls(),

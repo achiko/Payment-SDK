@@ -192,12 +192,16 @@ impl TryFrom<&[IndexedOutput]> for OutputRows {
     }
 }
 
-pub(crate) fn spends(keys: &[OutputKey]) -> Result<SpendKeys, IndexError> {
-    let mut spends = SpendKeys::default();
-    for key in keys {
-        spends.push(key)?;
+impl TryFrom<&[OutputKey]> for SpendKeys {
+    type Error = IndexError;
+
+    fn try_from(keys: &[OutputKey]) -> Result<Self, Self::Error> {
+        let mut spends = Self::default();
+        for key in keys {
+            spends.push(key)?;
+        }
+        Ok(spends)
     }
-    Ok(spends)
 }
 
 // design-lint: allow unclassified-free-function -- checked PostgreSQL INT4 output-index conversion is shared by created and spent column arrays and preserves the same storage-range error
@@ -390,18 +394,29 @@ mod tests {
 
     #[test]
     fn spend_keys_preserve_sql_index_boundaries_and_reject_overflow() {
+        assert!(SpendKeys::try_from([].as_slice()).unwrap().is_empty());
         let keys = [
             output("zero", 0, "1").key(),
             output("max", i32::MAX as u32, "1").key(),
+            output("zero", 0, "1").key(),
         ];
-        let rows = spends(&keys).expect("valid spent output identities");
-        assert_eq!(rows.transaction_id, ["zero", "max"]);
-        assert_eq!(rows.output_index, [0, i32::MAX]);
-        assert_eq!(rows.address, ["address-zero", "address-max"]);
+        let rows = SpendKeys::try_from(keys.as_slice()).expect("valid spent output identities");
+        assert_eq!(rows.transaction_id, ["zero", "max", "zero"]);
+        assert_eq!(rows.output_index, [0, i32::MAX, 0]);
+        assert_eq!(
+            rows.address,
+            ["address-zero", "address-max", "address-zero"]
+        );
+        assert_eq!(rows.len(), 3);
 
         for index in [i32::MAX as u32 + 1, u32::MAX] {
-            let keys = [output("invalid", index, "1").key()];
-            let error = spends(&keys).err().expect("unrepresentable spent index");
+            let keys = [
+                output("valid", 0, "1").key(),
+                output("invalid", index, "1").key(),
+            ];
+            let error = SpendKeys::try_from(keys.as_slice())
+                .err()
+                .expect("unrepresentable spent index");
             assert_eq!(error.kind, IndexErrorKind::Store);
             assert_eq!(error.message, "output index exceeds the storage range");
             assert!(!error.retryable);

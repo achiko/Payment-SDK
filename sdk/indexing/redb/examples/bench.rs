@@ -75,13 +75,6 @@ fn scope() -> IndexScope {
     }
 }
 
-fn transaction(height: u64, index: usize) -> TransactionRef {
-    TransactionRef {
-        scope: scope(),
-        value: format!("{height:010}-{index:05}"),
-    }
-}
-
 fn asset() -> AssetId {
     AssetId {
         chain: ChainId(CHAIN.into()),
@@ -95,6 +88,10 @@ fn interpret(
     parent: Option<&BlockRef>,
     spend: Vec<OutputKey>,
 ) -> (InterpretedBlock, Vec<OutputKey>) {
+    let transaction = |index: usize| TransactionRef {
+        scope: scope(),
+        value: format!("{height:010}-{index:05}"),
+    };
     let block = BlockRef {
         position: BlockPosition(height),
         height: BlockHeight(height),
@@ -120,7 +117,7 @@ fn interpret(
             .collect();
         transactions.push(ObservationDraft {
             scope: scope(),
-            transaction_id: transaction(height, index),
+            transaction_id: transaction(index),
             status: ObservationDraftStatus::Included,
             movements,
             fee: None,
@@ -131,7 +128,7 @@ fn interpret(
     for index in 0..profile.created {
         created.push(IndexedOutput {
             id: OutputId {
-                transaction: transaction(height, index),
+                transaction: transaction(index),
                 index: index as u32,
             },
             address: profile.address(index),

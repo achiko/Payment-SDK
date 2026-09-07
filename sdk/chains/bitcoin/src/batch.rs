@@ -47,7 +47,8 @@ impl Batch {
         let source = Address::from_wallet_address(&transfer.wallet.address(), self.network)?;
         let destination = transfer.wallet.parse_address(&transfer.to)?;
         let destination = Address::from_wallet_address(&destination, self.network)?;
-        let output = Output::new(destination, transfer.amount).map_err(transaction_error)?;
+        let output = Output::new(destination, transfer.amount)
+            .map_err(|error| Error::new(ErrorKind::Transaction, error.to_string()))?;
         Ok((transfer.wallet, source, output))
     }
 
@@ -169,13 +170,10 @@ impl Sender for Batch {
 impl Address {
     fn from_wallet_address(address: &base::Address, network: Network) -> Result<Self, Error> {
         let value = std::str::from_utf8(address.as_bytes())
-            .map_err(|_| transaction_error("Bitcoin address is not UTF-8"))?;
-        Self::parse_for_network(value, network).map_err(transaction_error)
+            .map_err(|_| Error::new(ErrorKind::Transaction, "Bitcoin address is not UTF-8"))?;
+        Self::parse_for_network(value, network)
+            .map_err(|error| Error::new(ErrorKind::Transaction, error.to_string()))
     }
-}
-
-fn transaction_error(error: impl std::fmt::Display) -> Error {
-    Error::new(ErrorKind::Transaction, error.to_string())
 }
 
 #[cfg(test)]

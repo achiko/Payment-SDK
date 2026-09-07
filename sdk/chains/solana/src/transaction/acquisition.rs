@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     sync::{
         Arc,
@@ -179,7 +179,14 @@ where
         cancellation.ensure()?;
         let destinations = validate_destinations(items)?;
         cancellation.ensure()?;
-        let query = stable_query(items, &destinations);
+        let mut seen = BTreeSet::new();
+        let query = items
+            .iter()
+            .zip(&destinations)
+            .flat_map(|(item, destination)| [&item.source, destination])
+            .filter(|address| seen.insert(*address))
+            .cloned()
+            .collect::<Vec<_>>();
 
         cancellation.race_acquisition(self.rpc.health()).await?;
         cancellation.ensure()?;
@@ -254,26 +261,11 @@ fn validate_destinations(items: &[ResolvedTransfer]) -> Result<Vec<Address>, Sen
         .collect()
 }
 
-fn stable_query(items: &[ResolvedTransfer], destinations: &[Address]) -> Vec<Address> {
-    let mut seen = BTreeMap::<Address, usize>::new();
-    let mut query = Vec::new();
-    for (item, destination) in items.iter().zip(destinations) {
-        for address in [&item.source, destination] {
-            if !seen.contains_key(address) {
-                seen.insert(address.clone(), query.len());
-                query.push(address.clone());
-            }
-        }
-    }
-    query
-}
-
 fn classify(
     items: &[ResolvedTransfer],
     destinations: &[Address],
     observed: &BTreeMap<Address, Option<AccountSnapshot>>,
 ) -> Result<Vec<Lamport>, SendError> {
-    let system = Address::from_bytes([0; 32]);
     let mut balances = Vec::with_capacity(items.len());
     for (item, destination) in items.iter().zip(destinations) {
         let source = observed.get(&item.source).ok_or_else(|| {
@@ -284,7 +276,7 @@ fn classify(
         })?;
         if source
             .as_ref()
-            .is_some_and(|account| !supported(account, &system))
+            .is_some_and(|account| !account.supports_native_transfer())
         {
             return Err(unsupported(item.index, "unsupported Solana source account"));
         }
@@ -296,7 +288,7 @@ fn classify(
         })?;
         if destination
             .as_ref()
-            .is_some_and(|account| !supported(account, &system))
+            .is_some_and(|account| !account.supports_native_transfer())
         {
             return Err(unsupported(
                 item.index,
@@ -312,8 +304,12 @@ fn classify(
     Ok(balances)
 }
 
-fn supported(account: &AccountSnapshot, system: &Address) -> bool {
-    !account.executable() && account.owner() == system && account.data().is_empty()
+impl AccountSnapshot {
+    fn supports_native_transfer(&self) -> bool {
+        !self.executable()
+            && self.owner() == &Address::from_bytes([0; 32])
+            && self.data().is_empty()
+    }
 }
 
 fn unsupported(index: usize, message: &'static str) -> SendError {
@@ -484,6 +480,7 @@ mod tests {
             transfer(0, &source, &destination),
             transfer(1, &other, &destination),
             transfer(2, &source, &other),
+            transfer(3, &destination, &source),
         ])
         .unwrap();
         let acquired = acquirer
@@ -493,7 +490,7 @@ mod tests {
         assert_eq!(acquired.floor(), 12);
         assert_eq!(
             acquired.destinations(),
-            &[destination.clone(), destination, other]
+            &[destination.clone(), destination, other, source.clone()]
         );
         assert_eq!(
             acquired
@@ -501,7 +498,7 @@ mod tests {
                 .iter()
                 .map(|value| value.atomic())
                 .collect::<Vec<_>>(),
-            [20, 30, 20]
+            [20, 30, 20, 0]
         );
         rpc.assert_finished();
         assert!(
@@ -652,34 +649,74 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stable_query_preserves_first_appearance_through_public_maximum() {
+    #[tokio::test]
+    async fn acquisition_preserves_first_appearance_through_public_maximum() {
         let mut items = Vec::new();
-        let mut destinations = Vec::new();
+        let mut expected = Vec::new();
         for index in 0..wallets::MAX_TRANSFERS {
             let source = address(u8::try_from(index + 1).unwrap());
             let destination = address(u8::try_from(index + 101).unwrap());
             items.push(transfer(index, &source, &destination));
-            destinations.push(destination);
+            expected.push(source.to_string());
+            expected.push(destination.to_string());
         }
-        let query = stable_query(&items, &destinations);
-        assert_eq!(query.len(), 100);
-        for (index, item) in items.iter().enumerate() {
-            assert_eq!(&query[index * 2], item.source());
-            assert_eq!(&query[index * 2 + 1], &destinations[index]);
-        }
-
-        let duplicate = stable_query(
-            &[
-                transfer(0, items[0].source(), &destinations[0]),
-                transfer(1, items[0].source(), &destinations[0]),
-            ],
-            &[destinations[0].clone(), destinations[0].clone()],
-        );
+        assert_eq!(expected.len(), 100);
+        let rpc = Scripted::new([
+            ("getHealth", json!([]), json!("ok")),
+            ("getSlot", json!([{"commitment":"confirmed"}]), json!(10)),
+            (
+                "getMultipleAccounts",
+                json!([expected, {"encoding":"base64","commitment":"confirmed","minContextSlot":10}]),
+                json!({"context":{"slot":11},"value":vec![serde_json::Value::Null;100]}),
+            ),
+            (
+                "getSlot",
+                json!([{"commitment":"confirmed","minContextSlot":11}]),
+                json!(12),
+            ),
+        ]);
+        let acquired = Acquirer::new(RpcClient::new(rpc.clone()), SourceCoordinator::default())
+            .acquire(Batch::new(items).unwrap(), &Cancellation::default())
+            .await
+            .expect("one complete maximum-size query");
+        assert_eq!(acquired.floor(), 12);
         assert_eq!(
-            duplicate,
-            [items[0].source().clone(), destinations[0].clone()]
+            acquired.balances(),
+            vec![Lamport::ZERO; wallets::MAX_TRANSFERS]
         );
+        rpc.assert_finished();
+    }
+
+    #[test]
+    fn classification_preserves_earliest_occurrence_and_source_before_destination_errors() {
+        let source = address(7);
+        let destination = address(8);
+        let other = address(9);
+        let items = [
+            transfer(0, &source, &destination),
+            transfer(1, &destination, &other),
+        ];
+        let unsupported = AccountSnapshot::new(other.clone(), Lamport::ZERO, false, Vec::new());
+        for (first_source, message) in [
+            (None, "unsupported Solana destination account"),
+            (
+                Some(unsupported.clone()),
+                "unsupported Solana source account",
+            ),
+        ] {
+            let observed = BTreeMap::from([
+                (source.clone(), first_source),
+                (destination.clone(), Some(unsupported.clone())),
+                (other.clone(), Some(unsupported.clone())),
+            ]);
+            let failure =
+                classify(&items, &[destination.clone(), other.clone()], &observed).unwrap_err();
+            assert_eq!(failure.failed_index, Some(0));
+            assert_eq!(failure.source.kind, WalletErrorKind::Unsupported);
+            assert_eq!(failure.source.message, message);
+            assert!(failure.accepted.is_empty());
+            assert_eq!(failure.ambiguous_transaction_id, None);
+        }
     }
 
     #[test]

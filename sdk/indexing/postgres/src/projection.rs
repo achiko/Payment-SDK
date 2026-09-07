@@ -5,7 +5,7 @@ use indexing::{BlockAddition, IndexError, IndexErrorKind, IndexScope};
 use tokio_postgres::types::ToSql;
 
 use crate::{
-    columns::{self, HistoryRows, OutputRows, SpendKeys},
+    columns::{HistoryRows, OutputRows, SpendKeys},
     row,
 };
 
@@ -188,8 +188,8 @@ pub(crate) async fn write_spent(
     height: i64,
     addition: &BlockAddition,
 ) -> Result<(), IndexError> {
-    let required = columns::spends(&addition.outputs().spent)?;
-    let tracked = columns::spends(&addition.outputs().tracked_spends)?;
+    let required = SpendKeys::try_from(addition.outputs().spent.as_slice())?;
+    let tracked = SpendKeys::try_from(addition.outputs().tracked_spends.as_slice())?;
 
     if !required.is_empty() {
         let moved = spend(transaction, scope, height, &required).await?;

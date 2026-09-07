@@ -185,10 +185,7 @@ where
         expected: &TransactionId,
     ) -> Result<bool, SourceError> {
         let raw = self
-            .request_result(
-                "eth_getTransactionByHash",
-                json!([super::wire::transaction_id_hex(expected)]),
-            )
+            .request_result("eth_getTransactionByHash", json!([expected.to_string()]))
             .await?;
         let value: Value = raw.deserialize().map_err(map_json_rpc_error)?;
         if value.is_null() {

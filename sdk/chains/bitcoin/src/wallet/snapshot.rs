@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use super::provider::{Config, SNAPSHOT_KIND, transaction_error};
+use super::provider::{Config, SNAPSHOT_KIND};
 use crate::{Address, Satoshi};
 use base::{Decimal, TransactionError, TransactionErrorKind, TransactionSnapshot};
 
@@ -78,7 +78,7 @@ pub(super) fn decode(
 
 // design-lint: allow unclassified-free-function -- shared Bitcoin snapshot boundary maps heterogeneous decode and validation errors to foreign TransactionError::InvalidSnapshot without submission ambiguity
 fn invalid(error: impl std::fmt::Display) -> TransactionError {
-    transaction_error(TransactionErrorKind::InvalidSnapshot, error)
+    TransactionError::new(TransactionErrorKind::InvalidSnapshot, error.to_string())
 }
 
 #[cfg(test)]

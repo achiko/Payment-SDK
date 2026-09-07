@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use super::{Builder, SNAPSHOT_KIND, Wallet, WalletConfig, transaction_error};
+use super::{Builder, SNAPSHOT_KIND, Wallet, WalletConfig};
 use crate::{Address, AssetKind};
 use base::{Decimal, TransactionError, TransactionErrorKind, TransactionSnapshot};
 
@@ -99,7 +99,7 @@ fn decode(
 
 // design-lint: allow unclassified-free-function -- shared Ethereum snapshot adapter maps heterogeneous validation failures to InvalidSnapshot without changing their messages or inventing transaction ambiguity
 fn invalid(error: impl std::fmt::Display) -> TransactionError {
-    transaction_error(TransactionErrorKind::InvalidSnapshot, error)
+    TransactionError::new(TransactionErrorKind::InvalidSnapshot, error.to_string())
 }
 
 #[cfg(test)]

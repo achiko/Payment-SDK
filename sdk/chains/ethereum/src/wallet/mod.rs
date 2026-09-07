@@ -64,10 +64,11 @@ impl WalletConfig {
         destination: Address,
         amount: &Decimal,
     ) -> Result<TransferRequest, TransactionError> {
-        self.validate()
-            .map_err(|error| transaction_error(TransactionErrorKind::InvalidSnapshot, error))?;
+        self.validate().map_err(|error| {
+            TransactionError::new(TransactionErrorKind::InvalidSnapshot, error.to_string())
+        })?;
         if amount <= &Decimal::zero() {
-            return Err(transaction_error(
+            return Err(TransactionError::new(
                 TransactionErrorKind::InvalidAmount,
                 "amount must be positive",
             ));
@@ -75,7 +76,9 @@ impl WalletConfig {
         let value = amount
             .to_atomic_be_bytes(self.decimals)
             .map(Wei)
-            .map_err(|error| transaction_error(TransactionErrorKind::InvalidAmount, error))?;
+            .map_err(|error| {
+                TransactionError::new(TransactionErrorKind::InvalidAmount, error.to_string())
+            })?;
         Ok(match &self.asset {
             AssetKind::Native => TransferRequest::native_atomic(from, destination, value),
             AssetKind::Erc20(token) => {
@@ -282,7 +285,7 @@ impl Builder {
     fn request(&self) -> Result<TransferRequest, TransactionError> {
         self.validate()?;
         let (destination, amount) = self.transfer.clone().ok_or_else(|| {
-            transaction_error(
+            TransactionError::new(
                 TransactionErrorKind::InvalidTransaction,
                 "transfer is not configured",
             )
@@ -292,9 +295,9 @@ impl Builder {
     }
 
     fn validate(&self) -> Result<(), TransactionError> {
-        self.config
-            .validate()
-            .map_err(|error| transaction_error(TransactionErrorKind::InvalidSnapshot, error))
+        self.config.validate().map_err(|error| {
+            TransactionError::new(TransactionErrorKind::InvalidSnapshot, error.to_string())
+        })
     }
 }
 
@@ -305,20 +308,22 @@ impl BaseBuilder for Builder {
         amount: Decimal,
     ) -> Result<(), TransactionError> {
         if self.transfer.is_some() {
-            return Err(transaction_error(
+            return Err(TransactionError::new(
                 TransactionErrorKind::Unsupported,
                 "Ethereum transaction builder supports exactly one transfer",
             ));
         }
         let bytes: [u8; 20] = destination.as_bytes().try_into().map_err(|_| {
-            transaction_error(
+            TransactionError::new(
                 TransactionErrorKind::InvalidAddress,
                 "Ethereum destination must contain exactly 20 bytes",
             )
         })?;
         amount
             .to_atomic_be_bytes::<32>(self.config.decimals)
-            .map_err(|error| transaction_error(TransactionErrorKind::InvalidAmount, error))?;
+            .map_err(|error| {
+                TransactionError::new(TransactionErrorKind::InvalidAmount, error.to_string())
+            })?;
         self.transfer = Some((Address(bytes), amount));
         Ok(())
     }
@@ -326,7 +331,7 @@ impl BaseBuilder for Builder {
     fn snapshot(&self) -> Result<TransactionSnapshot, TransactionError> {
         self.validate()?;
         let (destination, amount) = self.transfer.as_ref().ok_or_else(|| {
-            transaction_error(
+            TransactionError::new(
                 TransactionErrorKind::InvalidTransaction,
                 "transfer is not configured",
             )
@@ -390,18 +395,28 @@ impl Broadcaster for Wallet {
             if prepared.version() != base::SignedTransaction::VERSION
                 || prepared.kind() != PREPARED_KIND
             {
-                return Err(transaction_error(
+                return Err(TransactionError::new(
                     TransactionErrorKind::InvalidTransaction,
                     "prepared transaction is not an Ethereum signed envelope",
                 ));
             }
-            let id = prepared.id().as_str().parse().map_err(|error| {
-                transaction_error(TransactionErrorKind::InvalidTransaction, error)
-            })?;
+            let id = prepared
+                .id()
+                .as_str()
+                .parse::<crate::TransactionId>()
+                .map_err(|error| {
+                    TransactionError::new(
+                        TransactionErrorKind::InvalidTransaction,
+                        error.to_string(),
+                    )
+                })?;
             let signed =
                 SignedTransaction::from_envelope(id, prepared.envelope().as_bytes().to_vec())
                     .map_err(|error| {
-                        transaction_error(TransactionErrorKind::InvalidTransaction, error)
+                        TransactionError::new(
+                            TransactionErrorKind::InvalidTransaction,
+                            error.to_string(),
+                        )
                     })?;
             let id = self.coordinator.broadcast(signed).await?;
             Ok(BroadcastReceipt {
@@ -409,13 +424,6 @@ impl Broadcaster for Wallet {
             })
         })
     }
-}
-
-fn transaction_error(
-    kind: TransactionErrorKind,
-    error: impl std::fmt::Display,
-) -> TransactionError {
-    TransactionError::new(kind, error.to_string())
 }
 
 impl ChainError {
@@ -432,7 +440,7 @@ impl ChainError {
             ChainErrorKind::NotFound => TransactionErrorKind::InvalidTransaction,
             ChainErrorKind::Other => TransactionErrorKind::Unknown,
         };
-        transaction_error(kind, self)
+        TransactionError::new(kind, self.to_string())
     }
 }
 

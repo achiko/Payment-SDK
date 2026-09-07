@@ -301,6 +301,10 @@ fn broadcast_remote_rejection_is_definite_and_has_no_ambiguity() {
         .expect_err("a remote Bitcoin rejection must fail definitively");
 
     assert_eq!(error.kind, base::TransactionErrorKind::Rejected);
+    assert_eq!(
+        error.message,
+        "Bitcoin JSON-RPC request failed with code -26"
+    );
     assert_eq!(error.ambiguous_transaction_id, None);
 }
 

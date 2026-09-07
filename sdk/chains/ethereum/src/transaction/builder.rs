@@ -1,6 +1,6 @@
 use base::{Decimal, DecimalError, TransactionFuture};
 
-use crate::{Address, Wei, erc20};
+use crate::{Address, Wei};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TransferRequest(Transfer);
@@ -95,15 +95,6 @@ impl TransferRequest {
         match &self.0 {
             Transfer::Native { value, .. } => value.clone(),
             Transfer::Erc20 { .. } => Wei::ZERO,
-        }
-    }
-
-    pub(crate) fn input(&self) -> Vec<u8> {
-        match &self.0 {
-            Transfer::Native { .. } => Vec::new(),
-            Transfer::Erc20 {
-                recipient, amount, ..
-            } => erc20::transfer(recipient, amount),
         }
     }
 

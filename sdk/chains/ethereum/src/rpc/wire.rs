@@ -134,10 +134,6 @@ pub(super) fn wei_quantity(value: &Wei) -> String {
     format!("{:#x}", U256::from_be_bytes(value.0))
 }
 
-pub(super) fn transaction_id_hex(id: &TransactionId) -> String {
-    hex::encode_prefixed(id.0)
-}
-
 // design-lint: allow unclassified-free-function -- translates foreign JSON-RPC errors into foreign indexing source errors while preserving display text and retryability at the Ethereum RPC boundary
 pub(super) fn map_json_rpc_error(error: Error) -> SourceError {
     source_error(error.to_string(), error.is_retryable())
@@ -432,7 +428,7 @@ mod tests {
         hash[30] = 0xab;
         hash[31] = 0xcd;
         assert_eq!(
-            transaction_id_hex(&TransactionId(hash)),
+            TransactionId(hash).to_string(),
             format!("0x{}abcd", "00".repeat(30))
         );
     }

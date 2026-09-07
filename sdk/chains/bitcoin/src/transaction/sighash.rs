@@ -1,4 +1,4 @@
-use bitcoin::EcdsaSighashType;
+use bitcoin::{EcdsaSighashType, TapSighashType};
 
 use crate::ChainError;
 
@@ -14,6 +14,18 @@ pub enum SighashType {
 }
 
 impl SighashType {
+    pub(super) fn taproot(self) -> TapSighashType {
+        match self {
+            Self::All => TapSighashType::All,
+            Self::None => TapSighashType::None,
+            Self::Single => TapSighashType::Single,
+            Self::AllAnyoneCanPay => TapSighashType::AllPlusAnyoneCanPay,
+            Self::NoneAnyoneCanPay => TapSighashType::NonePlusAnyoneCanPay,
+            Self::SingleAnyoneCanPay => TapSighashType::SinglePlusAnyoneCanPay,
+            Self::TaprootDefault => TapSighashType::Default,
+        }
+    }
+
     pub(super) fn ecdsa(self) -> Result<EcdsaSighashType, ChainError> {
         match self {
             SighashType::All => Ok(EcdsaSighashType::All),
@@ -33,6 +45,21 @@ impl SighashType {
 mod tests {
     use super::*;
     use crate::ChainErrorKind;
+
+    #[test]
+    fn taproot_modes_preserve_all_consensus_flags() {
+        for (mode, flag) in [
+            (SighashType::All, 0x01),
+            (SighashType::None, 0x02),
+            (SighashType::Single, 0x03),
+            (SighashType::AllAnyoneCanPay, 0x81),
+            (SighashType::NoneAnyoneCanPay, 0x82),
+            (SighashType::SingleAnyoneCanPay, 0x83),
+            (SighashType::TaprootDefault, 0x00),
+        ] {
+            assert_eq!(mode.taproot() as u8, flag);
+        }
+    }
 
     #[test]
     fn ecdsa_modes_preserve_their_consensus_flags() {

@@ -248,7 +248,7 @@ where
         Box::pin(async move {
             let computed = TransactionId(keccak256(&transaction.envelope).0);
             if computed != transaction.id {
-                return Err(transaction_error(
+                return Err(TransactionError::new(
                     TransactionErrorKind::InvalidTransaction,
                     "signed Ethereum envelope hash does not match its transaction ID",
                 ));
@@ -433,16 +433,9 @@ where
     }
 }
 
-fn transaction_error(
-    kind: TransactionErrorKind,
-    error: impl std::fmt::Display,
-) -> TransactionError {
-    TransactionError::new(kind, error.to_string())
-}
-
 // design-lint: allow unclassified-free-function -- RPC boundary adapter adds Ethereum ambiguity context and the exact local transaction ID to uncertain submission failures without client state
 fn ambiguous_submission(id: &TransactionId, error: impl std::fmt::Display) -> TransactionError {
-    transaction_error(
+    TransactionError::new(
         TransactionErrorKind::Unavailable,
         format!("Ethereum submission outcome is ambiguous: {error}"),
     )

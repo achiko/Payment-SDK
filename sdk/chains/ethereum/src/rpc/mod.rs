@@ -42,7 +42,6 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::transport::{Call, Client as JsonClient, Error, Failure, RawJson};
-    use super::wire::transaction_id_hex;
     use super::*;
     use crate::{
         Address, AssetKind, ChainErrorKind, SignedTransaction, TransactionId, TransferRequest, Wei,
@@ -756,10 +755,7 @@ mod tests {
         );
         client.push_replies([
             success("eth_getTransactionByHash", Value::Null),
-            success(
-                "eth_sendRawTransaction",
-                json!(transaction_id_hex(&signed.id)),
-            ),
+            success("eth_sendRawTransaction", json!(signed.id.to_string())),
         ]);
 
         assert_eq!(
@@ -790,10 +786,7 @@ mod tests {
         let id = TransactionId(keccak256(&envelope).0);
         let matching = ScriptedClient::new(vec![
             failure("eth_sendRawTransaction", -32_000, "already known"),
-            success(
-                "eth_getTransactionByHash",
-                json!({"hash": transaction_id_hex(&id)}),
-            ),
+            success("eth_getTransactionByHash", json!({"hash": id.to_string()})),
         ]);
         let matching_rpc = rpc(matching);
 
@@ -829,7 +822,7 @@ mod tests {
 
         let matching = ScriptedClient::new(vec![success(
             "eth_getTransactionByHash",
-            json!({"hash": transaction_id_hex(&id)}),
+            json!({"hash": id.to_string()}),
         )]);
         assert!(block_on(rpc(matching).known(&id)).expect("matching hash must be known"));
 

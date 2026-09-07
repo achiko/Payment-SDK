@@ -111,6 +111,7 @@ fn get<'a, T: tokio_postgres::types::FromSql<'a>>(
         .map_err(|error| IndexError::new(IndexErrorKind::Store, error.to_string(), false))
 }
 
+// design-lint: allow unclassified-free-function -- shared PostgreSQL representation and range validation maps caller context to foreign nonretryable Store errors without moving database policy onto domain values
 pub(crate) fn store(message: impl Into<String>) -> IndexError {
     IndexError::new(IndexErrorKind::Store, message, false)
 }

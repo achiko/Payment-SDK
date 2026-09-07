@@ -7,7 +7,7 @@ use crate::{ChainError, ChainErrorKind, FeeRate, Network, Satoshi};
 
 use super::{
     BuildRequest, Funding, Input, Output, SpendSource, UnsignedTransaction, checked_output,
-    sum_utxos, validate_unique_utxos,
+    validate_unique_utxos,
 };
 
 const SEGWIT_MARKER_FLAG_WEIGHT: u64 = 2;
@@ -57,7 +57,13 @@ impl BuildRequest {
                 ));
             }
             self.available.sort_by(SpendSource::compare_outpoint);
-            let selected_total = sum_utxos(&self.available)?;
+            let selected_total = self
+                .available
+                .iter()
+                .try_fold(0_u64, |total, utxo| total.checked_add(utxo.value.0))
+                .ok_or_else(|| {
+                    ChainError::invalid_transaction("Bitcoin selected input amount overflowed u64")
+                })?;
             let fee = predicted_fee(&self.available, &recipient_scripts, self.fee_rate)?;
             let value = selected_total.checked_sub(fee).ok_or_else(|| {
                 ChainError::insufficient_funds(
@@ -156,7 +162,13 @@ pub(in crate::transaction) fn build_grouped(
             ));
         }
         group.available.sort_by(SpendSource::compare_outpoint);
-        let input = sum_utxos(&group.available)?;
+        let input = group
+            .available
+            .iter()
+            .try_fold(0_u64, |total, utxo| total.checked_add(utxo.value.0))
+            .ok_or_else(|| {
+                ChainError::invalid_transaction("Bitcoin selected input amount overflowed u64")
+            })?;
         let output = group.recipients.iter().try_fold(0_u64, |sum, value| {
             sum.checked_add(value.value.0).ok_or_else(|| {
                 ChainError::invalid_transaction("Bitcoin recipient amount overflowed u64")
@@ -296,6 +308,60 @@ fn predicted_fee(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drain_and_grouped_funding_keep_checked_input_total_and_overflow_error() {
+        let script = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([7; 20]));
+        let address = crate::Address::from_encoded(
+            bitcoin::Address::from_script(&script, Network::Regtest.native())
+                .unwrap()
+                .to_string(),
+        );
+        for first in [u64::MAX - 1, u64::MAX] {
+            let available = [first, 1]
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| SpendSource {
+                    transaction_id: [index as u8; 32],
+                    output_index: 0,
+                    value: Satoshi(value),
+                    script_pubkey: script.clone().into_bytes(),
+                    satisfaction_weight: 109,
+                })
+                .collect::<Vec<_>>();
+            let recipients = vec![Output::from_atomic(address.clone(), Satoshi(1_000))];
+            let drain = BuildRequest {
+                available: available.clone(),
+                recipients: recipients.clone(),
+                change_address: address.clone(),
+                fee_rate: FeeRate::new(1),
+                drain_wallet: true,
+            }
+            .build(Network::Regtest);
+            let grouped = build_grouped(
+                Network::Regtest,
+                vec![Funding {
+                    available,
+                    recipients,
+                    change_address: address.clone(),
+                }],
+                FeeRate::new(1),
+            );
+            if first == u64::MAX - 1 {
+                assert!(drain.is_ok());
+                assert!(grouped.is_ok());
+                continue;
+            }
+            for result in [drain, grouped] {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind, ChainErrorKind::InvalidTransaction);
+                assert_eq!(
+                    error.message,
+                    "Bitcoin selected input amount overflowed u64"
+                );
+            }
+        }
+    }
 
     #[test]
     fn fee_allocation_charges_sources_in_input_order() {

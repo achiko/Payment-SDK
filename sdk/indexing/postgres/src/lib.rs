@@ -261,6 +261,7 @@ fn invalid(message: impl Into<String>) -> IndexError {
     IndexError::new(IndexErrorKind::InvalidRequest, message, false)
 }
 
+// design-lint: allow unclassified-free-function -- PostgreSQL driver-to-IndexError translation between foreign types preserves display text and retryable Store classification across query and transaction boundaries
 fn store(error: tokio_postgres::Error) -> IndexError {
     IndexError::new(IndexErrorKind::Store, error.to_string(), true)
 }

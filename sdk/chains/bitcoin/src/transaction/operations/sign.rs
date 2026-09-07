@@ -13,9 +13,7 @@ use bitcoin::{
 
 use crate::{ChainError, Network};
 
-use super::{
-    Input, SighashType, SignedTransaction, TransactionId, UnsignedTransaction, taproot_sighash_type,
-};
+use super::{Input, SighashType, SignedTransaction, TransactionId, UnsignedTransaction};
 
 struct InputSigner<'a, S: ?Sized> {
     transaction: &'a Transaction,
@@ -160,7 +158,7 @@ impl<S: Signer + ?Sized> InputSigner<'_, S> {
     }
 
     async fn sign_p2tr_input(&self, input_index: usize) -> Result<Witness, ChainError> {
-        let sighash_type = taproot_sighash_type(self.sighash_type)?;
+        let sighash_type = self.sighash_type.taproot();
         let sighash = SighashCache::new(self.transaction)
             .taproot_key_spend_signature_hash(
                 input_index,
