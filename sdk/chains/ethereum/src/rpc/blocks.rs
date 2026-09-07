@@ -1,5 +1,6 @@
 use std::fmt;
 
+use alloy_primitives::hex;
 use indexing::SourceError;
 use json_rpc::{Config as TransportConfig, Http as HttpClient};
 use serde_json::{Value, json};
@@ -149,7 +150,7 @@ where
         let hash = super::wire::parse_fixed_data::<32>(hash, "block hash")
             .map_err(|message| invalid_rpc_response("eth_getBlockByNumber", message))?;
         Ok(json!({
-            "blockHash": super::wire::data_hex(&hash),
+            "blockHash": hex::encode_prefixed(hash),
             "requireCanonical": true,
         }))
     }

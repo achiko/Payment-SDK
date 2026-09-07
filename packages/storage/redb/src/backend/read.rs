@@ -1,9 +1,7 @@
 use redb::ReadableDatabase;
 use storage::{Error, ErrorKind, Key, Namespace, ScanPage, ScanRequest, StoredValue};
 
-use crate::codec::{
-    decode_physical_key, decode_stored_value, encode_physical_key, namespace_prefix,
-};
+use crate::codec::{StoredRecord, decode_physical_key, encode_physical_key, namespace_prefix};
 
 use super::{
     Backend, DATA_TABLE, invalid_request, operation_error, table_error, transaction_error,
@@ -30,7 +28,7 @@ impl Backend {
         let raw = table
             .get(physical_key)
             .map_err(|error| operation_error(error, "redb point read failed"))?;
-        raw.map(|value| decode_stored_value(value.value()))
+        raw.map(|value| StoredRecord::try_from(value.value()).map(StoredValue::from))
             .transpose()
     }
 
@@ -97,7 +95,10 @@ impl Backend {
             {
                 continue;
             }
-            entries.push((logical_key, decode_stored_value(raw_value.value())?));
+            entries.push((
+                logical_key,
+                StoredValue::from(StoredRecord::try_from(raw_value.value())?),
+            ));
             if entries.len() == read_limit {
                 break;
             }

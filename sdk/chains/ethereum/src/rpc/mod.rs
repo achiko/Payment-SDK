@@ -37,14 +37,14 @@ mod tests {
         time::Duration,
     };
 
-    use alloy_primitives::keccak256;
+    use alloy_primitives::{hex, keccak256};
     use futures_executor::block_on;
     use indexing::{BlockHash, BlockHeight, BlockPosition, BlockRef};
     use json_rpc::Retry;
     use serde_json::{Value, json};
 
     use super::transport::{Call, Client as JsonClient, Error, Failure, RawJson};
-    use super::wire::{data_hex, transaction_id_hex};
+    use super::wire::transaction_id_hex;
     use super::*;
     use crate::{
         Address, AssetKind, ChainErrorKind, SignedTransaction, TransactionId, TransferRequest, Wei,
@@ -655,7 +655,10 @@ mod tests {
                 .map(base::TransactionId::as_str),
             Some(provider_candidate.as_str())
         );
-        assert_eq!(client.requests()[0].1, json!([data_hex(&envelope)]));
+        assert_eq!(
+            client.requests()[0].1,
+            json!([hex::encode_prefixed(&envelope)])
+        );
     }
 
     #[test]
@@ -777,8 +780,8 @@ mod tests {
         assert_eq!(
             submissions,
             [
-                json!([data_hex(&signed.envelope)]),
-                json!([data_hex(&signed.envelope)])
+                json!([hex::encode_prefixed(&signed.envelope)]),
+                json!([hex::encode_prefixed(&signed.envelope)])
             ]
         );
     }

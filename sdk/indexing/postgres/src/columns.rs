@@ -155,20 +155,25 @@ impl TryFrom<&BlockAddition> for HistoryRows {
     }
 }
 
-pub(crate) fn created(outputs: &[IndexedOutput]) -> Result<OutputRows, IndexError> {
-    let mut rows = OutputRows::default();
-    for output in outputs {
-        rows.transaction_id
-            .push(output.id.transaction.value.clone());
-        rows.output_index.push(index(output.id.index)?);
-        rows.address.push(output.address.value.clone());
-        rows.asset_chain.push(output.asset.chain.0.clone());
-        rows.asset.push(output.asset.asset.clone());
-        rows.amount.push(output.amount.to_string());
-        rows.evidence.push(output.evidence.clone());
-        rows.coinbase.push(output.coinbase);
+impl TryFrom<&[IndexedOutput]> for OutputRows {
+    type Error = IndexError;
+
+    /// Transposes created outputs into the ordered columns of one batched insert.
+    fn try_from(outputs: &[IndexedOutput]) -> Result<Self, Self::Error> {
+        let mut rows = Self::default();
+        for output in outputs {
+            rows.transaction_id
+                .push(output.id.transaction.value.clone());
+            rows.output_index.push(index(output.id.index)?);
+            rows.address.push(output.address.value.clone());
+            rows.asset_chain.push(output.asset.chain.0.clone());
+            rows.asset.push(output.asset.asset.clone());
+            rows.amount.push(output.amount.to_string());
+            rows.evidence.push(output.evidence.clone());
+            rows.coinbase.push(output.coinbase);
+        }
+        Ok(rows)
     }
-    Ok(rows)
 }
 
 pub(crate) fn spends(keys: &[OutputKey]) -> Result<SpendKeys, IndexError> {
@@ -190,5 +195,85 @@ const fn kind(movement: &ValueMovement) -> &'static str {
         ValueMovement::Output { .. } => "output",
         ValueMovement::Mint { .. } => "mint",
         ValueMovement::Burn { .. } => "burn",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use indexing::{
+        AssetId, BlockHeight, CanonicalAddress, ChainId, IndexErrorKind, IndexScope, OutputId,
+        TransactionRef,
+    };
+
+    use super::*;
+
+    fn output(transaction: &str, index: u32, amount: &str) -> IndexedOutput {
+        let scope = IndexScope {
+            chain: ChainId("chain".to_owned()),
+            network: "network".to_owned(),
+        };
+        IndexedOutput {
+            id: OutputId {
+                transaction: TransactionRef {
+                    scope: scope.clone(),
+                    value: transaction.to_owned(),
+                },
+                index,
+            },
+            address: CanonicalAddress {
+                scope,
+                value: format!("address-{transaction}"),
+            },
+            asset: AssetId {
+                chain: ChainId("chain".to_owned()),
+                asset: "native".to_owned(),
+            },
+            amount: amount.parse().expect("test amount"),
+            evidence: vec![1, 2],
+            created_at: BlockHeight(42),
+            coinbase: false,
+        }
+    }
+
+    #[test]
+    fn output_rows_preserve_column_alignment_order_and_exact_amounts() {
+        let outputs = [
+            output("b", 0, "123456789012345678901234567890.000000000000000001"),
+            IndexedOutput {
+                evidence: vec![3, 4],
+                coinbase: true,
+                ..output("a", i32::MAX as u32, "0.5")
+            },
+        ];
+        let rows = OutputRows::try_from(outputs.as_slice()).expect("output columns");
+        assert_eq!(rows.transaction_id, ["b", "a"]);
+        assert_eq!(rows.output_index, [0, i32::MAX]);
+        assert_eq!(rows.address, ["address-b", "address-a"]);
+        assert_eq!(rows.asset_chain, ["chain", "chain"]);
+        assert_eq!(rows.asset, ["native", "native"]);
+        assert_eq!(
+            rows.amount,
+            ["123456789012345678901234567890.000000000000000001", "0.5"]
+        );
+        assert_eq!(rows.evidence, [vec![1, 2], vec![3, 4]]);
+        assert_eq!(rows.coinbase, [false, true]);
+    }
+
+    #[test]
+    fn output_rows_accept_empty_batches_and_reject_unstorable_indexes() {
+        assert!(
+            OutputRows::try_from([].as_slice())
+                .expect("empty batch")
+                .is_empty()
+        );
+        for index in [i32::MAX as u32 + 1, u32::MAX] {
+            let outputs = [output("a", index, "1")];
+            let error = OutputRows::try_from(outputs.as_slice())
+                .err()
+                .expect("out-of-range output index");
+            assert_eq!(error.kind, IndexErrorKind::Store);
+            assert_eq!(error.message, "output index exceeds the storage range");
+            assert!(!error.retryable);
+        }
     }
 }

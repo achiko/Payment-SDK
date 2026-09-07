@@ -2,6 +2,60 @@ use super::*;
 use crate::{Satoshi, indexer::model::PreviousOutput};
 
 #[test]
+fn block_consensus_decoding_rejects_invalid_rpc_claims_before_projection() {
+    let valid = block_result();
+    let trailing = format!("{}00", valid["tx"][0]["hex"].as_str().expect("fixture hex"));
+    for (field, value, message) in [
+        (
+            "hex",
+            Value::Null,
+            "Bitcoin raw transaction is missing or invalid",
+        ),
+        (
+            "hex",
+            json!(""),
+            "Bitcoin raw transaction is missing or invalid",
+        ),
+        (
+            "hex",
+            json!("not-hex"),
+            "Bitcoin transaction hex is invalid",
+        ),
+        (
+            "hex",
+            json!("ff"),
+            "Bitcoin transaction consensus bytes are invalid",
+        ),
+        (
+            "hex",
+            json!(trailing),
+            "Bitcoin transaction consensus bytes are invalid",
+        ),
+        (
+            "txid",
+            json!(TransactionId([0; 32]).to_string()),
+            "Bitcoin transaction ID does not match its consensus bytes",
+        ),
+    ] {
+        let mut block = valid.clone();
+        block["tx"][0][field] = value;
+        let mut replies = connect_replies();
+        replies.extend([
+            reply("getblockhash", Value::String(hash(2))),
+            reply_for("getblock", json!([hash(2), 2]), block),
+        ]);
+        let client = ScriptedClient::new(replies);
+        let calls = client.clone();
+        let source = block_on(Blocks::connect(client, config())).expect("valid source setup");
+        let error = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 1))
+            .expect_err("invalid consensus claim must stop ingestion");
+        assert_eq!(error.message, message);
+        assert!(error.retryable);
+        calls.assert_exhausted();
+    }
+}
+
+#[test]
 fn numbered_block_fetch_parses_transactions_and_rechecks_canonical_hash() {
     let mut replies = connect_replies();
     replies.extend([

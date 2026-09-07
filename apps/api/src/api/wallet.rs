@@ -25,6 +25,7 @@ pub struct CreateWallet {
     pub asset: WalletAsset,
 }
 
+// design-lint: allow unclassified-free-function -- Axum owns the extractor signature; this handler assigns the public wallet ID, delegates one wallet generation call, and maps the HTTP response
 #[utoipa::path(
     post,
     path = "/v1/wallets",

@@ -1,4 +1,4 @@
-use alloy_primitives::keccak256;
+use alloy_primitives::{hex, keccak256};
 use base::{TransactionError, TransactionErrorKind, TransactionId as BaseTransactionId};
 use indexing::{BoxFuture, SourceError};
 use serde_json::{Map, Value, json};
@@ -10,7 +10,7 @@ use super::{
     error::BuildError,
     transport::Client as Transport,
     wire::{
-        CallError, data_hex, gas_limit_with_margin, invalid_rpc_response, is_already_known,
+        CallError, gas_limit_with_margin, invalid_rpc_response, is_already_known,
         is_execution_revert, map_json_rpc_error, parse_fixed_data, parse_quantity_u64,
         parse_quantity_wei, parse_transaction_id, wei_quantity,
     },
@@ -94,7 +94,7 @@ where
             transaction.insert("from".to_owned(), json!(request.from().to_string()));
             transaction.insert("to".to_owned(), json!(request.to().to_string()));
             transaction.insert("value".to_owned(), json!(wei_quantity(&request.value())));
-            transaction.insert("data".to_owned(), json!(data_hex(&input)));
+            transaction.insert("data".to_owned(), json!(hex::encode_prefixed(&input)));
 
             if request.erc20_transfer().is_some() {
                 self.ensure_token_amount(request).await?;
@@ -261,7 +261,7 @@ where
             let result = self
                 .request_result_detailed_once(
                     "eth_sendRawTransaction",
-                    json!([data_hex(&transaction.envelope)]),
+                    json!([hex::encode_prefixed(&transaction.envelope)]),
                 )
                 .await;
             let raw = match result {

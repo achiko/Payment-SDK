@@ -11,13 +11,13 @@ const GLOBAL_VERSION_LEN: usize = 8;
 const MAX_STORED_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Decode, Encode, PartialEq, Eq)]
-struct StoredRecord {
+pub(crate) struct StoredRecord {
     storage_version: u64,
     payload: Vec<u8>,
 }
 
 #[derive(Debug, Decode, Encode, PartialEq, Eq)]
-struct GlobalVersion {
+pub(crate) struct GlobalVersion {
     version: u64,
 }
 
@@ -45,6 +45,7 @@ pub(crate) fn encode_physical_key(namespace: &Namespace, key: &Key) -> Result<Ve
     Ok(encoded)
 }
 
+// design-lint: allow unclassified-free-function -- adapter-owned physical key parsing validates the requested foreign Namespace before producing a backend-neutral Key
 pub(crate) fn decode_physical_key(
     physical: &[u8],
     expected_namespace: &Namespace,
@@ -98,29 +99,41 @@ pub(crate) fn encode_stored_value(value: &Value, version: Version) -> Result<Vec
     Ok(frame)
 }
 
-pub(crate) fn decode_stored_value(frame: &[u8]) -> Result<StoredValue, Error> {
-    let body = validate_frame_prefix(frame, VALUE_MAGIC, "storage value")?;
-    validate_record_length(body)?;
+impl TryFrom<&[u8]> for StoredRecord {
+    type Error = Error;
 
-    let (record, bytes_read) = bincode::decode_from_slice::<StoredRecord, _>(body, record_config())
-        .map_err(|error| {
-            Error::corrupt_data(format!("failed to decode storage value record: {error}"))
-        })?;
-    if bytes_read != body.len() {
-        return Err(Error::corrupt_data(
-            "storage value record contains trailing bytes",
-        ));
-    }
-    if record.storage_version == 0 {
-        return Err(Error::corrupt_data(
-            "storage value record has an invalid commit version",
-        ));
-    }
+    fn try_from(frame: &[u8]) -> Result<Self, Self::Error> {
+        let body = validate_frame_prefix(frame, VALUE_MAGIC, "storage value")?;
+        validate_record_length(body)?;
 
-    Ok(StoredValue {
-        value: Value(record.payload),
-        version: Version(record.storage_version),
-    })
+        let (record, bytes_read) =
+            bincode::decode_from_slice::<StoredRecord, _>(body, record_config()).map_err(
+                |error| {
+                    Error::corrupt_data(format!("failed to decode storage value record: {error}"))
+                },
+            )?;
+        if bytes_read != body.len() {
+            return Err(Error::corrupt_data(
+                "storage value record contains trailing bytes",
+            ));
+        }
+        if record.storage_version == 0 {
+            return Err(Error::corrupt_data(
+                "storage value record has an invalid commit version",
+            ));
+        }
+
+        Ok(record)
+    }
+}
+
+impl From<StoredRecord> for StoredValue {
+    fn from(record: StoredRecord) -> Self {
+        Self {
+            value: Value(record.payload),
+            version: Version(record.storage_version),
+        }
+    }
 }
 
 pub(crate) fn encode_global_version(version: Version) -> Result<Vec<u8>, Error> {
@@ -142,31 +155,43 @@ pub(crate) fn encode_global_version(version: Version) -> Result<Vec<u8>, Error> 
     Ok(frame)
 }
 
-pub(crate) fn decode_global_version(frame: &[u8]) -> Result<Version, Error> {
-    let body = validate_frame_prefix(frame, GLOBAL_VERSION_MAGIC, "global version")?;
-    if body.len() != GLOBAL_VERSION_LEN {
-        return Err(Error::corrupt_data(format!(
-            "global version record has length {}, expected {GLOBAL_VERSION_LEN}",
-            body.len()
-        )));
-    }
+impl TryFrom<&[u8]> for GlobalVersion {
+    type Error = Error;
 
-    let (record, bytes_read) =
-        bincode::decode_from_slice::<GlobalVersion, _>(body, record_config()).map_err(|error| {
-            Error::corrupt_data(format!("failed to decode global version record: {error}"))
-        })?;
-    if bytes_read != body.len() {
-        return Err(Error::corrupt_data(
-            "global version record contains trailing bytes",
-        ));
-    }
-    if record.version == 0 {
-        return Err(Error::corrupt_data(
-            "global version record has an invalid commit version",
-        ));
-    }
+    fn try_from(frame: &[u8]) -> Result<Self, Self::Error> {
+        let body = validate_frame_prefix(frame, GLOBAL_VERSION_MAGIC, "global version")?;
+        if body.len() != GLOBAL_VERSION_LEN {
+            return Err(Error::corrupt_data(format!(
+                "global version record has length {}, expected {GLOBAL_VERSION_LEN}",
+                body.len()
+            )));
+        }
 
-    Ok(Version(record.version))
+        let (record, bytes_read) =
+            bincode::decode_from_slice::<GlobalVersion, _>(body, record_config()).map_err(
+                |error| {
+                    Error::corrupt_data(format!("failed to decode global version record: {error}"))
+                },
+            )?;
+        if bytes_read != body.len() {
+            return Err(Error::corrupt_data(
+                "global version record contains trailing bytes",
+            ));
+        }
+        if record.version == 0 {
+            return Err(Error::corrupt_data(
+                "global version record has an invalid commit version",
+            ));
+        }
+
+        Ok(record)
+    }
+}
+
+impl From<GlobalVersion> for Version {
+    fn from(record: GlobalVersion) -> Self {
+        Self(record.version)
+    }
 }
 
 fn record_config() -> impl bincode::config::Config {
@@ -265,6 +290,95 @@ mod tests {
     use super::*;
 
     #[test]
+    fn persisted_frames_keep_their_exact_bytes() -> Result<(), Error> {
+        let value_frame = b"W3KV\0\0\0\0\0\0\0\x2a\0\0\0\0\0\0\0\x03\0\x01\xff";
+        let version_frame = b"W3GV\0\0\0\0\0\0\0\x2a";
+        let value = Value(vec![0, 1, 255]);
+
+        assert_eq!(encode_stored_value(&value, Version(42))?, value_frame);
+        assert_eq!(
+            StoredValue::from(StoredRecord::try_from(value_frame.as_slice())?),
+            StoredValue {
+                value,
+                version: Version(42)
+            }
+        );
+        assert_eq!(encode_global_version(Version(42))?, version_frame);
+        assert_eq!(
+            Version::from(GlobalVersion::try_from(version_frame.as_slice())?),
+            Version(42)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_global_versions_keep_corruption_classification_and_messages() {
+        for (frame, expected) in [
+            (
+                b"W3G".as_slice(),
+                "global version frame is shorter than its header",
+            ),
+            (
+                b"bad!".as_slice(),
+                "global version frame has invalid magic bytes",
+            ),
+            (
+                b"W3GV".as_slice(),
+                "global version record has length 0, expected 8",
+            ),
+            (
+                b"W3GV\0\0\0\0\0\0\0\0".as_slice(),
+                "global version record has an invalid commit version",
+            ),
+            (
+                b"W3GV\0\0\0\0\0\0\0\x01\0".as_slice(),
+                "global version record has length 9, expected 8",
+            ),
+        ] {
+            let error =
+                GlobalVersion::try_from(frame).expect_err("malformed metadata must fail closed");
+            assert_eq!(error.kind, ErrorKind::CorruptData);
+            assert_eq!(error.message, expected);
+        }
+    }
+
+    #[test]
+    fn zero_record_version_is_rejected() {
+        let frame = b"W3KV\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        let error = StoredRecord::try_from(frame.as_slice())
+            .expect_err("persisted commit version zero must fail closed");
+        assert_eq!(error.kind, ErrorKind::CorruptData);
+        assert_eq!(
+            error.message,
+            "storage value record has an invalid commit version"
+        );
+    }
+
+    #[test]
+    fn physical_keys_reject_corruption_and_cross_namespace_reads() {
+        let namespace = Namespace("a".to_owned());
+        for (physical, expected) in [
+            (
+                b"\0\0\0".as_slice(),
+                "physical key is shorter than its header",
+            ),
+            (
+                b"\0\0\0\x02a".as_slice(),
+                "physical key namespace length exceeds the encoded key",
+            ),
+            (
+                b"\0\0\0\x01bkey".as_slice(),
+                "physical key does not belong to the requested namespace",
+            ),
+        ] {
+            let error = decode_physical_key(physical, &namespace)
+                .expect_err("invalid physical key must not yield a logical key");
+            assert_eq!(error.kind, ErrorKind::CorruptData);
+            assert_eq!(error.message, expected);
+        }
+    }
+
+    #[test]
     fn physical_key_round_trips() -> Result<(), Error> {
         let namespace = Namespace("observations/chain-a-mainnet".to_owned());
         let logical = Key(vec![0, 1, 2, 255]);
@@ -282,7 +396,7 @@ mod tests {
         let encoded = encode_stored_value(&value, Version(42))?;
 
         assert_eq!(
-            decode_stored_value(&encoded)?,
+            StoredValue::from(StoredRecord::try_from(encoded.as_slice())?),
             StoredValue {
                 value,
                 version: Version(42),
@@ -296,7 +410,7 @@ mod tests {
         let mut encoded = encode_stored_value(&Value(vec![1, 2, 3]), Version(1))?;
         encoded.push(4);
 
-        let error = decode_stored_value(&encoded)
+        let error = StoredRecord::try_from(encoded.as_slice())
             .expect_err("a frame with trailing payload bytes must be rejected");
 
         assert_eq!(error.kind, ErrorKind::CorruptData);
@@ -312,8 +426,8 @@ mod tests {
         let mut encoded = encode_stored_value(&Value(vec![1]), Version(1))?;
         encoded[0] ^= 0xff;
 
-        let error =
-            decode_stored_value(&encoded).expect_err("invalid value magic must be rejected");
+        let error = StoredRecord::try_from(encoded.as_slice())
+            .expect_err("invalid value magic must be rejected");
 
         assert_eq!(error.kind, ErrorKind::CorruptData);
         assert_eq!(error.message, "storage value frame has invalid magic bytes");
@@ -330,7 +444,10 @@ mod tests {
     #[test]
     fn global_version_round_trips() -> Result<(), Error> {
         let encoded = encode_global_version(Version(7))?;
-        assert_eq!(decode_global_version(&encoded)?, Version(7));
+        assert_eq!(
+            Version::from(GlobalVersion::try_from(encoded.as_slice())?),
+            Version(7)
+        );
         Ok(())
     }
 }

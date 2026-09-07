@@ -1,3 +1,4 @@
+use alloy_primitives::hex;
 use indexing::{BlockRef, BoxFuture, SourceError};
 use serde_json::json;
 
@@ -6,10 +7,7 @@ use super::{
     blocks::Methods,
     error::BuildError,
     transport::Client as Transport,
-    wire::{
-        data_hex, invalid_rpc_response, map_json_rpc_error, parse_data, parse_fixed_data,
-        source_error,
-    },
+    wire::{invalid_rpc_response, map_json_rpc_error, parse_data, parse_fixed_data, source_error},
 };
 use crate::{Address, AssetKind, Wei, erc20};
 
@@ -79,7 +77,7 @@ where
                         ));
                     }
                     json!({
-                        "blockHash": data_hex(&block.hash.0),
+                        "blockHash": hex::encode_prefixed(&block.hash.0),
                         "requireCanonical": true,
                     })
                 }
@@ -101,7 +99,7 @@ where
                             "eth_call",
                             json!([{
                                 "to": token.to_string(),
-                                "data": data_hex(&erc20::balance_of(&address)),
+                                "data": hex::encode_prefixed(erc20::balance_of(&address)),
                             }, block]),
                         )
                         .await?;
@@ -195,7 +193,7 @@ where
                 "eth_call",
                 json!([{
                     "to": token.to_string(),
-                    "data": data_hex(&input),
+                    "data": hex::encode_prefixed(&input),
                 }, block]),
             )
             .await?;

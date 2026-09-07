@@ -1,9 +1,10 @@
 use redb::{Durability, ReadableDatabase, ReadableTable};
-use storage::{CommitResult, Condition, Error, ErrorKind, Operation, Version, WriteBatch};
+use storage::{
+    CommitResult, Condition, Error, ErrorKind, Operation, StoredValue, Version, WriteBatch,
+};
 
 use crate::codec::{
-    decode_global_version, decode_stored_value, encode_global_version, encode_physical_key,
-    encode_stored_value,
+    GlobalVersion, StoredRecord, encode_global_version, encode_physical_key, encode_stored_value,
 };
 
 use super::{
@@ -57,7 +58,7 @@ impl Backend {
                 .get(GLOBAL_VERSION_KEY)
                 .map_err(|error| operation_error(error, "failed to read redb global version"))?
             {
-                Some(raw) => decode_global_version(raw.value())?,
+                Some(raw) => Version::from(GlobalVersion::try_from(raw.value())?),
                 None => Version(0),
             };
             next_version = Version(
@@ -126,7 +127,7 @@ impl Backend {
             .get(GLOBAL_VERSION_KEY)
             .map_err(|error| operation_error(error, "failed to read redb global version"))?
         {
-            return decode_global_version(raw.value());
+            return GlobalVersion::try_from(raw.value()).map(Version::from);
         }
         drop(meta);
 
@@ -180,7 +181,7 @@ fn evaluate_condition(
                         namespace.0
                     ))
                 })?;
-            let actual = decode_stored_value(raw.value())?;
+            let actual = StoredValue::from(StoredRecord::try_from(raw.value())?);
             if actual.version != *expected {
                 return Err(Error::conflict(format!(
                     "version condition failed in namespace `{}`: expected {}, found {}",

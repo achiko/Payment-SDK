@@ -1,5 +1,6 @@
 use std::fmt;
 
+use alloy_primitives::{U256, hex};
 use indexing::SourceError;
 
 use crate::{TransactionId, Wei};
@@ -67,7 +68,9 @@ pub(super) fn parse_quantity_wei(value: &str) -> Result<Wei, &'static str> {
     if digits.len() > 64 {
         return Err("hex quantity exceeds 256 bits");
     }
-    decode_hex_right_aligned::<32>(digits).map(Wei)
+    U256::from_str_radix(digits, 16)
+        .map(|value| Wei(value.to_be_bytes()))
+        .map_err(|_| "hex data contains invalid data")
 }
 
 pub(super) fn quantity_digits(value: &str) -> Result<&str, &'static str> {
@@ -96,7 +99,7 @@ pub(super) fn parse_fixed_data<const N: usize>(
     if digits.len() != N * 2 {
         return Err("hex data has an invalid length");
     }
-    decode_hex_right_aligned(digits)
+    hex::decode_to_array(digits).map_err(|_| "hex data contains invalid data")
 }
 
 pub(super) fn parse_data(value: &str) -> Result<Vec<u8>, &'static str> {
@@ -115,33 +118,6 @@ pub(super) fn parse_data(value: &str) -> Result<Vec<u8>, &'static str> {
             Ok((high << 4) | low)
         })
         .collect()
-}
-
-pub(super) fn decode_hex_right_aligned<const N: usize>(
-    digits: &str,
-) -> Result<[u8; N], &'static str> {
-    if digits.len() > N * 2 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("hex data contains invalid data");
-    }
-    let mut decoded = [0_u8; N];
-    let byte_offset = N - digits.len().div_ceil(2);
-    let mut output = byte_offset;
-    let mut input = 0;
-    if digits.len() % 2 == 1 {
-        decoded[output] =
-            hex_nibble(digits.as_bytes()[0]).ok_or("hex data contains invalid data")?;
-        output += 1;
-        input = 1;
-    }
-    while input < digits.len() {
-        let high = hex_nibble(digits.as_bytes()[input]).ok_or("hex data contains invalid data")?;
-        let low =
-            hex_nibble(digits.as_bytes()[input + 1]).ok_or("hex data contains invalid data")?;
-        decoded[output] = (high << 4) | low;
-        output += 1;
-        input += 2;
-    }
-    Ok(decoded)
 }
 
 pub(super) fn parse_transaction_id(
@@ -191,17 +167,7 @@ pub(super) fn wei_quantity(value: &Wei) -> String {
 }
 
 pub(super) fn transaction_id_hex(id: &TransactionId) -> String {
-    data_hex(&id.0)
-}
-
-pub(super) fn data_hex(bytes: &[u8]) -> String {
-    let mut encoded = String::with_capacity(2 + bytes.len() * 2);
-    encoded.push_str("0x");
-    for byte in bytes {
-        encoded.push(hex_digit(byte >> 4));
-        encoded.push(hex_digit(byte & 0x0f));
-    }
-    encoded
+    hex::encode_prefixed(id.0)
 }
 
 pub(super) fn hex_nibble(byte: u8) -> Option<u8> {
@@ -236,5 +202,71 @@ pub(super) fn source_error(message: impl Into<String>, retryable: bool) -> Sourc
     SourceError {
         message: message.into(),
         retryable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quantities_preserve_big_endian_values_and_strict_wire_syntax() {
+        for (encoded, expected) in [
+            ("0x0", Wei::from_u128(0)),
+            ("0xf", Wei::from_u128(15)),
+            ("0xAbC", Wei::from_u128(0xabc)),
+        ] {
+            assert_eq!(parse_quantity_wei(encoded), Ok(expected));
+        }
+        assert_eq!(
+            parse_quantity_wei(&format!("0x{}", "f".repeat(64))),
+            Ok(Wei([255; 32]))
+        );
+        for (encoded, message) in [
+            ("1", "hex quantity has no 0x prefix"),
+            ("0x", "hex quantity is empty"),
+            ("0x01", "hex quantity contains a leading zero"),
+            ("0xg", "hex quantity contains invalid data"),
+            ("0xé", "hex quantity contains invalid data"),
+        ] {
+            assert_eq!(parse_quantity_wei(encoded), Err(message));
+        }
+        assert_eq!(
+            parse_quantity_wei(&format!("0x1{}", "0".repeat(64))),
+            Err("hex quantity exceeds 256 bits")
+        );
+    }
+
+    #[test]
+    fn fixed_data_preserves_leading_zeroes_and_requires_exact_width() {
+        assert_eq!(parse_fixed_data::<3>("0x000aBc", "test"), Ok([0, 10, 188]));
+        assert_eq!(parse_fixed_data::<0>("0x", "test"), Ok([]));
+        assert_eq!(
+            parse_fixed_data::<2>("0xabc", "test"),
+            Err("hex data has an invalid length")
+        );
+        assert_eq!(
+            parse_fixed_data::<2>("abcd", "test"),
+            Err("hex data has no 0x prefix")
+        );
+        assert_eq!(
+            parse_fixed_data::<2>("0x0x12", "test"),
+            Err("hex data contains invalid data")
+        );
+        assert_eq!(
+            parse_fixed_data::<2>("0x12zz", "test"),
+            Err("hex data contains invalid data")
+        );
+        assert_eq!(
+            parse_fixed_data::<1>("0xé", "test"),
+            Err("hex data contains invalid data")
+        );
+        let mut hash = [0; 32];
+        hash[30] = 0xab;
+        hash[31] = 0xcd;
+        assert_eq!(
+            transaction_id_hex(&TransactionId(hash)),
+            format!("0x{}abcd", "00".repeat(30))
+        );
     }
 }

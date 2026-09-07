@@ -684,3 +684,19 @@ async fn concurrent_same_sender_operations_never_reuse_a_nonce() {
         [5, 6]
     );
 }
+
+#[test]
+fn definite_submission_errors_preserve_retryability_without_an_ambiguous_id() {
+    for (retryable, kind) in [
+        (true, TransactionErrorKind::Unavailable),
+        (false, TransactionErrorKind::Rejected),
+    ] {
+        let error = definite_submission_error(SourceError {
+            message: "coordinator claim failed".to_owned(),
+            retryable,
+        });
+        assert_eq!(error.kind, kind);
+        assert_eq!(error.message, "coordinator claim failed");
+        assert!(error.ambiguous_transaction_id.is_none());
+    }
+}

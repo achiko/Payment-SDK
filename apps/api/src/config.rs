@@ -109,26 +109,26 @@ impl ConfiguredWallet {
     pub(crate) fn secret(&self) -> Result<wallets::SecretBytes, AnyError> {
         let encoded = env::var(&self.secret_env)
             .map_err(|_| "configured wallet secret environment variable is unavailable")?;
-        decode_secret(self.asset, &encoded)
+        self.decode_secret(&encoded)
     }
-}
 
-fn decode_secret(asset: WalletAsset, encoded: &str) -> Result<wallets::SecretBytes, AnyError> {
-    if asset == WalletAsset::Sol
-        && (encoded.len() != 64
-            || !encoded
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
-    {
-        return Err(
-            "Solana wallet seed must be exactly 64 lowercase hexadecimal characters".into(),
-        );
+    fn decode_secret(&self, encoded: &str) -> Result<wallets::SecretBytes, AnyError> {
+        if self.asset == WalletAsset::Sol
+            && (encoded.len() != 64
+                || !encoded
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        {
+            return Err(
+                "Solana wallet seed must be exactly 64 lowercase hexadecimal characters".into(),
+            );
+        }
+        let secret = hex::decode(encoded).map_err(|_| "wallet secret must be hexadecimal")?;
+        if secret.len() != 32 {
+            return Err("wallet secret must contain exactly 32 bytes".into());
+        }
+        Ok(wallets::SecretBytes::new(secret))
     }
-    let secret = hex::decode(encoded).map_err(|_| "wallet secret must be hexadecimal")?;
-    if secret.len() != 32 {
-        return Err("wallet secret must contain exactly 32 bytes".into());
-    }
-    Ok(wallets::SecretBytes::new(secret))
 }
 
 #[derive(Deserialize)]
@@ -276,7 +276,7 @@ impl EthereumConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UsdcConfig {
-    #[serde(deserialize_with = "deserialize_contract")]
+    #[serde(deserialize_with = "UsdcConfig::deserialize_contract")]
     contract: chain_ethereum::Address,
 }
 
@@ -284,27 +284,27 @@ impl UsdcConfig {
     pub(crate) fn contract(&self) -> chain_ethereum::Address {
         self.contract.clone()
     }
-}
 
-fn deserialize_contract<'de, D>(deserializer: D) -> Result<chain_ethereum::Address, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let encoded = String::deserialize(deserializer)?;
-    let contract = encoded
-        .parse::<chain_ethereum::Address>()
-        .map_err(de::Error::custom)?;
-    if contract.to_string() != encoded {
-        return Err(de::Error::custom(
-            "USDC contract must use canonical lowercase encoding",
-        ));
+    fn deserialize_contract<'de, D>(deserializer: D) -> Result<chain_ethereum::Address, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        let contract = encoded
+            .parse::<chain_ethereum::Address>()
+            .map_err(de::Error::custom)?;
+        if contract.to_string() != encoded {
+            return Err(de::Error::custom(
+                "USDC contract must use canonical lowercase encoding",
+            ));
+        }
+        if contract.is_zero() {
+            return Err(de::Error::custom(
+                "USDC contract must not be the zero address",
+            ));
+        }
+        Ok(contract)
     }
-    if contract.is_zero() {
-        return Err(de::Error::custom(
-            "USDC contract must not be the zero address",
-        ));
-    }
-    Ok(contract)
 }
 
 #[derive(Deserialize)]
@@ -452,15 +452,22 @@ mod tests {
 
     #[test]
     fn rejects_malformed_noncanonical_and_zero_usdc_contracts() {
-        for contract in [
-            "0x1234",
-            "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "0x0000000000000000000000000000000000000000",
+        for (contract, expected) in [
+            ("0x1234", "Ethereum address must contain exactly 20 bytes"),
+            (
+                "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "USDC contract must use canonical lowercase encoding",
+            ),
+            (
+                "0x0000000000000000000000000000000000000000",
+                "USDC contract must not be the zero address",
+            ),
         ] {
-            assert!(
-                parse(ethereum(Some(contract)), json!([])).is_err(),
-                "contract {contract} must be rejected"
-            );
+            let error = match parse(ethereum(Some(contract)), json!([])) {
+                Ok(_) => panic!("invalid contract must be rejected"),
+                Err(error) => error,
+            };
+            assert_eq!(error.to_string(), expected);
         }
     }
 
@@ -716,9 +723,16 @@ mod tests {
 
     #[test]
     fn solana_seed_decoder_accepts_only_exact_lowercase_hex_without_disclosure() {
+        let wallet = ConfiguredWallet {
+            id: "fixture".to_owned(),
+            asset: WalletAsset::Sol,
+            secret_env: "UNREAD_TEST_ENVIRONMENT".to_owned(),
+            start_position: 7,
+        };
         let accepted = "ab".repeat(32);
         assert_eq!(
-            decode_secret(WalletAsset::Sol, &accepted)
+            wallet
+                .decode_secret(&accepted)
                 .expect("canonical Solana seed")
                 .as_bytes(),
             &[0xab; 32]
@@ -732,11 +746,49 @@ mod tests {
             format!("{accepted}00"),
             "z1".repeat(32),
         ] {
-            let error = match decode_secret(WalletAsset::Sol, &rejected) {
+            let error = match wallet.decode_secret(&rejected) {
                 Ok(_) => panic!("alternate Solana seed encoding must fail"),
                 Err(error) => error,
             };
+            assert_eq!(
+                error.to_string(),
+                "Solana wallet seed must be exactly 64 lowercase hexadecimal characters"
+            );
             assert!(!error.to_string().contains(&rejected));
+        }
+    }
+
+    #[test]
+    fn other_assets_keep_hex_acceptance_and_error_precedence() {
+        for asset in [WalletAsset::Btc, WalletAsset::Eth, WalletAsset::Usdc] {
+            let wallet = ConfiguredWallet {
+                id: "fixture".to_owned(),
+                asset,
+                secret_env: "UNREAD_TEST_ENVIRONMENT".to_owned(),
+                start_position: 1,
+            };
+            let decoded = wallet
+                .decode_secret(&"AB".repeat(32))
+                .expect("uppercase hex remains accepted");
+            assert_eq!(decoded.as_bytes().len(), 32);
+            assert!(decoded.as_bytes().iter().all(|byte| *byte == 0xab));
+        }
+
+        let wallet = ConfiguredWallet {
+            id: "fixture".to_owned(),
+            asset: WalletAsset::Eth,
+            secret_env: "UNREAD_TEST_ENVIRONMENT".to_owned(),
+            start_position: 1,
+        };
+        for (encoded, expected) in [
+            ("not-hex", "wallet secret must be hexadecimal"),
+            ("ab", "wallet secret must contain exactly 32 bytes"),
+        ] {
+            let error = match wallet.decode_secret(encoded) {
+                Ok(_) => panic!("invalid secret encoding must be rejected"),
+                Err(error) => error,
+            };
+            assert_eq!(error.to_string(), expected);
         }
     }
 

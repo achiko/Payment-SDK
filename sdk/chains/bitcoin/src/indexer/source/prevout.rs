@@ -37,6 +37,7 @@ impl ResolvedOutput {
     }
 }
 
+// design-lint: allow unclassified-free-function -- shared Bitcoin RPC-to-consensus conversion verifies JSON bytes against an independent expected txid and preserves source retryability without RPC policy on transaction IDs
 pub(super) fn decode_consensus_transaction(
     object: &Map<String, Value>,
     expected_id: TransactionId,

@@ -33,6 +33,7 @@ pub(crate) fn transfer(recipient: &Address, amount: &Wei) -> Vec<u8> {
     .abi_encode()
 }
 
+// design-lint: allow unclassified-free-function -- strict ERC-20 balanceOf return decoding bridges Alloy ABI words and Wei for balance reads and token admission without adding token-call policy to amounts
 pub(crate) fn decode_balance(word: &[u8]) -> Result<Wei, &'static str> {
     let value = Erc20::balanceOfCall::abi_decode_returns_validate(word)
         .map_err(|_| "invalid balanceOf ABI word")?;
@@ -42,6 +43,7 @@ pub(crate) fn decode_balance(word: &[u8]) -> Result<Wei, &'static str> {
     Ok(Wei(value.to_be_bytes()))
 }
 
+// design-lint: allow unclassified-free-function -- strict ERC-20 decimals return decoding owns canonical uint8 ABI validation separately from configured-token admission policy
 pub(crate) fn decode_decimals(word: &[u8]) -> Result<u8, &'static str> {
     let value = Erc20::decimalsCall::abi_decode_returns_validate(word)
         .map_err(|_| "invalid decimals ABI word")?;
@@ -51,6 +53,7 @@ pub(crate) fn decode_decimals(word: &[u8]) -> Result<u8, &'static str> {
     Ok(value)
 }
 
+// design-lint: allow unclassified-free-function -- strict ERC-20 transfer return decoding validates the canonical ABI boolean separately from preflight policy requiring true
 pub(crate) fn decode_transfer(word: &[u8]) -> Result<bool, &'static str> {
     let value = Erc20::transferCall::abi_decode_returns_validate(word)
         .map_err(|_| "invalid transfer ABI word")?;
@@ -100,6 +103,25 @@ mod tests {
         assert!(decode_transfer(&[]).is_err());
         assert!(decode_transfer(&[0; 31]).is_err());
         assert!(decode_transfer(&[2; 32]).is_err());
+    }
+
+    #[test]
+    fn return_decoders_reject_truncation_and_trailing_words() {
+        for length in [0, 31, 33, 64] {
+            let bytes = vec![0; length];
+            assert!(decode_balance(&bytes).is_err());
+            assert!(decode_decimals(&bytes).is_err());
+            assert!(decode_transfer(&bytes).is_err());
+        }
+        assert_eq!(decode_balance(&[255; 32]), Ok(Wei([255; 32])));
+        assert_eq!(decode_transfer(&[0; 32]), Ok(false));
+        let mut word = [0; 32];
+        word[31] = 255;
+        assert_eq!(decode_decimals(&word), Ok(255));
+        assert!(decode_transfer(&word).is_err());
+        word[0] = 1;
+        assert!(decode_decimals(&word).is_err());
+        assert!(decode_transfer(&word).is_err());
     }
 
     fn hex(value: &str) -> Vec<u8> {

@@ -3,6 +3,7 @@ use redb::{
 };
 use storage::{Error, ErrorKind};
 
+// design-lint: allow unclassified-free-function -- redb database-open error translation between foreign types keeps backend-specific corruption and availability policy in this adapter
 pub(super) fn database_error(error: DatabaseError) -> Error {
     match error {
         DatabaseError::DatabaseAlreadyOpen => {
@@ -102,6 +103,48 @@ pub(super) fn other(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn database_open_errors_preserve_classification_and_context() {
+        for (native, kind, message) in [
+            (
+                DatabaseError::DatabaseAlreadyOpen,
+                ErrorKind::Unavailable,
+                "redb database file is already open for writing",
+            ),
+            (
+                DatabaseError::UpgradeRequired(1),
+                ErrorKind::CorruptData,
+                "redb database file requires an unsupported format upgrade from version 1",
+            ),
+            (
+                DatabaseError::RepairAborted,
+                ErrorKind::CorruptData,
+                "redb database repair was aborted while opening the file",
+            ),
+            (
+                DatabaseError::TransactionInProgress,
+                ErrorKind::Unavailable,
+                "redb database cannot open while a transaction is in progress",
+            ),
+            (
+                DatabaseError::Storage(StorageError::Corrupted("fixture damage".to_owned())),
+                ErrorKind::CorruptData,
+                "redb database open failed: fixture damage",
+            ),
+            (
+                DatabaseError::Storage(StorageError::Io(std::io::Error::other(
+                    "fixture I/O failure",
+                ))),
+                ErrorKind::Unavailable,
+                "redb database open failed: fixture I/O failure",
+            ),
+        ] {
+            let error = database_error(native);
+            assert_eq!(error.kind, kind);
+            assert_eq!(error.message, message);
+        }
+    }
 
     #[test]
     fn commit_errors_keep_unknown_outcome_classification_and_exact_context() {

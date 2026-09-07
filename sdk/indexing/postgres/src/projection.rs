@@ -5,7 +5,7 @@ use indexing::{BlockAddition, IndexError, IndexErrorKind, IndexScope};
 use tokio_postgres::types::ToSql;
 
 use crate::{
-    columns::{self, HistoryRows, SpendKeys},
+    columns::{self, HistoryRows, OutputRows, SpendKeys},
     prepare_in, row,
 };
 
@@ -144,7 +144,7 @@ pub(crate) async fn write_created(
     height: i64,
     addition: &BlockAddition,
 ) -> Result<(), IndexError> {
-    let rows = columns::created(&addition.outputs().created)?;
+    let rows = OutputRows::try_from(addition.outputs().created.as_slice())?;
     if rows.is_empty() {
         return Ok(());
     }

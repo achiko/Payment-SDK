@@ -450,6 +450,7 @@ fn source_error(message: impl Into<String>, retryable: bool) -> SourceError {
     }
 }
 
+// design-lint: allow unclassified-free-function -- coordinator claim and acceptance errors share a context-specific conversion between foreign errors that preserves retryability and excludes an ambiguous transaction ID
 fn definite_submission_error(error: SourceError) -> TransactionError {
     let kind = if error.retryable {
         TransactionErrorKind::Unavailable

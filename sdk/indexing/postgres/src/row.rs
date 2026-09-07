@@ -7,11 +7,12 @@ use indexing::{
 };
 use tokio_postgres::Row;
 
+// design-lint: allow unclassified-free-function -- shared PostgreSQL numeric text decoding validates canonical Decimal spelling and maps corruption to Store errors without database policy on Decimal
 /// Amounts are bound as canonical base-10 text and cast to `numeric` in SQL.
 ///
-/// The SDK's `Decimal` keeps its scale, so `0.50` and `0.5` are different
-/// values; reading back through `::text` preserves that, and the round-trip is
-/// verified rather than assumed.
+/// The SDK's `Decimal` normalizes trailing fractional zeros, so stored text
+/// must match its canonical display form. Reading back through `::text`
+/// verifies that representation rather than silently normalizing stored data.
 pub(crate) fn decimal(encoded: &str) -> Result<Decimal, IndexError> {
     let value = encoded
         .parse::<Decimal>()
@@ -113,6 +114,38 @@ pub(crate) fn store(message: impl Into<String>) -> IndexError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decimal_preserves_canonical_exact_values() {
+        for encoded in [
+            "0",
+            "-1",
+            "0.5",
+            "1234567890123456789012345678901234567890.000000000000000001",
+        ] {
+            assert_eq!(
+                decimal(encoded).expect("canonical amount").to_string(),
+                encoded
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_rejects_invalid_and_noncanonical_stored_text() {
+        for (encoded, message) in [
+            ("not-a-number", "stored amount is not a valid decimal"),
+            ("+1", "stored amount is not canonical"),
+            ("01", "stored amount is not canonical"),
+            ("1.0", "stored amount is not canonical"),
+            ("0.50", "stored amount is not canonical"),
+            ("-0", "stored amount is not canonical"),
+        ] {
+            let error = decimal(encoded).expect_err("noncanonical stored amount");
+            assert_eq!(error.kind, IndexErrorKind::Store, "{encoded}");
+            assert_eq!(error.message, message, "{encoded}");
+            assert!(!error.retryable, "{encoded}");
+        }
+    }
 
     #[test]
     fn as_i64_preserves_values_at_the_storage_boundaries() {

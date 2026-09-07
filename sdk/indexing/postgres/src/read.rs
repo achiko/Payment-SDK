@@ -402,6 +402,7 @@ fn encode_position(transaction: &str, index: u32) -> Vec<u8> {
 }
 
 // design-lint: allow single-use-free-function -- decodes the private PostgreSQL output cursor format paired with encode_position, keeping parsing separate from page queries
+// design-lint: allow unclassified-free-function -- private PostgreSQL output cursor parser keeps backend row-key bytes and Store errors out of the opaque chain-neutral OutputCursor
 fn decode_position(position: &[u8]) -> Result<(String, i32), IndexError> {
     let text =
         std::str::from_utf8(position).map_err(|_| row::store("output cursor is not valid"))?;
