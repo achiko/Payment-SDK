@@ -148,7 +148,7 @@ impl Builder {
     ) -> TransactionFuture<'a, Result<super::SignedTransaction, crate::ChainError>> {
         Box::pin(async move {
             let unsigned = super::UnsignedTransaction::new(&self.request, &self.context)?;
-            super::operations::sign(unsigned, signer).await
+            unsigned.sign(signer).await
         })
     }
 }

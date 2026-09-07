@@ -33,6 +33,7 @@ pub(super) fn map_json_rpc_error(error: Error) -> SourceError {
     source_error(error.to_string(), error.is_retryable())
 }
 
+// design-lint: allow unclassified-free-function -- shared Bitcoin RPC and block-source boundary constructs foreign SourceError while each caller retains its own validation message and retryability policy
 pub(crate) fn source_error(message: impl Into<String>, retryable: bool) -> SourceError {
     SourceError {
         message: message.into(),

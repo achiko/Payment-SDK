@@ -20,6 +20,13 @@ pub enum ChainErrorKind {
 }
 
 impl ChainError {
+    pub(crate) fn signing(message: impl Into<String>) -> Self {
+        Self {
+            kind: ChainErrorKind::Signer,
+            message: message.into(),
+        }
+    }
+
     pub(crate) fn invalid_transaction(message: impl Into<String>) -> Self {
         Self {
             kind: ChainErrorKind::InvalidTransaction,

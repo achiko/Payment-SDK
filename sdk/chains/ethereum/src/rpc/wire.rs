@@ -154,6 +154,7 @@ pub(super) fn invalid_rpc_response(
     )
 }
 
+// design-lint: allow unclassified-free-function -- shared Ethereum RPC boundary constructs foreign SourceError values while each wire decoder and RPC caller retains its message and retryability policy
 pub(super) fn source_error(message: impl Into<String>, retryable: bool) -> SourceError {
     SourceError {
         message: message.into(),

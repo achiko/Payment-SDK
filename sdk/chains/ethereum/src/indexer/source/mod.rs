@@ -362,6 +362,7 @@ fn map_json_rpc_error(error: Error) -> SourceError {
     source_error(error.to_string(), error.is_retryable())
 }
 
+// design-lint: allow unclassified-free-function -- Ethereum indexing boundary constructs foreign SourceError values while each validation and RPC call site retains its explicit message and retryability policy
 fn source_error(message: impl Into<String>, retryable: bool) -> SourceError {
     SourceError {
         message: message.into(),

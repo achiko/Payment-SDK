@@ -169,8 +169,8 @@ impl Decimal {
     /// todo would this be better add?
     pub fn checked_add(&self, other: &Self) -> Result<Self, DecimalError> {
         let scale = self.scale.max(other.scale);
-        let left = scaled_coefficient(self, scale)?;
-        let right = scaled_coefficient(other, scale)?;
+        let left = self.scaled_coefficient(scale)?;
+        let right = other.scaled_coefficient(scale)?;
         Ok(Self::new(left + right, scale))
     }
 
@@ -178,8 +178,8 @@ impl Decimal {
     /// todo just sub?
     pub fn checked_sub(&self, other: &Self) -> Result<Self, DecimalError> {
         let scale = self.scale.max(other.scale);
-        let left = scaled_coefficient(self, scale)?;
-        let right = scaled_coefficient(other, scale)?;
+        let left = self.scaled_coefficient(scale)?;
+        let right = other.scaled_coefficient(scale)?;
         Ok(Self::new(left - right, scale))
     }
 
@@ -241,6 +241,16 @@ impl Decimal {
         let mut value = [0_u8; N];
         value[N - bytes.len()..].copy_from_slice(&bytes);
         Ok(value)
+    }
+
+    fn scaled_coefficient(&self, scale: u32) -> Result<BigInt, DecimalError> {
+        let exponent = scale.checked_sub(self.scale).ok_or_else(|| {
+            DecimalError::new(
+                DecimalErrorKind::Invalid,
+                "target scale must not be smaller than the decimal scale",
+            )
+        })?;
+        Ok(&self.coefficient * BigInt::from(BigUint::from(10_u8).pow(exponent)))
     }
 
     fn compare_magnitude(&self, other: &Self) -> Ordering {
@@ -351,16 +361,6 @@ impl fmt::Display for Decimal {
         }
         formatter.write_str(&digits)
     }
-}
-
-fn scaled_coefficient(value: &Decimal, scale: u32) -> Result<BigInt, DecimalError> {
-    let exponent = scale.checked_sub(value.scale).ok_or_else(|| {
-        DecimalError::new(
-            DecimalErrorKind::Invalid,
-            "target scale must not be smaller than the decimal scale",
-        )
-    })?;
-    Ok(&value.coefficient * BigInt::from(BigUint::from(10_u8).pow(exponent)))
 }
 
 #[cfg(test)]

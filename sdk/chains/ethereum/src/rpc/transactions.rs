@@ -80,7 +80,7 @@ where
     ) -> BoxFuture<'a, Result<BuildContext, ChainError>> {
         Box::pin(async move {
             let input = request.input();
-            let limits = self.limits().map_err(rpc_error)?;
+            let limits = self.limits().map_err(ChainError::from_rpc)?;
             if input.len() > limits.max_input_bytes() {
                 return Err(ChainError::new(
                     ChainErrorKind::InvalidTransaction,
@@ -114,7 +114,7 @@ where
                                 ),
                             ));
                         }
-                        return Err(rpc_error(error.into_source("eth_call")));
+                        return Err(ChainError::from_rpc(error.into_source("eth_call")));
                     }
                 };
                 let value: String = raw.deserialize().map_err(|_| {
@@ -148,14 +148,14 @@ where
 
             let estimated_gas_limit = self.estimate_gas(Value::Object(transaction)).await?;
             if estimated_gas_limit == 0 {
-                return Err(rpc_error(invalid_rpc_response(
+                return Err(ChainError::from_rpc(invalid_rpc_response(
                     "eth_estimateGas",
                     "estimated gas limit is zero",
                 )));
             }
             let gas_limit = limits
                 .gas_limit_with_margin(estimated_gas_limit)
-                .map_err(rpc_error)?;
+                .map_err(ChainError::from_rpc)?;
             if gas_limit > limits.max_gas_limit() {
                 return Err(ChainError::new(
                     ChainErrorKind::FeeUnavailable,
@@ -166,7 +166,7 @@ where
             let max_priority_fee_per_gas = self
                 .rpc_wei("eth_maxPriorityFeePerGas", json!([]))
                 .await
-                .map_err(rpc_error)?;
+                .map_err(ChainError::from_rpc)?;
             if &max_priority_fee_per_gas > limits.max_priority_fee_per_gas() {
                 return Err(ChainError::new(
                     ChainErrorKind::FeeUnavailable,
@@ -176,16 +176,16 @@ where
             let latest_block = self
                 .request_result("eth_getBlockByNumber", json!(["latest", false]))
                 .await
-                .map_err(rpc_error)?;
+                .map_err(ChainError::from_rpc)?;
             let latest_block: Value = latest_block
                 .deserialize()
                 .map_err(map_json_rpc_error)
-                .map_err(rpc_error)?;
+                .map_err(ChainError::from_rpc)?;
             let base_fee = latest_block
                 .get("baseFeePerGas")
                 .and_then(Value::as_str)
                 .ok_or_else(|| {
-                    rpc_error(invalid_rpc_response(
+                    ChainError::from_rpc(invalid_rpc_response(
                         "eth_getBlockByNumber",
                         "latest block has no EIP-1559 baseFeePerGas",
                     ))
@@ -193,13 +193,13 @@ where
                 .and_then(|value| {
                     Wei::from_quantity(value)
                         .map_err(|message| invalid_rpc_response("eth_getBlockByNumber", message))
-                        .map_err(rpc_error)
+                        .map_err(ChainError::from_rpc)
                 })?;
             let max_fee_per_gas = base_fee
                 .checked_mul_u64(2)
                 .and_then(|fee| fee.checked_add(&max_priority_fee_per_gas))
                 .ok_or_else(|| {
-                    rpc_error(invalid_rpc_response(
+                    ChainError::from_rpc(invalid_rpc_response(
                         "eth_getBlockByNumber",
                         "fee calculation overflowed U256",
                     ))
@@ -211,7 +211,7 @@ where
                 ));
             }
             if max_fee_per_gas < max_priority_fee_per_gas {
-                return Err(rpc_error(invalid_rpc_response(
+                return Err(ChainError::from_rpc(invalid_rpc_response(
                     "eth_getBlockByNumber",
                     "calculated max fee is below the priority fee",
                 )));
@@ -314,7 +314,7 @@ where
         let actual = self
             .rpc_u64("eth_chainId", json!([]))
             .await
-            .map_err(rpc_error)?;
+            .map_err(ChainError::from_rpc)?;
         if actual != self.expected_chain_id {
             return Err(ChainError::new(
                 ChainErrorKind::Divergent,
@@ -340,16 +340,16 @@ where
                         format!("Ethereum gas estimation was rejected with code {code}"),
                     ));
                 }
-                return Err(rpc_error(error.into_source("eth_estimateGas")));
+                return Err(ChainError::from_rpc(error.into_source("eth_estimateGas")));
             }
         };
         let value: String = raw
             .deserialize()
             .map_err(map_json_rpc_error)
-            .map_err(rpc_error)?;
+            .map_err(ChainError::from_rpc)?;
         parse_quantity_u64(&value)
             .map_err(|message| invalid_rpc_response("eth_estimateGas", message))
-            .map_err(rpc_error)
+            .map_err(ChainError::from_rpc)
     }
 
     async fn ensure_token_amount(&self, request: &TransferRequest) -> Result<(), ChainError> {
@@ -360,7 +360,7 @@ where
         let token_balance = self
             .balance(request.from().clone(), &token_asset, None)
             .await
-            .map_err(rpc_error)?;
+            .map_err(ChainError::from_rpc)?;
         if token_balance < *amount {
             return Err(ChainError::new(
                 ChainErrorKind::InsufficientFunds,
@@ -379,7 +379,7 @@ where
         let native_balance = self
             .balance(request.from().clone(), &native, None)
             .await
-            .map_err(rpc_error)?;
+            .map_err(ChainError::from_rpc)?;
         if request.erc20_transfer().is_none() {
             let required = request.value().checked_add(total_fee).ok_or_else(|| {
                 ChainError::new(
@@ -431,10 +431,6 @@ where
     ) -> BoxFuture<'a, Result<bool, SourceError>> {
         self.methods.known(transaction)
     }
-}
-
-fn rpc_error(error: SourceError) -> ChainError {
-    ChainError::new(ChainErrorKind::RpcUnavailable, error.message)
 }
 
 fn transaction_error(

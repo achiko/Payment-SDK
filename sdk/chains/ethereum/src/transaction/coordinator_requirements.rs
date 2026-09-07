@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use super::{Draft, Preparation, PreparationError};
+use super::{Draft, PreparationError};
 use crate::{Address, ChainError, ChainErrorKind, Wei};
 
 type Contributions = (Wei, Vec<(usize, Wei)>);
@@ -126,16 +126,4 @@ fn add(
     })?;
     entry.1.push((index, amount));
     Ok(())
-}
-
-pub(super) fn senders(preparations: &[Preparation<'_>]) -> Vec<(Address, usize)> {
-    let mut values = BTreeMap::new();
-    for (index, preparation) in preparations.iter().enumerate() {
-        values
-            .entry(preparation.request.from().clone())
-            .or_insert(index);
-    }
-    let mut values = values.into_iter().collect::<Vec<_>>();
-    values.sort_by_key(|(_, index)| *index);
-    values
 }

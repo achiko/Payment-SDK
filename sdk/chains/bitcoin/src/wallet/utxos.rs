@@ -205,6 +205,7 @@ impl Satoshi {
     }
 }
 
+// design-lint: allow unclassified-free-function -- indexed Bitcoin output boundary constructs foreign SourceError with caller-selected retryability across amount, checkpoint and pagination validation without coupling wallet reads to RPC plumbing
 fn source_error(message: impl Into<String>, retryable: bool) -> SourceError {
     SourceError {
         message: message.into(),

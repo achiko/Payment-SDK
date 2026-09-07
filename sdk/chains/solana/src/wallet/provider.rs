@@ -199,11 +199,11 @@ where
                 destination.address().clone(),
                 amount,
             )?;
-            let mut submitted = self
-                .sender
-                .send(vec![transfer])
-                .await
-                .map_err(single_error)?;
+            let mut submitted = self.sender.send(vec![transfer]).await.map_err(|error| {
+                let mut source = error.source;
+                source.ambiguous_transaction_id = error.ambiguous_transaction_id;
+                source
+            })?;
             if submitted.len() != 1 {
                 return Err(WalletError::new(
                     WalletErrorKind::Transaction,
@@ -233,12 +233,6 @@ impl Keys {
             .get(address)
             .and_then(Weak::upgrade)
     }
-}
-
-fn single_error(error: wallets::SendError) -> WalletError {
-    let mut source = error.source;
-    source.ambiguous_transaction_id = error.ambiguous_transaction_id;
-    source
 }
 
 fn invalid_address() -> WalletError {
@@ -313,6 +307,7 @@ mod tests {
     #[derive(Default)]
     struct SenderFixture {
         calls: Mutex<Vec<Sent>>,
+        failure: Mutex<Option<wallets::SendError>>,
     }
 
     impl NativeSender for SenderFixture {
@@ -328,7 +323,10 @@ mod tests {
                     destination: transfer.destination().clone(),
                     amount: transfer.amount(),
                 }));
-                Ok(vec![TransactionId::new("local-first-signature")])
+                match self.failure.lock().unwrap().take() {
+                    Some(error) => Err(error),
+                    None => Ok(vec![TransactionId::new("local-first-signature")]),
+                }
             })
         }
     }
@@ -485,6 +483,44 @@ mod tests {
                 value: key(7).address().to_string(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn single_send_preserves_source_error_and_top_level_ambiguity() {
+        let id = TransactionId::new("canonical-local-id");
+        let mut source = WalletError::new(WalletErrorKind::Unavailable, "submission is unknown");
+        source.ambiguous_transaction_id = Some(id.clone());
+        let failures = [
+            wallets::SendError::operation(WalletErrorKind::SourceBusy, "source is busy"),
+            wallets::SendError::item(0, Vec::new(), source.clone()),
+            wallets::SendError::grouped(Vec::new(), source.clone()),
+            wallets::SendError {
+                accepted: Vec::new(),
+                failed_index: None,
+                ambiguous_transaction_id: None,
+                source,
+            },
+        ];
+        for failure in failures {
+            let mut expected = failure.source.clone();
+            expected.ambiguous_transaction_id = failure.ambiguous_transaction_id.clone();
+            let sender = Arc::new(SenderFixture {
+                calls: Mutex::new(Vec::new()),
+                failure: Mutex::new(Some(failure)),
+            });
+            let provider = provider(
+                Scripted::new([]),
+                Arc::new(HistoryFixture::default()),
+                Arc::clone(&sender),
+            );
+            let wallet = provider.create(SecretBytes::new([7; 32])).await.unwrap();
+            let error = wallet
+                .send(AddressText::from(key(8).address()), Decimal::from(1_u64))
+                .await
+                .unwrap_err();
+            assert_eq!(error, expected);
+            assert_eq!(sender.calls.lock().unwrap().len(), 1);
+        }
     }
 
     #[tokio::test]

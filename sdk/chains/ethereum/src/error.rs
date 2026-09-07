@@ -7,6 +7,10 @@ pub struct ChainError {
 }
 
 impl ChainError {
+    pub(crate) fn from_rpc(error: indexing::SourceError) -> Self {
+        Self::new(ChainErrorKind::RpcUnavailable, error.message)
+    }
+
     pub(crate) fn new(kind: ChainErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
@@ -36,3 +40,20 @@ impl fmt::Display for ChainError {
 }
 
 impl Error for ChainError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rpc_preparation_errors_preserve_message_and_existing_unavailable_classification() {
+        for retryable in [false, true] {
+            let error = ChainError::from_rpc(indexing::SourceError {
+                message: "fixture RPC error".to_owned(),
+                retryable,
+            });
+            assert_eq!(error.kind, ChainErrorKind::RpcUnavailable);
+            assert_eq!(error.message, "fixture RPC error");
+        }
+    }
+}

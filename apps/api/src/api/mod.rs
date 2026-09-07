@@ -35,6 +35,7 @@ impl State {
     }
 }
 
+// design-lint: allow unclassified-free-function -- application HTTP composition assembles resource routes and one OpenAPI contract while applying authentication and limits only to protected routes
 pub fn router(
     state: State,
     config: &http_support::server::Config,

@@ -330,6 +330,7 @@ fn unavailable(message: &'static str) -> SourceError {
     source_error(message, true)
 }
 
+// design-lint: allow unclassified-free-function -- Solana acquisition boundary constructs foreign SourceError values while each pruning, budget, timeout and RPC caller retains its retryability policy
 fn source_error(message: impl Into<String>, retryable: bool) -> SourceError {
     SourceError {
         message: message.into(),

@@ -11,7 +11,7 @@ mod requirements;
 #[path = "coordinator_state.rs"]
 mod state;
 
-use requirements::{RequiredAsset, Requirements, senders};
+use requirements::{RequiredAsset, Requirements};
 use state::{Admission, Claim, Core, Operation};
 
 /// Process-local nonce, preparation, and ambiguous-submission coordination.
@@ -56,7 +56,14 @@ impl TransactionCoordinator {
             ));
         }
 
-        let senders = senders(&preparations);
+        let mut senders = BTreeMap::new();
+        for (index, preparation) in preparations.iter().enumerate() {
+            senders
+                .entry(preparation.request.from().clone())
+                .or_insert(index);
+        }
+        let mut senders = senders.into_iter().collect::<Vec<_>>();
+        senders.sort_by_key(|(_, index)| *index);
         let operation = self.admit(&senders).await?;
         let nonces = self.nonces(&preparations, &senders).await?;
         let mut drafts = Vec::with_capacity(preparations.len());
@@ -164,7 +171,9 @@ impl TransactionCoordinator {
                 .accounts
                 .nonce(source.clone())
                 .await
-                .map_err(|error| PreparationError::new(*first_index, rpc_error(error)))?;
+                .map_err(|error| {
+                    PreparationError::new(*first_index, ChainError::from_rpc(error))
+                })?;
             let start = self
                 .core
                 .floor(source)
@@ -242,7 +251,7 @@ impl TransactionCoordinator {
                 .accounts
                 .balance(requirement.source.clone(), &asset, None)
                 .await
-                .map_err(|error| PreparationError::new(first_index, rpc_error(error)))?;
+                .map_err(|error| PreparationError::new(first_index, ChainError::from_rpc(error)))?;
             if balance < requirement.amount {
                 let index = requirement.failure_index(&balance);
                 insufficient =
@@ -439,10 +448,7 @@ struct PreparedEntry {
     signed: SignedTransaction,
 }
 
-fn rpc_error(error: SourceError) -> ChainError {
-    ChainError::new(ChainErrorKind::RpcUnavailable, error.message)
-}
-
+// design-lint: allow unclassified-free-function -- coordinator claim and acceptance boundaries construct foreign SourceError values with explicit retryability while preserving exact envelope and nonce error context
 fn source_error(message: impl Into<String>, retryable: bool) -> SourceError {
     SourceError {
         message: message.into(),

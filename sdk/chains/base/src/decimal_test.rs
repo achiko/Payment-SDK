@@ -188,3 +188,40 @@ fn ordering_is_antisymmetric_across_zero_and_maximum_scale() {
         }
     }
 }
+
+#[test]
+fn arithmetic_keeps_exact_signed_values_across_different_scales() {
+    let left = "-12345678901234567890.1".parse::<Decimal>().unwrap();
+    let right = "0.000000000000000001".parse::<Decimal>().unwrap();
+    assert_eq!(
+        left.checked_add(&right).unwrap().to_string(),
+        "-12345678901234567890.099999999999999999"
+    );
+    assert_eq!(
+        left.checked_sub(&right).unwrap().to_string(),
+        "-12345678901234567890.100000000000000001"
+    );
+    assert_eq!(right.checked_add(&left), left.checked_add(&right));
+    assert_eq!(left.checked_sub(&left).unwrap(), Decimal::zero());
+}
+
+#[test]
+fn coefficient_scaling_rejects_reduction_and_preserves_the_decimal() {
+    let value = "-1.25".parse::<Decimal>().unwrap();
+    let original = value.clone();
+    assert_eq!(value.scaled_coefficient(2).unwrap(), BigInt::from(-125));
+    assert_eq!(value.scaled_coefficient(4).unwrap(), BigInt::from(-12500));
+    let error = value.scaled_coefficient(1).unwrap_err();
+    assert_eq!(error.kind, DecimalErrorKind::Invalid);
+    assert_eq!(
+        error.message,
+        "target scale must not be smaller than the decimal scale"
+    );
+    assert_eq!(value, original);
+    assert_eq!(
+        Decimal::new(BigInt::from(1), u32::MAX)
+            .scaled_coefficient(u32::MAX)
+            .unwrap(),
+        BigInt::from(1)
+    );
+}
