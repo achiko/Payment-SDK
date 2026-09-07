@@ -75,7 +75,11 @@ impl Repository {
             .as_ref()
             .is_some_and(|cursor| cursor.checkpoint != checkpoint)
         {
-            return Err(conflict("history changed during pagination"));
+            return Err(IndexError::new(
+                IndexErrorKind::Conflict,
+                "history changed during pagination",
+                true,
+            ));
         }
 
         // One extra row reveals whether another page exists without a count.
@@ -121,7 +125,11 @@ impl Repository {
         // The checkpoint must not have moved while the page was assembled, or
         // the page would mix two views of canonical history.
         if self.checkpoint_in(&transaction).await? != checkpoint {
-            return Err(conflict("history changed during pagination"));
+            return Err(IndexError::new(
+                IndexErrorKind::Conflict,
+                "history changed during pagination",
+                true,
+            ));
         }
         let next = has_more
             .then(|| {
@@ -310,7 +318,11 @@ impl Repository {
             .as_ref()
             .is_some_and(|cursor| cursor.checkpoint != checkpoint)
         {
-            return Err(conflict("outputs changed during pagination"));
+            return Err(IndexError::new(
+                IndexErrorKind::Conflict,
+                "outputs changed during pagination",
+                true,
+            ));
         }
         let (after_transaction, after_index) = match &request.after {
             Some(cursor) => decode_position(&cursor.position)?,
@@ -341,7 +353,11 @@ impl Repository {
             .map(|entry| row::output(&request.scope, entry))
             .collect::<Result<Vec<_>, _>>()?;
         if self.checkpoint_in(&transaction).await? != checkpoint {
-            return Err(conflict("outputs changed during pagination"));
+            return Err(IndexError::new(
+                IndexErrorKind::Conflict,
+                "outputs changed during pagination",
+                true,
+            ));
         }
         let next = has_more
             .then(|| {
@@ -396,10 +412,6 @@ fn decode_position(position: &[u8]) -> Result<(String, i32), IndexError> {
         .parse::<i32>()
         .map_err(|_| row::store("output cursor is not valid"))?;
     Ok((transaction.to_owned(), index))
-}
-
-fn conflict(message: &'static str) -> IndexError {
-    IndexError::new(IndexErrorKind::Conflict, message, true)
 }
 
 fn validate_limit(limit: usize) -> Result<(), IndexError> {

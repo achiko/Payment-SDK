@@ -6,6 +6,15 @@ pub struct ChainError {
     pub message: String,
 }
 
+impl ChainError {
+    pub(crate) fn new(kind: ChainErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChainErrorKind {
     InvalidAddress,

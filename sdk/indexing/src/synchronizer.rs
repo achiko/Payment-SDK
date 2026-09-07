@@ -61,10 +61,6 @@ pub(super) fn earliest_position(filters: &[AddressFilter]) -> Option<BlockPositi
     filters.iter().map(|filter| filter.start_position).min()
 }
 
-fn cannot_connect(message: impl Into<String>) -> IndexError {
-    IndexError::new(IndexErrorKind::CannotConnect, message, true)
-}
-
 /// Synchronizes caller-selected addresses without owning their lifecycle.
 pub(crate) struct Synchronizer<S, I, R> {
     source: S,
@@ -151,7 +147,7 @@ where
                     let anchor = self.one_block(parent.position, parent.position).await?;
                     let anchor_ref = anchor.block_ref();
                     if anchor_ref.position != parent.position || anchor_ref.hash != parent.hash {
-                        return Err(cannot_connect(
+                        return Err(IndexError::cannot_connect(
                             "birthday anchor does not match the first block parent",
                         ));
                     }
@@ -182,7 +178,7 @@ where
                 .fetch_blocks(start, observed_tip.position, remaining)
                 .await?;
             if blocks.is_empty() {
-                return Err(cannot_connect(
+                return Err(IndexError::cannot_connect(
                     "source returned no produced block before its observed tip",
                 ));
             }
@@ -213,13 +209,7 @@ where
     fn enter(&self) -> Result<RunningGuard<'_>, IndexError> {
         self.running
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| {
-                IndexError::new(
-                    IndexErrorKind::Conflict,
-                    "synchronization is already running",
-                    true,
-                )
-            })?;
+            .map_err(|_| IndexError::retryable_conflict("synchronization is already running"))?;
         Ok(RunningGuard(&self.running))
     }
 
@@ -254,9 +244,9 @@ where
         end: BlockPosition,
     ) -> Result<I::Block, IndexError> {
         let blocks = self.fetch_blocks(start, end, 1).await?;
-        let [block]: [I::Block; 1] = blocks
-            .try_into()
-            .map_err(|_| cannot_connect("source did not return the required produced block"))?;
+        let [block]: [I::Block; 1] = blocks.try_into().map_err(|_| {
+            IndexError::cannot_connect("source did not return the required produced block")
+        })?;
         Ok(block)
     }
 
@@ -272,7 +262,9 @@ where
             .await
             .map_err(IndexError::from)?;
         if blocks.len() > limit {
-            return Err(cannot_connect("source exceeded the returned-block limit"));
+            return Err(IndexError::cannot_connect(
+                "source exceeded the returned-block limit",
+            ));
         }
         let mut previous = None;
         for block in &blocks {
@@ -281,7 +273,7 @@ where
                 || position > end
                 || previous.is_some_and(|previous| position <= previous)
             {
-                return Err(cannot_connect(
+                return Err(IndexError::cannot_connect(
                     "source blocks are outside the range or not strictly increasing",
                 ));
             }
@@ -300,10 +292,14 @@ where
         let block = source_block.block_ref();
         if block.position == BlockPosition(0) {
             if block.parent.is_some() {
-                return Err(cannot_connect("genesis block must not have a parent"));
+                return Err(IndexError::cannot_connect(
+                    "genesis block must not have a parent",
+                ));
             }
         } else if block.parent.is_none() {
-            return Err(cannot_connect("non-genesis block is missing its parent"));
+            return Err(IndexError::cannot_connect(
+                "non-genesis block is missing its parent",
+            ));
         }
         if let Some(tip) = &checkpoint {
             let expected_height = tip.height.checked_successor().ok_or_else(|| {
@@ -321,7 +317,7 @@ where
                         hash: tip.hash.clone(),
                     })
             {
-                return Err(cannot_connect(
+                return Err(IndexError::cannot_connect(
                     "source block does not connect to the checkpoint",
                 ));
             }
@@ -336,10 +332,8 @@ where
             .as_ref()
             != Some(&block)
         {
-            return Err(IndexError::new(
-                IndexErrorKind::CannotConnect,
+            return Err(IndexError::cannot_connect(
                 "source block changed before commit",
-                true,
             ));
         }
         let addition = BlockAddition::new(

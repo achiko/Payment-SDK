@@ -46,7 +46,7 @@ impl Backend {
         let marker = meta
             .get(DATABASE_FORMAT_KEY)
             .map_err(|error| super::operation_error(error, "failed to read redb format marker"))?
-            .ok_or_else(|| super::corrupt_data("redb database has no physical format marker"))?;
+            .ok_or_else(|| Error::corrupt_data("redb database has no physical format marker"))?;
         validate_database_format(marker.value())
     }
 }

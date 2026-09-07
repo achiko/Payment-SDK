@@ -1,45 +1,24 @@
 use std::collections::BTreeSet;
 
-use bitcoin::{
-    Address as NativeAddress, EcdsaSighashType, ScriptBuf, TapSighashType,
-    address::NetworkUnchecked,
-};
+use bitcoin::{EcdsaSighashType, ScriptBuf, TapSighashType};
 
-use crate::{Address, ChainError, ChainErrorKind, Network, Output, SighashType, SpendSource};
+use crate::{ChainError, Network, Output, SighashType, SpendSource};
 
-use super::{invalid_transaction, native_network};
+use super::invalid_transaction;
 
 pub(super) fn checked_output(
     network: Network,
     output: &Output,
     allow_zero: bool,
 ) -> Result<ScriptBuf, ChainError> {
-    let address = checked_address(network, &output.address)?;
-    let minimum = address.script_pubkey().minimal_non_dust().to_sat();
+    let script = output.address.script_pubkey_for_network(network)?;
+    let minimum = script.minimal_non_dust().to_sat();
     if !allow_zero && output.value.0 < minimum {
         return Err(invalid_transaction(format!(
             "Bitcoin recipient output is dust: minimum is {minimum} satoshis"
         )));
     }
-    Ok(address.script_pubkey())
-}
-
-pub(super) fn checked_address(
-    network: Network,
-    address: &Address,
-) -> Result<NativeAddress, ChainError> {
-    address
-        .encoded()
-        .parse::<NativeAddress<NetworkUnchecked>>()
-        .map_err(|error| ChainError {
-            kind: ChainErrorKind::InvalidAddress,
-            message: format!("invalid Bitcoin address: {error}"),
-        })?
-        .require_network(native_network(network))
-        .map_err(|error| ChainError {
-            kind: ChainErrorKind::InvalidAddress,
-            message: format!("Bitcoin address is for the wrong network: {error}"),
-        })
+    Ok(script)
 }
 
 pub(super) fn validate_unique_utxos(utxos: &[SpendSource]) -> Result<(), ChainError> {

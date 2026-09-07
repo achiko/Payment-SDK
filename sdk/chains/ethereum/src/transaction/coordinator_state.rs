@@ -6,7 +6,7 @@ use std::{
 use indexing::SourceError;
 use tokio::sync::Notify;
 
-use super::{PreparedEntry, chain_error, source_error};
+use super::{PreparedEntry, source_error};
 use crate::{Accounts, Address, ChainError, ChainErrorKind, Transactions};
 use crate::{SignedTransaction, TransactionId};
 
@@ -89,7 +89,7 @@ impl Core {
         let mut state = self.state();
         for entry in entries {
             if state.records.contains_key(&entry.signed.id) {
-                return Err(chain_error(
+                return Err(ChainError::new(
                     ChainErrorKind::Other,
                     "Ethereum signed transaction is already coordinated",
                 ));
@@ -99,7 +99,7 @@ impl Core {
                 .get(&entry.source)
                 .is_none_or(|sender| sender.active != Some(operation))
             {
-                return Err(chain_error(
+                return Err(ChainError::new(
                     ChainErrorKind::Other,
                     "Ethereum sender lost its atomic coordinator admission",
                 ));
@@ -129,13 +129,13 @@ impl Core {
     pub(super) fn detach(&self, operation: u64, id: &TransactionId) -> Result<(), ChainError> {
         let mut state = self.state();
         let record = state.records.get_mut(id).ok_or_else(|| {
-            chain_error(
+            ChainError::new(
                 ChainErrorKind::Other,
                 "Ethereum prepared transaction is not coordinated",
             )
         })?;
         if record.operation != Some(operation) || record.status != RecordStatus::Prepared {
-            return Err(chain_error(
+            return Err(ChainError::new(
                 ChainErrorKind::Other,
                 "Ethereum prepared transaction cannot leave its batch admission",
             ));

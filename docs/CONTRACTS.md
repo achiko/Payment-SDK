@@ -434,6 +434,13 @@ rollback state.
 lifecycle. A persistence implementation may use redb, PostgreSQL, or another
 transactional backend, but backend records never cross these contracts.
 
+Generic storage adapters use `storage::Error::conflict(message)` for
+compare-and-swap conflicts and `storage::Error::corrupt_data(message)` for
+malformed persisted data. These constructors preserve the supplied message and
+set the corresponding `ErrorKind`. Backend-specific translation stays in the
+adapter; an ambiguous redb commit remains `Unavailable` and requires
+reconciliation, even when its underlying error describes corruption.
+
 The application composition opens one PostgreSQL database/schema and
 one process-wide pool. It clones that pool into one
 `indexing_postgres::Repository` handle per exact `(chain, network)` scope. A

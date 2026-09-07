@@ -11,9 +11,10 @@ use indexing::{
 
 use crate::row;
 
-/// One row per address a transaction touched.
+/// One row per address a transaction touched, together with its ordered movements.
 #[derive(Default)]
 pub(crate) struct HistoryRows {
+    pub(crate) movements: MovementRows,
     pub(crate) address: Vec<String>,
     pub(crate) transaction_id: Vec<String>,
     pub(crate) status: Vec<String>,
@@ -96,63 +97,62 @@ impl SpendKeys {
     }
 }
 
-/// Transposes the block's canonical transactions into history and movement
-/// columns.
-///
-/// History is address-primary, so a transaction paying two watched addresses
-/// contributes one history row and one copy of its movements under each.
-pub(crate) fn canonical(
-    addition: &BlockAddition,
-) -> Result<(HistoryRows, MovementRows), IndexError> {
-    let mut history = HistoryRows::default();
-    let mut movements = MovementRows::default();
+impl TryFrom<&BlockAddition> for HistoryRows {
+    type Error = IndexError;
 
-    for canonical in addition.transactions() {
-        let (status, reason) = match &canonical.status {
-            CanonicalStatus::Included { .. } => ("included", None),
-            CanonicalStatus::Failed { reason, .. } => ("failed", reason.clone()),
-        };
-        let fee = canonical.fee.as_ref();
-        for address in canonical.addresses() {
-            history.address.push(address.value.clone());
-            history
-                .transaction_id
-                .push(canonical.transaction_id.value.clone());
-            history.status.push(status.to_owned());
-            history.failure_reason.push(reason.clone());
-            history
-                .fee_asset
-                .push(fee.map(|fee| fee.asset.asset.clone()));
-            history
-                .fee_amount
-                .push(fee.map(|fee| fee.amount.to_string()));
-            history
-                .fee_payer
-                .push(fee.and_then(|fee| fee.payer.as_ref().map(|payer| payer.value.clone())));
+    /// Transposes canonical transactions into address-primary history and
+    /// movement columns, duplicating each transaction's movements per address.
+    fn try_from(addition: &BlockAddition) -> Result<Self, Self::Error> {
+        let mut history = Self::default();
+        let movements = &mut history.movements;
 
-            for (ordinal, movement) in canonical.movements.iter().enumerate() {
-                let ordinal = i32::try_from(ordinal)
-                    .map_err(|_| row::store("transaction has too many movements"))?;
-                movements.address.push(address.value.clone());
-                movements
+        for canonical in addition.transactions() {
+            let (status, reason) = match &canonical.status {
+                CanonicalStatus::Included { .. } => ("included", None),
+                CanonicalStatus::Failed { reason, .. } => ("failed", reason.clone()),
+            };
+            let fee = canonical.fee.as_ref();
+            for address in canonical.addresses() {
+                history.address.push(address.value.clone());
+                history
                     .transaction_id
                     .push(canonical.transaction_id.value.clone());
-                movements.ordinal.push(ordinal);
-                movements.kind.push(kind(movement).to_owned());
-                movements.movement_id.push(movement.id().0.clone());
-                movements.asset_chain.push(movement.asset().chain.0.clone());
-                movements.asset.push(movement.asset().asset.clone());
-                movements.amount.push(movement.amount().to_string());
-                movements
-                    .from_address
-                    .push(movement.from().map(|value| value.value.clone()));
-                movements
-                    .to_address
-                    .push(movement.to().map(|value| value.value.clone()));
+                history.status.push(status.to_owned());
+                history.failure_reason.push(reason.clone());
+                history
+                    .fee_asset
+                    .push(fee.map(|fee| fee.asset.asset.clone()));
+                history
+                    .fee_amount
+                    .push(fee.map(|fee| fee.amount.to_string()));
+                history
+                    .fee_payer
+                    .push(fee.and_then(|fee| fee.payer.as_ref().map(|payer| payer.value.clone())));
+
+                for (ordinal, movement) in canonical.movements.iter().enumerate() {
+                    let ordinal = i32::try_from(ordinal)
+                        .map_err(|_| row::store("transaction has too many movements"))?;
+                    movements.address.push(address.value.clone());
+                    movements
+                        .transaction_id
+                        .push(canonical.transaction_id.value.clone());
+                    movements.ordinal.push(ordinal);
+                    movements.kind.push(kind(movement).to_owned());
+                    movements.movement_id.push(movement.id().0.clone());
+                    movements.asset_chain.push(movement.asset().chain.0.clone());
+                    movements.asset.push(movement.asset().asset.clone());
+                    movements.amount.push(movement.amount().to_string());
+                    movements
+                        .from_address
+                        .push(movement.from().map(|value| value.value.clone()));
+                    movements
+                        .to_address
+                        .push(movement.to().map(|value| value.value.clone()));
+                }
             }
         }
+        Ok(history)
     }
-    Ok((history, movements))
 }
 
 pub(crate) fn created(outputs: &[IndexedOutput]) -> Result<OutputRows, IndexError> {

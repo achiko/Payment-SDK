@@ -991,7 +991,11 @@ async fn batched_writes_keep_per_address_rows_and_movement_order() {
                 reason: Some("reverted".into()),
             },
             movements: Vec::new(),
-            fee: None,
+            fee: Some(indexing::NetworkFee {
+                asset: asset(&scope),
+                amount: Decimal::from(7),
+                payer: Some(address(&scope, "sender")),
+            }),
         },
     ];
 
@@ -1006,10 +1010,13 @@ async fn batched_writes_keep_per_address_rows_and_movement_order() {
         .await
         .expect("block with several transactions");
 
-    // Both endpoints of the transfer are watched, so both list both
-    // transactions — "beta" through neither endpoint, so only "alpha".
+    // Transfer endpoints own alpha; the failed transaction remains visible
+    // through its fee payer even though it has no movements.
     assert_eq!(history(&repository, &scope, "receiver").await, ["alpha"]);
-    assert_eq!(history(&repository, &scope, "sender").await, ["alpha"]);
+    assert_eq!(
+        history(&repository, &scope, "sender").await,
+        ["alpha", "beta"]
+    );
 
     let page = Transactions::list(
         &repository,
@@ -1024,6 +1031,32 @@ async fn batched_writes_keep_per_address_rows_and_movement_order() {
     .expect("history page");
     let alpha = &page.transactions[0];
     assert_eq!(alpha.movements, ordered, "movement order must survive");
+
+    let sender = Transactions::list(
+        &repository,
+        HistoryQuery {
+            scope: scope.clone(),
+            address: address(&scope, "sender"),
+            after: None,
+            limit: 10,
+        },
+    )
+    .await
+    .expect("fee payer history");
+    let beta = &sender.transactions[1];
+    assert!(matches!(
+        &beta.status,
+        indexing::CanonicalStatus::Failed { reason: Some(reason), .. } if reason == "reverted"
+    ));
+    assert!(beta.movements.is_empty());
+    assert_eq!(
+        beta.fee,
+        Some(indexing::NetworkFee {
+            asset: asset(&scope),
+            amount: Decimal::from(7),
+            payer: Some(address(&scope, "sender")),
+        })
+    );
 }
 
 /// A required spend that matches nothing is an invalid block; a tracked spend
@@ -1217,6 +1250,81 @@ async fn output_pagination_covers_every_output_once() {
     // textually and put "…:10" before "…:2".
     let expected: Vec<u32> = (0..12).collect();
     assert_eq!(seen, expected, "pages must be ordered and complete");
+}
+
+#[tokio::test]
+async fn stale_history_and_output_cursors_remain_retryable_conflicts() {
+    let scope = unique_scope();
+    let (database, repository) = repository(&scope).await;
+    let first = block(1, 1, 0);
+    repository
+        .add(addition(
+            &scope,
+            first.clone(),
+            None,
+            vec![draft(&scope, "alpha"), draft(&scope, "beta")],
+            OutputChanges {
+                created: vec![output(&scope, "alpha", 0, 1), output(&scope, "beta", 0, 1)],
+                ..OutputChanges::default()
+            },
+        ))
+        .await
+        .expect("first block");
+
+    let mut history = HistoryQuery {
+        scope: scope.clone(),
+        address: address(&scope, "receiver"),
+        after: None,
+        limit: 1,
+    };
+    history.after = Transactions::list(&repository, history.clone())
+        .await
+        .expect("first history page")
+        .next;
+    assert!(history.after.is_some());
+    let mut outputs = OutputRequest {
+        scope: scope.clone(),
+        address: address(&scope, "receiver"),
+        after: None,
+        limit: 1,
+    };
+    outputs.after = Outputs::list(&repository, outputs.clone())
+        .await
+        .expect("first output page")
+        .next;
+    assert!(outputs.after.is_some());
+
+    repository
+        .add(addition(
+            &scope,
+            block(2, 2, 1),
+            Some(first),
+            Vec::new(),
+            OutputChanges::default(),
+        ))
+        .await
+        .expect("advance checkpoint");
+    let before = scope_signature(&database, &scope).await;
+    for (error, message) in [
+        (
+            Transactions::list(&repository, history)
+                .await
+                .expect_err("stale history cursor"),
+            "history changed during pagination",
+        ),
+        (
+            Outputs::list(&repository, outputs)
+                .await
+                .expect_err("stale output cursor"),
+            "outputs changed during pagination",
+        ),
+    ] {
+        assert_eq!(error.kind, IndexErrorKind::Conflict);
+        assert_eq!(error.message, message);
+        assert!(error.retryable);
+    }
+    assert_eq!(scope_signature(&database, &scope).await, before);
+    assert!(database.registry_sentinel_unchanged().await);
 }
 
 #[tokio::test]

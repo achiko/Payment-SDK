@@ -292,6 +292,10 @@ fn failed_transaction_is_fee_only_and_visible_only_to_payer() {
         draft.fee.as_ref().expect("failed fee").amount.to_string(),
         "5"
     );
+    assert_eq!(
+        draft.fee.as_ref().and_then(|fee| fee.payer.as_ref()),
+        Some(&selected(1))
+    );
 
     let endpoint = inspect(vec![value], &[selected(2)]).expect("attempted endpoint ignored");
     assert!(endpoint.transactions.is_empty());
@@ -310,6 +314,13 @@ fn retains_successful_fee_only_transaction_for_selected_payer() {
     let interpreted = inspect(vec![value], &[selected(1)]).expect("fee-only success");
     assert_eq!(interpreted.transactions.len(), 1);
     assert!(interpreted.transactions[0].movements.is_empty());
+    assert_eq!(
+        interpreted.transactions[0]
+            .fee
+            .as_ref()
+            .and_then(|fee| fee.payer.as_ref()),
+        Some(&selected(1))
+    );
 }
 
 #[test]

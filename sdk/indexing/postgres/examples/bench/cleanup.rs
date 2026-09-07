@@ -1,6 +1,7 @@
 use deadpool_postgres::Client;
 use indexing::IndexScope;
 
+// design-lint: allow unclassified-free-function -- benchmark-only atomic cleanup across indexing tables using foreign client and scope types; not a production repository capability
 /// Deletes only one benchmark scope, with children removed before parents.
 pub(crate) async fn clear_scope(
     client: &mut Client,

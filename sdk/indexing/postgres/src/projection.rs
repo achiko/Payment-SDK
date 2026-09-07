@@ -5,7 +5,7 @@ use indexing::{BlockAddition, IndexError, IndexErrorKind, IndexScope};
 use tokio_postgres::types::ToSql;
 
 use crate::{
-    columns::{self, SpendKeys},
+    columns::{self, HistoryRows, SpendKeys},
     prepare_in, row,
 };
 
@@ -66,7 +66,7 @@ pub(crate) async fn write_history(
     height: i64,
     addition: &BlockAddition,
 ) -> Result<(), IndexError> {
-    let (history, movements) = columns::canonical(addition)?;
+    let history = HistoryRows::try_from(addition)?;
 
     if history.is_empty() {
         return Ok(());
@@ -109,6 +109,7 @@ pub(crate) async fn write_history(
         .await
         .map_err(conflict_aware)?;
 
+    let movements = &history.movements;
     if movements.is_empty() {
         return Ok(());
     }
@@ -218,6 +219,7 @@ async fn spend(
         .map_err(crate::store)
 }
 
+// design-lint: allow unclassified-free-function -- shared PostgreSQL write-error translation between foreign error types; SQLSTATE policy belongs to this adapter
 fn conflict_aware(error: tokio_postgres::Error) -> IndexError {
     let unique = error
         .code()

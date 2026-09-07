@@ -1,5 +1,3 @@
-use std::cmp::Ordering;
-
 use bitcoin::{
     Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, absolute,
     hashes::Hash, transaction::Version,
@@ -8,125 +6,127 @@ use bitcoin::{
 use crate::{ChainError, ChainErrorKind, FeeRate, Network, Satoshi};
 
 use super::{
-    BuildRequest, Funding, Input, Output, SpendSource, UnsignedTransaction, checked_address,
-    checked_output, insufficient_funds, invalid_transaction, sum_utxos, validate_unique_utxos,
+    BuildRequest, Funding, Input, Output, SpendSource, UnsignedTransaction, checked_output,
+    insufficient_funds, invalid_transaction, sum_utxos, validate_unique_utxos,
 };
 
 const SEGWIT_MARKER_FLAG_WEIGHT: u64 = 2;
 
-pub(in crate::transaction) fn build(
-    network: Network,
-    mut request: BuildRequest,
-) -> Result<UnsignedTransaction, ChainError> {
-    if request.available.is_empty() {
-        return Err(insufficient_funds(
-            "Bitcoin transfer has no available UTXOs",
-        ));
-    }
-    if request.recipients.is_empty() {
-        return Err(invalid_transaction("Bitcoin transfer has no recipients"));
-    }
-    if request.fee_rate.satoshis_per_kvb() == 0 {
-        return Err(ChainError {
-            kind: ChainErrorKind::FeeUnavailable,
-            message: "Bitcoin fee rate must be greater than zero".to_owned(),
-        });
-    }
-    validate_unique_utxos(&request.available)?;
-    for utxo in &request.available {
-        let script = ScriptBuf::from_bytes(utxo.script_pubkey.clone());
-        if !script.is_p2wpkh() && !script.is_p2tr() {
-            return Err(invalid_transaction(
-                "Bitcoin wallet supports P2WPKH and P2TR inputs only",
+impl BuildRequest {
+    pub(in crate::transaction) fn build(
+        mut self,
+        network: Network,
+    ) -> Result<UnsignedTransaction, ChainError> {
+        if self.available.is_empty() {
+            return Err(insufficient_funds(
+                "Bitcoin transfer has no available UTXOs",
             ));
         }
-    }
-
-    let recipient_scripts = request
-        .recipients
-        .iter()
-        .map(|output| checked_output(network, output, request.drain_wallet))
-        .collect::<Result<Vec<_>, ChainError>>()?;
-    let change_script = checked_address(network, &request.change_address)?.script_pubkey();
-
-    if request.drain_wallet {
-        if request.recipients.len() != 1 {
-            return Err(invalid_transaction(
-                "Bitcoin drain transfer requires exactly one recipient",
-            ));
+        if self.recipients.is_empty() {
+            return Err(invalid_transaction("Bitcoin transfer has no recipients"));
         }
-        request.available.sort_by(canonical_outpoint_order);
-        let selected_total = sum_utxos(&request.available)?;
-        let fee = predicted_fee(&request.available, &recipient_scripts, request.fee_rate)?;
-        let value = selected_total.checked_sub(fee).ok_or_else(|| {
-            insufficient_funds("Bitcoin UTXOs cannot cover the drain transaction fee")
-        })?;
-        let minimum = recipient_scripts[0].minimal_non_dust().to_sat();
-        if value < minimum {
-            return Err(insufficient_funds(format!(
-                "Bitcoin drain output is dust: minimum is {minimum} satoshis"
-            )));
-        }
-        request.recipients[0].value = Satoshi(value);
-        return Ok(unsigned(request.available, request.recipients));
-    }
-
-    request.available.sort_by(|left, right| {
-        right
-            .value
-            .cmp(&left.value)
-            .then_with(|| left.transaction_id.cmp(&right.transaction_id))
-            .then_with(|| left.output_index.cmp(&right.output_index))
-    });
-
-    let recipient_total = request.recipients.iter().try_fold(0_u64, |total, output| {
-        total
-            .checked_add(output.value.0)
-            .ok_or_else(|| invalid_transaction("Bitcoin recipient amount overflowed u64"))
-    })?;
-    let mut selected = Vec::new();
-    let mut selected_total = 0_u64;
-    let mut final_outputs = None;
-
-    for utxo in request.available {
-        selected_total = selected_total
-            .checked_add(utxo.value.0)
-            .ok_or_else(|| invalid_transaction("Bitcoin selected input amount overflowed u64"))?;
-        selected.push(utxo);
-
-        let fee_without_change = predicted_fee(&selected, &recipient_scripts, request.fee_rate)?;
-        let required = recipient_total
-            .checked_add(fee_without_change)
-            .ok_or_else(|| invalid_transaction("Bitcoin amount and fee overflowed u64"))?;
-        if selected_total < required {
-            continue;
-        }
-
-        let mut with_change_scripts = recipient_scripts.clone();
-        with_change_scripts.push(change_script.clone());
-        let fee_with_change = predicted_fee(&selected, &with_change_scripts, request.fee_rate)?;
-        let change = selected_total
-            .checked_sub(recipient_total)
-            .and_then(|value| value.checked_sub(fee_with_change));
-        let mut outputs = request.recipients.clone();
-        if let Some(change) =
-            change.filter(|value| *value >= change_script.minimal_non_dust().to_sat())
-        {
-            outputs.push(Output {
-                address: request.change_address.clone(),
-                value: Satoshi(change),
+        if self.fee_rate.satoshis_per_kvb() == 0 {
+            return Err(ChainError {
+                kind: ChainErrorKind::FeeUnavailable,
+                message: "Bitcoin fee rate must be greater than zero".to_owned(),
             });
         }
-        final_outputs = Some(outputs);
-        break;
-    }
+        validate_unique_utxos(&self.available)?;
+        for utxo in &self.available {
+            let script = ScriptBuf::from_bytes(utxo.script_pubkey.clone());
+            if !script.is_p2wpkh() && !script.is_p2tr() {
+                return Err(invalid_transaction(
+                    "Bitcoin wallet supports P2WPKH and P2TR inputs only",
+                ));
+            }
+        }
 
-    let outputs = final_outputs.ok_or_else(|| {
-        insufficient_funds(format!(
-            "insufficient Bitcoin funds for {recipient_total} satoshis plus network fee"
-        ))
-    })?;
-    Ok(unsigned(selected, outputs))
+        let recipient_scripts = self
+            .recipients
+            .iter()
+            .map(|output| checked_output(network, output, self.drain_wallet))
+            .collect::<Result<Vec<_>, ChainError>>()?;
+        let change_script = self.change_address.script_pubkey_for_network(network)?;
+
+        if self.drain_wallet {
+            if self.recipients.len() != 1 {
+                return Err(invalid_transaction(
+                    "Bitcoin drain transfer requires exactly one recipient",
+                ));
+            }
+            self.available.sort_by(SpendSource::compare_outpoint);
+            let selected_total = sum_utxos(&self.available)?;
+            let fee = predicted_fee(&self.available, &recipient_scripts, self.fee_rate)?;
+            let value = selected_total.checked_sub(fee).ok_or_else(|| {
+                insufficient_funds("Bitcoin UTXOs cannot cover the drain transaction fee")
+            })?;
+            let minimum = recipient_scripts[0].minimal_non_dust().to_sat();
+            if value < minimum {
+                return Err(insufficient_funds(format!(
+                    "Bitcoin drain output is dust: minimum is {minimum} satoshis"
+                )));
+            }
+            self.recipients[0].value = Satoshi(value);
+            return Ok(unsigned(self.available, self.recipients));
+        }
+
+        self.available.sort_by(|left, right| {
+            right
+                .value
+                .cmp(&left.value)
+                .then_with(|| left.transaction_id.cmp(&right.transaction_id))
+                .then_with(|| left.output_index.cmp(&right.output_index))
+        });
+
+        let recipient_total = self.recipients.iter().try_fold(0_u64, |total, output| {
+            total
+                .checked_add(output.value.0)
+                .ok_or_else(|| invalid_transaction("Bitcoin recipient amount overflowed u64"))
+        })?;
+        let mut selected = Vec::new();
+        let mut selected_total = 0_u64;
+        let mut final_outputs = None;
+
+        for utxo in self.available {
+            selected_total = selected_total.checked_add(utxo.value.0).ok_or_else(|| {
+                invalid_transaction("Bitcoin selected input amount overflowed u64")
+            })?;
+            selected.push(utxo);
+
+            let fee_without_change = predicted_fee(&selected, &recipient_scripts, self.fee_rate)?;
+            let required = recipient_total
+                .checked_add(fee_without_change)
+                .ok_or_else(|| invalid_transaction("Bitcoin amount and fee overflowed u64"))?;
+            if selected_total < required {
+                continue;
+            }
+
+            let mut with_change_scripts = recipient_scripts.clone();
+            with_change_scripts.push(change_script.clone());
+            let fee_with_change = predicted_fee(&selected, &with_change_scripts, self.fee_rate)?;
+            let change = selected_total
+                .checked_sub(recipient_total)
+                .and_then(|value| value.checked_sub(fee_with_change));
+            let mut outputs = self.recipients.clone();
+            if let Some(change) =
+                change.filter(|value| *value >= change_script.minimal_non_dust().to_sat())
+            {
+                outputs.push(Output {
+                    address: self.change_address.clone(),
+                    value: Satoshi(change),
+                });
+            }
+            final_outputs = Some(outputs);
+            break;
+        }
+
+        let outputs = final_outputs.ok_or_else(|| {
+            insufficient_funds(format!(
+                "insufficient Bitcoin funds for {recipient_total} satoshis plus network fee"
+            ))
+        })?;
+        Ok(unsigned(selected, outputs))
+    }
 }
 
 pub(in crate::transaction) fn build_grouped(
@@ -149,7 +149,7 @@ pub(in crate::transaction) fn build_grouped(
                 "each Bitcoin grouped source needs inputs and recipients",
             ));
         }
-        group.available.sort_by(canonical_outpoint_order);
+        group.available.sort_by(SpendSource::compare_outpoint);
         let input = sum_utxos(&group.available)?;
         let output = group.recipients.iter().try_fold(0_u64, |sum, value| {
             sum.checked_add(value.value.0)
@@ -158,7 +158,7 @@ pub(in crate::transaction) fn build_grouped(
         surplus.push(input.checked_sub(output).ok_or_else(|| {
             insufficient_funds("a Bitcoin grouped source cannot fund its requested outputs")
         })?);
-        change.push(checked_address(network, &group.change_address)?.script_pubkey());
+        change.push(group.change_address.script_pubkey_for_network(network)?);
         available.append(&mut group.available);
         recipients.append(&mut group.recipients);
     }
@@ -222,13 +222,6 @@ fn allocate_fee(surplus: &[u64], fee: u64) -> Result<Vec<u64>, ChainError> {
         ));
     }
     Ok(remaining)
-}
-
-fn canonical_outpoint_order(left: &SpendSource, right: &SpendSource) -> Ordering {
-    super::TransactionId(left.transaction_id)
-        .to_string()
-        .cmp(&super::TransactionId(right.transaction_id).to_string())
-        .then_with(|| left.output_index.cmp(&right.output_index))
 }
 
 fn unsigned(utxos: Vec<SpendSource>, outputs: Vec<Output>) -> UnsignedTransaction {

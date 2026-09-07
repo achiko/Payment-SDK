@@ -50,20 +50,22 @@ pub(crate) fn decode_physical_key(
     expected_namespace: &Namespace,
 ) -> Result<Key, Error> {
     if physical.len() < size_of::<u32>() {
-        return Err(corrupt_data("physical key is shorter than its header"));
+        return Err(Error::corrupt_data(
+            "physical key is shorter than its header",
+        ));
     }
 
     let namespace_len = read_u32(&physical[..4])? as usize;
     let key_offset = 4usize
         .checked_add(namespace_len)
-        .ok_or_else(|| corrupt_data("physical key namespace length overflows"))?;
+        .ok_or_else(|| Error::corrupt_data("physical key namespace length overflows"))?;
     if physical.len() < key_offset {
-        return Err(corrupt_data(
+        return Err(Error::corrupt_data(
             "physical key namespace length exceeds the encoded key",
         ));
     }
     if &physical[4..key_offset] != expected_namespace.0.as_bytes() {
-        return Err(corrupt_data(
+        return Err(Error::corrupt_data(
             "physical key does not belong to the requested namespace",
         ));
     }
@@ -101,12 +103,16 @@ pub(crate) fn decode_stored_value(frame: &[u8]) -> Result<StoredValue, Error> {
     validate_record_length(body)?;
 
     let (record, bytes_read) = bincode::decode_from_slice::<StoredRecord, _>(body, record_config())
-        .map_err(|error| corrupt_data(format!("failed to decode storage value record: {error}")))?;
+        .map_err(|error| {
+            Error::corrupt_data(format!("failed to decode storage value record: {error}"))
+        })?;
     if bytes_read != body.len() {
-        return Err(corrupt_data("storage value record contains trailing bytes"));
+        return Err(Error::corrupt_data(
+            "storage value record contains trailing bytes",
+        ));
     }
     if record.storage_version == 0 {
-        return Err(corrupt_data(
+        return Err(Error::corrupt_data(
             "storage value record has an invalid commit version",
         ));
     }
@@ -139,7 +145,7 @@ pub(crate) fn encode_global_version(version: Version) -> Result<Vec<u8>, Error> 
 pub(crate) fn decode_global_version(frame: &[u8]) -> Result<Version, Error> {
     let body = validate_frame_prefix(frame, GLOBAL_VERSION_MAGIC, "global version")?;
     if body.len() != GLOBAL_VERSION_LEN {
-        return Err(corrupt_data(format!(
+        return Err(Error::corrupt_data(format!(
             "global version record has length {}, expected {GLOBAL_VERSION_LEN}",
             body.len()
         )));
@@ -147,15 +153,15 @@ pub(crate) fn decode_global_version(frame: &[u8]) -> Result<Version, Error> {
 
     let (record, bytes_read) =
         bincode::decode_from_slice::<GlobalVersion, _>(body, record_config()).map_err(|error| {
-            corrupt_data(format!("failed to decode global version record: {error}"))
+            Error::corrupt_data(format!("failed to decode global version record: {error}"))
         })?;
     if bytes_read != body.len() {
-        return Err(corrupt_data(
+        return Err(Error::corrupt_data(
             "global version record contains trailing bytes",
         ));
     }
     if record.version == 0 {
-        return Err(corrupt_data(
+        return Err(Error::corrupt_data(
             "global version record has an invalid commit version",
         ));
     }
@@ -175,12 +181,12 @@ fn validate_frame_prefix<'a>(
     description: &str,
 ) -> Result<&'a [u8], Error> {
     if frame.len() < FRAME_PREFIX_LEN {
-        return Err(corrupt_data(format!(
+        return Err(Error::corrupt_data(format!(
             "{description} frame is shorter than its header"
         )));
     }
     if &frame[..4] != expected_magic {
-        return Err(corrupt_data(format!(
+        return Err(Error::corrupt_data(format!(
             "{description} frame has invalid magic bytes"
         )));
     }
@@ -189,14 +195,15 @@ fn validate_frame_prefix<'a>(
 
 fn validate_record_length(body: &[u8]) -> Result<(), Error> {
     if body.len() < RECORD_PREFIX_LEN {
-        return Err(corrupt_data(
+        return Err(Error::corrupt_data(
             "storage value record is shorter than its fixed fields",
         ));
     }
 
     let declared_payload_len = read_u64(&body[8..16])?;
-    let declared_payload_len = usize::try_from(declared_payload_len)
-        .map_err(|_| corrupt_data("storage value record payload length exceeds this platform"))?;
+    let declared_payload_len = usize::try_from(declared_payload_len).map_err(|_| {
+        Error::corrupt_data("storage value record payload length exceeds this platform")
+    })?;
     let actual_payload_len = body.len() - RECORD_PREFIX_LEN;
     validate_payload_length(declared_payload_len, actual_payload_len)?;
 
@@ -208,12 +215,12 @@ fn validate_payload_length(
     actual_payload_len: usize,
 ) -> Result<(), Error> {
     if declared_payload_len > MAX_STORED_PAYLOAD_BYTES {
-        return Err(corrupt_data(
+        return Err(Error::corrupt_data(
             "storage value record exceeds the physical record size limit",
         ));
     }
     if declared_payload_len != actual_payload_len {
-        return Err(corrupt_data(format!(
+        return Err(Error::corrupt_data(format!(
             "storage value record payload length is {declared_payload_len}, actual length is {actual_payload_len}"
         )));
     }
@@ -223,7 +230,7 @@ fn validate_payload_length(
 
 fn read_u32(bytes: &[u8]) -> Result<u32, Error> {
     if bytes.len() != size_of::<u32>() {
-        return Err(corrupt_data("invalid encoded u32 length"));
+        return Err(Error::corrupt_data("invalid encoded u32 length"));
     }
     let mut value = [0_u8; size_of::<u32>()];
     value.copy_from_slice(bytes);
@@ -232,7 +239,7 @@ fn read_u32(bytes: &[u8]) -> Result<u32, Error> {
 
 fn read_u64(bytes: &[u8]) -> Result<u64, Error> {
     if bytes.len() != size_of::<u64>() {
-        return Err(corrupt_data("invalid encoded u64 length"));
+        return Err(Error::corrupt_data("invalid encoded u64 length"));
     }
     let mut value = [0_u8; size_of::<u64>()];
     value.copy_from_slice(bytes);
@@ -242,13 +249,6 @@ fn read_u64(bytes: &[u8]) -> Result<u64, Error> {
 fn invalid_request(message: impl Into<String>) -> Error {
     Error {
         kind: ErrorKind::InvalidRequest,
-        message: message.into(),
-    }
-}
-
-fn corrupt_data(message: impl Into<String>) -> Error {
-    Error {
-        kind: ErrorKind::CorruptData,
         message: message.into(),
     }
 }
@@ -300,6 +300,10 @@ mod tests {
             .expect_err("a frame with trailing payload bytes must be rejected");
 
         assert_eq!(error.kind, ErrorKind::CorruptData);
+        assert_eq!(
+            error.message,
+            "storage value record payload length is 3, actual length is 4"
+        );
         Ok(())
     }
 
@@ -312,6 +316,7 @@ mod tests {
             decode_stored_value(&encoded).expect_err("invalid value magic must be rejected");
 
         assert_eq!(error.kind, ErrorKind::CorruptData);
+        assert_eq!(error.message, "storage value frame has invalid magic bytes");
         Ok(())
     }
 

@@ -39,7 +39,9 @@ impl ScopeAdmission {
         let revision = {
             let mut state = self.lock()?;
             if state.commit || state.publication {
-                return Err(conflict("address admission is changing"));
+                return Err(IndexError::retryable_conflict(
+                    "address admission is changing",
+                ));
             }
             if !state.initialized || state.recovery || state.persisted != persisted {
                 state.persisted = persisted.clone();
@@ -56,7 +58,7 @@ impl ScopeAdmission {
             || state.persisted != persisted
             || state.revision != revision
         {
-            return Err(conflict(
+            return Err(IndexError::retryable_conflict(
                 "checkpoint or address revision changed during filter capture",
             ));
         }
@@ -107,13 +109,17 @@ impl ScopeAdmission {
     fn begin(self: &Arc<Self>, plan: &SyncPlan) -> Result<CommitPermit, IndexError> {
         let mut state = self.lock()?;
         if state.recovery {
-            return Err(conflict("checkpoint admission requires repository reload"));
+            return Err(IndexError::retryable_conflict(
+                "checkpoint admission requires repository reload",
+            ));
         }
         if state.commit || state.publication {
-            return Err(conflict("checkpoint admission is busy"));
+            return Err(IndexError::retryable_conflict(
+                "checkpoint admission is busy",
+            ));
         }
         if state.persisted != plan.checkpoint || state.revision != plan.revision {
-            return Err(conflict(
+            return Err(IndexError::retryable_conflict(
                 "checkpoint or address revision changed before commit",
             ));
         }
@@ -287,10 +293,6 @@ fn notify(state: &mut State) {
     }
 }
 
-fn conflict(message: impl Into<String>) -> IndexError {
-    IndexError::new(IndexErrorKind::Conflict, message, true)
-}
-
 fn unavailable(message: impl Into<String>) -> IndexError {
     IndexError::new(IndexErrorKind::Store, message, false)
 }
@@ -436,13 +438,21 @@ mod tests {
             block_on(admission.publication(Some(block(7)))).expect("publication permit");
 
         assert_eq!(
-            commit_error(plan.begin(), "publication must block commit").kind,
-            IndexErrorKind::Conflict
+            commit_error(plan.begin(), "publication must block commit"),
+            IndexError::new(
+                IndexErrorKind::Conflict,
+                "checkpoint admission is busy",
+                true
+            )
         );
         publication.complete().expect("publish filter revision");
         assert_eq!(
-            commit_error(plan.begin(), "old revision must not commit").kind,
-            IndexErrorKind::Conflict
+            commit_error(plan.begin(), "old revision must not commit"),
+            IndexError::new(
+                IndexErrorKind::Conflict,
+                "checkpoint or address revision changed before commit",
+                true,
+            )
         );
     }
 
@@ -457,8 +467,12 @@ mod tests {
         drop(commit);
 
         assert_eq!(
-            commit_error(stale.begin(), "recovery must block stale plan").kind,
-            IndexErrorKind::Conflict
+            commit_error(stale.begin(), "recovery must block stale plan"),
+            IndexError::new(
+                IndexErrorKind::Conflict,
+                "checkpoint admission requires repository reload",
+                true,
+            )
         );
         let reloaded = admission
             .plan(Some(block(8)), || Ok(Vec::new()))

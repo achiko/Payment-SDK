@@ -166,3 +166,25 @@ fn ordering_handles_negative_values_across_scales() {
     assert!(farther_from_zero < closer_to_zero);
     assert!(closer_to_zero < Decimal::zero());
 }
+
+#[test]
+fn ordering_is_antisymmetric_across_zero_and_maximum_scale() {
+    let values = [
+        Decimal::new(BigInt::from(-1), 0),
+        "-0.0006".parse::<Decimal>().unwrap(),
+        "-0.00059859".parse::<Decimal>().unwrap(),
+        Decimal::new(BigInt::from(-1), u32::MAX),
+        Decimal::new(BigInt::from(0), u32::MAX),
+        Decimal::new(BigInt::from(1), u32::MAX),
+        "0.00059859".parse::<Decimal>().unwrap(),
+        "0.0006".parse::<Decimal>().unwrap(),
+        Decimal::from(1),
+    ];
+    assert_eq!(values[4].scale(), 0);
+    for (left_index, left) in values.iter().enumerate() {
+        for (right_index, right) in values.iter().enumerate() {
+            assert_eq!(left.cmp(right), left_index.cmp(&right_index));
+            assert_eq!(left.partial_cmp(right), Some(left_index.cmp(&right_index)));
+        }
+    }
+}

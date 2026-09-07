@@ -15,6 +15,7 @@ pub(super) fn namespace() -> Namespace {
     Namespace(NAMESPACE.to_owned())
 }
 
+// design-lint: allow unclassified-free-function -- encodes the shared checkpoint key for reads and atomic writes; foreign scope and key types keep storage-format policy in this adapter
 pub(super) fn checkpoint(scope: &IndexScope) -> Key {
     Key(prefix(scope, CHECKPOINT))
 }
@@ -71,7 +72,66 @@ fn prefix(scope: &IndexScope, tag: u8) -> Vec<u8> {
     key
 }
 
+// design-lint: allow unclassified-free-function -- shared length-prefix byte-append algorithm for scope, address and transaction key components; neither byte buffer is a domain receiver
 fn component(key: &mut Vec<u8>, value: &[u8]) {
     key.extend_from_slice(&(value.len() as u64).to_be_bytes());
     key.extend_from_slice(value);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use indexing::ChainId;
+
+    #[test]
+    fn checkpoint_has_the_persisted_format_and_scope_framing() {
+        let scope = IndexScope {
+            chain: ChainId("a".into()),
+            network: "bc".into(),
+        };
+        assert_eq!(
+            checkpoint(&scope).0,
+            [
+                1, 1, 0, 0, 0, 0, 0, 0, 0, 1, b'a', 0, 0, 0, 0, 0, 0, 0, 2, b'b', b'c'
+            ]
+        );
+        let differently_split_scope = IndexScope {
+            chain: ChainId("ab".into()),
+            network: "c".into(),
+        };
+        assert_ne!(checkpoint(&scope), checkpoint(&differently_split_scope));
+        for tag in [JOURNAL, HISTORY, OUTPUT] {
+            assert_ne!(checkpoint(&scope).0, prefix(&scope, tag));
+        }
+    }
+
+    #[test]
+    fn components_preserve_empty_binary_and_utf8_bytes() {
+        let mut key = vec![0x7f];
+        component(&mut key, &[]);
+        component(&mut key, &[0, 0xff]);
+        component(&mut key, "é".as_bytes());
+        assert_eq!(
+            key,
+            [
+                0x7f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0xff, 0, 0, 0, 0, 0, 0, 0,
+                2, 0xc3, 0xa9,
+            ]
+        );
+    }
+
+    #[test]
+    fn journal_keys_keep_numeric_height_order() {
+        let scope = IndexScope {
+            chain: ChainId("a".into()),
+            network: "bc".into(),
+        };
+        let heights = [0, 1, 255, 256, u32::MAX as u64, u64::MAX];
+        let keys = heights.map(|height| journal(&scope, BlockHeight(height)).0);
+        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+        for (key, height) in keys.iter().zip(heights) {
+            assert!(key.starts_with(&prefix(&scope, JOURNAL)));
+            assert_eq!(&key[key.len() - 8..], &height.to_be_bytes());
+        }
+    }
 }

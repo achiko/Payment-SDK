@@ -430,6 +430,47 @@ fn sparse_sync_uses_actual_blocks_and_resumes_a_bounded_prefix() {
 }
 
 #[test]
+fn malformed_source_parent_is_retryable_before_interpretation_or_commit() {
+    let mut genesis_with_parent = block(BlockHeight(0));
+    genesis_with_parent.parent = Some(BlockParent {
+        position: BlockPosition(1),
+        hash: hash(BlockHeight(1)),
+    });
+    let mut non_genesis_without_parent = block(BlockHeight(1));
+    non_genesis_without_parent.parent = None;
+
+    for (block, message) in [
+        (genesis_with_parent, "genesis block must not have a parent"),
+        (
+            non_genesis_without_parent,
+            "non-genesis block is missing its parent",
+        ),
+    ] {
+        let own_scope = scope("malformed-source");
+        let interpreter = Interpreter::default();
+        let repository = Repository::default();
+        let service = Service::new(
+            Source::sparse([block]),
+            interpreter.clone(),
+            repository.clone(),
+            config(own_scope.clone()),
+        );
+
+        let error = block_on(service.sync(&Vec::<AddressFilter>::new()))
+            .expect_err("malformed source reference must fail before interpretation");
+        assert_eq!(
+            error,
+            IndexError::new(IndexErrorKind::CannotConnect, message, true)
+        );
+        assert!(interpreter.inspections().is_empty());
+        assert_eq!(
+            block_on(repository.get(BlockSelector::Tip(own_scope))).expect("checkpoint lookup"),
+            None
+        );
+    }
+}
+
+#[test]
 fn sparse_sync_reconciles_a_retained_reorg_by_native_position() {
     let own_scope = scope("sparse-reorg");
     let owner = address(&own_scope, "owner");

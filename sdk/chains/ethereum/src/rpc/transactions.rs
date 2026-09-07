@@ -83,7 +83,7 @@ where
             let input = request.input();
             let limits = self.limits().map_err(rpc_error)?;
             if input.len() > limits.max_input_bytes() {
-                return Err(chain_error(
+                return Err(ChainError::new(
                     ChainErrorKind::InvalidTransaction,
                     "Ethereum transaction input exceeds the configured size limit",
                 ));
@@ -109,7 +109,7 @@ where
                     Err(CallError::Local(error)) => return Err(rpc_error(error)),
                     Err(CallError::Remote(failure)) => {
                         if is_execution_revert(&failure) {
-                            return Err(chain_error(
+                            return Err(ChainError::new(
                                 ChainErrorKind::Rejected,
                                 format!(
                                     "Ethereum ERC-20 transfer simulation was rejected with code {}",
@@ -123,14 +123,14 @@ where
                     }
                 };
                 let value: String = raw.deserialize().map_err(|_| {
-                    chain_error(
+                    ChainError::new(
                         ChainErrorKind::Rejected,
                         "Ethereum ERC-20 transfer simulation returned an invalid JSON value",
                     )
                 })?;
                 let word = parse_fixed_data::<32>(&value, "ERC-20 transfer result")
                     .map_err(|message| {
-                        chain_error(
+                        ChainError::new(
                             ChainErrorKind::Rejected,
                             format!(
                                 "Ethereum ERC-20 transfer simulation returned invalid data: {message}"
@@ -138,13 +138,13 @@ where
                         )
                     })?;
                 let transferred = erc20::decode_transfer(&word).map_err(|_| {
-                    chain_error(
+                    ChainError::new(
                         ChainErrorKind::Rejected,
                         "Ethereum ERC-20 transfer simulation returned an invalid ABI result",
                     )
                 })?;
                 if !transferred {
-                    return Err(chain_error(
+                    return Err(ChainError::new(
                         ChainErrorKind::Rejected,
                         "Ethereum ERC-20 transfer simulation returned false",
                     ));
@@ -162,7 +162,7 @@ where
                 gas_limit_with_margin(estimated_gas_limit, limits.gas_limit_margin_basis_points())
                     .map_err(rpc_error)?;
             if gas_limit > limits.max_gas_limit() {
-                return Err(chain_error(
+                return Err(ChainError::new(
                     ChainErrorKind::FeeUnavailable,
                     "Ethereum estimated gas limit exceeds the configured ceiling",
                 ));
@@ -173,7 +173,7 @@ where
                 .await
                 .map_err(rpc_error)?;
             if &max_priority_fee_per_gas > limits.max_priority_fee_per_gas() {
-                return Err(chain_error(
+                return Err(ChainError::new(
                     ChainErrorKind::FeeUnavailable,
                     "Ethereum priority fee exceeds the configured ceiling",
                 ));
@@ -210,7 +210,7 @@ where
                     ))
                 })?;
             if &max_fee_per_gas > limits.max_fee_per_gas() {
-                return Err(chain_error(
+                return Err(ChainError::new(
                     ChainErrorKind::FeeUnavailable,
                     "Ethereum max fee per gas exceeds the configured ceiling",
                 ));
@@ -222,13 +222,13 @@ where
                 )));
             }
             let total_fee = max_fee_per_gas.checked_mul_u64(gas_limit).ok_or_else(|| {
-                chain_error(
+                ChainError::new(
                     ChainErrorKind::FeeUnavailable,
                     "Ethereum maximum transaction fee overflowed U256",
                 )
             })?;
             if &total_fee > limits.max_total_fee() {
-                return Err(chain_error(
+                return Err(ChainError::new(
                     ChainErrorKind::FeeUnavailable,
                     "Ethereum maximum transaction fee exceeds the configured ceiling",
                 ));
@@ -321,7 +321,7 @@ where
             .await
             .map_err(rpc_error)?;
         if actual != self.expected_chain_id {
-            return Err(chain_error(
+            return Err(ChainError::new(
                 ChainErrorKind::Divergent,
                 format!(
                     "Ethereum RPC chain ID {actual} does not match configured chain ID {}",
@@ -340,7 +340,7 @@ where
             Ok(raw) => raw,
             Err(CallError::Local(error)) => return Err(rpc_error(error)),
             Err(CallError::Remote(failure)) if is_execution_revert(&failure) => {
-                return Err(chain_error(
+                return Err(ChainError::new(
                     ChainErrorKind::Rejected,
                     format!(
                         "Ethereum gas estimation was rejected with code {}",
@@ -373,7 +373,7 @@ where
             .await
             .map_err(rpc_error)?;
         if token_balance < *amount {
-            return Err(chain_error(
+            return Err(ChainError::new(
                 ChainErrorKind::InsufficientFunds,
                 "Ethereum ERC-20 balance is insufficient for the transfer amount",
             ));
@@ -393,13 +393,13 @@ where
             .map_err(rpc_error)?;
         if request.erc20_transfer().is_none() {
             let required = request.value().checked_add(total_fee).ok_or_else(|| {
-                chain_error(
+                ChainError::new(
                     ChainErrorKind::FeeUnavailable,
                     "Ethereum transfer value plus maximum fee overflowed U256",
                 )
             })?;
             if native_balance < required {
-                return Err(chain_error(
+                return Err(ChainError::new(
                     ChainErrorKind::InsufficientFunds,
                     "Ethereum native balance is insufficient for transfer value and maximum fee",
                 ));
@@ -408,7 +408,7 @@ where
         }
 
         if native_balance < *total_fee {
-            return Err(chain_error(
+            return Err(ChainError::new(
                 ChainErrorKind::InsufficientFunds,
                 "Ethereum native balance is insufficient for the ERC-20 maximum fee",
             ));
@@ -444,15 +444,8 @@ where
     }
 }
 
-fn chain_error(kind: ChainErrorKind, message: impl Into<String>) -> ChainError {
-    ChainError {
-        kind,
-        message: message.into(),
-    }
-}
-
 fn rpc_error(error: SourceError) -> ChainError {
-    chain_error(ChainErrorKind::RpcUnavailable, error.message)
+    ChainError::new(ChainErrorKind::RpcUnavailable, error.message)
 }
 
 fn transaction_error(

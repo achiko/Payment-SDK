@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use crate::{ChainError, ChainErrorKind};
 use base::{Decimal, DecimalError, TransactionFuture};
 use bitcoin::ScriptBuf;
@@ -51,6 +53,14 @@ pub struct SpendSource {
 }
 
 impl SpendSource {
+    /// Orders only outpoint identity, using displayed transaction IDs before output indices.
+    pub(super) fn compare_outpoint(&self, other: &Self) -> Ordering {
+        TransactionId(self.transaction_id)
+            .to_string()
+            .cmp(&TransactionId(other.transaction_id).to_string())
+            .then_with(|| self.output_index.cmp(&other.output_index))
+    }
+
     /// Accepts one exact PS-reserved/IX-sourced outpoint while deriving all
     /// signing weight from the verified chain-native script.
     pub fn from_exact_selection(
@@ -172,7 +182,7 @@ impl Builder {
     pub fn build<'a>(
         &'a self,
     ) -> TransactionFuture<'a, Result<super::UnsignedTransaction, ChainError>> {
-        Box::pin(async move { super::operations::build(self.network, self.request.clone()) })
+        Box::pin(async move { self.request.clone().build(self.network) })
     }
 
     pub fn sign<'a>(
@@ -180,7 +190,7 @@ impl Builder {
         signer: &'a dyn base::Signer,
     ) -> TransactionFuture<'a, Result<super::SignedTransaction, ChainError>> {
         Box::pin(async move {
-            let unsigned = super::operations::build(self.network, self.request.clone())?;
+            let unsigned = self.request.clone().build(self.network)?;
             super::operations::sign(self.network, unsigned, signer).await
         })
     }
@@ -195,7 +205,7 @@ impl Builder {
         signers: &'a [&'a S],
     ) -> TransactionFuture<'a, Result<super::SignedTransaction, ChainError>> {
         Box::pin(async move {
-            let unsigned = super::operations::build(self.network, self.request.clone())?;
+            let unsigned = self.request.clone().build(self.network)?;
             super::operations::sign_each(self.network, unsigned, signers).await
         })
     }
@@ -329,6 +339,162 @@ mod tests {
         .expect_err("mismatched selection script must fail");
 
         assert_eq!(error.kind, ChainErrorKind::InvalidTransaction);
+    }
+
+    #[test]
+    fn drain_preserves_displayed_outpoint_order_and_exact_fee() {
+        let (address, script) = address_and_script();
+        let mut first = [0; 32];
+        first[0] = 1;
+        let mut last = [0; 32];
+        last[31] = 1;
+        let source = |transaction_id, output_index| SpendSource {
+            transaction_id,
+            output_index,
+            value: Satoshi(100_000),
+            script_pubkey: script.clone(),
+            satisfaction_weight: P2WPKH_SATISFACTION_WEIGHT,
+        };
+        let request = BuildRequest {
+            available: vec![source(last, 0), source(first, 10), source(first, 2)],
+            recipients: vec![Output::from_atomic(address.clone(), Satoshi(0))],
+            change_address: address,
+            fee_rate: FeeRate::new(1_000),
+            drain_wallet: true,
+        };
+
+        let grouped = crate::transaction::operations::build_grouped(
+            Network::Regtest,
+            vec![Funding {
+                available: request.available.clone(),
+                recipients: vec![Output::from_atomic(
+                    request.change_address.clone(),
+                    Satoshi(50_000),
+                )],
+                change_address: request.change_address.clone(),
+            }],
+            request.fee_rate,
+        )
+        .expect("grouped funding must retain canonical outpoint order");
+        let transaction =
+            futures_executor::block_on(Builder::new(Network::Regtest, request).build())
+                .expect("drain must retain every selected outpoint");
+
+        assert_eq!(
+            transaction
+                .inputs
+                .iter()
+                .map(|input| (input.utxo.transaction_id, input.utxo.output_index))
+                .collect::<Vec<_>>(),
+            vec![(first, 2), (first, 10), (last, 0)]
+        );
+        assert_eq!(grouped.inputs, transaction.inputs);
+        assert_eq!(transaction.outputs.len(), 1);
+        // Three P2WPKH inputs and one output predict 247 virtual bytes.
+        assert_eq!(transaction.outputs[0].value, Satoshi(299_753));
+    }
+
+    #[test]
+    fn normal_selection_keeps_amount_then_raw_outpoint_order() {
+        let (address, script) = address_and_script();
+        let mut first = [0; 32];
+        first[0] = 1;
+        let mut last = [0; 32];
+        last[31] = 1;
+        let source = |transaction_id, value| SpendSource {
+            transaction_id,
+            output_index: 0,
+            value: Satoshi(value),
+            script_pubkey: script.clone(),
+            satisfaction_weight: P2WPKH_SATISFACTION_WEIGHT,
+        };
+        let request = BuildRequest {
+            available: vec![
+                source(first, 100_000),
+                source([0; 32], 40_000),
+                source(last, 100_000),
+            ],
+            recipients: vec![Output::from_atomic(address.clone(), Satoshi(150_000))],
+            change_address: address.clone(),
+            fee_rate: FeeRate::new(1_000),
+            drain_wallet: false,
+        };
+
+        let transaction =
+            futures_executor::block_on(Builder::new(Network::Regtest, request).build())
+                .expect("two largest inputs must fund the transfer");
+
+        assert_eq!(
+            transaction
+                .inputs
+                .iter()
+                .map(|input| input.utxo.transaction_id)
+                .collect::<Vec<_>>(),
+            vec![last, first]
+        );
+        assert_eq!(transaction.outputs.len(), 2);
+        assert_eq!(transaction.outputs[0].value, Satoshi(150_000));
+        assert_eq!(transaction.outputs[1].address, address);
+        // Two P2WPKH inputs and two outputs predict 209 virtual bytes.
+        assert_eq!(transaction.outputs[1].value, Satoshi(49_791));
+    }
+
+    #[test]
+    fn transaction_construction_rejects_invalid_and_wrong_network_addresses() {
+        let (regtest, script) = address_and_script();
+        let mainnet = Address::from_script_for_network(
+            &ScriptBuf::from_bytes(script.clone()),
+            Network::Mainnet,
+        )
+        .expect("fixture script must encode for mainnet");
+        for (recipient, change_address, network, expected_message) in [
+            (
+                Address::from_encoded("invalid"),
+                regtest.clone(),
+                Network::Regtest,
+                "invalid Bitcoin address:",
+            ),
+            (
+                regtest.clone(),
+                Address::from_encoded("invalid"),
+                Network::Regtest,
+                "invalid Bitcoin address:",
+            ),
+            (
+                regtest.clone(),
+                mainnet.clone(),
+                Network::Mainnet,
+                "Bitcoin address is for the wrong network:",
+            ),
+            (
+                mainnet,
+                regtest,
+                Network::Mainnet,
+                "Bitcoin address is for the wrong network:",
+            ),
+        ] {
+            let request = BuildRequest {
+                available: vec![SpendSource {
+                    transaction_id: [1; 32],
+                    output_index: 0,
+                    value: Satoshi(100_000),
+                    script_pubkey: script.clone(),
+                    satisfaction_weight: P2WPKH_SATISFACTION_WEIGHT,
+                }],
+                recipients: vec![Output::from_atomic(recipient, Satoshi(50_000))],
+                change_address,
+                fee_rate: FeeRate::new(1_000),
+                drain_wallet: false,
+            };
+            let error = futures_executor::block_on(Builder::new(network, request).build())
+                .expect_err("address must be valid for the configured network");
+            assert_eq!(error.kind, ChainErrorKind::InvalidAddress);
+            assert!(
+                error.message.starts_with(expected_message),
+                "{}",
+                error.message
+            );
+        }
     }
 
     #[test]

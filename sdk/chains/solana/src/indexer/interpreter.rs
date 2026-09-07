@@ -128,7 +128,10 @@ impl IndexBlockInterpreter for Interpreter {
                 fee: Some(NetworkFee {
                     asset: self.asset.clone(),
                     amount: base::Decimal::from_atomic(transaction.fee().into(), 0),
-                    payer: Some(canonical(transaction.fee_payer(), &self.scope)),
+                    payer: Some(CanonicalAddress {
+                        scope: self.scope.clone(),
+                        value: transaction.fee_payer().to_string(),
+                    }),
                 }),
             });
         }
@@ -138,13 +141,6 @@ impl IndexBlockInterpreter for Interpreter {
             transactions: observations,
             outputs: OutputChanges::default(),
         })
-    }
-}
-
-fn canonical(address: &Address, scope: &IndexScope) -> CanonicalAddress {
-    CanonicalAddress {
-        scope: scope.clone(),
-        value: address.to_string(),
     }
 }
 

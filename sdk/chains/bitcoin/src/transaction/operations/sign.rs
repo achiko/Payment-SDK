@@ -110,7 +110,7 @@ fn native_transaction(
         .map(|output| {
             Ok(TxOut {
                 value: Amount::from_sat(output.value.0),
-                script_pubkey: super::checked_address(network, &output.address)?.script_pubkey(),
+                script_pubkey: output.address.script_pubkey_for_network(network)?,
             })
         })
         .collect::<Result<Vec<_>, ChainError>>()?;

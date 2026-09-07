@@ -89,6 +89,7 @@ pub fn pool_for_schema(url: &str, max_size: usize, schema: &str) -> Result<Pool,
     build_pool(config, max_size)
 }
 
+// design-lint: allow unclassified-free-function -- constructs foreign pool types for both public factories; repositories receive the completed pool by injection
 fn build_pool(config: tokio_postgres::Config, max_size: usize) -> Result<Pool, IndexError> {
     let manager = Manager::from_config(
         config,

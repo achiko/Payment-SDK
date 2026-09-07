@@ -1,11 +1,11 @@
 use std::collections::BTreeSet;
 
-use indexing::{AssetId, IndexError, IndexScope, MovementId, ValueMovement};
+use indexing::{AssetId, CanonicalAddress, IndexError, IndexScope, MovementId, ValueMovement};
 use solana_system_interface::{instruction::SystemInstruction, program::ID as SYSTEM_ID};
 
 use crate::Address;
 
-use super::{canonical, invalid_block, wire::Transaction};
+use super::{invalid_block, wire::Transaction};
 
 #[derive(Debug, Default)]
 pub(super) struct Movements(Vec<Movement>);
@@ -86,8 +86,14 @@ impl Movements {
                 id: MovementId(movement.id),
                 asset: asset.clone(),
                 amount: base::Decimal::from_atomic(movement.lamports.into(), 0),
-                from: canonical(&movement.source, scope),
-                to: canonical(&movement.destination, scope),
+                from: CanonicalAddress {
+                    scope: scope.clone(),
+                    value: movement.source.to_string(),
+                },
+                to: CanonicalAddress {
+                    scope: scope.clone(),
+                    value: movement.destination.to_string(),
+                },
             })
             .collect()
     }

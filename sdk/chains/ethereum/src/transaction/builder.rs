@@ -139,9 +139,7 @@ impl Builder {
     pub fn build<'a>(
         &'a self,
     ) -> TransactionFuture<'a, Result<super::UnsignedTransaction, crate::ChainError>> {
-        Box::pin(
-            async move { super::operations::build(self.request.clone(), self.context.clone()) },
-        )
+        Box::pin(async move { super::UnsignedTransaction::new(&self.request, &self.context) })
     }
 
     pub fn sign<'a>(
@@ -149,7 +147,7 @@ impl Builder {
         signer: &'a dyn base::Signer,
     ) -> TransactionFuture<'a, Result<super::SignedTransaction, crate::ChainError>> {
         Box::pin(async move {
-            let unsigned = super::operations::build(self.request.clone(), self.context.clone())?;
+            let unsigned = super::UnsignedTransaction::new(&self.request, &self.context)?;
             super::operations::sign(unsigned, signer).await
         })
     }

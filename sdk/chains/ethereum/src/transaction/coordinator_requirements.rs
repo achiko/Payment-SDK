@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
-use super::{Draft, Preparation, PreparationError, chain_error};
-use crate::{Address, ChainErrorKind, Wei};
+use super::{Draft, Preparation, PreparationError};
+use crate::{Address, ChainError, ChainErrorKind, Wei};
 
 type Contributions = (Wei, Vec<(usize, Wei)>);
 type RequirementsByAsset = BTreeMap<(Address, RequiredAsset), Contributions>;
@@ -55,7 +55,7 @@ impl Requirements {
                 .ok_or_else(|| {
                     PreparationError::new(
                         index,
-                        chain_error(
+                        ChainError::new(
                             ChainErrorKind::FeeUnavailable,
                             "Ethereum aggregate maximum fee overflows U256",
                         ),
@@ -65,7 +65,7 @@ impl Requirements {
                 fee.checked_add(&request.value()).ok_or_else(|| {
                     PreparationError::new(
                         index,
-                        chain_error(
+                        ChainError::new(
                             ChainErrorKind::InsufficientFunds,
                             "Ethereum aggregate native requirement overflows U256",
                         ),
@@ -118,7 +118,7 @@ fn add(
     entry.0 = entry.0.checked_add(&amount).ok_or_else(|| {
         PreparationError::new(
             index,
-            chain_error(
+            ChainError::new(
                 ChainErrorKind::InsufficientFunds,
                 "Ethereum aggregate asset requirement overflows U256",
             ),

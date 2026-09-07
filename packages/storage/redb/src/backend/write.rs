@@ -7,8 +7,8 @@ use crate::codec::{
 };
 
 use super::{
-    Backend, DATA_TABLE, GLOBAL_VERSION_KEY, META_TABLE, commit_error, conflict, corrupt_data,
-    durability_error, operation_error, other, table_error, transaction_error,
+    Backend, DATA_TABLE, GLOBAL_VERSION_KEY, META_TABLE, commit_error, durability_error,
+    operation_error, other, table_error, transaction_error,
 };
 
 impl Backend {
@@ -138,7 +138,7 @@ impl Backend {
             .map_err(|error| operation_error(error, "failed to inspect redb data table"))?
             .is_some()
         {
-            return Err(corrupt_data(
+            return Err(Error::corrupt_data(
                 "redb database contains data records but has no global version",
             ));
         }
@@ -159,7 +159,7 @@ fn evaluate_condition(
                 .map_err(|error| operation_error(error, "failed to evaluate redb condition"))?
                 .is_some()
             {
-                return Err(conflict(format!(
+                return Err(Error::conflict(format!(
                     "missing condition failed in namespace `{}` because the key exists",
                     namespace.0
                 )));
@@ -175,14 +175,14 @@ fn evaluate_condition(
                 .get(physical_key.as_slice())
                 .map_err(|error| operation_error(error, "failed to evaluate redb condition"))?
                 .ok_or_else(|| {
-                    conflict(format!(
+                    Error::conflict(format!(
                         "version condition failed in namespace `{}` because the key is missing",
                         namespace.0
                     ))
                 })?;
             let actual = decode_stored_value(raw.value())?;
             if actual.version != *expected {
-                return Err(conflict(format!(
+                return Err(Error::conflict(format!(
                     "version condition failed in namespace `{}`: expected {}, found {}",
                     namespace.0, expected.0, actual.version.0
                 )));

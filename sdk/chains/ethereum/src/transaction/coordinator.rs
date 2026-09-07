@@ -49,7 +49,7 @@ impl TransactionCoordinator {
         if preparations.is_empty() {
             return Err(PreparationError::new(
                 0,
-                chain_error(
+                ChainError::new(
                     ChainErrorKind::InvalidTransaction,
                     "Ethereum transaction batch is empty",
                 ),
@@ -70,7 +70,7 @@ impl TransactionCoordinator {
             if context.chain_id != preparation.expected_chain_id {
                 return Err(PreparationError::new(
                     index,
-                    chain_error(
+                    ChainError::new(
                         ChainErrorKind::Divergent,
                         "Ethereum RPC chain ID does not match the wallet network",
                     ),
@@ -130,7 +130,7 @@ impl TransactionCoordinator {
                     self.submit(None, id).await.map_err(|source| {
                         PreparationError::new(
                             index,
-                            chain_error(
+                            ChainError::new(
                                 ChainErrorKind::RpcUnavailable,
                                 format!(
                                     "Ethereum sender is blocked by an ambiguous transaction: {source}"
@@ -142,7 +142,7 @@ impl TransactionCoordinator {
                 Admission::Exhausted(index) => {
                     return Err(PreparationError::new(
                         index,
-                        chain_error(
+                        ChainError::new(
                             ChainErrorKind::Other,
                             "Ethereum transaction coordinator exhausted operation identifiers",
                         ),
@@ -176,7 +176,7 @@ impl TransactionCoordinator {
             let count = u64::try_from(count).map_err(|_| {
                 PreparationError::new(
                     *first_index,
-                    chain_error(
+                    ChainError::new(
                         ChainErrorKind::InvalidTransaction,
                         "Ethereum transaction count exceeds u64",
                     ),
@@ -185,7 +185,7 @@ impl TransactionCoordinator {
             start.checked_add(count).ok_or_else(|| {
                 PreparationError::new(
                     *first_index,
-                    chain_error(
+                    ChainError::new(
                         ChainErrorKind::InvalidTransaction,
                         "Ethereum batch nonce range overflows u64",
                     ),
@@ -201,7 +201,7 @@ impl TransactionCoordinator {
                 let nonce = next.get_mut(preparation.request.from()).ok_or_else(|| {
                     PreparationError::new(
                         index,
-                        chain_error(
+                        ChainError::new(
                             ChainErrorKind::Other,
                             "Ethereum sender was not admitted for nonce assignment",
                         ),
@@ -211,7 +211,7 @@ impl TransactionCoordinator {
                 *nonce = nonce.checked_add(1).ok_or_else(|| {
                     PreparationError::new(
                         index,
-                        chain_error(
+                        ChainError::new(
                             ChainErrorKind::InvalidTransaction,
                             "Ethereum transaction nonce overflows u64",
                         ),
@@ -252,7 +252,7 @@ impl TransactionCoordinator {
         if let Some(index) = insufficient {
             return Err(PreparationError::new(
                 index,
-                chain_error(
+                ChainError::new(
                     ChainErrorKind::InsufficientFunds,
                     "Ethereum aggregate batch balance is insufficient",
                 ),
@@ -408,13 +408,13 @@ impl PreparedBatch {
 
     fn detach_one(mut self) -> Result<SignedTransaction, ChainError> {
         let entry = self.entries.pop().ok_or_else(|| {
-            chain_error(
+            ChainError::new(
                 ChainErrorKind::Other,
                 "Ethereum single preparation produced no transaction",
             )
         })?;
         let operation = self.operation.as_ref().ok_or_else(|| {
-            chain_error(
+            ChainError::new(
                 ChainErrorKind::Other,
                 "Ethereum single preparation lost its coordinator admission",
             )
@@ -439,15 +439,8 @@ struct PreparedEntry {
     signed: SignedTransaction,
 }
 
-fn chain_error(kind: ChainErrorKind, message: impl Into<String>) -> ChainError {
-    ChainError {
-        kind,
-        message: message.into(),
-    }
-}
-
 fn rpc_error(error: SourceError) -> ChainError {
-    chain_error(ChainErrorKind::RpcUnavailable, error.message)
+    ChainError::new(ChainErrorKind::RpcUnavailable, error.message)
 }
 
 fn source_error(message: impl Into<String>, retryable: bool) -> SourceError {
