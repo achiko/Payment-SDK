@@ -489,6 +489,16 @@ History and output cursors carry the checkpoint snapshot from their first
 page. A changed checkpoint produces a conflict and requires pagination to
 restart.
 
+The HTTP history cursor is an opaque URL-safe Base64 JSON value. Its checkpoint
+composes the API `Block` representation under `block` with a separate
+`timestamp`, preserving the complete SDK checkpoint on round-trip. Decoding
+rejects unknown fields, malformed or empty block/parent hashes, and incomplete
+parent references. The previous pre-release flat checkpoint encoding is not
+accepted; callers holding one must restart pagination. Public transaction and
+page checkpoint responses retain their existing block fields. Shared `Block`
+and parent deserialization reject unknown fields, which their OpenAPI schemas
+also express with `additionalProperties: false`.
+
 ## Address coverage contract
 
 All imported wallets and native-position birthdays for an existing scope form
