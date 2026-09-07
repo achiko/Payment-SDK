@@ -400,3 +400,33 @@ fn malformed_block_and_receipt_errors_remain_terminal_before_projection() {
     );
     assert!(!error.retryable);
 }
+
+#[test]
+fn canonical_address_adapter_preserves_chain_precedence_and_alloy_syntax() {
+    for prefix in ["", "0x", "0X"] {
+        let address = CanonicalAddress {
+            scope: scope(),
+            value: format!("{prefix}{}", "aB".repeat(20)),
+        };
+        assert_eq!(parse_canonical_address(&address).unwrap(), [0xab; 20]);
+    }
+    let mut address = CanonicalAddress {
+        scope: scope(),
+        value: "invalid".into(),
+    };
+    let error = parse_canonical_address(&address).unwrap_err();
+    assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+    assert!(!error.retryable);
+    assert_eq!(
+        error.message,
+        "Ethereum movement contains a malformed canonical address"
+    );
+    address.scope.chain = ChainId("foreign".into());
+    let error = parse_canonical_address(&address).unwrap_err();
+    assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+    assert!(!error.retryable);
+    assert_eq!(
+        error.message,
+        "Ethereum movement contains a foreign-chain address"
+    );
+}

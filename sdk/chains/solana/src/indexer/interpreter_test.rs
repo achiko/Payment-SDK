@@ -435,3 +435,30 @@ fn shared_interpretation_errors_preserve_exact_context_and_nonretryability() {
         assert!(!error.retryable);
     }
 }
+
+#[test]
+fn malformed_static_and_loaded_addresses_keep_context_before_balance_validation() {
+    for target in ["static", "writable", "readonly"] {
+        let mut value = baseline(31);
+        match target {
+            "static" => value["transaction"]["message"]["accountKeys"][1] = json!("invalid"),
+            "writable" => {
+                value["version"] = json!(0);
+                value["meta"]["loadedAddresses"] = json!({"writable":["invalid"],"readonly":[]});
+            }
+            "readonly" => {
+                value["version"] = json!(0);
+                value["meta"]["loadedAddresses"] = json!({"writable":[],"readonly":["invalid"]});
+            }
+            _ => unreachable!(),
+        }
+        value["meta"]["preBalances"] = json!([]);
+        let error = inspect(vec![value], &[selected(2)]).unwrap_err();
+        assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+        assert!(!error.retryable);
+        assert_eq!(
+            error.message,
+            "Solana transaction contains a malformed canonical address"
+        );
+    }
+}

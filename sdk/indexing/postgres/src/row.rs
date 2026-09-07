@@ -73,6 +73,7 @@ pub(crate) fn block(row: &Row, prefix: &str) -> Result<BlockRef, IndexError> {
     })
 }
 
+// design-lint: allow unclassified-free-function -- PostgreSQL output-row decoding owns column names and stored-value validation while combining foreign Row and IndexScope into an IndexedOutput without database policy on domain values
 pub(crate) fn output(scope: &IndexScope, row: &Row) -> Result<IndexedOutput, IndexError> {
     let index: i32 = get(row, "output_index")?;
     let created: i64 = get(row, "created_at")?;

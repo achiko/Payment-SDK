@@ -98,8 +98,10 @@ impl StoredRecord {
     }
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>, Error> {
-        let body = bincode::encode_to_vec(self, record_config())
-            .map_err(|error| other(format!("failed to encode the storage value frame: {error}")))?;
+        let body = bincode::encode_to_vec(self, record_config()).map_err(|error| Error {
+            kind: ErrorKind::Other,
+            message: format!("failed to encode the storage value frame: {error}"),
+        })?;
 
         let mut frame = Vec::with_capacity(FRAME_PREFIX_LEN + body.len());
         frame.extend_from_slice(VALUE_MAGIC);
@@ -156,10 +158,9 @@ impl GlobalVersion {
     }
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>, Error> {
-        let body = bincode::encode_to_vec(self, record_config()).map_err(|error| {
-            other(format!(
-                "failed to encode the global version frame: {error}"
-            ))
+        let body = bincode::encode_to_vec(self, record_config()).map_err(|error| Error {
+            kind: ErrorKind::Other,
+            message: format!("failed to encode the global version frame: {error}"),
         })?;
         let mut frame = Vec::with_capacity(FRAME_PREFIX_LEN + body.len());
         frame.extend_from_slice(GLOBAL_VERSION_MAGIC);
@@ -282,13 +283,6 @@ fn read_u64(bytes: &[u8]) -> Result<u64, Error> {
     let mut value = [0_u8; size_of::<u64>()];
     value.copy_from_slice(bytes);
     Ok(u64::from_be_bytes(value))
-}
-
-fn other(message: impl Into<String>) -> Error {
-    Error {
-        kind: ErrorKind::Other,
-        message: message.into(),
-    }
 }
 
 #[cfg(test)]

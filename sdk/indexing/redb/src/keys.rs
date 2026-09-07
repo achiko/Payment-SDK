@@ -51,6 +51,7 @@ pub(super) fn history(
     Key(key)
 }
 
+// design-lint: allow unclassified-free-function -- shared redb output-prefix encoding preserves scope and address framing for writes and scans without exposing physical keys on foreign domain values
 pub(super) fn output_prefix(scope: &IndexScope, address: &CanonicalAddress) -> Vec<u8> {
     let mut key = prefix(scope, OUTPUT);
     component(&mut key, address.value.as_bytes());
@@ -62,6 +63,7 @@ pub(super) fn is_output(scope: &IndexScope, key: &[u8]) -> bool {
     key.starts_with(&prefix(scope, OUTPUT))
 }
 
+// design-lint: allow unclassified-free-function -- shared redb output-key encoding preserves address, transaction and numeric index ordering for writes and rollback validation without adding backend bytes to OutputKey
 pub(super) fn output(scope: &IndexScope, output: &OutputKey) -> Key {
     let mut key = output_prefix(scope, &output.address);
     component(&mut key, output.output.transaction.value.as_bytes());
@@ -186,6 +188,58 @@ mod tests {
             assert_eq!(is_history(&scope, key), history);
             assert_eq!(is_output(&scope, key), output);
         }
+    }
+
+    #[test]
+    fn output_keys_preserve_address_framing_and_numeric_index_order() {
+        let scope = IndexScope {
+            chain: ChainId("a".into()),
+            network: "b".into(),
+        };
+        let address = CanonicalAddress {
+            scope: scope.clone(),
+            value: "é".into(),
+        };
+        let expected_prefix =
+            b"\x01\x04\0\0\0\0\0\0\0\x01a\0\0\0\0\0\0\0\x01b\0\0\0\0\0\0\0\x02\xc3\xa9";
+        assert_eq!(output_prefix(&scope, &address), expected_prefix);
+        let mut identity = OutputKey {
+            address: address.clone(),
+            output: indexing::OutputId {
+                transaction: TransactionRef {
+                    scope: scope.clone(),
+                    value: "tx".into(),
+                },
+                index: 42,
+            },
+        };
+        assert_eq!(
+            output(&scope, &identity).0,
+            b"\x01\x04\0\0\0\0\0\0\0\x01a\0\0\0\0\0\0\0\x01b\0\0\0\0\0\0\0\x02\xc3\xa9\0\0\0\0\0\0\0\x02tx\0\0\0\x2a"
+        );
+        let ordered = [0, 1, 255, 256, u32::MAX].map(|index| {
+            identity.output.index = index;
+            output(&scope, &identity).0
+        });
+        assert!(ordered.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(ordered.iter().all(|key| key.starts_with(expected_prefix)));
+        for other_scope in [
+            IndexScope {
+                chain: ChainId("ab".into()),
+                network: String::new(),
+            },
+            IndexScope {
+                network: "other".into(),
+                ..scope.clone()
+            },
+        ] {
+            assert_ne!(output_prefix(&other_scope, &address), expected_prefix);
+        }
+        let longer_address = CanonicalAddress {
+            value: "éx".into(),
+            ..address
+        };
+        assert!(!output_prefix(&scope, &longer_address).starts_with(expected_prefix));
     }
 
     #[test]

@@ -376,7 +376,9 @@ fn core_maximum_fee_json_preserves_exact_satoshis_and_validation() {
         let encoded = FeeRate::new(satoshis).core_maximum_json().unwrap();
         assert_eq!(encoded.to_string(), expected);
         assert_eq!(
-            wire::parse_btc_amount(&Value::Number(encoded), "maximum fee").unwrap(),
+            Satoshi::from_rpc_json(&Value::Number(encoded), "maximum fee")
+                .unwrap()
+                .0,
             satoshis
         );
     }
@@ -415,5 +417,61 @@ fn block_hash_format_rejects_non_native_lengths() {
         let error = format_bitcoin_block_hash(&indexing::BlockHash(vec![0; length])).unwrap_err();
         assert_eq!(error.message, "Bitcoin block hash must be 32 bytes");
         assert!(!error.retryable);
+    }
+}
+
+#[test]
+fn rpc_amount_json_keeps_exact_precision_and_range() {
+    for (json, expected) in [
+        ("0", 0),
+        ("0.00000001", 1),
+        ("1.23000000", 123_000_000),
+        ("184467440737.09551615", u64::MAX),
+    ] {
+        let value = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            Satoshi::from_rpc_json(&value, "amount").unwrap(),
+            Satoshi(expected)
+        );
+    }
+}
+
+#[test]
+fn rpc_amount_json_keeps_rejection_context_and_retryability() {
+    for (json, suffix) in [
+        ("null", "must be a JSON number"),
+        ("\"1\"", "must be a JSON number"),
+        ("true", "must be a JSON number"),
+        ("{}", "must be a JSON number"),
+        ("[]", "must be a JSON number"),
+        ("-1", "must be a non-negative fixed-point decimal"),
+        ("1e0", "must be a non-negative fixed-point decimal"),
+        ("1E2", "must be a non-negative fixed-point decimal"),
+        ("0.000000001", "is not an exact Bitcoin amount"),
+        ("1.000000000", "is not an exact Bitcoin amount"),
+        ("184467440737.09551616", "exceeds u64 satoshis"),
+        ("184467440738", "exceeds u64 satoshis"),
+        ("18446744073709551616", "exceeds u64 satoshis"),
+    ] {
+        let value = serde_json::from_str(json).unwrap();
+        let error = Satoshi::from_rpc_json(&value, "amount").unwrap_err();
+        assert_eq!(error.to_string(), format!("amount {suffix}"), "{json}");
+        assert!(error.retryable);
+    }
+}
+
+#[test]
+fn block_hash_parse_rejects_invalid_text_as_retryable_rpc_data() {
+    for value in [
+        String::new(),
+        "00".repeat(31),
+        "00".repeat(33),
+        "gg".repeat(32),
+        format!("0x{}", "00".repeat(32)),
+        format!(" {}", "00".repeat(32)),
+    ] {
+        let error = parse_bitcoin_block_hash(&value).unwrap_err();
+        assert_eq!(error.message, "Bitcoin RPC returned an invalid block hash");
+        assert!(error.retryable);
     }
 }

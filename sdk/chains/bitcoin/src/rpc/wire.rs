@@ -4,7 +4,7 @@ use bitcoin::{BlockHash as NativeBlockHash, hashes::Hash};
 use indexing::{BlockHash, BlockHeight, BlockParent, BlockPosition, BlockRef, SourceError};
 use serde_json::{Map, Number, Value};
 
-use crate::{FeeRate, Network};
+use crate::{FeeRate, Network, Satoshi};
 
 use super::{
     BITCOIN_CORE_MAX_FEE_RATE_SATOSHIS_PER_KVB, SATOSHIS_PER_BITCOIN,
@@ -99,6 +99,7 @@ pub(crate) fn parse_header(
     })
 }
 
+// design-lint: allow unclassified-free-function -- public Bitcoin wire adapter delegates reversed hash display order to the native parser and preserves RPC errors while returning a foreign neutral BlockHash
 pub fn parse_bitcoin_block_hash(value: &str) -> Result<BlockHash, SourceError> {
     value
         .parse::<NativeBlockHash>()
@@ -162,50 +163,53 @@ pub(super) fn required_bool(
         .ok_or_else(|| source_error(format!("{context} is missing or invalid"), true))
 }
 
-pub(super) fn parse_btc_amount(value: &Value, context: &'static str) -> Result<u64, SourceError> {
-    let lexical = value
-        .as_number()
-        .map(Number::to_string)
-        .ok_or_else(|| source_error(format!("{context} must be a JSON number"), true))?;
-    if lexical.starts_with('-') || lexical.contains(['e', 'E', '+']) {
-        return Err(source_error(
-            format!("{context} must be a non-negative fixed-point decimal"),
-            true,
-        ));
-    }
-    let mut parts = lexical.split('.');
-    let whole = parts.next().unwrap_or_default();
-    let fraction = parts.next().unwrap_or_default();
-    if parts.next().is_some()
-        || whole.is_empty()
-        || !whole.bytes().all(|byte| byte.is_ascii_digit())
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-        || fraction.len() > 8
-    {
-        return Err(source_error(
-            format!("{context} is not an exact Bitcoin amount"),
-            true,
-        ));
-    }
-    let whole = whole
-        .parse::<u64>()
-        .map_err(|_| source_error(format!("{context} exceeds u64 satoshis"), true))?;
-    let fraction = if fraction.is_empty() {
-        0
-    } else {
-        let parsed = fraction
+impl Satoshi {
+    pub(super) fn from_rpc_json(value: &Value, context: &'static str) -> Result<Self, SourceError> {
+        let lexical = value
+            .as_number()
+            .map(Number::to_string)
+            .ok_or_else(|| source_error(format!("{context} must be a JSON number"), true))?;
+        if lexical.starts_with('-') || lexical.contains(['e', 'E', '+']) {
+            return Err(source_error(
+                format!("{context} must be a non-negative fixed-point decimal"),
+                true,
+            ));
+        }
+        let mut parts = lexical.split('.');
+        let whole = parts.next().unwrap_or_default();
+        let fraction = parts.next().unwrap_or_default();
+        if parts.next().is_some()
+            || whole.is_empty()
+            || !whole.bytes().all(|byte| byte.is_ascii_digit())
+            || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+            || fraction.len() > 8
+        {
+            return Err(source_error(
+                format!("{context} is not an exact Bitcoin amount"),
+                true,
+            ));
+        }
+        let whole = whole
             .parse::<u64>()
-            .map_err(|_| source_error(format!("{context} is invalid"), true))?;
-        let power = u32::try_from(8_usize.saturating_sub(fraction.len()))
-            .map_err(|_| source_error(format!("{context} precision is invalid"), true))?;
-        parsed
-            .checked_mul(10_u64.pow(power))
-            .ok_or_else(|| source_error(format!("{context} exceeds u64 satoshis"), true))?
-    };
-    whole
-        .checked_mul(SATOSHIS_PER_BITCOIN)
-        .and_then(|satoshis| satoshis.checked_add(fraction))
-        .ok_or_else(|| source_error(format!("{context} exceeds u64 satoshis"), true))
+            .map_err(|_| source_error(format!("{context} exceeds u64 satoshis"), true))?;
+        let fraction = if fraction.is_empty() {
+            0
+        } else {
+            let parsed = fraction
+                .parse::<u64>()
+                .map_err(|_| source_error(format!("{context} is invalid"), true))?;
+            let power = u32::try_from(8_usize.saturating_sub(fraction.len()))
+                .map_err(|_| source_error(format!("{context} precision is invalid"), true))?;
+            parsed
+                .checked_mul(10_u64.pow(power))
+                .ok_or_else(|| source_error(format!("{context} exceeds u64 satoshis"), true))?
+        };
+        whole
+            .checked_mul(SATOSHIS_PER_BITCOIN)
+            .and_then(|satoshis| satoshis.checked_add(fraction))
+            .map(Self)
+            .ok_or_else(|| source_error(format!("{context} exceeds u64 satoshis"), true))
+    }
 }
 
 impl FeeRate {

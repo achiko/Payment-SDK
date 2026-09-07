@@ -1,8 +1,7 @@
-use bitcoin::{BlockHash as NativeBlockHash, ScriptBuf, hashes::Hash, hex::FromHex};
-use indexing::BlockHash;
+use bitcoin::{ScriptBuf, hex::FromHex};
 use serde_json::{Map, Number, Value};
 
-use crate::TransactionId;
+use crate::{Satoshi, TransactionId};
 
 use super::ParseError;
 
@@ -68,53 +67,96 @@ pub(super) fn parse_txid(value: &str) -> Result<TransactionId, ParseError> {
         .map_err(|_| ParseError::new("Bitcoin transaction ID is invalid"))
 }
 
-pub(super) fn parse_block_hash(value: &str) -> Result<BlockHash, ParseError> {
-    value
-        .parse::<NativeBlockHash>()
-        .map(|hash| BlockHash(hash.to_byte_array().to_vec()))
-        .map_err(|_| ParseError::new("Bitcoin block hash is invalid"))
+impl Satoshi {
+    pub(super) fn from_block_json(
+        value: &Value,
+        context: &'static str,
+    ) -> Result<Self, ParseError> {
+        let lexical = value
+            .as_number()
+            .map(Number::to_string)
+            .ok_or_else(|| ParseError::new(format!("{context} must be a JSON number")))?;
+        if lexical.starts_with('-') || lexical.contains(['e', 'E', '+']) {
+            return Err(ParseError::new(format!(
+                "{context} must be a non-negative fixed-point decimal"
+            )));
+        }
+        let mut parts = lexical.split('.');
+        let whole = parts.next().unwrap_or_default();
+        let fraction = parts.next().unwrap_or_default();
+        if parts.next().is_some()
+            || whole.is_empty()
+            || !whole.bytes().all(|byte| byte.is_ascii_digit())
+            || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+            || fraction.len() > 8
+        {
+            return Err(ParseError::new(format!(
+                "{context} is not an exact Bitcoin amount"
+            )));
+        }
+        let whole = whole
+            .parse::<u64>()
+            .map_err(|_| ParseError::new(format!("{context} exceeds u64 satoshis")))?;
+        let fractional = if fraction.is_empty() {
+            0
+        } else {
+            let value = fraction
+                .parse::<u64>()
+                .map_err(|_| ParseError::new(format!("{context} is invalid")))?;
+            let padding = u32::try_from(8_usize.saturating_sub(fraction.len()))
+                .map_err(|_| ParseError::new(format!("{context} precision is invalid")))?;
+            value
+                .checked_mul(10_u64.pow(padding))
+                .ok_or_else(|| ParseError::new(format!("{context} exceeds u64 satoshis")))?
+        };
+        whole
+            .checked_mul(SATOSHIS_PER_BITCOIN)
+            .and_then(|value| value.checked_add(fractional))
+            .map(Self)
+            .ok_or_else(|| ParseError::new(format!("{context} exceeds u64 satoshis")))
+    }
 }
 
-pub(super) fn parse_btc_amount(value: &Value, context: &'static str) -> Result<u64, ParseError> {
-    let lexical = value
-        .as_number()
-        .map(Number::to_string)
-        .ok_or_else(|| ParseError::new(format!("{context} must be a JSON number")))?;
-    if lexical.starts_with('-') || lexical.contains(['e', 'E', '+']) {
-        return Err(ParseError::new(format!(
-            "{context} must be a non-negative fixed-point decimal"
-        )));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_amount_json_keeps_exact_precision_and_range() {
+        for (json, expected) in [
+            ("0", 0),
+            ("0.00000001", 1),
+            ("1.23000000", 123_000_000),
+            ("184467440737.09551615", u64::MAX),
+        ] {
+            let value = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                Satoshi::from_block_json(&value, "amount").unwrap(),
+                Satoshi(expected)
+            );
+        }
     }
-    let mut parts = lexical.split('.');
-    let whole = parts.next().unwrap_or_default();
-    let fraction = parts.next().unwrap_or_default();
-    if parts.next().is_some()
-        || whole.is_empty()
-        || !whole.bytes().all(|byte| byte.is_ascii_digit())
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-        || fraction.len() > 8
-    {
-        return Err(ParseError::new(format!(
-            "{context} is not an exact Bitcoin amount"
-        )));
+
+    #[test]
+    fn block_amount_json_keeps_rejection_context() {
+        for (json, suffix) in [
+            ("null", "must be a JSON number"),
+            ("\"1\"", "must be a JSON number"),
+            ("true", "must be a JSON number"),
+            ("{}", "must be a JSON number"),
+            ("[]", "must be a JSON number"),
+            ("-1", "must be a non-negative fixed-point decimal"),
+            ("1e0", "must be a non-negative fixed-point decimal"),
+            ("1E2", "must be a non-negative fixed-point decimal"),
+            ("0.000000001", "is not an exact Bitcoin amount"),
+            ("1.000000000", "is not an exact Bitcoin amount"),
+            ("184467440737.09551616", "exceeds u64 satoshis"),
+            ("184467440738", "exceeds u64 satoshis"),
+            ("18446744073709551616", "exceeds u64 satoshis"),
+        ] {
+            let value = serde_json::from_str(json).unwrap();
+            let error = Satoshi::from_block_json(&value, "amount").unwrap_err();
+            assert_eq!(error.to_string(), format!("amount {suffix}"), "{json}");
+        }
     }
-    let whole = whole
-        .parse::<u64>()
-        .map_err(|_| ParseError::new(format!("{context} exceeds u64 satoshis")))?;
-    let fractional = if fraction.is_empty() {
-        0
-    } else {
-        let value = fraction
-            .parse::<u64>()
-            .map_err(|_| ParseError::new(format!("{context} is invalid")))?;
-        let padding = u32::try_from(8_usize.saturating_sub(fraction.len()))
-            .map_err(|_| ParseError::new(format!("{context} precision is invalid")))?;
-        value
-            .checked_mul(10_u64.pow(padding))
-            .ok_or_else(|| ParseError::new(format!("{context} exceeds u64 satoshis")))?
-    };
-    whole
-        .checked_mul(SATOSHIS_PER_BITCOIN)
-        .and_then(|value| value.checked_add(fractional))
-        .ok_or_else(|| ParseError::new(format!("{context} exceeds u64 satoshis")))
 }

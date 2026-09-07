@@ -78,7 +78,10 @@ impl Cancellation {
 
     pub(super) fn ensure(&self) -> Result<(), SendError> {
         if self.state.cancelled.load(Ordering::Acquire) {
-            return Err(operation("Solana account acquisition was cancelled"));
+            return Err(SendError::operation(
+                WalletErrorKind::Unavailable,
+                "Solana account acquisition was cancelled",
+            ));
         }
         Ok(())
     }
@@ -263,18 +266,24 @@ fn classify(
     let system = Address::from_bytes([0; 32]);
     let mut balances = Vec::with_capacity(items.len());
     for (item, destination) in items.iter().zip(destinations) {
-        let source = observed
-            .get(&item.source)
-            .ok_or_else(|| operation("Solana source observation is missing"))?;
+        let source = observed.get(&item.source).ok_or_else(|| {
+            SendError::operation(
+                WalletErrorKind::Unavailable,
+                "Solana source observation is missing",
+            )
+        })?;
         if source
             .as_ref()
             .is_some_and(|account| !supported(account, &system))
         {
             return Err(unsupported(item.index, "unsupported Solana source account"));
         }
-        let destination = observed
-            .get(destination)
-            .ok_or_else(|| operation("Solana destination observation is missing"))?;
+        let destination = observed.get(destination).ok_or_else(|| {
+            SendError::operation(
+                WalletErrorKind::Unavailable,
+                "Solana destination observation is missing",
+            )
+        })?;
         if destination
             .as_ref()
             .is_some_and(|account| !supported(account, &system))
@@ -302,8 +311,8 @@ pub(super) async fn raced<T>(
     future: impl Future<Output = Result<T, crate::Error>>,
 ) -> Result<T, SendError> {
     tokio::select! {
-        result = future => result.map_err(|_| operation("Solana account acquisition failed")),
-        () = cancellation.cancelled() => Err(operation("Solana account acquisition was cancelled")),
+        result = future => result.map_err(|_| SendError::operation(WalletErrorKind::Unavailable, "Solana account acquisition failed")),
+        () = cancellation.cancelled() => Err(SendError::operation(WalletErrorKind::Unavailable, "Solana account acquisition was cancelled")),
     }
 }
 
@@ -313,10 +322,6 @@ fn unsupported(index: usize, message: &'static str) -> SendError {
         Vec::new(),
         WalletError::new(WalletErrorKind::Unsupported, message),
     )
-}
-
-fn operation(message: &'static str) -> SendError {
-    SendError::operation(WalletErrorKind::Unavailable, message)
 }
 
 #[cfg(test)]
@@ -330,6 +335,44 @@ mod tests {
     use crate::rpc::test_support::Scripted;
 
     use super::*;
+
+    #[tokio::test]
+    async fn acquisition_failures_preserve_operation_scope_and_redacted_messages() {
+        let source = Address::from_bytes([1; 32]);
+        let destination = Address::from_bytes([2; 32]);
+        let items = [ResolvedTransfer::new(
+            0,
+            source.clone(),
+            destination.to_string(),
+            Lamport::from_atomic(1),
+        )];
+        let missing_source =
+            classify(&items, std::slice::from_ref(&destination), &BTreeMap::new()).unwrap_err();
+        let missing_destination =
+            classify(&items, &[destination], &BTreeMap::from([(source, None)])).unwrap_err();
+        let transport = raced::<()>(&Cancellation::default(), async {
+            Err(crate::Error::new(
+                crate::ErrorKind::RpcTimeout,
+                "provider secret",
+            ))
+        })
+        .await
+        .unwrap_err();
+        for (failure, message) in [
+            (missing_source, "Solana source observation is missing"),
+            (
+                missing_destination,
+                "Solana destination observation is missing",
+            ),
+            (transport, "Solana account acquisition failed"),
+        ] {
+            assert_eq!(failure.source.kind, WalletErrorKind::Unavailable);
+            assert_eq!(failure.to_string(), message);
+            assert_eq!(failure.failed_index, None);
+            assert!(failure.accepted.is_empty());
+            assert_eq!(failure.ambiguous_transaction_id, None);
+        }
+    }
 
     #[derive(Clone)]
     struct Blocking {
@@ -595,6 +638,12 @@ mod tests {
             .expect("cancelled acquisition");
         assert_eq!(failure.failed_index, None);
         assert_eq!(failure.source.kind, WalletErrorKind::Unavailable);
+        assert_eq!(
+            failure.to_string(),
+            "Solana account acquisition was cancelled"
+        );
+        assert!(failure.accepted.is_empty());
+        assert_eq!(failure.ambiguous_transaction_id, None);
         assert!(
             sources
                 .lease(&[transfer(0, &source, &destination)], false)
@@ -695,6 +744,12 @@ mod tests {
             cancellation.cancel();
             let failure = task.await.unwrap().err().expect("cancelled RPC await");
             assert_eq!(failure.failed_index, None);
+            assert_eq!(
+                failure.to_string(),
+                "Solana account acquisition was cancelled"
+            );
+            assert!(failure.accepted.is_empty());
+            assert_eq!(failure.ambiguous_transaction_id, None);
             assert_eq!(calls.load(Ordering::SeqCst), block_at + 1);
             assert!(
                 sources

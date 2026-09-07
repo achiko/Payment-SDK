@@ -91,9 +91,10 @@ impl Sender for Batch {
                 .fees
                 .estimate(self.fee_target_blocks)
                 .await
-                .map_err(operation_failure_with)?;
+                .map_err(|error| SendError::operation(ErrorKind::Transaction, error.to_string()))?;
             if fee_rate > self.max_fee_rate {
-                return Err(operation_failure(
+                return Err(SendError::operation(
+                    ErrorKind::Transaction,
                     "estimated fee rate exceeds the configured maximum",
                 ));
             }
@@ -106,12 +107,15 @@ impl Sender for Batch {
                     .utxos
                     .utxos(vec![source.address.clone()])
                     .await
-                    .map_err(operation_failure_with)?;
+                    .map_err(|error| {
+                        SendError::operation(ErrorKind::Transaction, error.to_string())
+                    })?;
                 if checkpoint
                     .as_ref()
                     .is_some_and(|expected| expected != &set.checkpoint)
                 {
-                    return Err(operation_failure(
+                    return Err(SendError::operation(
+                        ErrorKind::Transaction,
                         "indexed output snapshot changed while building the transaction",
                     ));
                 }
@@ -128,7 +132,9 @@ impl Sender for Batch {
                             output.value,
                             output.script_pubkey,
                         )
-                        .map_err(operation_failure_with)
+                        .map_err(|error| {
+                            SendError::operation(ErrorKind::Transaction, error.to_string())
+                        })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 owners.extend(std::iter::repeat_n(source.wallet.as_ref(), available.len()));
@@ -142,7 +148,7 @@ impl Sender for Batch {
             let signed = BatchBuilder::new(self.network, funding, fee_rate)
                 .sign_each(&owners)
                 .await
-                .map_err(operation_failure_with)?;
+                .map_err(|error| SendError::operation(ErrorKind::Transaction, error.to_string()))?;
             let prepared = Prepared::new(
                 PREPARED_KIND,
                 BaseId::new(signed.id().to_string()),
@@ -166,14 +172,6 @@ impl Address {
             .map_err(|_| transaction_error("Bitcoin address is not UTF-8"))?;
         Self::parse_for_network(value, network).map_err(transaction_error)
     }
-}
-
-fn operation_failure(message: &'static str) -> SendError {
-    SendError::operation(ErrorKind::Transaction, message)
-}
-
-fn operation_failure_with(error: impl std::fmt::Display) -> SendError {
-    SendError::operation(ErrorKind::Transaction, error.to_string())
 }
 
 fn transaction_error(error: impl std::fmt::Display) -> Error {
@@ -244,6 +242,10 @@ mod tests {
     }
 
     fn direct_sender() -> (Arc<dyn Sender>, Arc<dyn Wallet>) {
+        direct_sender_with_fees(Arc::new(InactiveDependencies))
+    }
+
+    fn direct_sender_with_fees(fees: Arc<dyn Fees>) -> (Arc<dyn Sender>, Arc<dyn Wallet>) {
         let network = Network::Regtest;
         let scope = IndexScope {
             chain: ChainId(crate::CHAIN.to_owned()),
@@ -251,7 +253,6 @@ mod tests {
         };
         let dependencies = Arc::new(InactiveDependencies);
         let outputs: Arc<dyn Outputs> = dependencies.clone();
-        let fees: Arc<dyn Fees> = dependencies.clone();
         let transactions: Arc<dyn Transactions> = dependencies.clone();
         let history: Arc<dyn History> = dependencies;
         let utxos = Arc::new(
@@ -344,15 +345,48 @@ mod tests {
     }
 
     #[test]
-    fn operation_failures_are_index_free() {
-        for failure in [
-            operation_failure("fee ceiling exceeded"),
-            operation_failure_with("indexed outputs unavailable"),
+    fn fee_preparation_failures_are_index_free_before_output_reads() {
+        struct FeeReply(Result<FeeRate, SourceError>);
+
+        impl Fees for FeeReply {
+            fn estimate<'a>(
+                &'a self,
+                target_blocks: u16,
+            ) -> BoxFuture<'a, Result<FeeRate, SourceError>> {
+                assert_eq!(target_blocks, 6);
+                Box::pin(async { self.0.clone() })
+            }
+        }
+
+        for (reply, message) in [
+            (
+                Err(SourceError {
+                    message: "fee provider unavailable\nretry later".to_owned(),
+                    retryable: true,
+                }),
+                "fee provider unavailable\nretry later",
+            ),
+            (
+                Ok(FeeRate::new(1_001)),
+                "estimated fee rate exceeds the configured maximum",
+            ),
         ] {
+            let (sender, wallet) = direct_sender_with_fees(Arc::new(FeeReply(reply)));
+            let destination = wallet.address_text(&wallet.address()).unwrap();
+            let failure = block_on(sender.send(vec![Transfer {
+                wallet,
+                to: destination,
+                amount: "0.00000001".parse().unwrap(),
+            }]))
+            .unwrap_err();
+
             assert!(failure.accepted.is_empty());
             assert_eq!(failure.failed_index, None);
             assert_eq!(failure.ambiguous_transaction_id, None);
             assert_eq!(failure.source.ambiguous_transaction_id, None);
+            assert_eq!(failure.source.kind, ErrorKind::Transaction);
+            assert_eq!(failure.source.message, message);
+            assert_eq!(failure.to_string(), message);
         }
     }
 

@@ -30,6 +30,15 @@ struct AccountKey {
     writable: bool,
 }
 
+impl AccountKey {
+    fn parse(text: &str, writable: bool) -> Result<Self, IndexError> {
+        let address = text.parse::<Address>().map_err(|_| {
+            invalid_block("Solana transaction contains a malformed canonical address")
+        })?;
+        Ok(Self { address, writable })
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct Instruction {
     pub program: usize,
@@ -98,10 +107,7 @@ impl Transaction {
             } else {
                 index < static_count - readonly_unsigned
             };
-            keys.push(AccountKey {
-                address: parse_address(&text)?,
-                writable,
-            });
+            keys.push(AccountKey::parse(&text, writable)?);
         }
 
         let meta = wire
@@ -118,16 +124,10 @@ impl Transaction {
             (Version::Legacy, _) => {}
             (Version::Zero, Some(loaded)) => {
                 for text in loaded.writable {
-                    keys.push(AccountKey {
-                        address: parse_address(&text)?,
-                        writable: true,
-                    });
+                    keys.push(AccountKey::parse(&text, true)?);
                 }
                 for text in loaded.readonly {
-                    keys.push(AccountKey {
-                        address: parse_address(&text)?,
-                        writable: false,
-                    });
+                    keys.push(AccountKey::parse(&text, false)?);
                 }
             }
             (Version::Zero, None) => {
@@ -287,11 +287,6 @@ fn parse_inner(
         }
     }
     Ok(inner)
-}
-
-fn parse_address(text: &str) -> Result<Address, IndexError> {
-    text.parse::<Address>()
-        .map_err(|_| invalid_block("Solana transaction contains a malformed canonical address"))
 }
 
 #[derive(Clone, Copy)]

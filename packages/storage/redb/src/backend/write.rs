@@ -6,8 +6,8 @@ use storage::{
 use crate::codec::{GlobalVersion, StoredRecord, encode_physical_key};
 
 use super::{
-    Backend, DATA_TABLE, GLOBAL_VERSION_KEY, META_TABLE, commit_error, other, storage_error,
-    table_error, transaction_error,
+    Backend, DATA_TABLE, GLOBAL_VERSION_KEY, META_TABLE, commit_error, storage_error, table_error,
+    transaction_error,
 };
 
 impl Backend {
@@ -37,7 +37,10 @@ impl Backend {
             .map_err(|error| transaction_error(error, "failed to begin redb write transaction"))?;
         transaction
             .set_durability(Durability::Immediate)
-            .map_err(|error| other(format!("failed to configure redb commit: {error}")))?;
+            .map_err(|error| Error {
+                kind: ErrorKind::Other,
+                message: format!("failed to configure redb commit: {error}"),
+            })?;
 
         let next_version;
         {
@@ -59,12 +62,10 @@ impl Backend {
                 Some(raw) => Version::from(GlobalVersion::try_from(raw.value())?),
                 None => Version(0),
             };
-            next_version = Version(
-                current_version
-                    .0
-                    .checked_add(1)
-                    .ok_or_else(|| other("global storage version is exhausted"))?,
-            );
+            next_version = Version(current_version.0.checked_add(1).ok_or_else(|| Error {
+                kind: ErrorKind::Other,
+                message: "global storage version is exhausted".into(),
+            })?);
 
             for operation in batch.operations {
                 match operation {
@@ -188,4 +189,47 @@ fn evaluate_condition(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exhausted_version_rejects_commit_without_writing_or_wrapping() -> Result<(), Error> {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("exhausted.redb");
+        let mut backend = Backend::open(&path)?;
+        let transaction = backend.database()?.begin_write().expect("seed transaction");
+        {
+            let mut meta = transaction.open_table(META_TABLE).expect("metadata table");
+            let encoded = GlobalVersion::new(Version(u64::MAX))?.encode()?;
+            meta.insert(GLOBAL_VERSION_KEY, encoded.as_slice())
+                .expect("maximum version");
+        }
+        transaction.commit().expect("seed commit");
+
+        let namespace = storage::Namespace("records".into());
+        let key = storage::Key(b"new".to_vec());
+        let error = backend
+            .commit(WriteBatch {
+                conditions: vec![],
+                operations: vec![Operation::Put {
+                    namespace: namespace.clone(),
+                    key: key.clone(),
+                    value: storage::Value(b"must not persist".to_vec()),
+                }],
+            })
+            .expect_err("version cannot wrap");
+        assert_eq!(error.kind, ErrorKind::Other);
+        assert_eq!(error.message, "global storage version is exhausted");
+        assert_eq!(backend.global_version()?, Version(u64::MAX));
+        assert_eq!(backend.get(&namespace, &key)?, None);
+        drop(backend);
+
+        let mut reopened = Backend::open(&path)?;
+        assert_eq!(reopened.global_version()?, Version(u64::MAX));
+        assert_eq!(reopened.get(&namespace, &key)?, None);
+        Ok(())
+    }
 }

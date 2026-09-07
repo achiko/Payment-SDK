@@ -2,10 +2,7 @@
 
 use indexing::{BlockRef, IndexError, IndexErrorKind, IndexScope};
 
-use crate::{
-    Repository, prepare_in, row,
-    write::{move_checkpoint, optional_block},
-};
+use crate::{Repository, prepare_in, row, write::move_checkpoint};
 
 const JOURNAL_ENTRY: &str = "\
 SELECT block_hash, previous_checkpoint_position AS previous_position,
@@ -95,7 +92,12 @@ impl Repository {
             .await
             .map_err(crate::store)?;
 
-        let previous = optional_block(&entry, "previous_")?;
+        let previous_height: Option<i64> =
+            entry.try_get("previous_height").map_err(crate::store)?;
+        let previous = match previous_height {
+            None => None,
+            Some(_) => Some(row::block(&entry, "previous_")?),
+        };
         match &previous {
             Some(block) => move_checkpoint(&transaction, scope, block).await?,
             None => {

@@ -342,10 +342,13 @@ impl ParsedLog {
             .ok_or_else(|| ParseError::new("Ethereum log topics must be an array"))?
             .iter()
             .map(|topic| {
-                topic
+                let topic = topic
                     .as_str()
-                    .ok_or_else(|| ParseError::new("Ethereum log topic must be a hash"))
-                    .and_then(|topic| parse_hash(topic, "log topic"))
+                    .ok_or_else(|| ParseError::new("Ethereum log topic must be a hash"))?;
+                topic
+                    .parse::<B256>()
+                    .map(Into::into)
+                    .map_err(|_| ParseError::new("Ethereum log topic is not a 32-byte hash"))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let data = object
@@ -390,14 +393,12 @@ fn required_hash(
         .get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| ParseError::new(format!("Ethereum {label} is missing")))
-        .and_then(|value| parse_hash(value, label))
-}
-
-fn parse_hash(value: &str, label: &str) -> Result<[u8; 32], ParseError> {
-    value
-        .parse::<B256>()
-        .map(Into::into)
-        .map_err(|_| ParseError::new(format!("Ethereum {label} is not a 32-byte hash")))
+        .and_then(|value| {
+            value
+                .parse::<B256>()
+                .map(Into::into)
+                .map_err(|_| ParseError::new(format!("Ethereum {label} is not a 32-byte hash")))
+        })
 }
 
 fn required_address(
@@ -409,7 +410,12 @@ fn required_address(
         .get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| ParseError::new(format!("Ethereum {label} is missing")))
-        .and_then(|value| parse_address(value, label))
+        .and_then(|value| {
+            value
+                .parse::<Address>()
+                .map(Address::into_array)
+                .map_err(|_| ParseError::new(format!("Ethereum {label} is not a 20-byte address")))
+        })
 }
 
 fn optional_address(
@@ -419,18 +425,14 @@ fn optional_address(
 ) -> Result<Option<[u8; 20]>, ParseError> {
     match object.get(key) {
         Some(Value::Null) | None => Ok(None),
-        Some(Value::String(value)) => parse_address(value, label).map(Some),
+        Some(Value::String(value)) => value
+            .parse::<Address>()
+            .map(|address| Some(address.into_array()))
+            .map_err(|_| ParseError::new(format!("Ethereum {label} is not a 20-byte address"))),
         Some(_) => Err(ParseError::new(format!(
             "Ethereum {label} must be an address or null"
         ))),
     }
-}
-
-fn parse_address(value: &str, label: &str) -> Result<[u8; 20], ParseError> {
-    value
-        .parse::<Address>()
-        .map(Address::into_array)
-        .map_err(|_| ParseError::new(format!("Ethereum {label} is not a 20-byte address")))
 }
 
 fn required_quantity(
@@ -492,6 +494,78 @@ mod tests {
                 index: 0,
             }],
         }
+    }
+
+    #[test]
+    fn address_and_hash_fields_keep_alloy_syntax_and_contextual_errors() {
+        for prefix in ["", "0x", "0X"] {
+            let value = json!({"address": format!("{prefix}{}", "aB".repeat(20)),
+                               "hash": format!("{prefix}{}", "aB".repeat(32))});
+            let object = value.as_object().unwrap();
+            assert_eq!(
+                required_address(object, "address", "sender").unwrap(),
+                [0xab; 20]
+            );
+            assert_eq!(
+                optional_address(object, "address", "recipient").unwrap(),
+                Some([0xab; 20])
+            );
+            assert_eq!(
+                required_hash(object, "hash", "transaction hash").unwrap(),
+                [0xab; 32]
+            );
+        }
+        for invalid in ["0x", "0Xabcd", "0x0xabcd", "é", "zz"] {
+            let value = json!({"address": invalid, "hash": invalid});
+            let object = value.as_object().unwrap();
+            assert_eq!(
+                required_address(object, "address", "sender")
+                    .unwrap_err()
+                    .to_string(),
+                "Ethereum sender is not a 20-byte address"
+            );
+            assert_eq!(
+                optional_address(object, "address", "recipient")
+                    .unwrap_err()
+                    .to_string(),
+                "Ethereum recipient is not a 20-byte address"
+            );
+            assert_eq!(
+                required_hash(object, "hash", "transaction hash")
+                    .unwrap_err()
+                    .to_string(),
+                "Ethereum transaction hash is not a 32-byte hash"
+            );
+        }
+        let object = Map::new();
+        assert_eq!(
+            optional_address(&object, "address", "recipient").unwrap(),
+            None
+        );
+        assert_eq!(
+            required_address(&object, "address", "sender")
+                .unwrap_err()
+                .to_string(),
+            "Ethereum sender is missing"
+        );
+        assert_eq!(
+            required_hash(&object, "hash", "transaction hash")
+                .unwrap_err()
+                .to_string(),
+            "Ethereum transaction hash is missing"
+        );
+        let value = json!({"address": null});
+        assert_eq!(
+            optional_address(value.as_object().unwrap(), "address", "recipient").unwrap(),
+            None
+        );
+        let value = json!({"address": 1});
+        assert_eq!(
+            optional_address(value.as_object().unwrap(), "address", "recipient")
+                .unwrap_err()
+                .to_string(),
+            "Ethereum recipient must be an address or null"
+        );
     }
 
     #[test]

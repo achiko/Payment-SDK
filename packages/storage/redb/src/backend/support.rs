@@ -24,9 +24,10 @@ pub(super) fn database_error(error: DatabaseError) -> Error {
 pub(super) fn transaction_error(error: TransactionError, context: &str) -> Error {
     match error {
         TransactionError::Storage(error) => storage_error(error, context),
-        TransactionError::ReadTransactionStillInUse(_) => {
-            other(format!("{context}: read transaction is still in use"))
-        }
+        TransactionError::ReadTransactionStillInUse(_) => Error {
+            kind: ErrorKind::Other,
+            message: format!("{context}: read transaction is still in use"),
+        },
         _ => unavailable(format!("{context}: {error}")),
     }
 }
@@ -40,7 +41,10 @@ pub(super) fn table_error(error: TableError, context: &str) -> Error {
         | TableError::TypeDefinitionChanged { .. }
         | TableError::TableDoesNotExist(_)
         | TableError::TableExists(_) => Error::corrupt_data(format!("{context}: {error}")),
-        TableError::TableAlreadyOpen(_, _) => other(format!("{context}: {error}")),
+        TableError::TableAlreadyOpen(_, _) => Error {
+            kind: ErrorKind::Other,
+            message: format!("{context}: {error}"),
+        },
         _ => Error::corrupt_data(format!("{context}: {error}")),
     }
 }
@@ -76,6 +80,7 @@ pub(super) fn unavailable(message: impl Into<String>) -> Error {
     }
 }
 
+#[cfg(test)]
 pub(super) fn other(message: impl Into<String>) -> Error {
     Error {
         kind: ErrorKind::Other,
@@ -86,6 +91,32 @@ pub(super) fn other(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_borrow_conflicts_remain_other_errors() {
+        use redb::ReadableDatabase;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = redb::Database::builder()
+            .create(directory.path().join("borrow.redb"))
+            .expect("test database");
+        let read = database.begin_read().expect("read transaction");
+        let error = transaction_error(
+            TransactionError::ReadTransactionStillInUse(Box::new(read)),
+            "close failed",
+        );
+        assert_eq!(error.kind, ErrorKind::Other);
+        assert_eq!(
+            error.message,
+            "close failed: read transaction is still in use"
+        );
+
+        let native = TableError::TableAlreadyOpen("data".into(), std::panic::Location::caller());
+        let expected = format!("open failed: {native}");
+        let error = table_error(native, "open failed");
+        assert_eq!(error.kind, ErrorKind::Other);
+        assert_eq!(error.message, expected);
+    }
 
     #[test]
     fn oversized_native_values_keep_invalid_request_classification_and_context() {

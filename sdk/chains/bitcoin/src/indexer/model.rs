@@ -3,7 +3,10 @@ use std::{
     fmt,
 };
 
-use bitcoin::{ScriptBuf, Transaction as NativeTransaction, Txid, consensus, hex::FromHex};
+use bitcoin::{
+    BlockHash as NativeBlockHash, ScriptBuf, Transaction as NativeTransaction, Txid, consensus,
+    hashes::Hash, hex::FromHex,
+};
 use indexing::{BlockHash, BlockHeight, BlockParent, BlockPosition, BlockRef};
 use serde_json::{Map, Value};
 
@@ -14,10 +17,7 @@ use super::Outpoint;
 #[path = "model_value.rs"]
 mod value;
 
-use value::{
-    parse_block_hash, parse_btc_amount, parse_script, parse_txid, required_bool, required_string,
-    required_u32, required_u64,
-};
+use value::{parse_script, parse_txid, required_bool, required_string, required_u32, required_u64};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct BlockData {
@@ -88,7 +88,10 @@ impl BlockData {
                 "Bitcoin block height does not match the requested height",
             ));
         }
-        let hash = parse_block_hash(required_string(object, "hash", "Bitcoin block hash")?)?;
+        let hash = required_string(object, "hash", "Bitcoin block hash")?
+            .parse::<NativeBlockHash>()
+            .map(|hash| BlockHash(hash.to_byte_array().to_vec()))
+            .map_err(|_| ParseError::new("Bitcoin block hash is invalid"))?;
         if expected_hash.is_some_and(|expected| expected != &hash) {
             return Err(ParseError::new(
                 "Bitcoin block hash does not match the requested hash",
@@ -107,11 +110,10 @@ impl BlockData {
         } else {
             Some(BlockParent {
                 position: BlockPosition(height.0 - 1),
-                hash: parse_block_hash(required_string(
-                    object,
-                    "previousblockhash",
-                    "Bitcoin previous block hash",
-                )?)?,
+                hash: required_string(object, "previousblockhash", "Bitcoin previous block hash")?
+                    .parse::<NativeBlockHash>()
+                    .map(|hash| BlockHash(hash.to_byte_array().to_vec()))
+                    .map_err(|_| ParseError::new("Bitcoin block hash is invalid"))?,
             })
         };
         let timestamp = required_u64(object, "time", "Bitcoin block timestamp")?;
@@ -285,13 +287,13 @@ impl Transaction {
                     "Bitcoin transaction output index does not match its position",
                 ));
             }
-            let value = parse_btc_amount(
+            let value = Satoshi::from_block_json(
                 object
                     .get("value")
                     .ok_or_else(|| ParseError::new("Bitcoin output value is missing"))?,
                 "Bitcoin output value",
             )?;
-            if native_output.value.to_sat() != value {
+            if native_output.value.to_sat() != value.0 {
                 return Err(ParseError::new(
                     "Bitcoin output value does not match its consensus bytes",
                 ));
@@ -308,7 +310,7 @@ impl Transaction {
                 ));
             }
             outputs.push(Output {
-                value: Satoshi(value),
+                value,
                 script_pubkey: script.into_bytes(),
             });
         }
@@ -367,12 +369,12 @@ impl PreviousOutput {
 
         // Direct Block::parse callers may supply Bitcoin Core's
         // verbosity-3-compatible previous-output shape.
-        let value = Satoshi(parse_btc_amount(
+        let value = Satoshi::from_block_json(
             prevout
                 .get("value")
                 .ok_or_else(|| ParseError::new("Bitcoin prevout value is missing"))?,
             "Bitcoin prevout value",
-        )?);
+        )?;
         let script = parse_script(
             prevout
                 .get("scriptPubKey")
@@ -395,5 +397,64 @@ impl PreviousOutput {
             value,
             address: crate::Address::from_script_for_network(&script, network),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_hashes_keep_native_byte_order_and_case_acceptance() {
+        let hash = "1F1E1D1C1B1A191817161514131211100F0E0D0C0B0A09080706050403020100";
+        let parent = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let raw = serde_json::json!({
+            "height": 1, "hash": hash, "previousblockhash": parent,
+            "time": 2, "tx": [], "nTx": 0,
+        });
+        let block = BlockData::parse(
+            &serde_json::to_vec(&raw).unwrap(),
+            None,
+            None,
+            Network::Regtest,
+        )
+        .unwrap();
+        assert_eq!(block.reference.hash, BlockHash((0_u8..32).collect()));
+        assert_eq!(
+            block.reference.parent.unwrap().hash,
+            BlockHash((0_u8..32).rev().collect())
+        );
+    }
+
+    #[test]
+    fn block_hash_errors_keep_context_and_height_validation_precedence() {
+        let invalid = serde_json::json!({"height": 1, "hash": "invalid"});
+        let raw = serde_json::to_vec(&invalid).unwrap();
+        let error =
+            BlockData::parse(&raw, Some(BlockHeight(2)), None, Network::Regtest).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Bitcoin block height does not match the requested height"
+        );
+        let error = BlockData::parse(&raw, None, None, Network::Regtest).unwrap_err();
+        assert_eq!(error.to_string(), "Bitcoin block hash is invalid");
+
+        for field in ["hash", "previousblockhash"] {
+            for value in ["00".repeat(31), "00".repeat(33), "gg".repeat(32)] {
+                let mut block = serde_json::json!({
+                    "height": 1, "hash": "00".repeat(32), "previousblockhash": "00".repeat(32),
+                    "time": 2, "tx": [], "nTx": 0,
+                });
+                block[field] = Value::String(value);
+                let error = BlockData::parse(
+                    &serde_json::to_vec(&block).unwrap(),
+                    None,
+                    None,
+                    Network::Regtest,
+                )
+                .unwrap_err();
+                assert_eq!(error.to_string(), "Bitcoin block hash is invalid");
+            }
+        }
     }
 }

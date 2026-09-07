@@ -251,6 +251,7 @@ impl IndexBlockInterpreter for BlockInterpreter {
     }
 }
 
+// design-lint: allow unclassified-free-function -- Ethereum indexing adapter validates foreign canonical-address chain identity and preserves Alloy address syntax with contextual IndexError
 fn parse_canonical_address(address: &CanonicalAddress) -> Result<[u8; 20], IndexError> {
     if address.scope.chain != *CHAIN_ID {
         return Err(IndexError::new(

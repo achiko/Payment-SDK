@@ -9,7 +9,7 @@ use super::{
     Client, Preflight,
     error::{map_json_rpc_error, source_error},
     transport::Client as Transport,
-    wire::{parse_btc_amount, required_bool, required_string},
+    wire::{required_bool, required_string},
 };
 
 impl<C> Client<C>
@@ -62,9 +62,8 @@ where
             .get("fees")
             .and_then(Value::as_object)
             .and_then(|fees| fees.get("base"))
-            .map(|value| parse_btc_amount(value, "Bitcoin preflight base fee"))
-            .transpose()?
-            .map(Satoshi);
+            .map(|value| Satoshi::from_rpc_json(value, "Bitcoin preflight base fee"))
+            .transpose()?;
         Ok(Preflight {
             allowed,
             reject_reason,

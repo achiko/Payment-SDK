@@ -141,19 +141,6 @@ impl Repository {
     }
 }
 
-pub(crate) fn optional_block(
-    row: &tokio_postgres::Row,
-    prefix: &str,
-) -> Result<Option<BlockRef>, IndexError> {
-    let height: Option<i64> = row
-        .try_get(&*format!("{prefix}height"))
-        .map_err(crate::store)?;
-    match height {
-        None => Ok(None),
-        Some(_) => row::block(row, prefix).map(Some),
-    }
-}
-
 pub(crate) async fn move_checkpoint(
     transaction: &Transaction<'_>,
     scope: &IndexScope,

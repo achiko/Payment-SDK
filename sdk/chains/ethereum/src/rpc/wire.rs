@@ -93,6 +93,7 @@ pub(super) fn quantity_digits(value: &str) -> Result<&str, &'static str> {
     Ok(digits)
 }
 
+// design-lint: allow unclassified-free-function -- shared Ethereum RPC fixed-width DATA codec validates lowercase prefix and exact byte width for hashes and ABI words before library decoding
 pub(super) fn parse_fixed_data<const N: usize>(
     value: &str,
     _field: &'static str,
@@ -106,6 +107,7 @@ pub(super) fn parse_fixed_data<const N: usize>(
     hex::decode_to_array(digits).map_err(|_| "hex data contains invalid data")
 }
 
+// design-lint: allow unclassified-free-function -- Ethereum RPC DATA codec preserves lowercase-prefix and byte-parity checks before library decoding with stable wire errors
 pub(super) fn parse_data(value: &str) -> Result<Vec<u8>, &'static str> {
     let digits = value
         .strip_prefix("0x")

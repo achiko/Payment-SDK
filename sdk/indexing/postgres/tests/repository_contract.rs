@@ -799,9 +799,20 @@ async fn reorg_preserves_atomic_canonical_state() {
             .expect("stored journal rollback"),
         Some(first.clone())
     );
-    assert_eq!(tip(&repository, &scope).await, Some(first));
+    assert_eq!(tip(&repository, &scope).await, Some(first.clone()));
     assert_eq!(history(&repository, &scope, "receiver").await, ["funding"]);
     assert_eq!(outputs(&repository, &scope).await, vec![funding]);
+
+    assert_eq!(
+        repository
+            .remove(scope.clone(), first)
+            .await
+            .expect("rollback to absent checkpoint"),
+        None
+    );
+    assert_eq!(tip(&repository, &scope).await, None);
+    assert!(history(&repository, &scope, "receiver").await.is_empty());
+    assert!(outputs(&repository, &scope).await.is_empty());
 }
 
 #[tokio::test]
