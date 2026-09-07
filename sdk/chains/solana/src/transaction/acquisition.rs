@@ -50,6 +50,40 @@ impl ResolvedTransfer {
     pub const fn amount(&self) -> Lamport {
         self.amount
     }
+
+    fn destination(&self) -> Result<Address, SendError> {
+        let parsed = self.destination.parse::<Address>().map_err(|_| {
+            SendError::item(
+                self.index,
+                Vec::new(),
+                WalletError::new(
+                    WalletErrorKind::InvalidAddress,
+                    "invalid Solana destination",
+                ),
+            )
+        })?;
+        let destination = NativeDestination::try_from(parsed).map_err(|_| {
+            SendError::item(
+                self.index,
+                Vec::new(),
+                WalletError::new(
+                    WalletErrorKind::Unsupported,
+                    "unsupported Solana native destination",
+                ),
+            )
+        })?;
+        if destination.address() == &self.source {
+            return Err(SendError::item(
+                self.index,
+                Vec::new(),
+                WalletError::new(
+                    WalletErrorKind::AddressMismatch,
+                    "Solana source and destination must differ",
+                ),
+            ));
+        }
+        Ok(destination.address().clone())
+    }
 }
 
 #[derive(Clone, Default)]
@@ -177,7 +211,10 @@ where
         }
         let leases = self.sources.lease(items, items.len() > 1)?;
         cancellation.ensure()?;
-        let destinations = validate_destinations(items)?;
+        let destinations = items
+            .iter()
+            .map(ResolvedTransfer::destination)
+            .collect::<Result<Vec<_>, _>>()?;
         cancellation.ensure()?;
         let mut seen = BTreeSet::new();
         let query = items
@@ -222,45 +259,6 @@ where
     }
 }
 
-fn validate_destinations(items: &[ResolvedTransfer]) -> Result<Vec<Address>, SendError> {
-    items
-        .iter()
-        .map(|item| {
-            let parsed = item.destination.parse::<Address>().map_err(|_| {
-                SendError::item(
-                    item.index,
-                    Vec::new(),
-                    WalletError::new(
-                        WalletErrorKind::InvalidAddress,
-                        "invalid Solana destination",
-                    ),
-                )
-            })?;
-            let destination = NativeDestination::try_from(parsed).map_err(|_| {
-                SendError::item(
-                    item.index,
-                    Vec::new(),
-                    WalletError::new(
-                        WalletErrorKind::Unsupported,
-                        "unsupported Solana native destination",
-                    ),
-                )
-            })?;
-            if destination.address() == &item.source {
-                return Err(SendError::item(
-                    item.index,
-                    Vec::new(),
-                    WalletError::new(
-                        WalletErrorKind::AddressMismatch,
-                        "Solana source and destination must differ",
-                    ),
-                ));
-            }
-            Ok(destination.address().clone())
-        })
-        .collect()
-}
-
 fn classify(
     items: &[ResolvedTransfer],
     destinations: &[Address],
@@ -278,7 +276,14 @@ fn classify(
             .as_ref()
             .is_some_and(|account| !account.supports_native_transfer())
         {
-            return Err(unsupported(item.index, "unsupported Solana source account"));
+            return Err(SendError::item(
+                item.index,
+                Vec::new(),
+                WalletError::new(
+                    WalletErrorKind::Unsupported,
+                    "unsupported Solana source account",
+                ),
+            ));
         }
         let destination = observed.get(destination).ok_or_else(|| {
             SendError::operation(
@@ -290,9 +295,13 @@ fn classify(
             .as_ref()
             .is_some_and(|account| !account.supports_native_transfer())
         {
-            return Err(unsupported(
+            return Err(SendError::item(
                 item.index,
-                "unsupported Solana destination account",
+                Vec::new(),
+                WalletError::new(
+                    WalletErrorKind::Unsupported,
+                    "unsupported Solana destination account",
+                ),
             ));
         }
         balances.push(
@@ -310,14 +319,6 @@ impl AccountSnapshot {
             && self.owner() == &Address::from_bytes([0; 32])
             && self.data().is_empty()
     }
-}
-
-fn unsupported(index: usize, message: &'static str) -> SendError {
-    SendError::item(
-        index,
-        Vec::new(),
-        WalletError::new(WalletErrorKind::Unsupported, message),
-    )
 }
 
 #[cfg(test)]
@@ -520,9 +521,22 @@ mod tests {
         let rpc = Scripted::new([]);
         let sources = SourceCoordinator::default();
         let acquirer = Acquirer::new(RpcClient::new(rpc.clone()), sources.clone());
-        for (destination, kind) in [
-            ("bad".to_owned(), WalletErrorKind::InvalidAddress),
-            (source.to_string(), WalletErrorKind::AddressMismatch),
+        for (destination, kind, message) in [
+            (
+                "bad".to_owned(),
+                WalletErrorKind::InvalidAddress,
+                "invalid Solana destination",
+            ),
+            (
+                "2fnQrngrQT4SeLcdToJAD96phoEjNL2man2kfRLCASVk".to_owned(),
+                WalletErrorKind::Unsupported,
+                "unsupported Solana native destination",
+            ),
+            (
+                source.to_string(),
+                WalletErrorKind::AddressMismatch,
+                "Solana source and destination must differ",
+            ),
         ] {
             let failure = acquirer
                 .acquire(
@@ -540,6 +554,9 @@ mod tests {
                 .expect("destination rejection");
             assert_eq!(failure.failed_index, Some(0));
             assert_eq!(failure.source.kind, kind);
+            assert_eq!(failure.source.message, message);
+            assert!(failure.accepted.is_empty());
+            assert_eq!(failure.ambiguous_transaction_id, None);
             assert!(
                 sources
                     .lease(&[transfer(0, &source, &address(8))], false)

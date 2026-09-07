@@ -78,7 +78,15 @@ pub fn pool_for_schema(url: &str, max_size: usize, schema: &str) -> Result<Pool,
     if max_size == 0 {
         return Err(invalid("PostgreSQL pool size must be greater than zero"));
     }
-    if !valid_schema(schema) {
+    let bytes = schema.as_bytes();
+    let valid = (1..=63).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .skip(1)
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+        && !schema.starts_with("pg_");
+    if !valid {
         return Err(invalid(
             "PostgreSQL schema must be a canonical application identifier",
         ));
@@ -103,17 +111,6 @@ fn build_pool(config: tokio_postgres::Config, max_size: usize) -> Result<Pool, I
         .max_size(max_size)
         .build()
         .map_err(|error| invalid(format!("could not build a connection pool: {error}")))
-}
-
-fn valid_schema(schema: &str) -> bool {
-    let bytes = schema.as_bytes();
-    (1..=63).contains(&bytes.len())
-        && bytes[0].is_ascii_lowercase()
-        && bytes
-            .iter()
-            .skip(1)
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
-        && !schema.starts_with("pg_")
 }
 
 /// One chain's indexing store.
@@ -266,6 +263,7 @@ fn store(error: tokio_postgres::Error) -> IndexError {
     IndexError::new(IndexErrorKind::Store, error.to_string(), true)
 }
 
+// design-lint: allow unclassified-free-function -- PostgreSQL pool acquisition translates foreign errors to retryable Store errors for repository access and startup validation while preserving native display context
 fn unavailable(error: deadpool_postgres::PoolError) -> IndexError {
     IndexError::new(IndexErrorKind::Store, error.to_string(), true)
 }
@@ -288,8 +286,21 @@ mod tests {
 
     #[test]
     fn schema_pool_rejects_invalid_identifiers_before_url_parsing() {
-        for schema in ["", "Pg", "0payment", "payment-data", "pg_catalog"] {
-            let error = pool_for_schema("not a PostgreSQL URL", 1, schema)
+        for schema in [
+            "".to_owned(),
+            "Pg".to_owned(),
+            "0payment".to_owned(),
+            "payment-data".to_owned(),
+            "pg_catalog".to_owned(),
+            "a".repeat(64),
+            "é".to_owned(),
+            "a,b".to_owned(),
+            "a b".to_owned(),
+            "a;".to_owned(),
+            "a\0".to_owned(),
+            "_payment".to_owned(),
+        ] {
+            let error = pool_for_schema("not a PostgreSQL URL", 1, &schema)
                 .expect_err("invalid schema must fail first");
             assert_eq!(error.kind, IndexErrorKind::InvalidRequest);
             assert_eq!(
@@ -297,6 +308,20 @@ mod tests {
                 "PostgreSQL schema must be a canonical application identifier"
             );
             assert!(!error.retryable);
+        }
+    }
+
+    #[test]
+    fn schema_pool_accepts_grammar_boundaries_without_opening_storage() {
+        for schema in [
+            "a".to_owned(),
+            "a0_".to_owned(),
+            "pg".to_owned(),
+            "a".repeat(63),
+        ] {
+            let pool = pool_for_schema("postgres://localhost/unused", 1, &schema)
+                .expect("canonical schema");
+            assert_eq!(pool.status().size, 0);
         }
     }
 

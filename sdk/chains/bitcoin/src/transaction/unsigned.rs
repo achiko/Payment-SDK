@@ -1,4 +1,4 @@
-use crate::{ChainError, Network};
+use crate::{ChainError, Network, SpendSource};
 use bitcoin::{
     Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, absolute,
     hashes::Hash, transaction::Version,
@@ -16,6 +16,22 @@ pub struct UnsignedTransaction {
 }
 
 impl UnsignedTransaction {
+    pub(super) fn from_selected(utxos: Vec<SpendSource>, outputs: Vec<Output>) -> Self {
+        Self {
+            version: 2,
+            lock_time: 0,
+            inputs: utxos
+                .into_iter()
+                .map(|utxo| Input {
+                    utxo,
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME.to_consensus_u32(),
+                })
+                .collect(),
+            outputs,
+            sighash_type: SighashType::All,
+        }
+    }
+
     pub(super) fn native(&self, network: Network) -> Result<Transaction, ChainError> {
         let input = self
             .inputs
@@ -53,6 +69,37 @@ impl UnsignedTransaction {
 mod tests {
     use super::*;
     use crate::{Address, ChainErrorKind, Satoshi, SpendSource};
+
+    #[test]
+    fn selected_funding_keeps_order_and_transaction_defaults() {
+        let sources = [7, 3].map(|index| SpendSource {
+            transaction_id: [index; 32],
+            output_index: u32::from(index),
+            value: Satoshi(u64::from(index)),
+            script_pubkey: vec![0x51],
+            satisfaction_weight: 109,
+        });
+        let outputs = [11, 5].map(|value| {
+            Output::from_atomic(
+                Address::from_encoded("mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn"),
+                Satoshi(value),
+            )
+        });
+        let unsigned = UnsignedTransaction::from_selected(sources.to_vec(), outputs.to_vec());
+
+        assert_eq!(unsigned.version, 2);
+        assert_eq!(unsigned.lock_time, 0);
+        assert_eq!(unsigned.sighash_type, SighashType::All);
+        assert_eq!(unsigned.outputs, outputs);
+        assert_eq!(unsigned.inputs.len(), sources.len());
+        for (input, source) in unsigned.inputs.iter().zip(&sources) {
+            assert_eq!(&input.utxo, source);
+            assert_eq!(
+                input.sequence,
+                Sequence::ENABLE_RBF_NO_LOCKTIME.to_consensus_u32()
+            );
+        }
+    }
 
     #[test]
     fn native_conversion_keeps_unsigned_fields_and_empty_signing_material() {

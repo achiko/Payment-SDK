@@ -17,7 +17,15 @@ impl PostgresConfig {
         if self.url_env.trim().is_empty() {
             return Err("PostgreSQL URL environment name must not be empty".into());
         }
-        if !valid_schema(&self.schema) {
+        let bytes = self.schema.as_bytes();
+        let valid = (1..=63).contains(&bytes.len())
+            && bytes[0].is_ascii_lowercase()
+            && bytes
+                .iter()
+                .skip(1)
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+            && !self.schema.starts_with("pg_");
+        if !valid {
             return Err("PostgreSQL schema must be a canonical application identifier".into());
         }
         if self.max_connections == 0 {
@@ -45,17 +53,6 @@ impl PostgresConfig {
         lookup(&self.url_env)
             .map_err(|_| "configured PostgreSQL URL environment variable is unavailable".into())
     }
-}
-
-fn valid_schema(schema: &str) -> bool {
-    let bytes = schema.as_bytes();
-    (1..=63).contains(&bytes.len())
-        && bytes[0].is_ascii_lowercase()
-        && bytes
-            .iter()
-            .skip(1)
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
-        && !schema.starts_with("pg_")
 }
 
 #[cfg(test)]

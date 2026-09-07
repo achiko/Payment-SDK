@@ -74,7 +74,12 @@ impl IndexUtxos {
             let checkpoint = page.checkpoint.as_ref().ok_or_else(|| {
                 source_error("indexed outputs have no canonical checkpoint", true)
             })?;
-            validate_checkpoint(expected_checkpoint, checkpoint)?;
+            if expected_checkpoint.get_or_insert_with(|| checkpoint.clone()) != checkpoint {
+                return Err(source_error(
+                    "indexed output checkpoint changed while loading Bitcoin outputs",
+                    true,
+                ));
+            }
             for output in page.outputs {
                 if output.address != canonical
                     || output.asset != *NATIVE_ASSET
@@ -162,23 +167,6 @@ impl IndexUtxos {
     }
 }
 
-fn validate_checkpoint(
-    expected: &mut Option<BlockRef>,
-    actual: &BlockRef,
-) -> Result<(), SourceError> {
-    match expected {
-        Some(expected) if expected != actual => Err(source_error(
-            "indexed output checkpoint changed while loading Bitcoin outputs",
-            true,
-        )),
-        Some(_) => Ok(()),
-        None => {
-            *expected = Some(actual.clone());
-            Ok(())
-        }
-    }
-}
-
 fn validate_cursor(
     previous: Option<&OutputCursor>,
     next: &OutputCursor,
@@ -215,6 +203,8 @@ fn source_error(message: impl Into<String>, retryable: bool) -> SourceError {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::VecDeque, sync::Mutex};
+
     use base::{Decimal, DecimalErrorKind};
     use futures_executor::block_on;
     use indexing::{BoxFuture, IndexError, IndexErrorKind, OutputPage};
@@ -269,19 +259,86 @@ mod tests {
         }
     }
 
+    struct ScriptedOutputs(Mutex<VecDeque<(Option<OutputCursor>, OutputPage)>>);
+
+    impl Outputs for ScriptedOutputs {
+        fn list<'a>(
+            &'a self,
+            request: OutputRequest,
+        ) -> BoxFuture<'a, Result<OutputPage, IndexError>> {
+            let (after, page) = self
+                .0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("expected output read");
+            assert_eq!(request.after, after);
+            Box::pin(async { Ok(page) })
+        }
+    }
+
     #[test]
-    fn output_pages_must_keep_one_checkpoint() {
+    fn output_pages_and_addresses_must_keep_one_checkpoint() {
         let first = checkpoint(10);
-        let mut expected = None;
-
-        validate_checkpoint(&mut expected, &first).expect("first page establishes checkpoint");
-        validate_checkpoint(&mut expected, &first).expect("same checkpoint remains valid");
-        let error = validate_checkpoint(&mut expected, &checkpoint(11))
-            .expect_err("changed checkpoint must restart the output read");
-
-        assert_eq!(expected, Some(first));
-        assert!(error.retryable);
-        assert!(error.message.contains("checkpoint changed"));
+        let mut reorg = first.clone();
+        reorg.hash = indexing::BlockHash(vec![99]);
+        for last in [first.clone(), checkpoint(11), reorg] {
+            let cursor = OutputCursor {
+                checkpoint: Some(first.clone()),
+                position: vec![1],
+            };
+            let pages = Arc::new(ScriptedOutputs(Mutex::new(VecDeque::from([
+                (
+                    None,
+                    OutputPage {
+                        checkpoint: Some(first.clone()),
+                        outputs: Vec::new(),
+                        next: Some(cursor.clone()),
+                    },
+                ),
+                (
+                    Some(cursor),
+                    OutputPage {
+                        checkpoint: Some(first.clone()),
+                        outputs: Vec::new(),
+                        next: None,
+                    },
+                ),
+                (
+                    None,
+                    OutputPage {
+                        checkpoint: Some(last.clone()),
+                        outputs: Vec::new(),
+                        next: None,
+                    },
+                ),
+            ]))));
+            let outputs = IndexUtxos::new(
+                IndexScope {
+                    chain: ChainId(crate::CHAIN.to_owned()),
+                    network: "mainnet".to_owned(),
+                },
+                Network::Mainnet,
+                pages.clone(),
+            )
+            .unwrap();
+            let addresses = vec![
+                Address::from_encoded("1BitcoinEaterAddressDontSendf59kuE"),
+                Address::from_encoded("1BoatSLRHtKNngkdXEeobR76b53LETtpyT"),
+            ];
+            let result = block_on(outputs.utxos(addresses));
+            assert!(pages.0.lock().unwrap().is_empty());
+            if last == first {
+                assert_eq!(result.unwrap().checkpoint, first);
+                continue;
+            }
+            let error = result.expect_err("checkpoint changes must restart the entire read");
+            assert!(error.retryable);
+            assert_eq!(
+                error.message,
+                "indexed output checkpoint changed while loading Bitcoin outputs"
+            );
+        }
     }
 
     #[test]

@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use bitcoin::{
     Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, absolute,
     hashes::Hash, transaction::Version,
@@ -5,10 +7,7 @@ use bitcoin::{
 
 use crate::{ChainError, ChainErrorKind, FeeRate, Network, Satoshi};
 
-use super::{
-    BuildRequest, Funding, Input, Output, SpendSource, UnsignedTransaction, checked_output,
-    validate_unique_utxos,
-};
+use super::{BuildRequest, Funding, Output, SpendSource, UnsignedTransaction, checked_output};
 
 const SEGWIT_MARKER_FLAG_WEIGHT: u64 = 2;
 
@@ -33,7 +32,16 @@ impl BuildRequest {
                 message: "Bitcoin fee rate must be greater than zero".to_owned(),
             });
         }
-        validate_unique_utxos(&self.available)?;
+        let mut seen = BTreeSet::new();
+        if self
+            .available
+            .iter()
+            .any(|utxo| !seen.insert((utxo.transaction_id, utxo.output_index)))
+        {
+            return Err(ChainError::invalid_transaction(
+                "Bitcoin transfer contains a duplicate UTXO",
+            ));
+        }
         for utxo in &self.available {
             let script = ScriptBuf::from_bytes(utxo.script_pubkey.clone());
             if !script.is_p2wpkh() && !script.is_p2tr() {
@@ -77,7 +85,10 @@ impl BuildRequest {
                 )));
             }
             self.recipients[0].value = Satoshi(value);
-            return Ok(unsigned(self.available, self.recipients));
+            return Ok(UnsignedTransaction::from_selected(
+                self.available,
+                self.recipients,
+            ));
         }
 
         self.available.sort_by(|left, right| {
@@ -137,7 +148,7 @@ impl BuildRequest {
                 "insufficient Bitcoin funds for {recipient_total} satoshis plus network fee"
             ))
         })?;
-        Ok(unsigned(selected, outputs))
+        Ok(UnsignedTransaction::from_selected(selected, outputs))
     }
 }
 
@@ -183,7 +194,15 @@ pub(in crate::transaction) fn build_grouped(
         available.append(&mut group.available);
         recipients.append(&mut group.recipients);
     }
-    validate_unique_utxos(&available)?;
+    let mut seen = BTreeSet::new();
+    if available
+        .iter()
+        .any(|utxo| !seen.insert((utxo.transaction_id, utxo.output_index)))
+    {
+        return Err(ChainError::invalid_transaction(
+            "Bitcoin transfer contains a duplicate UTXO",
+        ));
+    }
     let recipient_scripts = recipients
         .iter()
         .map(|output| checked_output(network, output, false))
@@ -219,7 +238,7 @@ pub(in crate::transaction) fn build_grouped(
                     ));
                 }
             }
-            return Ok(unsigned(available, recipients));
+            return Ok(UnsignedTransaction::from_selected(available, recipients));
         }
         active = next;
     }
@@ -243,22 +262,6 @@ fn allocate_fee(surplus: &[u64], fee: u64) -> Result<Vec<u64>, ChainError> {
         ));
     }
     Ok(remaining)
-}
-
-fn unsigned(utxos: Vec<SpendSource>, outputs: Vec<Output>) -> UnsignedTransaction {
-    UnsignedTransaction {
-        version: 2,
-        lock_time: 0,
-        inputs: utxos
-            .into_iter()
-            .map(|utxo| Input {
-                utxo,
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME.to_consensus_u32(),
-            })
-            .collect(),
-        outputs,
-        sighash_type: super::SighashType::All,
-    }
 }
 
 fn predicted_fee(

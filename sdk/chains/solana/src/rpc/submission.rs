@@ -144,9 +144,19 @@ where
                 local_id.clone(),
             )
             .await?;
-        let signature = Signature::from_str(&returned).map_err(|_| unknown(local_id.clone()))?;
+        let signature = Signature::from_str(&returned).map_err(|_| {
+            TransactionError::new(
+                TransactionErrorKind::Unknown,
+                "Solana submission outcome is unknown",
+            )
+            .with_ambiguous_transaction_id(local_id.clone())
+        })?;
         if signature.to_string() != returned || returned != local_id.as_str() {
-            return Err(unknown(local_id));
+            return Err(TransactionError::new(
+                TransactionErrorKind::Unknown,
+                "Solana submission outcome is unknown",
+            )
+            .with_ambiguous_transaction_id(local_id));
         }
         Ok(())
     }
@@ -186,14 +196,6 @@ where
             value: status.transpose()?,
         })
     }
-}
-
-fn unknown(local_id: TransactionId) -> TransactionError {
-    TransactionError::new(
-        TransactionErrorKind::Unknown,
-        "Solana submission outcome is unknown",
-    )
-    .with_ambiguous_transaction_id(local_id)
 }
 
 #[cfg(test)]
@@ -351,15 +353,25 @@ mod tests {
         rpc.assert_finished();
 
         let local = TransactionId::new(Signature::from([7; 64]).to_string());
-        let mismatch = Client::new(Scripted::one(
-            "sendTransaction",
-            json!([STANDARD.encode(bytes), {"encoding":"base64","skipPreflight":false,"preflightCommitment":"confirmed","minContextSlot":11,"maxRetries":0}]),
-            json!(Signature::from([8; 64]).to_string()),
-        ))
-        .send_transaction(&bytes, 11, local.clone())
-        .await
-        .expect_err("provider mismatch is ambiguous");
-        assert_eq!(mismatch.ambiguous_transaction_id, Some(local));
+        for returned in [
+            Signature::from([8; 64]).to_string(),
+            "malformed".to_owned(),
+            String::new(),
+        ] {
+            let rpc = Scripted::one(
+                "sendTransaction",
+                json!([STANDARD.encode(bytes), {"encoding":"base64","skipPreflight":false,"preflightCommitment":"confirmed","minContextSlot":11,"maxRetries":0}]),
+                json!(returned),
+            );
+            let error = Client::new(rpc.clone())
+                .send_transaction(&bytes, 11, local.clone())
+                .await
+                .expect_err("a mismatched or malformed response stays ambiguous");
+            assert_eq!(error.kind, TransactionErrorKind::Unknown);
+            assert_eq!(error.message, "Solana submission outcome is unknown");
+            assert_eq!(error.ambiguous_transaction_id, Some(local.clone()));
+            rpc.assert_finished();
+        }
     }
 
     #[tokio::test]

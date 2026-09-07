@@ -257,6 +257,8 @@ async fn rejects_broken_produced_height_or_parent_sequence() {
 
 #[tokio::test]
 async fn within_preserves_rpc_error_messages_and_retryability() {
+    let rpc = RpcClient::new(Scripted::new([]));
+    let attempt = Attempt::new(&rpc);
     for (kind, retryable) in [
         (ErrorKind::InvalidBatch, false),
         (ErrorKind::InvalidBudget, false),
@@ -277,12 +279,10 @@ async fn within_preserves_rpc_error_messages_and_retryability() {
         (ErrorKind::Simulation, true),
     ] {
         let message = format!("source RPC fixture {kind:?}");
-        let error = within::<()>(
-            Instant::now() + ATTEMPT_DEADLINE,
-            std::future::ready(Err(Error::new(kind, message.clone()))),
-        )
-        .await
-        .expect_err("RPC error must remain an error");
+        let error = attempt
+            .within::<()>(std::future::ready(Err(Error::new(kind, message.clone()))))
+            .await
+            .expect_err("RPC error must remain an error");
 
         assert_eq!(error.message, message, "{kind:?}");
         assert_eq!(error.retryable, retryable, "{kind:?}");
@@ -291,30 +291,42 @@ async fn within_preserves_rpc_error_messages_and_retryability() {
 
 #[tokio::test]
 async fn within_preserves_successful_values() {
-    let value = within(
-        Instant::now() + ATTEMPT_DEADLINE,
-        std::future::ready(Ok(vec![3, 100, 107])),
-    )
-    .await
-    .expect("successful RPC must retain its value");
+    let rpc = RpcClient::new(Scripted::new([]));
+    let attempt = Attempt::new(&rpc);
+    let value = attempt
+        .within(std::future::ready(Ok(vec![3, 100, 107])))
+        .await
+        .expect("successful RPC must retain its value");
 
     assert_eq!(value, vec![3, 100, 107]);
 }
 
 #[tokio::test]
 async fn within_times_out_a_pending_future_at_the_existing_deadline() {
-    let error = within(
-        Instant::now() - Duration::from_millis(1),
-        std::future::pending::<Result<(), Error>>(),
-    )
-    .await
-    .expect_err("pending RPC must respect the elapsed attempt deadline");
+    let rpc = RpcClient::new(Scripted::new([]));
+    let deadline = Instant::now() - Duration::from_millis(1);
+    let attempt = Attempt {
+        rpc: &rpc,
+        deadline,
+        enumerations: 17,
+    };
+    let value = attempt.within(std::future::ready(Ok(42))).await.unwrap();
+    assert_eq!(
+        value, 42,
+        "a ready future retains timeout_at polling precedence"
+    );
+    let error = attempt
+        .within(std::future::pending::<Result<(), Error>>())
+        .await
+        .expect_err("pending RPC must respect the elapsed attempt deadline");
 
     assert_eq!(
         error.message,
         "Solana source exceeded its 30-second deadline"
     );
     assert!(error.retryable);
+    assert_eq!(attempt.deadline, deadline);
+    assert_eq!(attempt.enumerations, 17);
 }
 
 #[test]

@@ -627,6 +627,93 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_outpoints_precede_scripts_and_selection_but_follow_fee_validation() {
+        let (address, _) = address_and_script();
+        let source = SpendSource {
+            transaction_id: [7; 32],
+            output_index: 2,
+            value: Satoshi(100_000),
+            script_pubkey: vec![0x51],
+            satisfaction_weight: 109,
+        };
+        let mut conflicting = source.clone();
+        conflicting.value = Satoshi(1);
+        conflicting.satisfaction_weight = 67;
+        for (fee_rate, kind, message) in [
+            (
+                0,
+                ChainErrorKind::FeeUnavailable,
+                "Bitcoin fee rate must be greater than zero",
+            ),
+            (
+                1_000,
+                ChainErrorKind::InvalidTransaction,
+                "Bitcoin transfer contains a duplicate UTXO",
+            ),
+        ] {
+            let request = BuildRequest {
+                available: vec![source.clone(), conflicting.clone()],
+                recipients: vec![Output::from_atomic(address.clone(), Satoshi(1_000))],
+                change_address: address.clone(),
+                fee_rate: FeeRate::new(fee_rate),
+                drain_wallet: false,
+            };
+            let error = futures_executor::block_on(Builder::new(Network::Regtest, request).build())
+                .unwrap_err();
+            assert_eq!(error.kind, kind);
+            assert_eq!(error.message, message);
+        }
+    }
+
+    #[test]
+    fn grouped_funding_rejects_cross_source_duplicates_after_source_solvency() {
+        let (address, script) = address_and_script();
+        let group = Funding {
+            available: vec![SpendSource {
+                transaction_id: [7; 32],
+                output_index: 2,
+                value: Satoshi(100_000),
+                script_pubkey: script,
+                satisfaction_weight: 109,
+            }],
+            recipients: vec![Output::from_atomic(address.clone(), Satoshi(1_000))],
+            change_address: address,
+        };
+        let mut distinct = group.clone();
+        distinct.available[0].output_index = 3;
+        let built = crate::transaction::operations::build_grouped(
+            Network::Regtest,
+            vec![group.clone(), distinct],
+            FeeRate::new(1_000),
+        )
+        .expect("distinct outputs of one transaction remain valid funding");
+        assert_eq!(built.inputs.len(), 2);
+        for (amount, kind, message) in [
+            (
+                1_000,
+                ChainErrorKind::InvalidTransaction,
+                "Bitcoin transfer contains a duplicate UTXO",
+            ),
+            (
+                200_000,
+                ChainErrorKind::InsufficientFunds,
+                "a Bitcoin grouped source cannot fund its requested outputs",
+            ),
+        ] {
+            let mut second = group.clone();
+            second.recipients[0].value = Satoshi(amount);
+            let error = crate::transaction::operations::build_grouped(
+                Network::Regtest,
+                vec![group.clone(), second],
+                FeeRate::new(1_000),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind, kind);
+            assert_eq!(error.message, message);
+        }
+    }
+
+    #[test]
     fn no_available_inputs_retains_insufficient_funds_before_recipient_validation() {
         let (address, _) = address_and_script();
         let request = BuildRequest {

@@ -119,7 +119,30 @@ impl TryFrom<&[u8]> for StoredRecord {
 
     fn try_from(frame: &[u8]) -> Result<Self, Self::Error> {
         let body = validate_frame_prefix(frame, VALUE_MAGIC, "storage value")?;
-        validate_record_length(body)?;
+        if body.len() < RECORD_PREFIX_LEN {
+            return Err(Error::corrupt_data(
+                "storage value record is shorter than its fixed fields",
+            ));
+        }
+        let declared_payload_len = u64::from_be_bytes(
+            body[8..16]
+                .try_into()
+                .map_err(|_| Error::corrupt_data("invalid encoded u64 length"))?,
+        );
+        let declared_payload_len = usize::try_from(declared_payload_len).map_err(|_| {
+            Error::corrupt_data("storage value record payload length exceeds this platform")
+        })?;
+        let actual_payload_len = body.len() - RECORD_PREFIX_LEN;
+        if declared_payload_len > MAX_STORED_PAYLOAD_BYTES {
+            return Err(Error::corrupt_data(
+                "storage value record exceeds the physical record size limit",
+            ));
+        }
+        if declared_payload_len != actual_payload_len {
+            return Err(Error::corrupt_data(format!(
+                "storage value record payload length is {declared_payload_len}, actual length is {actual_payload_len}"
+            )));
+        }
 
         let (record, bytes_read) =
             bincode::decode_from_slice::<StoredRecord, _>(body, record_config()).map_err(
@@ -234,45 +257,6 @@ fn validate_frame_prefix<'a>(
         )));
     }
     Ok(&frame[FRAME_PREFIX_LEN..])
-}
-
-fn validate_record_length(body: &[u8]) -> Result<(), Error> {
-    if body.len() < RECORD_PREFIX_LEN {
-        return Err(Error::corrupt_data(
-            "storage value record is shorter than its fixed fields",
-        ));
-    }
-
-    let declared_payload_len = u64::from_be_bytes(
-        body[8..16]
-            .try_into()
-            .map_err(|_| Error::corrupt_data("invalid encoded u64 length"))?,
-    );
-    let declared_payload_len = usize::try_from(declared_payload_len).map_err(|_| {
-        Error::corrupt_data("storage value record payload length exceeds this platform")
-    })?;
-    let actual_payload_len = body.len() - RECORD_PREFIX_LEN;
-    validate_payload_length(declared_payload_len, actual_payload_len)?;
-
-    Ok(())
-}
-
-fn validate_payload_length(
-    declared_payload_len: usize,
-    actual_payload_len: usize,
-) -> Result<(), Error> {
-    if declared_payload_len > MAX_STORED_PAYLOAD_BYTES {
-        return Err(Error::corrupt_data(
-            "storage value record exceeds the physical record size limit",
-        ));
-    }
-    if declared_payload_len != actual_payload_len {
-        return Err(Error::corrupt_data(format!(
-            "storage value record payload length is {declared_payload_len}, actual length is {actual_payload_len}"
-        )));
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -529,9 +513,30 @@ mod tests {
 
     #[test]
     fn declared_payload_above_the_corruption_limit_is_rejected_without_allocation() {
-        let error = validate_payload_length(MAX_STORED_PAYLOAD_BYTES + 1, 0)
-            .expect_err("oversized declared payload must fail closed");
-        assert_eq!(error.kind, ErrorKind::CorruptData);
+        for (declared, expected) in [
+            (
+                MAX_STORED_PAYLOAD_BYTES as u64 + 1,
+                "storage value record exceeds the physical record size limit".to_owned(),
+            ),
+            (
+                MAX_STORED_PAYLOAD_BYTES as u64,
+                format!(
+                    "storage value record payload length is {MAX_STORED_PAYLOAD_BYTES}, actual length is 0"
+                ),
+            ),
+            (
+                1,
+                "storage value record payload length is 1, actual length is 0".to_owned(),
+            ),
+        ] {
+            let mut frame = VALUE_MAGIC.to_vec();
+            frame.extend_from_slice(&0_u64.to_be_bytes());
+            frame.extend_from_slice(&declared.to_be_bytes());
+            let error = StoredRecord::try_from(frame.as_slice())
+                .expect_err("invalid length must precede decode and zero-version validation");
+            assert_eq!(error.kind, ErrorKind::CorruptData);
+            assert_eq!(error.message, expected);
+        }
     }
 
     #[test]

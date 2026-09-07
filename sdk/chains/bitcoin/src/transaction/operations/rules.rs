@@ -1,8 +1,6 @@
-use std::collections::BTreeSet;
-
 use bitcoin::ScriptBuf;
 
-use crate::{ChainError, Network, Output, SpendSource};
+use crate::{ChainError, Network, Output};
 
 pub(super) fn checked_output(
     network: Network,
@@ -17,16 +15,4 @@ pub(super) fn checked_output(
         )));
     }
     Ok(script)
-}
-
-pub(super) fn validate_unique_utxos(utxos: &[SpendSource]) -> Result<(), ChainError> {
-    let mut seen = BTreeSet::new();
-    for utxo in utxos {
-        if !seen.insert((utxo.transaction_id, utxo.output_index)) {
-            return Err(ChainError::invalid_transaction(
-                "Bitcoin transfer contains a duplicate UTXO",
-            ));
-        }
-    }
-    Ok(())
 }

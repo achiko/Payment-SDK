@@ -179,6 +179,7 @@ payment_wallets.payment_wallets_by_scope:false:false:chain,network
 payment_wallets.payment_wallets_chain_network_address_key:false:true:chain,network,address
 payment_wallets.payment_wallets_pkey:true:true:id";
 
+// design-lint: allow unclassified-free-function -- public startup algorithm validates the deployment-owned shared schema through one read-only repeatable-read transaction on an injected foreign pool independently of scope-bound repositories
 /// Checks that a pool resolves to the configured compatible schema.
 ///
 /// Validation uses one read-only repeatable-read transaction and never creates,

@@ -13,58 +13,60 @@ pub(super) struct DatabasePath {
     pub(super) initialize: bool,
 }
 
-pub(super) fn validated_database_path(path: &Path) -> Result<DatabasePath, Error> {
-    let normalized = normalized_absolute_path(path)?;
-    let file_name = normalized
-        .file_name()
-        .ok_or_else(|| Error::invalid_request("redb path must identify a database file"))?;
-    let parent = normalized
-        .parent()
-        .ok_or_else(|| Error::invalid_request("redb database file must have a parent directory"))?;
-    let parent_metadata = fs::metadata(parent).map_err(|error| match error.kind() {
-        ErrorKind::NotFound => {
-            Error::invalid_request("redb database parent directory does not exist")
+impl DatabasePath {
+    pub(super) fn validate(path: &Path) -> Result<Self, Error> {
+        let normalized = normalized_absolute_path(path)?;
+        let file_name = normalized
+            .file_name()
+            .ok_or_else(|| Error::invalid_request("redb path must identify a database file"))?;
+        let parent = normalized.parent().ok_or_else(|| {
+            Error::invalid_request("redb database file must have a parent directory")
+        })?;
+        let parent_metadata = fs::metadata(parent).map_err(|error| match error.kind() {
+            ErrorKind::NotFound => {
+                Error::invalid_request("redb database parent directory does not exist")
+            }
+            _ => unavailable(format!(
+                "failed to inspect redb database parent directory: {error}"
+            )),
+        })?;
+        if !parent_metadata.is_dir() {
+            return Err(Error::invalid_request(
+                "redb database parent path must be a directory",
+            ));
         }
-        _ => unavailable(format!(
-            "failed to inspect redb database parent directory: {error}"
-        )),
-    })?;
-    if !parent_metadata.is_dir() {
-        return Err(Error::invalid_request(
-            "redb database parent path must be a directory",
-        ));
+        let canonical_parent = fs::canonicalize(parent).map_err(|error| {
+            unavailable(format!(
+                "failed to resolve redb database parent directory: {error}"
+            ))
+        })?;
+        let resolved = canonical_parent.join(file_name);
+
+        let initialize = match fs::metadata(&resolved) {
+            Ok(metadata) if metadata.is_dir() => {
+                return Err(Error::invalid_request(
+                    "redb database path must be a file, not a directory",
+                ));
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(Error::invalid_request(
+                    "redb database path must identify a regular file",
+                ));
+            }
+            Ok(metadata) => metadata.len() == 0,
+            Err(error) if error.kind() == ErrorKind::NotFound => true,
+            Err(error) => {
+                return Err(unavailable(format!(
+                    "failed to inspect redb database file: {error}"
+                )));
+            }
+        };
+
+        Ok(Self {
+            path: resolved,
+            initialize,
+        })
     }
-    let canonical_parent = fs::canonicalize(parent).map_err(|error| {
-        unavailable(format!(
-            "failed to resolve redb database parent directory: {error}"
-        ))
-    })?;
-    let resolved = canonical_parent.join(file_name);
-
-    let initialize = match fs::metadata(&resolved) {
-        Ok(metadata) if metadata.is_dir() => {
-            return Err(Error::invalid_request(
-                "redb database path must be a file, not a directory",
-            ));
-        }
-        Ok(metadata) if !metadata.is_file() => {
-            return Err(Error::invalid_request(
-                "redb database path must identify a regular file",
-            ));
-        }
-        Ok(metadata) => metadata.len() == 0,
-        Err(error) if error.kind() == ErrorKind::NotFound => true,
-        Err(error) => {
-            return Err(unavailable(format!(
-                "failed to inspect redb database file: {error}"
-            )));
-        }
-    };
-
-    Ok(DatabasePath {
-        path: resolved,
-        initialize,
-    })
 }
 
 // design-lint: allow single-use-free-function -- complete lexical path normalization with root-escape checks stays separate from filesystem canonicalization and database-file validation
@@ -124,7 +126,7 @@ mod tests {
                 "redb path must identify a database file",
             ),
         ] {
-            let error = validated_database_path(&path).err().expect("invalid path");
+            let error = DatabasePath::validate(&path).err().expect("invalid path");
             assert_eq!(error.kind, storage::ErrorKind::InvalidRequest);
             assert_eq!(error.message, message);
         }
@@ -134,7 +136,7 @@ mod tests {
     fn normalizes_dot_and_parent_components_before_checking_the_parent() {
         let directory = TempDir::new().expect("temporary directory");
         let input = directory.path().join("missing/.././database.redb");
-        let validated = validated_database_path(&input).expect("normalized path");
+        let validated = DatabasePath::validate(&input).expect("normalized path");
         assert_eq!(
             validated.path,
             directory
@@ -153,21 +155,21 @@ mod tests {
         let directory = TempDir::new().expect("temporary directory");
         let path = directory.path().join("database.redb");
         assert!(
-            validated_database_path(&path)
+            DatabasePath::validate(&path)
                 .expect("absent file")
                 .initialize
         );
 
         fs::write(&path, []).expect("empty file");
         assert!(
-            validated_database_path(&path)
+            DatabasePath::validate(&path)
                 .expect("empty file")
                 .initialize
         );
 
         fs::write(&path, b"existing file").expect("nonempty file");
         assert!(
-            !validated_database_path(&path)
+            !DatabasePath::validate(&path)
                 .expect("existing file")
                 .initialize
         );
@@ -184,11 +186,11 @@ mod tests {
         std::os::unix::fs::symlink(&nested, &link).expect("parent symlink");
 
         let direct =
-            validated_database_path(&link.join("database.redb")).expect("symlink parent resolves");
+            DatabasePath::validate(&link.join("database.redb")).expect("symlink parent resolves");
         assert_eq!(direct.path, nested.join("database.redb"));
         assert!(direct.initialize);
 
-        let traversed = validated_database_path(&link.join("../database.redb"))
+        let traversed = DatabasePath::validate(&link.join("../database.redb"))
             .expect("lexical parent resolves");
         assert_eq!(traversed.path, parent.join("database.redb"));
         assert!(traversed.initialize);
@@ -204,7 +206,7 @@ mod tests {
         let link = parent.join("database.redb");
         std::os::unix::fs::symlink(&target, &link).expect("file symlink");
 
-        let validated = validated_database_path(&link).expect("file symlink resolves");
+        let validated = DatabasePath::validate(&link).expect("file symlink resolves");
         assert_eq!(validated.path, link);
         assert!(!validated.initialize);
     }

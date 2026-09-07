@@ -10,4 +10,4 @@ mod sign;
 pub(super) use build::build_grouped;
 pub(super) use sign::{sign, sign_each};
 
-use rules::{checked_output, validate_unique_utxos};
+use rules::checked_output;

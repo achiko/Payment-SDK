@@ -76,6 +76,7 @@ pub(super) fn storage_error(error: StorageError, context: &str) -> Error {
     }
 }
 
+// design-lint: allow unclassified-free-function -- redb owner-thread, filesystem and native-error boundaries construct foreign availability errors while preserving caller context and unknown commit outcomes
 pub(super) fn unavailable(message: impl Into<String>) -> Error {
     Error {
         kind: ErrorKind::Unavailable,

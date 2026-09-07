@@ -56,6 +56,51 @@ fn block_consensus_decoding_rejects_invalid_rpc_claims_before_projection() {
 }
 
 #[test]
+fn input_claim_validation_precedes_prevout_requests() {
+    let (valid, _, _, _) = external_prevout_block();
+    let mut wrong_outpoint = valid["tx"][0]["vin"].clone();
+    wrong_outpoint[0]["vout"] = json!(1);
+    let mut invalid_id = valid["tx"][0]["vin"].clone();
+    invalid_id[0]["txid"] = json!("invalid");
+    invalid_id[0]["vout"] = Value::Null;
+    for (inputs, message) in [
+        (Value::Null, "Bitcoin transaction inputs must be an array"),
+        (
+            json!([]),
+            "Bitcoin transaction input count does not match its consensus bytes",
+        ),
+        (
+            json!([null, null, null]),
+            "Bitcoin transaction input must be an object",
+        ),
+        (
+            invalid_id,
+            "Bitcoin input previous transaction ID is invalid",
+        ),
+        (
+            wrong_outpoint,
+            "Bitcoin input 0 outpoint does not match its consensus bytes",
+        ),
+    ] {
+        let mut block = valid.clone();
+        block["tx"][0]["vin"] = inputs;
+        let mut replies = connect_replies();
+        replies.extend([
+            reply("getblockhash", Value::String(hash(2))),
+            reply_for("getblock", json!([hash(2), 2]), block),
+        ]);
+        let client = ScriptedClient::new(replies);
+        let calls = client.clone();
+        let source = block_on(Blocks::connect(client, config())).unwrap();
+        let error = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 1))
+            .expect_err("input claims must be verified before any previous transaction request");
+        assert_eq!(error.message, message);
+        assert!(error.retryable);
+        calls.assert_exhausted();
+    }
+}
+
+#[test]
 fn numbered_block_fetch_parses_transactions_and_rechecks_canonical_hash() {
     let mut replies = connect_replies();
     replies.extend([

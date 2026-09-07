@@ -4,8 +4,8 @@ use bitcoin::{Transaction, consensus, hex::FromHex};
 use indexing::SourceError;
 use serde_json::{Map, Value};
 
-use crate::TransactionId;
 use crate::rpc::source_error;
+use crate::{Address, TransactionId};
 
 use super::{
     MAX_COMPACT_ADDRESS_BYTES, MAX_COMPACT_PREVOUT_JSON_BYTES, MAX_EXTERNAL_PREVOUTS_PER_BLOCK,
@@ -19,7 +19,10 @@ pub(super) struct ResolvedOutput {
 
 impl ResolvedOutput {
     pub(super) fn compact_json(&self) -> Result<Value, SourceError> {
-        validate_compact_address(self.address.as_ref())?;
+        self.address
+            .as_ref()
+            .map(Address::validate_compact_prevout)
+            .transpose()?;
         let prevout = serde_json::json!({
             "value_satoshis": self.value_satoshis,
             "address": self.address.as_ref().map(|address| address.encoded()),
@@ -55,6 +58,7 @@ pub(super) fn decode_consensus_transaction(
     Ok(transaction)
 }
 
+// design-lint: allow unclassified-free-function -- Bitcoin RPC boundary compares independent foreign JSON and consensus input claims before prevout acquisition, preserving coinbase and outpoint validation order and source retryability
 pub(super) fn validate_input_claims(
     value: &Value,
     transaction: &Transaction,
@@ -134,24 +138,21 @@ pub(super) fn record_external_prevout(
     Ok(())
 }
 
-pub(super) fn validate_compact_address(
-    address: Option<&crate::Address>,
-) -> Result<(), SourceError> {
-    let Some(address) = address else {
-        return Ok(());
-    };
-    if address.encoded().len() > MAX_COMPACT_ADDRESS_BYTES
-        || !address
-            .encoded()
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric())
-    {
-        return Err(source_error(
-            "Bitcoin canonical prevout address exceeds the compact data bound",
-            false,
-        ));
+impl Address {
+    pub(super) fn validate_compact_prevout(&self) -> Result<(), SourceError> {
+        if self.encoded().len() > MAX_COMPACT_ADDRESS_BYTES
+            || !self
+                .encoded()
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return Err(source_error(
+                "Bitcoin canonical prevout address exceeds the compact data bound",
+                false,
+            ));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 pub(super) fn required_string<'a>(
@@ -178,4 +179,48 @@ pub(super) fn required_u32(
         .and_then(|value| {
             u32::try_from(value).map_err(|_| source_error(format!("{context} exceeds u32"), true))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_prevout_preserves_optional_address_and_exact_satoshis() {
+        for address in [None, Some(String::new()), Some("A1".repeat(64))] {
+            let output = ResolvedOutput {
+                value_satoshis: u64::MAX,
+                address: address.as_ref().map(Address::from_encoded),
+            };
+            assert_eq!(
+                output.compact_json().unwrap(),
+                serde_json::json!({
+                    "value_satoshis": u64::MAX,
+                    "address": address,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn compact_prevout_rejects_oversized_and_non_alphanumeric_addresses() {
+        for address in [
+            "a".repeat(129),
+            "a b".to_owned(),
+            "a\"b".to_owned(),
+            "é".to_owned(),
+        ] {
+            let error = ResolvedOutput {
+                value_satoshis: 1,
+                address: Some(Address::from_encoded(address)),
+            }
+            .compact_json()
+            .unwrap_err();
+            assert_eq!(
+                error.message,
+                "Bitcoin canonical prevout address exceeds the compact data bound"
+            );
+            assert!(!error.retryable);
+        }
+    }
 }

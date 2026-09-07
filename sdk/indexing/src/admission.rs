@@ -108,9 +108,20 @@ impl ScopeAdmission {
                     });
                 }
             };
-            let wait = wait.ok_or_else(|| unavailable("busy admission did not create a waiter"))?;
-            wait.await
-                .map_err(|_| unavailable("address admission waiter was abandoned"))?;
+            let wait = wait.ok_or_else(|| {
+                IndexError::new(
+                    IndexErrorKind::Store,
+                    "busy admission did not create a waiter",
+                    false,
+                )
+            })?;
+            wait.await.map_err(|_| {
+                IndexError::new(
+                    IndexErrorKind::Store,
+                    "address admission waiter was abandoned",
+                    false,
+                )
+            })?;
         }
     }
 
@@ -140,9 +151,13 @@ impl ScopeAdmission {
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, State>, IndexError> {
-        self.state
-            .lock()
-            .map_err(|_| unavailable("address admission lock is poisoned"))
+        self.state.lock().map_err(|_| {
+            IndexError::new(
+                IndexErrorKind::Store,
+                "address admission lock is poisoned",
+                false,
+            )
+        })
     }
 }
 
@@ -278,10 +293,13 @@ impl PublicationPermit {
 
     pub fn complete(mut self) -> Result<(), IndexError> {
         let mut state = self.admission.lock()?;
-        state.revision = state
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| unavailable("address filter revision is exhausted"))?;
+        state.revision = state.revision.checked_add(1).ok_or_else(|| {
+            IndexError::new(
+                IndexErrorKind::Store,
+                "address filter revision is exhausted",
+                false,
+            )
+        })?;
         state.publication = false;
         state.notify();
         drop(state);
@@ -300,10 +318,6 @@ impl Drop for PublicationPermit {
             state.notify();
         }
     }
-}
-
-fn unavailable(message: impl Into<String>) -> IndexError {
-    IndexError::new(IndexErrorKind::Store, message, false)
 }
 
 #[cfg(test)]
@@ -555,6 +569,82 @@ mod tests {
         admission
             .plan(None, || Ok(Vec::new()))
             .expect("admission remains usable");
+    }
+
+    #[test]
+    fn exhausted_revision_releases_publication_and_wakes_waiters() {
+        let admission = Arc::new(ScopeAdmission::new());
+        admission.lock().unwrap().revision = u64::MAX;
+        let first = block_on(admission.publication(Some(block(7)))).unwrap();
+        let mut second = Box::pin(admission.publication(None));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(second.as_mut().poll(&mut context), Poll::Pending));
+
+        assert_eq!(
+            first.complete(),
+            Err(IndexError::new(
+                IndexErrorKind::Store,
+                "address filter revision is exhausted",
+                false,
+            ))
+        );
+        assert_eq!(admission.lock().unwrap().revision, u64::MAX);
+        let second = block_on(second).expect("failed completion releases the waiter");
+        assert_eq!(second.checkpoint(), Some(&block(7)));
+        drop(second);
+        assert!(!admission.lock().unwrap().publication);
+    }
+
+    #[test]
+    fn abandoned_publication_waiter_is_a_terminal_store_error() {
+        let admission = Arc::new(ScopeAdmission::new());
+        let first = block_on(admission.publication(None)).unwrap();
+        let mut second = Box::pin(admission.publication(None));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(second.as_mut().poll(&mut context), Poll::Pending));
+        admission.lock().unwrap().waiters.clear();
+
+        let error = block_on(second).err().expect("abandoned waiter error");
+        assert_eq!(
+            error,
+            IndexError::new(
+                IndexErrorKind::Store,
+                "address admission waiter was abandoned",
+                false,
+            )
+        );
+        assert!(admission.lock().unwrap().publication);
+        drop(first);
+        assert!(!admission.lock().unwrap().publication);
+    }
+
+    #[test]
+    fn poisoned_admission_rejects_plan_before_capturing_filters() {
+        let admission = Arc::new(ScopeAdmission::new());
+        let poisoned = admission.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _state = poisoned.state.lock().unwrap();
+                panic!("poison the owned admission fixture");
+            })
+            .join()
+            .is_err()
+        );
+
+        let error = admission
+            .plan(None, || {
+                panic!("poisoned state must precede filter capture")
+            })
+            .err()
+            .expect("poisoned admission error");
+        assert_eq!(
+            error,
+            IndexError::new(
+                IndexErrorKind::Store,
+                "address admission lock is poisoned",
+                false,
+            )
+        );
     }
 
     #[test]

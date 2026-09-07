@@ -219,7 +219,10 @@ where
             })?;
             let address =
                 crate::Address::from_script_for_network(&output.script_pubkey, self.config.network);
-            validate_compact_address(address.as_ref())?;
+            address
+                .as_ref()
+                .map(crate::Address::validate_compact_prevout)
+                .transpose()?;
             outputs.insert(
                 *output_index,
                 ResolvedOutput {

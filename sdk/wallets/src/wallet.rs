@@ -173,7 +173,11 @@ impl HistoryEntry {
         let fee = transaction
             .fee
             .map(|fee| {
-                validate_asset_scope(&fee.asset, &scope)?;
+                if fee.asset.chain != scope.chain {
+                    return Err(Error::history(
+                        "indexed asset does not belong to the transaction chain",
+                    ));
+                }
                 if fee
                     .payer
                     .as_ref()
@@ -262,7 +266,11 @@ impl HistoryMovement {
                 from,
             } => (id, asset, amount, Some(from), None),
         };
-        validate_asset_scope(&asset_id, scope)?;
+        if asset_id.chain != scope.chain {
+            return Err(Error::history(
+                "indexed asset does not belong to the transaction chain",
+            ));
+        }
         if from
             .iter()
             .chain(to.iter())
@@ -282,15 +290,6 @@ impl HistoryMovement {
             to,
         })
     }
-}
-
-fn validate_asset_scope(asset: &AssetId, scope: &IndexScope) -> Result<(), Error> {
-    if asset.chain != scope.chain {
-        return Err(Error::history(
-            "indexed asset does not belong to the transaction chain",
-        ));
-    }
-    Ok(())
 }
 
 impl Error {
@@ -477,6 +476,10 @@ mod tests {
                 value: "payer".to_owned(),
             }),
         });
+        let mut fifth = fourth.clone();
+        let foreign_fee = fifth.transactions[0].fee.as_mut().expect("fee fixture");
+        foreign_fee.asset.chain = ChainId("another".to_owned());
+        foreign_fee.amount = "0.1".parse().expect("fractional amount");
         for (page, message) in [
             (
                 first,
@@ -493,6 +496,10 @@ mod tests {
             (
                 fourth,
                 "indexed fee payer does not belong to the transaction scope",
+            ),
+            (
+                fifth,
+                "indexed asset does not belong to the transaction chain",
             ),
         ] {
             let error = History::from_index(page, &scope(), |_| {

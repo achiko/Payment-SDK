@@ -60,7 +60,13 @@ impl Repository {
     ) -> Result<CanonicalPage, IndexError> {
         self.check_scope(&request.scope)?;
         self.check_address(&request.address)?;
-        validate_limit(request.limit)?;
+        if request.limit == 0 || request.limit > MAX_PAGE {
+            return Err(IndexError::new(
+                IndexErrorKind::InvalidRequest,
+                "page limit must be between one and one thousand",
+                false,
+            ));
+        }
         let mut client = self.client().await?;
         let transaction = client
             .build_transaction()
@@ -309,7 +315,13 @@ impl Repository {
     ) -> Result<OutputPage, IndexError> {
         self.check_scope(&request.scope)?;
         self.check_address(&request.address)?;
-        validate_limit(request.limit)?;
+        if request.limit == 0 || request.limit > MAX_PAGE {
+            return Err(IndexError::new(
+                IndexErrorKind::InvalidRequest,
+                "page limit must be between one and one thousand",
+                false,
+            ));
+        }
         let mut client = self.client().await?;
         let transaction = client
             .build_transaction()
@@ -425,17 +437,6 @@ fn decode_position(position: &[u8]) -> Result<(String, i32), IndexError> {
     Ok((transaction.to_owned(), index))
 }
 
-fn validate_limit(limit: usize) -> Result<(), IndexError> {
-    if limit == 0 || limit > MAX_PAGE {
-        return Err(IndexError::new(
-            IndexErrorKind::InvalidRequest,
-            "page limit must be between one and one thousand",
-            false,
-        ));
-    }
-    Ok(())
-}
-
 /// Unused today but kept so the movement mapper can name every variant.
 #[allow(dead_code)]
 const fn kinds() -> [MovementKind; 5] {
@@ -451,6 +452,55 @@ const fn kinds() -> [MovementKind; 5] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn page_limit_boundaries_preserve_errors_before_pool_access() {
+        let pool = crate::pool("postgres://localhost/unused", 1).unwrap();
+        pool.close();
+        let scope = indexing::IndexScope {
+            chain: ChainId("chain".into()),
+            network: "network".into(),
+        };
+        let address = indexing::CanonicalAddress {
+            scope: scope.clone(),
+            value: "address".into(),
+        };
+        let repository = Repository::new(pool.clone(), scope.clone()).unwrap();
+        let unavailable = deadpool_postgres::PoolError::Closed.to_string();
+        let invalid = "page limit must be between one and one thousand";
+        for (limit, kind, message, retryable) in [
+            (0, IndexErrorKind::InvalidRequest, invalid, false),
+            (MAX_PAGE + 1, IndexErrorKind::InvalidRequest, invalid, false),
+            (usize::MAX, IndexErrorKind::InvalidRequest, invalid, false),
+            (1, IndexErrorKind::Store, unavailable.as_str(), true),
+            (MAX_PAGE, IndexErrorKind::Store, unavailable.as_str(), true),
+        ] {
+            let history = repository
+                .list_history(HistoryQuery {
+                    scope: scope.clone(),
+                    address: address.clone(),
+                    after: None,
+                    limit,
+                })
+                .await
+                .unwrap_err();
+            let outputs = repository
+                .list_outputs(OutputRequest {
+                    scope: scope.clone(),
+                    address: address.clone(),
+                    after: None,
+                    limit,
+                })
+                .await
+                .unwrap_err();
+            for error in [history, outputs] {
+                assert_eq!(error.kind, kind);
+                assert_eq!(error.message, message);
+                assert_eq!(error.retryable, retryable);
+            }
+        }
+        assert_eq!(pool.status().size, 0);
+    }
 
     #[test]
     fn output_position_keeps_its_existing_wire_format() {

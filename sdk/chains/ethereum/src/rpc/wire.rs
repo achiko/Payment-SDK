@@ -67,6 +67,10 @@ pub(super) fn parse_quantity_u64(value: &str) -> Result<u64, &'static str> {
 }
 
 impl Wei {
+    pub(super) fn to_quantity(&self) -> String {
+        format!("{:#x}", U256::from_be_bytes(self.0))
+    }
+
     pub(super) fn from_quantity(value: &str) -> Result<Self, &'static str> {
         let digits = quantity_digits(value)?;
         if digits.len() > 64 {
@@ -128,10 +132,6 @@ impl TransactionId {
             .map(Self)
             .map_err(|message| invalid_rpc_response(method, message))
     }
-}
-
-pub(super) fn wei_quantity(value: &Wei) -> String {
-    format!("{:#x}", U256::from_be_bytes(value.0))
 }
 
 // design-lint: allow unclassified-free-function -- translates foreign JSON-RPC errors into foreign indexing source errors while preserving display text and retryability at the Ethereum RPC boundary
@@ -334,14 +334,14 @@ mod tests {
             (Wei::from_u128(u128::MAX), format!("0x{}", "f".repeat(32))),
             (Wei([255; 32]), format!("0x{}", "f".repeat(64))),
         ] {
-            assert_eq!(wei_quantity(&value), expected);
+            assert_eq!(value.to_quantity(), expected);
             assert_eq!(Wei::from_quantity(&expected), Ok(value));
         }
         let mut value = [0; 32];
         value[0] = 1;
         value[31] = 0xab;
         assert_eq!(
-            wei_quantity(&Wei(value)),
+            Wei(value).to_quantity(),
             format!("0x1{}ab", "00".repeat(30))
         );
     }

@@ -299,7 +299,7 @@ struct Backend {
 
 impl Backend {
     fn open(path: &Path) -> Result<Self, Error> {
-        let database_path = validated_database_path(path)?;
+        let database_path = DatabasePath::validate(path)?;
         let db = open_database(&database_path.path, database_path.initialize)?;
         let mut backend = Self {
             db: Some(db),

@@ -11,7 +11,6 @@ use super::{
     transport::Client as Transport,
     wire::{
         CallError, invalid_rpc_response, map_json_rpc_error, parse_fixed_data, parse_quantity_u64,
-        wei_quantity,
     },
 };
 use crate::{
@@ -92,7 +91,7 @@ where
             let mut transaction = Map::new();
             transaction.insert("from".to_owned(), json!(request.from().to_string()));
             transaction.insert("to".to_owned(), json!(request.to().to_string()));
-            transaction.insert("value".to_owned(), json!(wei_quantity(&request.value())));
+            transaction.insert("value".to_owned(), json!(request.value().to_quantity()));
             transaction.insert("data".to_owned(), json!(hex::encode_prefixed(&input)));
 
             if request.erc20_transfer().is_some() {

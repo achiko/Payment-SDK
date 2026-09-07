@@ -644,15 +644,56 @@ mod tests {
             "pg_catalog".to_owned(),
             "pg_private".to_owned(),
             "éclair".to_owned(),
+            "a,b".to_owned(),
+            "a b".to_owned(),
+            "a;".to_owned(),
+            "a\0".to_owned(),
             format!("a{}", "0".repeat(63)),
         ] {
             let mut value = base_solana_value();
             value["postgres"]["schema"] = json!(schema);
-            assert!(
-                parse_value(value).is_err(),
-                "schema {schema} must be rejected"
+            let error = parse_value(value).err().expect("schema must be rejected");
+            assert_eq!(
+                error.to_string(),
+                "PostgreSQL schema must be a canonical application identifier"
             );
         }
+    }
+
+    #[test]
+    fn postgres_validation_keeps_field_precedence_without_environment_reads() {
+        for (url_env, schema, max_connections, message) in [
+            (
+                " ",
+                "pg_catalog",
+                0,
+                "PostgreSQL URL environment name must not be empty",
+            ),
+            (
+                "NOT_AN_ENVIRONMENT=NAME",
+                "pg_catalog",
+                0,
+                "PostgreSQL schema must be a canonical application identifier",
+            ),
+            (
+                "NOT_AN_ENVIRONMENT=NAME",
+                "payment",
+                0,
+                "PostgreSQL maximum connections must be positive",
+            ),
+        ] {
+            let mut value = base_solana_value();
+            value["postgres"] =
+                json!({"url_env": url_env, "schema": schema, "max_connections": max_connections});
+            let error = parse_value(value).err().expect("invalid configuration");
+            assert_eq!(error.to_string(), message);
+        }
+        let mut value = base_solana_value();
+        value["postgres"]["url_env"] = json!("NOT_AN_ENVIRONMENT=NAME");
+        assert!(
+            parse_value(value).is_ok(),
+            "validation must not look up the environment"
+        );
     }
 
     #[test]

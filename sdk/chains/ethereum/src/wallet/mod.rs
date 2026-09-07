@@ -118,7 +118,7 @@ impl WalletProvider {
         match generator() {
             Ok(secret) => self.create(secret),
             Err(error) => {
-                let error = wallet_error(WalletErrorKind::Generation, error);
+                let error = WalletError::new(WalletErrorKind::Generation, error.to_string());
                 Box::pin(async move { Err(error) })
             }
         }
@@ -137,17 +137,20 @@ impl Provider for WalletProvider {
     fn create<'a>(&'a self, secret: SecretBytes) -> FutureResult<'a, Arc<dyn WalletContract>> {
         Box::pin(async move {
             self.config.validate()?;
-            let key = SecretKey::new(secret.as_bytes().to_vec())
-                .map_err(|error| wallet_error(WalletErrorKind::InvalidSecret, error))?;
-            let public = key
-                .public_key(PublicKeyFormat::Raw)
-                .map_err(|error| wallet_error(WalletErrorKind::InvalidSecret, error))?;
+            let key = SecretKey::new(secret.as_bytes().to_vec()).map_err(|error| {
+                WalletError::new(WalletErrorKind::InvalidSecret, error.to_string())
+            })?;
+            let public = key.public_key(PublicKeyFormat::Raw).map_err(|error| {
+                WalletError::new(WalletErrorKind::InvalidSecret, error.to_string())
+            })?;
             let hash = keccak256(&public.bytes);
             let mut bytes = [0_u8; 20];
             bytes.copy_from_slice(&hash[12..]);
             let address = Address(bytes);
-            let signer = KeyPair::new(address.clone(), secret.as_bytes().to_vec())
-                .map_err(|error| wallet_error(WalletErrorKind::InvalidSecret, error))?;
+            let signer =
+                KeyPair::new(address.clone(), secret.as_bytes().to_vec()).map_err(|error| {
+                    WalletError::new(WalletErrorKind::InvalidSecret, error.to_string())
+                })?;
             Ok(Arc::new(Wallet {
                 config: self.config.clone(),
                 address,
@@ -187,8 +190,9 @@ impl base::Signer for Wallet {
 
 impl AddressFormat for Wallet {
     fn address_text(&self, address: &BaseAddress) -> Result<AddressText, WalletError> {
-        let address = Address::try_from(address)
-            .map_err(|error| wallet_error(WalletErrorKind::InvalidAddress, error))?;
+        let address = Address::try_from(address).map_err(|error| {
+            WalletError::new(WalletErrorKind::InvalidAddress, error.to_string())
+        })?;
         Ok(AddressText::new(AddressEncoding::Hex, address.to_string()))
     }
 
@@ -203,7 +207,7 @@ impl AddressFormat for Wallet {
             .text
             .parse::<Address>()
             .map(|parsed| parsed.address())
-            .map_err(|error| wallet_error(WalletErrorKind::InvalidAddress, error))
+            .map_err(|error| WalletError::new(WalletErrorKind::InvalidAddress, error.to_string()))
     }
 }
 
@@ -214,7 +218,7 @@ impl BalanceReader for Wallet {
                 .accounts
                 .balance(self.address.clone(), &self.config.asset, None)
                 .await
-                .map_err(|error| wallet_error(WalletErrorKind::Balance, error))?;
+                .map_err(|error| WalletError::new(WalletErrorKind::Balance, error.to_string()))?;
             Ok(Balance {
                 amount: Decimal::from_atomic(
                     num_bigint::BigUint::from_bytes_be(&amount.0),
@@ -444,10 +448,6 @@ impl ChainError {
     }
 }
 
-fn wallet_error(kind: WalletErrorKind, error: impl std::fmt::Display) -> WalletError {
-    WalletError::new(kind, error.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,6 +548,66 @@ mod tests {
             assert_eq!(
                 error.message,
                 "Ethereum address must contain exactly 20 bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn address_parsing_preserves_encoding_and_native_error_precedence() {
+        let wallet = block_on(provider().create(SecretBytes::new([1_u8; 32]))).unwrap();
+        for (encoding, text, message) in [
+            (
+                AddressEncoding::Base58,
+                "bad",
+                "Ethereum addresses use hexadecimal encoding",
+            ),
+            (
+                AddressEncoding::Hex,
+                "bad",
+                "Ethereum address is missing its 0x prefix",
+            ),
+            (
+                AddressEncoding::Hex,
+                "0xzz",
+                "Ethereum address must contain exactly 20 bytes",
+            ),
+        ] {
+            let error = wallet
+                .parse_address(&AddressText::new(encoding, text))
+                .unwrap_err();
+            assert_eq!(
+                error,
+                WalletError::new(WalletErrorKind::InvalidAddress, message)
+            );
+        }
+    }
+
+    #[test]
+    fn creation_validates_configuration_before_secret_and_preserves_secret_errors() {
+        let mut provider = provider();
+        provider.config.chain_id = 0;
+        let error = block_on(provider.create(SecretBytes::new(Vec::new())))
+            .err()
+            .expect("invalid configuration");
+        assert_eq!(
+            error,
+            WalletError::new(
+                WalletErrorKind::Unsupported,
+                "Ethereum wallet network, asset, and decimals must agree",
+            )
+        );
+
+        provider.config.chain_id = 1;
+        for secret in [Vec::new(), vec![0; 32], vec![255; 32]] {
+            let error = block_on(provider.create(SecretBytes::new(secret)))
+                .err()
+                .expect("invalid scalar");
+            assert_eq!(
+                error,
+                WalletError::new(
+                    WalletErrorKind::InvalidSecret,
+                    "secret key must be a valid 32-byte secp256k1 scalar",
+                )
             );
         }
     }

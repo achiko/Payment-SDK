@@ -114,8 +114,9 @@ where
         let tip = self.finalized_slot().await?;
         let opening = self.first_available().await?;
         if opening > tip {
-            return Err(unavailable(
+            return Err(source_error(
                 "Solana first available block is above the finalized slot",
+                true,
             ));
         }
 
@@ -127,8 +128,9 @@ where
                 break candidate;
             }
             if start == opening {
-                return Err(unavailable(
+                return Err(source_error(
                     "Solana finalized history contains no retained produced block",
+                    true,
                 ));
             }
             end = start - 1;
@@ -136,8 +138,9 @@ where
         let block = self.required_block(candidate).await?;
         let closing = self.first_available().await?;
         if closing > candidate {
-            return Err(unavailable(
+            return Err(source_error(
                 "Solana selected anchor was pruned during source acquisition",
+                true,
             ));
         }
         Ok(Tip {
@@ -179,8 +182,9 @@ where
             if window_end == tip.block.reference().position.0
                 && slots.last().copied() != Some(window_end)
             {
-                return Err(unavailable(
+                return Err(source_error(
                     "Solana range enumeration omitted its previously proved tip",
+                    true,
                 ));
             }
 
@@ -196,7 +200,7 @@ where
             }
             cursor = window_end
                 .checked_add(1)
-                .ok_or_else(|| unavailable("Solana slot range cannot advance"))?;
+                .ok_or_else(|| source_error("Solana slot range cannot advance", true))?;
         }
 
         let closing = self.first_available().await?;
@@ -219,16 +223,18 @@ where
             ));
         }
         if position.0 > tip {
-            return Err(unavailable(
+            return Err(source_error(
                 "Solana canonical position is above the finalized slot",
+                true,
             ));
         }
 
         let slots = self.enumerate(position.0, position.0, tip).await?;
         let block = if slots.is_empty() {
             if tip <= position.0 {
-                return Err(unavailable(
+                return Err(source_error(
                     "Solana same-slot omission is not canonical evidence",
+                    true,
                 ));
             }
             None
@@ -246,17 +252,21 @@ where
     }
 
     async fn finalized_slot(&self) -> Result<u64, SourceError> {
-        within(self.deadline, self.rpc.slot(RpcCommitment::Finalized, None)).await
+        self.within(self.rpc.slot(RpcCommitment::Finalized, None))
+            .await
     }
 
     async fn first_available(&self) -> Result<u64, SourceError> {
-        within(self.deadline, self.rpc.first_available_block()).await
+        self.within(self.rpc.first_available_block()).await
     }
 
     async fn required_block(&self, slot: u64) -> Result<Block, SourceError> {
-        let raw = within(self.deadline, self.rpc.finalized_block(slot))
+        let raw = self
+            .within(self.rpc.finalized_block(slot))
             .await?
-            .ok_or_else(|| unavailable("Solana selected finalized block became unavailable"))?;
+            .ok_or_else(|| {
+                source_error("Solana selected finalized block became unavailable", true)
+            })?;
         Block::parse(slot, raw.get().as_bytes().to_vec())
             .map_err(|error| source_error(error.to_string(), true))
     }
@@ -275,31 +285,32 @@ where
             ));
         }
         self.enumerations += 1;
-        within(self.deadline, self.rpc.finalized_blocks(start, end, floor)).await
+        self.within(self.rpc.finalized_blocks(start, end, floor))
+            .await
     }
-}
 
-async fn within<T>(
-    deadline: Instant,
-    future: impl Future<Output = Result<T, Error>>,
-) -> Result<T, SourceError> {
-    timeout_at(deadline, future)
-        .await
-        .map_err(|_| source_error("Solana source exceeded its 30-second deadline", true))?
-        .map_err(|error| {
-            let retryable = !matches!(
-                error.kind(),
-                ErrorKind::InvalidRpcConfiguration
-                    | ErrorKind::InvalidIdentity
-                    | ErrorKind::InvalidBatch
-                    | ErrorKind::InvalidBudget
-                    | ErrorKind::InvalidSecret
-                    | ErrorKind::Generation
-                    | ErrorKind::Signing
-                    | ErrorKind::UnsupportedDestination
-            );
-            source_error(error.to_string(), retryable)
-        })
+    async fn within<T>(
+        &self,
+        future: impl Future<Output = Result<T, Error>>,
+    ) -> Result<T, SourceError> {
+        timeout_at(self.deadline, future)
+            .await
+            .map_err(|_| source_error("Solana source exceeded its 30-second deadline", true))?
+            .map_err(|error| {
+                let retryable = !matches!(
+                    error.kind(),
+                    ErrorKind::InvalidRpcConfiguration
+                        | ErrorKind::InvalidIdentity
+                        | ErrorKind::InvalidBatch
+                        | ErrorKind::InvalidBudget
+                        | ErrorKind::InvalidSecret
+                        | ErrorKind::Generation
+                        | ErrorKind::Signing
+                        | ErrorKind::UnsupportedDestination
+                );
+                source_error(error.to_string(), retryable)
+            })
+    }
 }
 
 impl Block {
@@ -309,7 +320,7 @@ impl Block {
         let expected_height = previous
             .height
             .checked_successor()
-            .ok_or_else(|| unavailable("Solana produced height is exhausted"))?;
+            .ok_or_else(|| source_error("Solana produced height is exhausted", true))?;
         let expected_parent = BlockParent {
             position: previous.position,
             hash: previous.hash.clone(),
@@ -318,16 +329,13 @@ impl Block {
             || current.height != expected_height
             || current.parent.as_ref() != Some(&expected_parent)
         {
-            return Err(unavailable(
+            return Err(source_error(
                 "Solana produced blocks are not a strict canonical sequence",
+                true,
             ));
         }
         Ok(())
     }
-}
-
-fn unavailable(message: &'static str) -> SourceError {
-    source_error(message, true)
 }
 
 // design-lint: allow unclassified-free-function -- Solana acquisition boundary constructs foreign SourceError values while each pruning, budget, timeout and RPC caller retains its retryability policy

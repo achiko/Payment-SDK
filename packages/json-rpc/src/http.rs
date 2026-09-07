@@ -106,6 +106,25 @@ impl Config {
         }
     }
 
+    fn validate(&self) -> std::result::Result<(), Error> {
+        if self.endpoints.is_empty() || self.endpoints.iter().any(|value| value.trim().is_empty()) {
+            return Err(Error::new(
+                ErrorKind::InvalidConfiguration,
+                "JSON-RPC requires at least one endpoint",
+            ));
+        }
+        if self.request_timeout.is_zero()
+            || self.max_request_bytes == 0
+            || self.max_response_bytes == 0
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidConfiguration,
+                "JSON-RPC bounds must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+
     fn parsed_headers(&self) -> std::result::Result<HeaderMap, Error> {
         let mut headers = HeaderMap::new();
         for (name, value) in &self.headers {
@@ -147,7 +166,7 @@ impl fmt::Debug for Http {
 
 impl Http {
     pub fn new(config: Config) -> std::result::Result<Self, Error> {
-        validate(&config)?;
+        config.validate()?;
         let headers = config.parsed_headers()?;
         let max_request = u32::try_from(config.max_request_bytes).map_err(|_| invalid_limit())?;
         let max_response = u32::try_from(config.max_response_bytes).map_err(|_| invalid_limit())?;
@@ -363,25 +382,6 @@ impl Error {
     }
 }
 
-fn validate(config: &Config) -> std::result::Result<(), Error> {
-    if config.endpoints.is_empty() || config.endpoints.iter().any(|value| value.trim().is_empty()) {
-        return Err(Error::new(
-            ErrorKind::InvalidConfiguration,
-            "JSON-RPC requires at least one endpoint",
-        ));
-    }
-    if config.request_timeout.is_zero()
-        || config.max_request_bytes == 0
-        || config.max_response_bytes == 0
-    {
-        return Err(Error::new(
-            ErrorKind::InvalidConfiguration,
-            "JSON-RPC bounds must be greater than zero",
-        ));
-    }
-    Ok(())
-}
-
 fn invalid_limit() -> Error {
     Error::new(
         ErrorKind::InvalidConfiguration,
@@ -545,14 +545,36 @@ mod tests {
 
     #[test]
     fn endpoint_and_zero_bound_checks_still_precede_header_parsing() {
-        let mut config = Config::new("", Duration::ZERO);
+        let mut config = Config::new("http://example.invalid", Duration::from_secs(1));
         config
             .headers
             .push(("invalid name".to_owned(), "hidden".to_owned()));
-        let error = Http::new(config.clone()).expect_err("empty endpoint must fail first");
-        assert_eq!(error.message, "JSON-RPC requires at least one endpoint");
-        config.endpoints[0] = "http://example.invalid".to_owned();
-        let error = Http::new(config).expect_err("zero bounds must fail before headers");
-        assert_eq!(error.message, "JSON-RPC bounds must be greater than zero");
+        for endpoints in [
+            Vec::new(),
+            vec![String::new()],
+            vec!["http://example.invalid".to_owned(), " \t\n".to_owned()],
+        ] {
+            let mut invalid = config.clone();
+            invalid.endpoints = endpoints;
+            invalid.request_timeout = Duration::ZERO;
+            let error = Http::new(invalid).expect_err("empty endpoint must fail first");
+            assert_eq!(error.kind, ErrorKind::InvalidConfiguration);
+            assert_eq!(error.message, "JSON-RPC requires at least one endpoint");
+            assert!(!error.is_retryable());
+        }
+        for (timeout, request, response) in [
+            (Duration::ZERO, 1, 1),
+            (Duration::from_secs(1), 0, 1),
+            (Duration::from_secs(1), 1, 0),
+        ] {
+            let mut invalid = config.clone();
+            invalid.request_timeout = timeout;
+            invalid.max_request_bytes = request;
+            invalid.max_response_bytes = response;
+            let error = Http::new(invalid).expect_err("zero bounds must fail before headers");
+            assert_eq!(error.kind, ErrorKind::InvalidConfiguration);
+            assert_eq!(error.message, "JSON-RPC bounds must be greater than zero");
+            assert!(!error.is_retryable());
+        }
     }
 }

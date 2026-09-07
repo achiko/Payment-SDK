@@ -159,7 +159,7 @@ fn populated_database_without_global_version_is_rejected() -> Result<(), Error> 
                     .map_err(|error| other(format!("test data write failed: {error}")))?,
             );
             drop(
-                meta.insert(DATABASE_FORMAT_KEY, crate::format::DATABASE_FORMAT)
+                meta.insert(DATABASE_FORMAT_KEY, super::format::DATABASE_FORMAT)
                     .map_err(|error| other(format!("test marker write failed: {error}")))?,
             );
         }
@@ -242,7 +242,7 @@ fn incompatible_table_type_is_rejected() -> Result<(), Error> {
                 .open_table(META_TABLE)
                 .map_err(|error| other(format!("test metadata table failed: {error}")))?;
             drop(
-                meta.insert(DATABASE_FORMAT_KEY, crate::format::DATABASE_FORMAT)
+                meta.insert(DATABASE_FORMAT_KEY, super::format::DATABASE_FORMAT)
                     .map_err(|error| other(format!("test marker write failed: {error}")))?,
             );
         }
@@ -261,36 +261,47 @@ fn incompatible_table_type_is_rejected() -> Result<(), Error> {
 
 #[test]
 fn different_database_format_fails_closed() -> Result<(), Error> {
-    let directory = TempDir::new().map_err(|error| other(error.to_string()))?;
-    let database_path = directory.path().join("database.redb");
-    {
-        let storage = Redb::open(&database_path)?;
-        drop(storage);
-    }
-    {
-        let db = open_raw(&database_path)?;
-        let transaction = db
-            .begin_write()
-            .map_err(|error| other(format!("test transaction failed: {error}")))?;
+    for marker in [
+        b"".as_slice(),
+        b"w3-storage-red".as_slice(),
+        b"w3-storage-redb-extra".as_slice(),
+        b"another-database-format".as_slice(),
+    ] {
+        let directory = TempDir::new().map_err(|error| other(error.to_string()))?;
+        let database_path = directory.path().join("database.redb");
         {
-            let mut meta = transaction
-                .open_table(META_TABLE)
-                .map_err(|error| other(format!("test metadata table failed: {error}")))?;
-            drop(
-                meta.insert(DATABASE_FORMAT_KEY, b"another-database-format".as_slice())
-                    .map_err(|error| other(format!("test marker write failed: {error}")))?,
-            );
+            let storage = Redb::open(&database_path)?;
+            drop(storage);
         }
-        transaction
-            .commit()
-            .map_err(|error| other(format!("test commit failed: {error}")))?;
-    }
+        {
+            let db = open_raw(&database_path)?;
+            let transaction = db
+                .begin_write()
+                .map_err(|error| other(format!("test transaction failed: {error}")))?;
+            {
+                let mut meta = transaction
+                    .open_table(META_TABLE)
+                    .map_err(|error| other(format!("test metadata table failed: {error}")))?;
+                drop(
+                    meta.insert(DATABASE_FORMAT_KEY, marker)
+                        .map_err(|error| other(format!("test marker write failed: {error}")))?,
+                );
+            }
+            transaction
+                .commit()
+                .map_err(|error| other(format!("test commit failed: {error}")))?;
+        }
 
-    let error = match Redb::open(&database_path) {
-        Ok(_) => panic!("a different database format must fail closed"),
-        Err(error) => error,
-    };
-    assert_eq!(error.kind, ErrorKind::CorruptData);
+        let error = match Redb::open(&database_path) {
+            Ok(_) => panic!("a different database format must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, ErrorKind::CorruptData);
+        assert_eq!(
+            error.message,
+            "database format is not supported by this adapter"
+        );
+    }
     Ok(())
 }
 
