@@ -162,6 +162,13 @@ impl SyncPlan {
         &self.filters
     }
 
+    pub(crate) fn earliest_position(&self) -> Option<BlockPosition> {
+        self.filters
+            .iter()
+            .map(|filter| filter.start_position)
+            .min()
+    }
+
     pub(crate) fn active_addresses(&self, position: BlockPosition) -> Vec<CanonicalAddress> {
         self.filters
             .iter()
@@ -346,8 +353,36 @@ mod tests {
     fn empty_plan_has_no_active_addresses() {
         let plan = SyncPlan::detached(Vec::new(), None);
 
+        assert_eq!(plan.earliest_position(), None);
         assert!(plan.active_addresses(BlockPosition(0)).is_empty());
         assert!(plan.active_addresses(BlockPosition(u64::MAX)).is_empty());
+    }
+
+    #[test]
+    fn earliest_position_uses_native_birthdays_without_inventing_a_parent() {
+        for (starts, expected) in [
+            (vec![950, 900], Some(BlockPosition(900))),
+            (vec![0], Some(BlockPosition(0))),
+            (vec![u64::MAX], Some(BlockPosition(u64::MAX))),
+            (vec![900, 900, 950], Some(BlockPosition(900))),
+        ] {
+            let filters = starts
+                .into_iter()
+                .enumerate()
+                .map(|(index, position)| filter(&format!("address-{index}"), position))
+                .collect();
+            let plan = SyncPlan::detached(filters, Some(block(1)));
+            assert_eq!(plan.earliest_position(), expected);
+        }
+    }
+
+    #[test]
+    fn earliest_position_tracks_replaced_filters_without_changing_checkpoint() {
+        let plan = SyncPlan::detached(vec![filter("old", 50)], Some(block(10)))
+            .with_filters(vec![filter("future", 100), filter("earlier", 20)]);
+        assert_eq!(plan.earliest_position(), Some(BlockPosition(20)));
+        assert_eq!(plan.checkpoint(), Some(&block(10)));
+        assert_eq!(plan.with_filters(Vec::new()).earliest_position(), None);
     }
 
     #[test]
@@ -396,6 +431,7 @@ mod tests {
 
         for position in [107, 100] {
             plan.advance(block(position));
+            assert_eq!(plan.earliest_position(), Some(BlockPosition(103)));
             assert_eq!(plan.checkpoint(), Some(&block(position)));
             assert!(plan.active_addresses(BlockPosition(102)).is_empty());
             assert_eq!(

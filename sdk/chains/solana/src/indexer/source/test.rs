@@ -315,3 +315,53 @@ async fn within_times_out_a_pending_future_at_the_existing_deadline() {
     );
     assert!(error.retryable);
 }
+
+#[test]
+fn deadline_guard_is_strict_and_does_not_reset_attempt_state() {
+    let rpc = RpcClient::new(Scripted::new([]));
+    let deadline = Instant::now();
+    let attempt = Attempt {
+        rpc: &rpc,
+        deadline,
+        enumerations: 17,
+    };
+
+    assert!(
+        attempt
+            .ensure_before_deadline(deadline - Duration::from_nanos(1))
+            .is_ok()
+    );
+    for observed in [deadline, deadline + Duration::from_nanos(1)] {
+        let error = attempt.ensure_before_deadline(observed).unwrap_err();
+        assert_eq!(
+            error.message,
+            "Solana source exceeded its 30-second deadline"
+        );
+        assert!(error.retryable);
+    }
+    assert_eq!(attempt.deadline, deadline);
+    assert_eq!(attempt.enumerations, 17);
+}
+
+#[tokio::test]
+async fn expired_attempt_rejects_before_spending_enumeration_budget_or_rpc() {
+    let scripted = Scripted::new([]);
+    let rpc = RpcClient::new(scripted.clone());
+    let deadline = Instant::now() - Duration::from_nanos(1);
+    for enumerations in [0, MAX_ENUMERATIONS] {
+        let mut attempt = Attempt {
+            rpc: &rpc,
+            deadline,
+            enumerations,
+        };
+        let error = attempt.enumerate(1, 1, 1).await.unwrap_err();
+        assert_eq!(
+            error.message,
+            "Solana source exceeded its 30-second deadline"
+        );
+        assert!(error.retryable);
+        assert_eq!(attempt.enumerations, enumerations);
+        assert_eq!(attempt.deadline, deadline);
+    }
+    scripted.assert_finished();
+}

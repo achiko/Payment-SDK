@@ -100,6 +100,16 @@ where
         }
     }
 
+    fn ensure_before_deadline(&self, now: Instant) -> Result<(), SourceError> {
+        if now >= self.deadline {
+            return Err(source_error(
+                "Solana source exceeded its 30-second deadline",
+                true,
+            ));
+        }
+        Ok(())
+    }
+
     async fn complete_tip(&mut self) -> Result<Tip, SourceError> {
         let tip = self.finalized_slot().await?;
         let opening = self.first_available().await?;
@@ -147,7 +157,7 @@ where
         let mut cursor = start.0;
         let mut blocks = Vec::with_capacity(limit.min(64));
         while cursor <= bounded_end && blocks.len() < limit {
-            ensure_before(self.deadline)?;
+            self.ensure_before_deadline(Instant::now())?;
             let remaining = limit - blocks.len();
             let width = u64::try_from(remaining)
                 .unwrap_or(u64::MAX)
@@ -232,7 +242,7 @@ where
         end: u64,
         floor: u64,
     ) -> Result<Vec<u64>, SourceError> {
-        ensure_before(self.deadline)?;
+        self.ensure_before_deadline(Instant::now())?;
         if self.enumerations >= MAX_ENUMERATIONS {
             return Err(source_error(
                 "Solana source exhausted its 64-call enumeration budget",
@@ -265,16 +275,6 @@ async fn within<T>(
             );
             source_error(error.to_string(), retryable)
         })
-}
-
-fn ensure_before(deadline: Instant) -> Result<(), SourceError> {
-    if Instant::now() >= deadline {
-        return Err(source_error(
-            "Solana source exceeded its 30-second deadline",
-            true,
-        ));
-    }
-    Ok(())
 }
 
 fn require_anchor_retained(first_available: u64, anchor: u64) -> Result<(), SourceError> {

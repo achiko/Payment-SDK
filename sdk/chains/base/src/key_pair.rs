@@ -21,7 +21,7 @@ impl<A> KeyPair<A> {
 
     fn sign_now(&self, request: SignRequest) -> Result<SignedPayload, SignerError> {
         let SignablePayload::Digest(digest) = request.payload else {
-            return Err(error(
+            return Err(SignerError::new(
                 SignerErrorKind::UnsupportedOperation,
                 "signer accepts precomputed digests only",
             ));
@@ -33,7 +33,7 @@ impl<A> KeyPair<A> {
         let bytes = match request.scheme {
             SignatureScheme::EcdsaSecp256k1 => {
                 if request.key_tweak.is_some() {
-                    return Err(error(
+                    return Err(SignerError::new(
                         SignerErrorKind::UnsupportedOperation,
                         "ECDSA does not accept a key tweak",
                     ));
@@ -47,7 +47,7 @@ impl<A> KeyPair<A> {
                 .sign_schnorr(&digest.bytes, request.encoding, request.key_tweak.as_ref())
                 .map_err(signer_error)?,
             _ => {
-                return Err(error(
+                return Err(SignerError::new(
                     SignerErrorKind::UnsupportedScheme,
                     "key pair supports secp256k1 only",
                 ));
@@ -83,19 +83,51 @@ fn signer_error(error: CryptoError) -> SignerError {
     }
 }
 
-fn error(kind: SignerErrorKind, message: impl Into<String>) -> SignerError {
-    SignerError {
-        kind,
-        message: message.into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use futures_executor::block_on;
 
     use super::*;
     use crate::{Digest, PublicKeyFormat, SignablePayload, SignatureEncoding, SignatureScheme};
+
+    #[test]
+    fn unsupported_signing_requests_preserve_error_kind_and_validation_order() {
+        let pair = KeyPair::new([7_u8; 20], [1_u8; 32]).expect("test key must be valid");
+        for (payload, scheme, key_tweak, kind, message) in [
+            (
+                SignablePayload::Message(vec![9; 32]),
+                SignatureScheme::Ed25519,
+                None,
+                SignerErrorKind::UnsupportedOperation,
+                "signer accepts precomputed digests only",
+            ),
+            (
+                SignablePayload::Digest(Digest { bytes: vec![9; 31] }),
+                SignatureScheme::EcdsaSecp256k1,
+                Some(crate::KeyTweak::Add([0; 32])),
+                SignerErrorKind::UnsupportedOperation,
+                "ECDSA does not accept a key tweak",
+            ),
+            (
+                SignablePayload::Digest(Digest { bytes: vec![9; 31] }),
+                SignatureScheme::Ed25519,
+                None,
+                SignerErrorKind::UnsupportedScheme,
+                "key pair supports secp256k1 only",
+            ),
+        ] {
+            let error = block_on(pair.sign(SignRequest {
+                payload,
+                scheme,
+                encoding: SignatureEncoding::Recoverable,
+                public_key_format: PublicKeyFormat::Raw,
+                key_tweak,
+            }))
+            .expect_err("unsupported requests must fail before digest signing");
+            assert_eq!(error.kind, kind);
+            assert_eq!(error.message, message);
+        }
+    }
 
     #[test]
     fn key_pair_is_the_local_signer() {

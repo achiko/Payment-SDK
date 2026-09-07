@@ -65,6 +65,18 @@ impl Address {
     }
 }
 
+impl TryFrom<&BaseAddress> for Address {
+    type Error = AddressParseError;
+
+    fn try_from(address: &BaseAddress) -> Result<Self, Self::Error> {
+        address
+            .as_bytes()
+            .try_into()
+            .map(Self)
+            .map_err(|_| AddressParseError::InvalidLength)
+    }
+}
+
 impl TryFrom<&CanonicalAddress> for Address {
     type Error = AddressParseError;
 

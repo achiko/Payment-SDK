@@ -245,7 +245,7 @@ impl FeeRecord {
     fn from_domain(value: &NetworkFee) -> Self {
         Self {
             asset: AssetRecord::from_domain(&value.asset),
-            amount: crate::amount_record::encode(&value.amount),
+            amount: value.amount.to_string(),
             payer: value.payer.as_ref().map(AddressRecord::from_domain),
         }
     }
@@ -284,7 +284,7 @@ impl OutputRecord {
         Self {
             id: OutputIdentity::from_domain(&value.key()),
             asset: AssetRecord::from_domain(&value.asset),
-            amount: crate::amount_record::encode(&value.amount),
+            amount: value.amount.to_string(),
             evidence: value.evidence.clone(),
             created_at: value.created_at.0,
             coinbase: value.coinbase,

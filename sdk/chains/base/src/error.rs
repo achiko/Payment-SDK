@@ -6,6 +6,15 @@ pub struct Error {
     pub message: String,
 }
 
+impl Error {
+    pub(crate) fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ErrorKind {
     UnsupportedCurve,

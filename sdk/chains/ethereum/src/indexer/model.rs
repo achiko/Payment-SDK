@@ -465,18 +465,6 @@ pub(super) fn parse_quantity(value: &str, label: &str) -> Result<U256, ParseErro
         .map_err(|_| ParseError::new(format!("Ethereum {label} exceeds 256 bits")))
 }
 
-pub(super) fn encode_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
-    let mut encoded = String::with_capacity(2 + bytes.len() * 2);
-    encoded.push_str("0x");
-    for byte in bytes {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    encoded
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

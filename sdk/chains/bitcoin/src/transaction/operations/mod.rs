@@ -14,9 +14,7 @@ mod sign;
 pub(super) use build::build_grouped;
 pub(super) use sign::{sign, sign_each};
 
-use rules::{
-    checked_output, ecdsa_sighash_type, sum_utxos, taproot_sighash_type, validate_unique_utxos,
-};
+use rules::{checked_output, sum_utxos, taproot_sighash_type, validate_unique_utxos};
 
 pub(crate) const fn native_network(network: Network) -> NativeNetwork {
     match network {

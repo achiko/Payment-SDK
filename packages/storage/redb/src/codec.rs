@@ -35,6 +35,7 @@ pub(crate) fn namespace_prefix(namespace: &Namespace) -> Result<Vec<u8>, Error> 
     Ok(encoded)
 }
 
+// design-lint: allow unclassified-free-function -- adapter-owned physical key encoding combines foreign Namespace and Key values without leaking the redb wire format into neutral storage
 pub(crate) fn encode_physical_key(namespace: &Namespace, key: &Key) -> Result<Vec<u8>, Error> {
     let mut encoded = namespace_prefix(namespace)?;
     encoded
@@ -74,29 +75,34 @@ pub(crate) fn decode_physical_key(
     Ok(Key(physical[key_offset..].to_vec()))
 }
 
-pub(crate) fn encode_stored_value(value: &Value, version: Version) -> Result<Vec<u8>, Error> {
-    if version.0 == 0 {
-        return Err(invalid_request(
-            "storage version zero is reserved for an uninitialized database",
-        ));
-    }
-    if value.0.len() > MAX_STORED_PAYLOAD_BYTES {
-        return Err(invalid_request(
-            "storage value exceeds the physical record size limit",
-        ));
+impl StoredRecord {
+    pub(crate) fn new(value: Value, version: Version) -> Result<Self, Error> {
+        if version.0 == 0 {
+            return Err(invalid_request(
+                "storage version zero is reserved for an uninitialized database",
+            ));
+        }
+        if value.0.len() > MAX_STORED_PAYLOAD_BYTES {
+            return Err(invalid_request(
+                "storage value exceeds the physical record size limit",
+            ));
+        }
+
+        Ok(Self {
+            storage_version: version.0,
+            payload: value.0,
+        })
     }
 
-    let record = StoredRecord {
-        storage_version: version.0,
-        payload: value.0.clone(),
-    };
-    let body = bincode::encode_to_vec(record, record_config())
-        .map_err(|error| other(format!("failed to encode the storage value frame: {error}")))?;
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, Error> {
+        let body = bincode::encode_to_vec(self, record_config())
+            .map_err(|error| other(format!("failed to encode the storage value frame: {error}")))?;
 
-    let mut frame = Vec::with_capacity(FRAME_PREFIX_LEN + body.len());
-    frame.extend_from_slice(VALUE_MAGIC);
-    frame.extend_from_slice(&body);
-    Ok(frame)
+        let mut frame = Vec::with_capacity(FRAME_PREFIX_LEN + body.len());
+        frame.extend_from_slice(VALUE_MAGIC);
+        frame.extend_from_slice(&body);
+        Ok(frame)
+    }
 }
 
 impl TryFrom<&[u8]> for StoredRecord {
@@ -136,23 +142,27 @@ impl From<StoredRecord> for StoredValue {
     }
 }
 
-pub(crate) fn encode_global_version(version: Version) -> Result<Vec<u8>, Error> {
-    if version.0 == 0 {
-        return Err(invalid_request(
-            "persisted global version zero is not a valid commit version",
-        ));
+impl GlobalVersion {
+    pub(crate) fn new(version: Version) -> Result<Self, Error> {
+        if version.0 == 0 {
+            return Err(invalid_request(
+                "persisted global version zero is not a valid commit version",
+            ));
+        }
+        Ok(Self { version: version.0 })
     }
 
-    let body = bincode::encode_to_vec(GlobalVersion { version: version.0 }, record_config())
-        .map_err(|error| {
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, Error> {
+        let body = bincode::encode_to_vec(self, record_config()).map_err(|error| {
             other(format!(
                 "failed to encode the global version frame: {error}"
             ))
         })?;
-    let mut frame = Vec::with_capacity(FRAME_PREFIX_LEN + body.len());
-    frame.extend_from_slice(GLOBAL_VERSION_MAGIC);
-    frame.extend_from_slice(&body);
-    Ok(frame)
+        let mut frame = Vec::with_capacity(FRAME_PREFIX_LEN + body.len());
+        frame.extend_from_slice(GLOBAL_VERSION_MAGIC);
+        frame.extend_from_slice(&body);
+        Ok(frame)
+    }
 }
 
 impl TryFrom<&[u8]> for GlobalVersion {
@@ -290,12 +300,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn record_construction_rejects_reserved_zero_version() {
+        let value_error = StoredRecord::new(Value(Vec::new()), Version(0))
+            .expect_err("zero cannot identify a committed value");
+        assert_eq!(value_error.kind, ErrorKind::InvalidRequest);
+        assert_eq!(
+            value_error.message,
+            "storage version zero is reserved for an uninitialized database"
+        );
+
+        let version_error = GlobalVersion::new(Version(0))
+            .expect_err("zero cannot identify a persisted global version");
+        assert_eq!(version_error.kind, ErrorKind::InvalidRequest);
+        assert_eq!(
+            version_error.message,
+            "persisted global version zero is not a valid commit version"
+        );
+    }
+
+    #[test]
+    fn empty_value_at_maximum_version_preserves_exact_frames() -> Result<(), Error> {
+        let value_frame = b"W3KV\xff\xff\xff\xff\xff\xff\xff\xff\0\0\0\0\0\0\0\0";
+        let version_frame = b"W3GV\xff\xff\xff\xff\xff\xff\xff\xff";
+        let version = Version(u64::MAX);
+        assert_eq!(
+            StoredRecord::new(Value(Vec::new()), version)?.encode()?,
+            value_frame
+        );
+        assert_eq!(GlobalVersion::new(version)?.encode()?, version_frame);
+        assert_eq!(
+            StoredValue::from(StoredRecord::try_from(value_frame.as_slice())?),
+            StoredValue {
+                value: Value(Vec::new()),
+                version,
+            }
+        );
+        assert_eq!(
+            Version::from(GlobalVersion::try_from(version_frame.as_slice())?),
+            version
+        );
+        Ok(())
+    }
+
+    #[test]
     fn persisted_frames_keep_their_exact_bytes() -> Result<(), Error> {
         let value_frame = b"W3KV\0\0\0\0\0\0\0\x2a\0\0\0\0\0\0\0\x03\0\x01\xff";
         let version_frame = b"W3GV\0\0\0\0\0\0\0\x2a";
         let value = Value(vec![0, 1, 255]);
 
-        assert_eq!(encode_stored_value(&value, Version(42))?, value_frame);
+        assert_eq!(
+            StoredRecord::new(value.clone(), Version(42))?.encode()?,
+            value_frame
+        );
         assert_eq!(
             StoredValue::from(StoredRecord::try_from(value_frame.as_slice())?),
             StoredValue {
@@ -303,7 +359,7 @@ mod tests {
                 version: Version(42)
             }
         );
-        assert_eq!(encode_global_version(Version(42))?, version_frame);
+        assert_eq!(GlobalVersion::new(Version(42))?.encode()?, version_frame);
         assert_eq!(
             Version::from(GlobalVersion::try_from(version_frame.as_slice())?),
             Version(42)
@@ -390,10 +446,26 @@ mod tests {
     }
 
     #[test]
+    fn physical_key_encoding_preserves_namespace_boundaries_and_binary_keys() -> Result<(), Error> {
+        for (namespace, key, expected) in [
+            ("", b"\0\xff".as_slice(), b"\0\0\0\0\0\xff".as_slice()),
+            ("a", b"bc".as_slice(), b"\0\0\0\x01abc".as_slice()),
+            ("ab", b"c".as_slice(), b"\0\0\0\x02abc".as_slice()),
+            ("é", b"".as_slice(), b"\0\0\0\x02\xc3\xa9".as_slice()),
+        ] {
+            let namespace = Namespace(namespace.to_owned());
+            let key = Key(key.to_vec());
+            assert_eq!(encode_physical_key(&namespace, &key)?, expected);
+            assert_eq!(decode_physical_key(expected, &namespace)?, key);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn stored_value_round_trips() -> Result<(), Error> {
         let value = Value(vec![0, 1, 2, 3, 255]);
 
-        let encoded = encode_stored_value(&value, Version(42))?;
+        let encoded = StoredRecord::new(value.clone(), Version(42))?.encode()?;
 
         assert_eq!(
             StoredValue::from(StoredRecord::try_from(encoded.as_slice())?),
@@ -407,7 +479,7 @@ mod tests {
 
     #[test]
     fn malformed_value_length_is_rejected() -> Result<(), Error> {
-        let mut encoded = encode_stored_value(&Value(vec![1, 2, 3]), Version(1))?;
+        let mut encoded = StoredRecord::new(Value(vec![1, 2, 3]), Version(1))?.encode()?;
         encoded.push(4);
 
         let error = StoredRecord::try_from(encoded.as_slice())
@@ -423,7 +495,7 @@ mod tests {
 
     #[test]
     fn invalid_value_magic_is_rejected() -> Result<(), Error> {
-        let mut encoded = encode_stored_value(&Value(vec![1]), Version(1))?;
+        let mut encoded = StoredRecord::new(Value(vec![1]), Version(1))?.encode()?;
         encoded[0] ^= 0xff;
 
         let error = StoredRecord::try_from(encoded.as_slice())
@@ -443,7 +515,7 @@ mod tests {
 
     #[test]
     fn global_version_round_trips() -> Result<(), Error> {
-        let encoded = encode_global_version(Version(7))?;
+        let encoded = GlobalVersion::new(Version(7))?.encode()?;
         assert_eq!(
             Version::from(GlobalVersion::try_from(encoded.as_slice())?),
             Version(7)

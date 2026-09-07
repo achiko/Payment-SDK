@@ -1,6 +1,4 @@
-use redb::{
-    CommitError, DatabaseError, SetDurabilityError, StorageError, TableError, TransactionError,
-};
+use redb::{CommitError, DatabaseError, StorageError, TableError, TransactionError};
 use storage::{Error, ErrorKind};
 
 // design-lint: allow unclassified-free-function -- redb database-open error translation between foreign types keeps backend-specific corruption and availability policy in this adapter
@@ -49,10 +47,6 @@ pub(super) fn table_error(error: TableError, context: &str) -> Error {
 
 pub(super) fn operation_error(error: StorageError, context: &str) -> Error {
     storage_error(error, context)
-}
-
-pub(super) fn durability_error(error: SetDurabilityError, context: &str) -> Error {
-    other(format!("{context}: {error}"))
 }
 
 // design-lint: allow unclassified-free-function -- shared redb commit-error adapter between foreign types preserves unknown persistence outcomes for format and batch commits

@@ -57,10 +57,6 @@ impl Drop for RunningGuard<'_> {
     }
 }
 
-pub(super) fn earliest_position(filters: &[AddressFilter]) -> Option<BlockPosition> {
-    filters.iter().map(|filter| filter.start_position).min()
-}
-
 /// Synchronizes caller-selected addresses without owning their lifecycle.
 pub(crate) struct Synchronizer<S, I, R> {
     source: S,
@@ -133,7 +129,7 @@ where
         }
         let mut applied = 0_usize;
         if checkpoint.is_none() {
-            let birthday = earliest_position(plan.filters());
+            let birthday = plan.earliest_position();
             if birthday.is_none_or(|position| position > observed_tip.position) {
                 let anchor = self
                     .one_block(observed_tip.position, observed_tip.position)

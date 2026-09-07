@@ -5,10 +5,7 @@ use indexing::SourceError;
 
 use crate::{TransactionId, Wei};
 
-use super::{
-    BASIS_POINTS_DENOMINATOR,
-    transport::{Error, Failure},
-};
+use super::transport::{Error, Failure};
 
 pub(crate) enum CallError {
     Local(SourceError),
@@ -127,23 +124,6 @@ pub(super) fn parse_transaction_id(
     parse_fixed_data::<32>(value, "transaction hash")
         .map(TransactionId)
         .map_err(|message| invalid_rpc_response(method, message))
-}
-
-pub(super) fn gas_limit_with_margin(
-    estimated: u64,
-    margin_basis_points: u32,
-) -> Result<u64, SourceError> {
-    let numerator = u128::from(estimated)
-        .checked_mul(u128::from(margin_basis_points))
-        .ok_or_else(|| invalid_rpc_response("eth_estimateGas", "gas margin overflowed"))?;
-    let margin = numerator
-        .checked_add(u128::from(BASIS_POINTS_DENOMINATOR - 1))
-        .map(|value| value / u128::from(BASIS_POINTS_DENOMINATOR))
-        .and_then(|value| u64::try_from(value).ok())
-        .ok_or_else(|| invalid_rpc_response("eth_estimateGas", "gas margin exceeds u64"))?;
-    estimated
-        .checked_add(margin)
-        .ok_or_else(|| invalid_rpc_response("eth_estimateGas", "gas limit with margin exceeds u64"))
 }
 
 pub(super) fn wei_quantity(value: &Wei) -> String {

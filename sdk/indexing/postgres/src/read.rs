@@ -395,6 +395,7 @@ impl indexing::Outputs for Repository {
     }
 }
 
+// design-lint: allow unclassified-free-function -- private PostgreSQL output cursor encoder pairs transaction and index bytes for decode_position without exposing backend framing on the opaque indexing cursor
 /// An output cursor is the output's identity, not a rendering of it: the page
 /// query compares it as a row value so the index can supply the order.
 fn encode_position(transaction: &str, index: u32) -> Vec<u8> {

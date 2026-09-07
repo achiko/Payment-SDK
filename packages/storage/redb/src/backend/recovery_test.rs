@@ -5,7 +5,7 @@ use redb::{Durability, TableDefinition};
 use storage::{ErrorKind, Operation, Version};
 use tempfile::TempDir;
 
-use crate::codec::{encode_global_version, encode_physical_key, encode_stored_value};
+use crate::codec::{GlobalVersion, StoredRecord, encode_physical_key};
 
 const CRASH_CHILD_PATH_ENV: &str = "STORAGE_REDB_CRASH_CHILD_PATH";
 
@@ -107,12 +107,12 @@ async fn populated_database_without_format_marker_is_rejected() -> Result<(), Er
                 .open_table(META_TABLE)
                 .map_err(|error| other(format!("test metadata table failed: {error}")))?;
             let physical_key = encode_physical_key(&records, &primary)?;
-            let stored = encode_stored_value(&value("stored-value"), Version(1))?;
+            let stored = StoredRecord::new(value("stored-value"), Version(1))?.encode()?;
             drop(
                 data.insert(physical_key.as_slice(), stored.as_slice())
                     .map_err(|error| other(format!("test data write failed: {error}")))?,
             );
-            let version = encode_global_version(Version(1))?;
+            let version = GlobalVersion::new(Version(1))?.encode()?;
             drop(
                 meta.insert(GLOBAL_VERSION_KEY, version.as_slice())
                     .map_err(|error| other(format!("test metadata write failed: {error}")))?,
@@ -153,7 +153,7 @@ fn populated_database_without_global_version_is_rejected() -> Result<(), Error> 
                 .open_table(META_TABLE)
                 .map_err(|error| other(format!("test metadata table failed: {error}")))?;
             let physical_key = encode_physical_key(&records, &primary)?;
-            let stored = encode_stored_value(&value("stored-value"), Version(1))?;
+            let stored = StoredRecord::new(value("stored-value"), Version(1))?.encode()?;
             drop(
                 data.insert(physical_key.as_slice(), stored.as_slice())
                     .map_err(|error| other(format!("test data write failed: {error}")))?,
@@ -321,7 +321,7 @@ async fn malformed_persisted_frame_is_reported_as_corruption() -> Result<(), Err
                 data.insert(physical_key.as_slice(), b"invalid".as_slice())
                     .map_err(|error| other(format!("test malformed write failed: {error}")))?,
             );
-            let version = encode_global_version(Version(1))?;
+            let version = GlobalVersion::new(Version(1))?.encode()?;
             drop(
                 meta.insert(GLOBAL_VERSION_KEY, version.as_slice())
                     .map_err(|error| other(format!("test metadata write failed: {error}")))?,

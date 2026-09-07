@@ -4,8 +4,8 @@ use storage::Error;
 use crate::format::{DATABASE_FORMAT, validate_database_format};
 
 use super::{
-    Backend, DATA_TABLE, DATABASE_FORMAT_KEY, META_TABLE, commit_error, durability_error,
-    table_error, transaction_error,
+    Backend, DATA_TABLE, DATABASE_FORMAT_KEY, META_TABLE, commit_error, other, table_error,
+    transaction_error,
 };
 
 impl Backend {
@@ -16,7 +16,7 @@ impl Backend {
             .map_err(|error| transaction_error(error, "failed to initialize redb format"))?;
         transaction
             .set_durability(Durability::Immediate)
-            .map_err(|error| durability_error(error, "failed to configure redb initialization"))?;
+            .map_err(|error| other(format!("failed to configure redb initialization: {error}")))?;
         {
             let _data = transaction
                 .open_table(DATA_TABLE)

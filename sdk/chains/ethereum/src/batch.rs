@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use base::Address as BaseAddress;
 use wallets::{Error, ErrorKind, MAX_TRANSFERS, SendError, SendFuture, Sender, Transfer};
 
 use crate::transaction::{Preparation, PreparationError};
@@ -21,9 +20,11 @@ impl Batch {
     }
 
     fn preparation<'a>(&self, transfer: &'a Transfer) -> Result<Preparation<'a>, Error> {
-        let from = ethereum_address(&transfer.wallet.address())?;
+        let from = Address::try_from(&transfer.wallet.address())
+            .map_err(|error| Error::new(ErrorKind::InvalidAddress, error.to_string()))?;
         let destination = transfer.wallet.parse_address(&transfer.to)?;
-        let destination = ethereum_address(&destination)?;
+        let destination = Address::try_from(&destination)
+            .map_err(|error| Error::new(ErrorKind::InvalidAddress, error.to_string()))?;
         let request = self
             .config
             .transfer_request(from, destination, &transfer.amount)
@@ -76,16 +77,6 @@ impl Sender for Batch {
             }
         })
     }
-}
-
-fn ethereum_address(address: &BaseAddress) -> Result<Address, Error> {
-    let bytes: [u8; 20] = address.as_bytes().try_into().map_err(|_| {
-        Error::new(
-            ErrorKind::InvalidAddress,
-            "Ethereum address must contain exactly 20 bytes",
-        )
-    })?;
-    Ok(Address(bytes))
 }
 
 fn preparation_failure(error: PreparationError) -> SendError {
@@ -346,14 +337,6 @@ mod tests {
             failure.source.message,
             "provider claimed transaction provider-candidate"
         );
-    }
-
-    #[test]
-    fn rejects_non_ethereum_source_addresses_before_preparation() {
-        let error = ethereum_address(&BaseAddress::new(vec![0_u8; 19]))
-            .expect_err("a non-Ethereum address must fail before RPC");
-
-        assert_eq!(error.kind, ErrorKind::InvalidAddress);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use bitcoin::{EcdsaSighashType, ScriptBuf, TapSighashType};
+use bitcoin::{ScriptBuf, TapSighashType};
 
 use crate::{ChainError, Network, Output, SighashType, SpendSource};
 
@@ -39,22 +39,6 @@ pub(super) fn sum_utxos(utxos: &[SpendSource]) -> Result<u64, ChainError> {
             .checked_add(utxo.value.0)
             .ok_or_else(|| invalid_transaction("Bitcoin selected input amount overflowed u64"))
     })
-}
-
-pub(super) fn ecdsa_sighash_type(
-    sighash_type: SighashType,
-) -> Result<EcdsaSighashType, ChainError> {
-    match sighash_type {
-        SighashType::All => Ok(EcdsaSighashType::All),
-        SighashType::None => Ok(EcdsaSighashType::None),
-        SighashType::Single => Ok(EcdsaSighashType::Single),
-        SighashType::AllAnyoneCanPay => Ok(EcdsaSighashType::AllPlusAnyoneCanPay),
-        SighashType::NoneAnyoneCanPay => Ok(EcdsaSighashType::NonePlusAnyoneCanPay),
-        SighashType::SingleAnyoneCanPay => Ok(EcdsaSighashType::SinglePlusAnyoneCanPay),
-        SighashType::TaprootDefault => Err(invalid_transaction(
-            "Taproot default sighash cannot sign a P2WPKH input",
-        )),
-    }
 }
 
 pub(super) fn taproot_sighash_type(

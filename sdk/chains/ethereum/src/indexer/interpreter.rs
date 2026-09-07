@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, sync::LazyLock};
 
-use alloy_primitives::U256;
+use alloy_primitives::{U256, hex};
 use base::Decimal;
 use indexing::{
     AssetId, BlockInterpreter as IndexBlockInterpreter, CanonicalAddress, ChainId, IndexError,
@@ -11,7 +11,7 @@ use num_bigint::BigUint;
 
 use super::{
     Block,
-    model::{ParsedBlock, ParsedLog, ParsedReceipt, ParsedTransaction, encode_hex},
+    model::{ParsedBlock, ParsedLog, ParsedReceipt, ParsedTransaction},
 };
 
 const TRANSFER_TOPIC: [u8; 32] = [
@@ -37,7 +37,7 @@ impl Movements {
         receipt: &ParsedReceipt,
         scope: &IndexScope,
     ) -> Result<Self, IndexError> {
-        let transaction_id = encode_hex(&transaction.hash);
+        let transaction_id = hex::encode_prefixed(transaction.hash);
         let mut movements = Self::new();
         if !transaction.value.is_zero() {
             let to = transaction.to.or(receipt.contract_address).ok_or_else(|| {
@@ -88,7 +88,7 @@ impl ParsedLog {
         let id = MovementId(format!("{transaction_id}:{}", self.log_index));
         let asset = AssetId {
             chain: (*CHAIN_ID).clone(),
-            asset: encode_hex(&self.address),
+            asset: hex::encode_prefixed(self.address),
         };
         if from == ZERO_ADDRESS {
             (to != ZERO_ADDRESS).then(|| ValueMovement::Mint {
@@ -289,7 +289,7 @@ impl Canonicalize for [u8; 20] {
     fn canonical(self, scope: &IndexScope) -> Self::Output {
         CanonicalAddress {
             scope: scope.clone(),
-            value: encode_hex(&self),
+            value: hex::encode_prefixed(self),
         }
     }
 }
@@ -300,7 +300,7 @@ impl Canonicalize for [u8; 32] {
     fn canonical(self, scope: &IndexScope) -> Self::Output {
         TransactionRef {
             scope: scope.clone(),
-            value: encode_hex(&self),
+            value: hex::encode_prefixed(self),
         }
     }
 }

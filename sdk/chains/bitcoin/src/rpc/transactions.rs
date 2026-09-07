@@ -9,7 +9,7 @@ use super::{
     Client, Preflight,
     error::{map_json_rpc_error, source_error},
     transport::Client as Transport,
-    wire::{fee_rate_json, parse_btc_amount, required_bool, required_string},
+    wire::{parse_btc_amount, required_bool, required_string},
 };
 
 impl<C> Client<C>
@@ -21,7 +21,7 @@ where
         transaction: &SignedTransaction,
         max_fee_rate: FeeRate,
     ) -> Result<Preflight, SourceError> {
-        let max_fee_rate = fee_rate_json(max_fee_rate)?;
+        let max_fee_rate = max_fee_rate.core_maximum_json()?;
         let raw = self
             .request_result(
                 "testmempoolaccept",
@@ -79,7 +79,8 @@ where
         max_fee_rate: FeeRate,
     ) -> Result<TransactionId, TransactionError> {
         let expected_id = transaction.id();
-        let max_fee_rate = fee_rate_json(max_fee_rate)
+        let max_fee_rate = max_fee_rate
+            .core_maximum_json()
             .map_err(|error| transaction_error(TransactionErrorKind::Fee, error))?;
         let raw = match self
             .request_result_detailed_once(

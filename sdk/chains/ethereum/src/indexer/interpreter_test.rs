@@ -97,7 +97,7 @@ fn log(index: u64, from: &str, to: &str, data: &str) -> Value {
     json!({
         "address": TOKEN,
         "topics": [
-            encode_hex(&TRANSFER_TOPIC),
+            hex::encode_prefixed(TRANSFER_TOPIC),
             topic_address(from),
             topic_address(to)
         ],
@@ -317,7 +317,7 @@ fn interprets_transfer_mint_and_burn_logs() {
 #[test]
 fn ignores_structurally_malformed_transfer_log() {
     let mut malformed = log(0, FROM, TO, &format!("0x{:064x}", 1));
-    malformed["topics"] = json!([encode_hex(&TRANSFER_TOPIC)]);
+    malformed["topics"] = json!([hex::encode_prefixed(TRANSFER_TOPIC)]);
     let block = ethereum_block(
         transaction(Some(TO), "0x0"),
         receipt(true, Some(TO), None, "0x1", vec![malformed]),
@@ -358,5 +358,23 @@ fn raw_block_reference_is_stable() {
             }),
             timestamp: Some(100),
         }
+    );
+}
+
+#[test]
+fn canonical_identities_preserve_scope_leading_zeroes_and_lowercase_hex() {
+    let scope = scope();
+    let mut address = [0; 20];
+    address[18..].copy_from_slice(&[0xab, 0xff]);
+    let canonical = address.canonical(&scope);
+    assert_eq!(canonical.scope, scope);
+    assert_eq!(canonical.value, format!("0x{}abff", "00".repeat(18)));
+
+    let hash: [u8; 32] = std::array::from_fn(|index| index as u8);
+    let transaction = hash.canonical(&scope);
+    assert_eq!(transaction.scope, scope);
+    assert_eq!(
+        transaction.value,
+        "0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
     );
 }

@@ -315,3 +315,35 @@ fn write_json_response(stream: &mut std::net::TcpStream, response: &Value) -> st
     )?;
     stream.write_all(&body)
 }
+
+#[test]
+fn remote_failure_conversion_preserves_code_and_message() {
+    use jsonrpsee::types::ErrorObjectOwned;
+
+    for code in [i32::MIN, -32_000, 0, i32::MAX] {
+        let native =
+            ErrorObjectOwned::owned(code, "remote \"message\"\nwith unicode: λ", None::<()>);
+        let failure = crate::Failure::from(native);
+        assert_eq!(failure.code, i64::from(code));
+        assert_eq!(failure.message, "remote \"message\"\nwith unicode: λ");
+        assert_eq!(failure.data, None);
+    }
+}
+
+#[test]
+fn remote_failure_conversion_preserves_explicit_null_and_raw_data_bytes() {
+    use jsonrpsee::types::ErrorObjectOwned;
+    use serde_json::value::RawValue;
+
+    for raw in [
+        "null",
+        r#"{ "amount": 1.2300, "large": 18446744073709551616, "tag": "\u0061", "items": [true, null] }"#,
+        r#"[ 1, "two", false ]"#,
+        r#""remote data""#,
+    ] {
+        let data = RawValue::from_string(raw.to_owned()).unwrap();
+        let native = ErrorObjectOwned::owned(-32_001, "retained error data", Some(data));
+        let failure = crate::Failure::from(native);
+        assert_eq!(failure.data.unwrap().as_bytes(), raw.as_bytes());
+    }
+}

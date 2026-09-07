@@ -106,6 +106,7 @@ pub fn parse_bitcoin_block_hash(value: &str) -> Result<BlockHash, SourceError> {
         .map_err(|_| source_error("Bitcoin RPC returned an invalid block hash", true))
 }
 
+// design-lint: allow unclassified-free-function -- public Bitcoin wire adapter validates a foreign neutral BlockHash and delegates reversed display order to the native hash type; neither foreign type is an owned receiver
 pub fn format_bitcoin_block_hash(hash: &BlockHash) -> Result<String, SourceError> {
     let bytes: [u8; 32] = hash
         .0
@@ -207,29 +208,31 @@ pub(super) fn parse_btc_amount(value: &Value, context: &'static str) -> Result<u
         .ok_or_else(|| source_error(format!("{context} exceeds u64 satoshis"), true))
 }
 
-pub(super) fn fee_rate_json(fee_rate: FeeRate) -> Result<Number, SourceError> {
-    let satoshis = fee_rate.satoshis_per_kvb();
-    if satoshis == 0 {
-        return Err(source_error(
-            "Bitcoin maximum fee rate must be greater than zero",
-            false,
-        ));
+impl FeeRate {
+    pub(super) fn core_maximum_json(self) -> Result<Number, SourceError> {
+        let satoshis = self.satoshis_per_kvb();
+        if satoshis == 0 {
+            return Err(source_error(
+                "Bitcoin maximum fee rate must be greater than zero",
+                false,
+            ));
+        }
+        if satoshis > BITCOIN_CORE_MAX_FEE_RATE_SATOSHIS_PER_KVB {
+            return Err(source_error(
+                "Bitcoin maximum fee rate exceeds Bitcoin Core's 1 BTC/kvB limit",
+                false,
+            ));
+        }
+        let whole = satoshis / SATOSHIS_PER_BITCOIN;
+        let remainder = satoshis % SATOSHIS_PER_BITCOIN;
+        let lexical = if remainder == 0 {
+            whole.to_string()
+        } else {
+            format!("{whole}.{remainder:08}")
+                .trim_end_matches('0')
+                .to_owned()
+        };
+        Number::from_str(&lexical)
+            .map_err(|_| source_error("Bitcoin maximum fee rate could not be encoded", false))
     }
-    if satoshis > BITCOIN_CORE_MAX_FEE_RATE_SATOSHIS_PER_KVB {
-        return Err(source_error(
-            "Bitcoin maximum fee rate exceeds Bitcoin Core's 1 BTC/kvB limit",
-            false,
-        ));
-    }
-    let whole = satoshis / SATOSHIS_PER_BITCOIN;
-    let remainder = satoshis % SATOSHIS_PER_BITCOIN;
-    let lexical = if remainder == 0 {
-        whole.to_string()
-    } else {
-        format!("{whole}.{remainder:08}")
-            .trim_end_matches('0')
-            .to_owned()
-    };
-    Number::from_str(&lexical)
-        .map_err(|_| source_error("Bitcoin maximum fee rate could not be encoded", false))
 }

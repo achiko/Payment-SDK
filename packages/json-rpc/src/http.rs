@@ -168,7 +168,7 @@ impl Client for Http {
                         .await
                     {
                         Ok(value) => return Ok(Ok(RawJson(value.get().as_bytes().to_vec()))),
-                        Err(RpcError::Call(error)) => return Ok(Err(failure(error))),
+                        Err(RpcError::Call(error)) => return Ok(Err(Failure::from(error))),
                         Err(source) => {
                             let error = map_error(source);
                             if !error.is_retryable() {
@@ -200,7 +200,7 @@ impl Client for Http {
             })?;
             match client.request::<Box<RawValue>, _>(method, params).await {
                 Ok(value) => Ok(Ok(RawJson(value.get().as_bytes().to_vec()))),
-                Err(RpcError::Call(error)) => Ok(Err(failure(error))),
+                Err(RpcError::Call(error)) => Ok(Err(Failure::from(error))),
                 Err(source) => Err(map_error(source)),
             }
         })
@@ -241,7 +241,7 @@ impl Client for Http {
                                 .into_iter()
                                 .map(|entry| match entry {
                                     Ok(value) => Ok(RawJson(value.get().as_bytes().to_vec())),
-                                    Err(error) => Err(failure(error.into_owned())),
+                                    Err(error) => Err(Failure::from(error.into_owned())),
                                 })
                                 .collect());
                         }
@@ -294,13 +294,15 @@ impl ToRpcParams for Params {
     }
 }
 
-fn failure(error: ErrorObjectOwned) -> Failure {
-    Failure {
-        code: error.code() as i64,
-        message: error.message().to_owned(),
-        data: error
-            .data()
-            .map(|data| RawJson(data.get().as_bytes().to_vec())),
+impl From<ErrorObjectOwned> for Failure {
+    fn from(error: ErrorObjectOwned) -> Self {
+        Self {
+            code: error.code() as i64,
+            message: error.message().to_owned(),
+            data: error
+                .data()
+                .map(|data| RawJson(data.get().as_bytes().to_vec())),
+        }
     }
 }
 

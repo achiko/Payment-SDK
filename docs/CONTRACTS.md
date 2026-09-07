@@ -144,6 +144,12 @@ capability.
 address boundary decodes exactly 32 bytes and requires canonical plain-Base58
 round trips; Bitcoin encodings keep their existing network and checksum rules.
 
+`chain_ethereum::Address::try_from(&base_address)` converts a borrowed
+`base::Address` into the native 20-byte representation. It preserves the bytes
+and returns `AddressParseError::InvalidLength` for any other width. The generic
+address carries bytes only; chain and network compatibility remain with the
+wallet/provider composition described above.
+
 `chain_solana::SOL` is the canonical native asset metadata: name `Solana`,
 ticker `SOL`, and nine decimal places. `chain_solana::AssetKind` currently
 contains only `Native`; `chain_solana::WalletConfig` binds that kind to one
@@ -583,6 +589,14 @@ scopes and `payment_wallets` unchanged. Solana system evidence must additionally
 prove singular endpoint configuration and redaction, genesis/Memo probes,
 tracked registration before dispatch, shutdown races and indefinite ambiguity,
 the pinned/checksummed owned validator, and the explicit `solana_stack` target.
+
+## JSON-RPC failures
+
+`json_rpc::Failure::from(jsonrpsee::types::ErrorObjectOwned)` preserves the
+remote error code, message, and optional raw JSON data. Absent data remains
+absent; present data retains its exact bytes, including explicit `null`.
+This representation conversion does not classify retryability or change
+single-request and batch execution policy.
 
 ## HTTP contract
 

@@ -1,16 +1,13 @@
+//! Stable storage representation for an exact monetary value.
+//!
+//! Record owners write canonical base-10 text through Decimal's Display.
+//! This representation is independent of the in-memory big-integer
+//! implementation; the surrounding private record identifies it on disk.
+
 use std::str::FromStr;
 
 use base::Decimal;
 use indexing::IndexError;
-
-/// Stable storage representation for an exact monetary value.
-///
-/// Canonical base-10 text is independent of the in-memory big-integer
-/// implementation. The surrounding private repository record identifies this
-/// representation on disk.
-pub(super) fn encode(value: &Decimal) -> String {
-    value.to_string()
-}
 
 // design-lint: allow unclassified-free-function -- shared redb monetary text codec validates canonical nonnegative Decimal values across fee, movement and output records while keeping stored-data errors in the adapter
 pub(super) fn decode(encoded: &str) -> Result<Decimal, IndexError> {
@@ -39,7 +36,10 @@ mod tests {
             Decimal::from_str("1234567890123456789012345678901234567890.000000000000000001")
                 .expect("test decimal must parse");
 
-        assert_eq!(decode(&encode(&value)).expect("amount must decode"), value);
+        assert_eq!(
+            decode(&value.to_string()).expect("amount must decode"),
+            value
+        );
     }
 
     #[test]

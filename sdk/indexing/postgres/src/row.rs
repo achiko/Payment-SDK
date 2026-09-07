@@ -99,6 +99,7 @@ pub(crate) fn output(scope: &IndexScope, row: &Row) -> Result<IndexedOutput, Ind
     })
 }
 
+// design-lint: allow unclassified-free-function -- generic PostgreSQL column extraction maps foreign Row and FromSql errors to nonretryable Store errors shared by block and output projections
 fn get<'a, T: tokio_postgres::types::FromSql<'a>>(
     row: &'a Row,
     column: &str,

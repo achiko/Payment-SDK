@@ -184,16 +184,9 @@ impl base::Signer for Wallet {
 
 impl AddressFormat for Wallet {
     fn address_text(&self, address: &BaseAddress) -> Result<AddressText, WalletError> {
-        let bytes: [u8; 20] = address.as_bytes().try_into().map_err(|_| {
-            WalletError::new(
-                WalletErrorKind::InvalidAddress,
-                "Ethereum address must contain exactly 20 bytes",
-            )
-        })?;
-        Ok(AddressText::new(
-            AddressEncoding::Hex,
-            Address(bytes).to_string(),
-        ))
+        let address = Address::try_from(address)
+            .map_err(|error| wallet_error(WalletErrorKind::InvalidAddress, error))?;
+        Ok(AddressText::new(AddressEncoding::Hex, address.to_string()))
     }
 
     fn parse_address(&self, address: &AddressText) -> Result<BaseAddress, WalletError> {
@@ -535,6 +528,22 @@ mod tests {
             coordinator,
             history,
         )
+    }
+
+    #[test]
+    fn address_format_preserves_invalid_width_error_classification() {
+        let wallet = block_on(provider().create(SecretBytes::new([1_u8; 32])))
+            .expect("fixed valid secret must create a wallet");
+        for length in [0, 19, 21, 32] {
+            let error = wallet
+                .address_text(&BaseAddress::new(vec![0; length]))
+                .expect_err("malformed address width must fail at the wallet boundary");
+            assert_eq!(error.kind, WalletErrorKind::InvalidAddress);
+            assert_eq!(
+                error.message,
+                "Ethereum address must contain exactly 20 bytes"
+            );
+        }
     }
 
     #[test]

@@ -15,8 +15,8 @@ use bitcoin::{
 use crate::{ChainError, Network};
 
 use super::{
-    Input, SighashType, SignedTransaction, TransactionId, UnsignedTransaction, ecdsa_sighash_type,
-    invalid_transaction, native_network, signer_error, signer_error_message, taproot_sighash_type,
+    Input, SighashType, SignedTransaction, TransactionId, UnsignedTransaction, invalid_transaction,
+    native_network, signer_error, signer_error_message, taproot_sighash_type,
 };
 
 struct InputSigner<'a, S: ?Sized> {
@@ -129,7 +129,7 @@ impl<S: Signer + ?Sized> InputSigner<'_, S> {
         input: &Input,
     ) -> Result<Witness, ChainError> {
         let script = &self.prevouts[input_index].script_pubkey;
-        let sighash_type = ecdsa_sighash_type(self.sighash_type)?;
+        let sighash_type = self.sighash_type.ecdsa()?;
         let sighash = SighashCache::new(self.transaction)
             .p2wpkh_signature_hash(
                 input_index,

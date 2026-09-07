@@ -15,8 +15,6 @@ pub use transactions::{HttpAccounts, HttpTransactions, TransactionClient, Transa
 
 use blocks::Methods;
 
-const BASIS_POINTS_DENOMINATOR: u64 = 10_000;
-
 impl HttpConfig {
     /// Builds focused account and transaction adapters over shared endpoints.
     pub fn connect(self) -> Result<(HttpAccounts, HttpTransactions), BuildError> {

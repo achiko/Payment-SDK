@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use alloy_primitives::hex;
 use indexing::{
     BlockHash, BlockHeight, BlockPosition, BlockRef, BlockSource, BoxFuture, IndexScope,
     SourceError,
@@ -11,7 +12,7 @@ use crate::rpc::client::{CallError, Client};
 
 use super::{
     Block,
-    model::{ParsedBlock, ParsedReceipt, encode_hex, parse_quantity},
+    model::{ParsedBlock, ParsedReceipt, parse_quantity},
 };
 
 const RECEIPTS_UNKNOWN: u8 = 0;
@@ -177,7 +178,7 @@ where
         &self,
         block: &super::model::ParsedBlock,
     ) -> Result<Vec<Vec<u8>>, CallFailure> {
-        let hash = encode_hex(&block.reference.hash.0);
+        let hash = hex::encode_prefixed(&block.reference.hash.0);
         let raw = self
             .request_result_detailed("eth_getBlockReceipts", serde_json::json!([hash]))
             .await?;
@@ -197,7 +198,7 @@ where
     ) -> Result<Vec<Vec<u8>>, SourceError> {
         let mut requests = Vec::with_capacity(block.transactions.len());
         for transaction in &block.transactions {
-            let hash = encode_hex(&transaction.hash);
+            let hash = hex::encode_prefixed(transaction.hash);
             requests.push(("eth_getTransactionReceipt", serde_json::json!([hash])));
         }
         self.client

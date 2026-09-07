@@ -3,13 +3,11 @@ use storage::{
     CommitResult, Condition, Error, ErrorKind, Operation, StoredValue, Version, WriteBatch,
 };
 
-use crate::codec::{
-    GlobalVersion, StoredRecord, encode_global_version, encode_physical_key, encode_stored_value,
-};
+use crate::codec::{GlobalVersion, StoredRecord, encode_physical_key};
 
 use super::{
-    Backend, DATA_TABLE, GLOBAL_VERSION_KEY, META_TABLE, commit_error, durability_error,
-    operation_error, other, table_error, transaction_error,
+    Backend, DATA_TABLE, GLOBAL_VERSION_KEY, META_TABLE, commit_error, operation_error, other,
+    table_error, transaction_error,
 };
 
 impl Backend {
@@ -39,7 +37,7 @@ impl Backend {
             .map_err(|error| transaction_error(error, "failed to begin redb write transaction"))?;
         transaction
             .set_durability(Durability::Immediate)
-            .map_err(|error| durability_error(error, "failed to configure redb commit"))?;
+            .map_err(|error| other(format!("failed to configure redb commit: {error}")))?;
 
         let next_version;
         {
@@ -76,7 +74,7 @@ impl Backend {
                         value,
                     } => {
                         let physical_key = encode_physical_key(&namespace, &key)?;
-                        let frame = encode_stored_value(&value, next_version)?;
+                        let frame = StoredRecord::new(value, next_version)?.encode()?;
                         drop(
                             data.insert(physical_key.as_slice(), frame.as_slice())
                                 .map_err(|error| {
@@ -92,7 +90,7 @@ impl Backend {
                     }
                 }
             }
-            let encoded_version = encode_global_version(next_version)?;
+            let encoded_version = GlobalVersion::new(next_version)?.encode()?;
             drop(
                 meta.insert(GLOBAL_VERSION_KEY, encoded_version.as_slice())
                     .map_err(|error| {
@@ -148,6 +146,7 @@ impl Backend {
 }
 
 // design-lint: allow single-use-free-function -- isolates redb-specific Missing and Version checks before any batch mutation in the same write transaction
+// design-lint: allow unclassified-free-function -- transaction-local algorithm evaluates foreign storage conditions against the redb table before any batch mutation
 fn evaluate_condition(
     data: &impl ReadableTable<&'static [u8], &'static [u8]>,
     condition: &Condition,

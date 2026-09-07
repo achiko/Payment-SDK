@@ -10,9 +10,9 @@ use super::{
     error::BuildError,
     transport::Client as Transport,
     wire::{
-        CallError, gas_limit_with_margin, invalid_rpc_response, is_already_known,
-        is_execution_revert, map_json_rpc_error, parse_fixed_data, parse_quantity_u64,
-        parse_quantity_wei, parse_transaction_id, wei_quantity,
+        CallError, invalid_rpc_response, is_already_known, is_execution_revert, map_json_rpc_error,
+        parse_fixed_data, parse_quantity_u64, parse_quantity_wei, parse_transaction_id,
+        wei_quantity,
     },
 };
 use crate::{
@@ -158,9 +158,9 @@ where
                     "estimated gas limit is zero",
                 )));
             }
-            let gas_limit =
-                gas_limit_with_margin(estimated_gas_limit, limits.gas_limit_margin_basis_points())
-                    .map_err(rpc_error)?;
+            let gas_limit = limits
+                .gas_limit_with_margin(estimated_gas_limit)
+                .map_err(rpc_error)?;
             if gas_limit > limits.max_gas_limit() {
                 return Err(ChainError::new(
                     ChainErrorKind::FeeUnavailable,
