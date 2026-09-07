@@ -110,7 +110,7 @@ impl Repository {
             ));
         }
 
-        write_journal(&transaction, &self.scope, height, &addition).await?;
+        self.write_journal(&transaction, height, &addition).await?;
         projection::write_history(&transaction, &self.scope, height, &addition).await?;
         projection::write_created(&transaction, &self.scope, height, &addition).await?;
         projection::write_spent(&transaction, &self.scope, height, &addition).await?;
@@ -190,80 +190,83 @@ pub(crate) async fn move_checkpoint(
     Ok(())
 }
 
-async fn write_journal(
-    transaction: &Transaction<'_>,
-    scope: &IndexScope,
-    height: i64,
-    addition: &BlockAddition,
-) -> Result<(), IndexError> {
-    let previous = addition.expected_checkpoint();
-    let previous_height = previous
-        .map(|block| row::as_i64(block.height.0, "block height"))
-        .transpose()?;
-    let previous_position = previous
-        .map(|block| row::as_i64(block.position.0, "block position"))
-        .transpose()?;
-    let previous_parent_position = previous
-        .and_then(|block| block.parent.as_ref())
-        .map(|parent| row::as_i64(parent.position.0, "parent block position"))
-        .transpose()?;
-    let previous_time = previous
-        .and_then(|block| block.timestamp)
-        .map(|value| row::as_i64(value, "block timestamp"))
-        .transpose()?;
-    // Below the retention window nothing has aged out yet. A height no row can
-    // hold keeps the folded prune inert rather than needing a second statement.
-    let oldest = addition
-        .block()
-        .height
-        .0
-        .checked_sub(addition.retention())
-        .map(|value| row::as_i64(value, "block height"))
-        .transpose()?
-        .unwrap_or(-1);
-    let block_timestamp = addition
-        .block()
-        .timestamp
-        .map(|value| row::as_i64(value, "block timestamp"))
-        .transpose()?;
-    let block_position = row::as_i64(addition.block().position.0, "block position")?;
-    let block_parent_position = addition
-        .block()
-        .parent
-        .as_ref()
-        .map(|parent| row::as_i64(parent.position.0, "parent block position"))
-        .transpose()?;
-    let statement = transaction
-        .prepare_cached(WRITE_JOURNAL)
-        .await
-        .map_err(crate::store)?;
-    transaction
-        .execute(
-            &statement,
-            &[
-                &scope.chain.0,
-                &scope.network,
-                &height,
-                &block_position,
-                &addition.block().hash.0,
-                &block_parent_position,
-                &addition
-                    .block()
-                    .parent
-                    .as_ref()
-                    .map(|parent| parent.hash.0.clone()),
-                &block_timestamp,
-                &previous_height,
-                &previous_position,
-                &previous.map(|block| block.hash.0.clone()),
-                &previous_parent_position,
-                &previous
-                    .and_then(|block| block.parent.as_ref().map(|parent| parent.hash.0.clone())),
-                &previous_time,
-                &oldest,
-            ],
-        )
-        .await
-        .map_err(crate::store)?;
-    Ok(())
+impl Repository {
+    async fn write_journal(
+        &self,
+        transaction: &Transaction<'_>,
+        height: i64,
+        addition: &BlockAddition,
+    ) -> Result<(), IndexError> {
+        let previous = addition.expected_checkpoint();
+        let previous_height = previous
+            .map(|block| row::as_i64(block.height.0, "block height"))
+            .transpose()?;
+        let previous_position = previous
+            .map(|block| row::as_i64(block.position.0, "block position"))
+            .transpose()?;
+        let previous_parent_position = previous
+            .and_then(|block| block.parent.as_ref())
+            .map(|parent| row::as_i64(parent.position.0, "parent block position"))
+            .transpose()?;
+        let previous_time = previous
+            .and_then(|block| block.timestamp)
+            .map(|value| row::as_i64(value, "block timestamp"))
+            .transpose()?;
+        // Below the retention window nothing has aged out yet. A height no row can
+        // hold keeps the folded prune inert rather than needing a second statement.
+        let oldest = addition
+            .block()
+            .height
+            .0
+            .checked_sub(addition.retention())
+            .map(|value| row::as_i64(value, "block height"))
+            .transpose()?
+            .unwrap_or(-1);
+        let block_timestamp = addition
+            .block()
+            .timestamp
+            .map(|value| row::as_i64(value, "block timestamp"))
+            .transpose()?;
+        let block_position = row::as_i64(addition.block().position.0, "block position")?;
+        let block_parent_position = addition
+            .block()
+            .parent
+            .as_ref()
+            .map(|parent| row::as_i64(parent.position.0, "parent block position"))
+            .transpose()?;
+        let statement = transaction
+            .prepare_cached(WRITE_JOURNAL)
+            .await
+            .map_err(crate::store)?;
+        transaction
+            .execute(
+                &statement,
+                &[
+                    &self.scope.chain.0,
+                    &self.scope.network,
+                    &height,
+                    &block_position,
+                    &addition.block().hash.0,
+                    &block_parent_position,
+                    &addition
+                        .block()
+                        .parent
+                        .as_ref()
+                        .map(|parent| parent.hash.0.clone()),
+                    &block_timestamp,
+                    &previous_height,
+                    &previous_position,
+                    &previous.map(|block| block.hash.0.clone()),
+                    &previous_parent_position,
+                    &previous.and_then(|block| {
+                        block.parent.as_ref().map(|parent| parent.hash.0.clone())
+                    }),
+                    &previous_time,
+                    &oldest,
+                ],
+            )
+            .await
+            .map_err(crate::store)?;
+        Ok(())
+    }
 }

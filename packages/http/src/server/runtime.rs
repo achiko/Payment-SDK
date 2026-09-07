@@ -69,6 +69,7 @@ async fn readiness(State(state): State<ReadinessState>) -> Response {
     }
 }
 
+// design-lint: allow single-use-free-function -- Axum registers this State/Request/Next callback once for every protected request; the named middleware keeps authentication rejection and continuation separate from router assembly
 async fn require_bearer(
     State(token): State<BearerToken>,
     request: Request,

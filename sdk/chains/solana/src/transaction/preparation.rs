@@ -172,7 +172,7 @@ where
 
         for envelope in &envelopes {
             cancellation.ensure()?;
-            floor = simulate(cancellation, &self.rpc, envelope, floor).await?;
+            floor = self.simulate(cancellation, envelope, floor).await?;
         }
         cancellation.ensure()?;
         Ok(PreparedBatch {
@@ -180,6 +180,26 @@ where
             envelopes,
             leases,
         })
+    }
+
+    async fn simulate(
+        &self,
+        cancellation: &Cancellation,
+        envelope: &Envelope,
+        floor: u64,
+    ) -> Result<u64, SendError> {
+        tokio::select! {
+            result = self.rpc.simulate(envelope.signed_bytes(), floor) => match result {
+                Ok(slot) => Ok(slot),
+                Err(error) if error.kind() == ErrorKind::Simulation => Err(item(
+                    envelope.index(),
+                    WalletErrorKind::Transaction,
+                    "Solana transaction simulation failed",
+                )),
+                Err(_) => Err(SendError::operation(WalletErrorKind::Unavailable, "Solana transaction simulation is unavailable")),
+            },
+            () = cancellation.cancelled() => Err(SendError::operation(WalletErrorKind::Unavailable, "Solana transaction preparation was cancelled")),
+        }
     }
 
     #[cfg(test)]
@@ -260,29 +280,6 @@ impl Cancellation {
     }
 }
 
-async fn simulate<C>(
-    cancellation: &Cancellation,
-    rpc: &RpcClient<C>,
-    envelope: &Envelope,
-    floor: u64,
-) -> Result<u64, SendError>
-where
-    C: json_rpc::Client,
-{
-    tokio::select! {
-        result = rpc.simulate(envelope.signed_bytes(), floor) => match result {
-            Ok(slot) => Ok(slot),
-            Err(error) if error.kind() == ErrorKind::Simulation => Err(item(
-                envelope.index(),
-                WalletErrorKind::Transaction,
-                "Solana transaction simulation failed",
-            )),
-            Err(_) => Err(SendError::operation(WalletErrorKind::Unavailable, "Solana transaction simulation is unavailable")),
-        },
-        () = cancellation.cancelled() => Err(SendError::operation(WalletErrorKind::Unavailable, "Solana transaction preparation was cancelled")),
-    }
-}
-
 fn item(index: usize, kind: WalletErrorKind, message: &'static str) -> SendError {
     SendError::item(index, Vec::new(), WalletError::new(kind, message))
 }
@@ -303,6 +300,61 @@ mod tests {
         Arc::new(
             Key::from_seed(hex::encode([value; 32]).parse::<Seed>().expect("seed")).expect("key"),
         )
+    }
+
+    #[tokio::test]
+    async fn simulation_preserves_context_precedence_and_original_occurrence() {
+        let signer = key(7);
+        let lifetime = crate::BlockhashLifetime::new(Hash::new_from_array([9; 32]), 44);
+        let message = Message::native_transfer(
+            signer.address(),
+            key(8).address(),
+            Lamport::from_atomic(10),
+            Memo::from_bytes([3; Memo::LENGTH]),
+            &lifetime,
+        )
+        .unwrap();
+        let envelope =
+            Envelope::sign(signer.address().clone(), 7, message, 8, lifetime, &signer).unwrap();
+        let original = envelope.clone();
+        for (response, index, kind, message) in [
+            (
+                json!({"context":{"slot":10},"value":{"err":"provider detail"}}),
+                Some(7),
+                WalletErrorKind::Transaction,
+                "Solana transaction simulation failed",
+            ),
+            (
+                json!({"context":{"slot":9},"value":{"err":"provider detail"}}),
+                None,
+                WalletErrorKind::Unavailable,
+                "Solana transaction simulation is unavailable",
+            ),
+            (
+                json!({"context":{"slot":10},"value":"malformed"}),
+                None,
+                WalletErrorKind::Unavailable,
+                "Solana transaction simulation is unavailable",
+            ),
+        ] {
+            let rpc = Scripted::one(
+                "simulateTransaction",
+                json!([STANDARD.encode(envelope.signed_bytes()), {"encoding":"base64","commitment":"confirmed","sigVerify":true,"replaceRecentBlockhash":false,"minContextSlot":10}]),
+                response,
+            );
+            let error = Preparer::new(RpcClient::new(rpc.clone()))
+                .simulate(&Cancellation::default(), &envelope, 10)
+                .await
+                .unwrap_err();
+            assert_eq!(error.failed_index, index);
+            assert_eq!(error.source.kind, kind);
+            assert_eq!(error.source.message, message);
+            assert!(error.accepted.is_empty());
+            assert_eq!(error.ambiguous_transaction_id, None);
+            assert_eq!(error.source.ambiguous_transaction_id, None);
+            assert_eq!(envelope, original);
+            rpc.assert_finished();
+        }
     }
 
     #[tokio::test]

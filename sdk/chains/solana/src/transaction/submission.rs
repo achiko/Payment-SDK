@@ -98,7 +98,7 @@ where
             }
         });
 
-        register(self.registrar.as_ref(), task, activation, cancellation).await?;
+        self.register(task, activation, cancellation).await?;
 
         tokio::select! {
             result = result_wait => result.unwrap_or_else(|_| {
@@ -113,27 +113,27 @@ where
             )),
         }
     }
-}
 
-async fn register(
-    registrar: &dyn SubmissionRegistrar,
-    task: SubmissionTask,
-    activation: Activation,
-    cancellation: &Cancellation,
-) -> Result<(), SendError> {
-    tokio::select! {
-        result = registrar.register(task) => {
-            result.map_err(|_| SendError::operation(
+    async fn register(
+        &self,
+        task: SubmissionTask,
+        activation: Activation,
+        cancellation: &Cancellation,
+    ) -> Result<(), SendError> {
+        tokio::select! {
+            result = self.registrar.register(task) => {
+                result.map_err(|_| SendError::operation(
+                    WalletErrorKind::Unavailable,
+                    "Solana submission registration failed",
+                ))?;
+                activation.start();
+                Ok(())
+            },
+            () = cancellation.cancelled() => Err(SendError::operation(
                 WalletErrorKind::Unavailable,
-                "Solana submission registration failed",
-            ))?;
-            activation.start();
-            Ok(())
-        },
-        () = cancellation.cancelled() => Err(SendError::operation(
-            WalletErrorKind::Unavailable,
-            "Solana submission registration was cancelled",
-        )),
+                "Solana submission registration was cancelled",
+            )),
+        }
     }
 }
 
@@ -286,6 +286,20 @@ mod tests {
         }
     }
 
+    struct PendingRegistrar;
+
+    impl SubmissionRegistrar for PendingRegistrar {
+        fn register<'a>(
+            &'a self,
+            task: SubmissionTask,
+        ) -> super::super::registration::RegistrationFuture<'a> {
+            Box::pin(async move {
+                task.run().await;
+                panic!("unacknowledged registration must not activate the task")
+            })
+        }
+    }
+
     #[derive(Default)]
     struct Resolution {
         envelopes: Mutex<Vec<Envelope>>,
@@ -359,6 +373,13 @@ mod tests {
             .submit(prepared(&coordinator), &Cancellation::default())
             .await
             .expect_err("closed registration");
+        assert_eq!(error.source.kind, WalletErrorKind::Unavailable);
+        assert_eq!(
+            error.source.message,
+            "Solana submission registration failed"
+        );
+        assert!(error.accepted.is_empty());
+        assert_eq!(error.failed_index, None);
         assert!(error.ambiguous_transaction_id.is_none());
         rpc.assert_finished();
         assert!(
@@ -374,6 +395,47 @@ mod tests {
                 )
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_acknowledgement_never_activates_and_releases_guard() {
+        use std::task::{Context, Poll, Waker};
+
+        let coordinator = SourceCoordinator::default();
+        let prepared = prepared(&coordinator);
+        let source = prepared.envelopes()[0].source().clone();
+        let transfer = ResolvedTransfer::new(0, source, String::new(), Lamport::from_atomic(1));
+        let rpc = Scripted::one(
+            "getBlockHeight",
+            json!([{"commitment":"confirmed", "minContextSlot":11}]),
+            json!(44),
+        );
+        let submitter = Submitter::fixture(RpcClient::new(rpc.clone()), Arc::new(PendingRegistrar));
+        let cancellation = Cancellation::default();
+        let mut waiting = Box::pin(submitter.submit(prepared, &cancellation));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
+        assert!(
+            coordinator
+                .lease(std::slice::from_ref(&transfer), false)
+                .is_err()
+        );
+
+        cancellation.cancel();
+        let error = waiting.await.expect_err("registration cancellation");
+        assert_eq!(error.source.kind, WalletErrorKind::Unavailable);
+        assert_eq!(
+            error.source.message,
+            "Solana submission registration was cancelled"
+        );
+        assert!(error.accepted.is_empty());
+        assert_eq!(error.failed_index, None);
+        assert_eq!(error.ambiguous_transaction_id, None);
+        assert_eq!(error.source.ambiguous_transaction_id, None);
+        coordinator
+            .lease(&[transfer], false)
+            .expect("cancelled registration releases source");
+        rpc.assert_finished();
     }
 
     #[tokio::test]
