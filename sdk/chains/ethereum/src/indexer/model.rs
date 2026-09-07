@@ -456,6 +456,7 @@ fn required_quantity_u64(
     u64::try_from(value).map_err(|_| ParseError::new(format!("Ethereum {label} exceeds u64")))
 }
 
+// design-lint: allow unclassified-free-function -- shared indexing quantity decoder preserves field context and established native U256 parsing semantics across transaction fields and source chain-ID checks
 pub(super) fn parse_quantity(value: &str, label: &str) -> Result<U256, ParseError> {
     let digits = value
         .strip_prefix("0x")
@@ -494,6 +495,38 @@ mod tests {
                 index: 0,
             }],
         }
+    }
+
+    #[test]
+    fn indexing_quantity_preserves_library_grammar_and_field_errors() {
+        for (text, expected) in [("0x0", 0), ("0xAbC", 0xabc), ("0x_", 0), ("0x1_0", 16)] {
+            assert_eq!(
+                parse_quantity(text, "chain ID").unwrap(),
+                U256::from(expected)
+            );
+        }
+        assert_eq!(
+            parse_quantity(&format!("0x{}", "f".repeat(64)), "value").unwrap(),
+            U256::MAX
+        );
+        for (text, reason) in [
+            ("0X1", "is not a hex quantity"),
+            ("0x", "is not a canonical hex quantity"),
+            ("0x0g", "is not a canonical hex quantity"),
+            ("0xg", "exceeds 256 bits"),
+            ("0xé", "exceeds 256 bits"),
+        ] {
+            assert_eq!(
+                parse_quantity(text, "chain ID").unwrap_err().to_string(),
+                format!("Ethereum chain ID {reason}")
+            );
+        }
+        assert_eq!(
+            parse_quantity(&format!("0x1{}", "0".repeat(64)), "value")
+                .unwrap_err()
+                .to_string(),
+            "Ethereum value exceeds 256 bits"
+        );
     }
 
     #[test]

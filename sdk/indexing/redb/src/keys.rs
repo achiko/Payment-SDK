@@ -71,6 +71,7 @@ pub(super) fn output(scope: &IndexScope, output: &OutputKey) -> Key {
     Key(key)
 }
 
+// design-lint: allow unclassified-free-function -- shared redb prefix framing keeps format, collection tag and length-framed scope bytes identical across key encoders and rollback classifiers without exposing backend format on IndexScope
 fn prefix(scope: &IndexScope, tag: u8) -> Vec<u8> {
     let mut key = vec![FORMAT, tag];
     component(&mut key, scope.chain.0.as_bytes());

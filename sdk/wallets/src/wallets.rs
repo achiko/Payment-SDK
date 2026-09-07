@@ -13,7 +13,7 @@ use indexing::{
 
 use crate::{
     AddressText, Balance, Error, ErrorKind, FutureResult, History, HistoryRequest, Provider,
-    SecretBytes, SendError, SendFuture, Sender, Transfer, Wallet,
+    SecretBytes, SendError, SendFuture, Sender, Transfer, Wallet, selection::publication_error,
 };
 
 /// Non-secret facts retained for one registered wallet.
@@ -127,7 +127,7 @@ where
             let wallet = configured.provider.generate().await?;
             let (info, _, publication) =
                 self.store(id, family_key, configured, wallet, None).await?;
-            crate::selection::publication(publication)?.complete()?;
+            publication.ok_or_else(publication_error)?.complete()?;
             Ok(info)
         })
     }
@@ -177,7 +177,7 @@ where
                 self.forget(&id);
                 return Err(error.into());
             }
-            crate::selection::publication(publication)?.complete()?;
+            publication.ok_or_else(publication_error)?.complete()?;
             Ok(info)
         })
     }
@@ -357,7 +357,7 @@ where
                 })?,
                 None => BlockPosition(0),
             },
-            (None, None) => return Err(crate::selection::publication_error()),
+            (None, None) => return Err(publication_error()),
         };
         let entry = self
             .activate(id.clone(), family_key, family, wallet, start_position)

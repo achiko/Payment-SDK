@@ -3,7 +3,7 @@ use std::sync::Arc;
 use wallets::{Error, ErrorKind, MAX_TRANSFERS, SendError, SendFuture, Sender, Transfer};
 
 use crate::transaction::{Preparation, PreparationError};
-use crate::wallet::{WalletConfig, preparation_error};
+use crate::wallet::WalletConfig;
 use crate::{Address, TransactionCoordinator};
 
 pub(crate) struct Batch {
@@ -64,7 +64,7 @@ impl Sender for Batch {
                 .coordinator
                 .prepare_batch(preparations)
                 .await
-                .map_err(preparation_failure)?;
+                .map_err(PreparationError::into_send)?;
             let mut accepted = Vec::with_capacity(prepared.len());
             loop {
                 let id = prepared.next().await.map_err(|error| {
@@ -79,12 +79,14 @@ impl Sender for Batch {
     }
 }
 
-fn preparation_failure(error: PreparationError) -> SendError {
-    SendError::item(
-        error.index,
-        Vec::new(),
-        preparation_error(error.source).into(),
-    )
+impl PreparationError {
+    fn into_send(self) -> SendError {
+        SendError::item(
+            self.index,
+            Vec::new(),
+            self.source.into_preparation().into(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -341,7 +343,7 @@ mod tests {
 
     #[test]
     fn preparation_failure_preserves_index_with_zero_accepted() {
-        let failure = preparation_failure(PreparationError {
+        let failure = PreparationError::into_send(PreparationError {
             index: 2,
             source: ChainError {
                 kind: ChainErrorKind::InsufficientFunds,
@@ -352,6 +354,9 @@ mod tests {
         assert_eq!(failure.failed_index, Some(2));
         assert!(failure.accepted.is_empty());
         assert_eq!(failure.source.kind, ErrorKind::Transaction);
+        assert_eq!(failure.source.message, "aggregate balance is insufficient");
+        assert_eq!(failure.ambiguous_transaction_id, None);
+        assert_eq!(failure.source.ambiguous_transaction_id, None);
     }
 
     #[test]

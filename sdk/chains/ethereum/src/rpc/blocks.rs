@@ -135,8 +135,7 @@ where
     ) -> Result<Wei, SourceError> {
         let raw = self.request_result(method, params).await?;
         let value: String = raw.deserialize().map_err(map_json_rpc_error)?;
-        super::wire::parse_quantity_wei(&value)
-            .map_err(|message| invalid_rpc_response(method, message))
+        Wei::from_quantity(&value).map_err(|message| invalid_rpc_response(method, message))
     }
 
     pub(super) async fn latest_canonical_parameter(&self) -> Result<Value, SourceError> {
@@ -198,7 +197,7 @@ where
         let returned = value.get("hash").and_then(Value::as_str).ok_or_else(|| {
             invalid_rpc_response("eth_getTransactionByHash", "transaction object has no hash")
         })?;
-        let returned = super::wire::parse_transaction_id(returned, "eth_getTransactionByHash")?;
+        let returned = TransactionId::from_rpc(returned, "eth_getTransactionByHash")?;
         if &returned != expected {
             return Err(invalid_rpc_response(
                 "eth_getTransactionByHash",

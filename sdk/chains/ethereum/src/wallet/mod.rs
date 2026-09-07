@@ -375,7 +375,7 @@ impl BaseBuilder for Builder {
                     self.signer.as_ref(),
                 ))
                 .await
-                .map_err(preparation_error)?;
+                .map_err(ChainError::into_preparation)?;
             Ok(base::SignedTransaction::new(
                 PREPARED_KIND,
                 TransactionId::new(signed.id.to_string()),
@@ -422,20 +422,22 @@ fn transaction_error(
     TransactionError::new(kind, error.to_string())
 }
 
-pub(crate) fn preparation_error(error: ChainError) -> TransactionError {
-    let kind = match error.kind {
-        ChainErrorKind::InvalidAddress => TransactionErrorKind::InvalidAddress,
-        ChainErrorKind::InvalidTransaction => TransactionErrorKind::InvalidTransaction,
-        ChainErrorKind::InsufficientFunds => TransactionErrorKind::InsufficientFunds,
-        ChainErrorKind::FeeUnavailable => TransactionErrorKind::Fee,
-        ChainErrorKind::RpcUnavailable => TransactionErrorKind::Unavailable,
-        ChainErrorKind::Divergent => TransactionErrorKind::Divergent,
-        ChainErrorKind::Signer => TransactionErrorKind::Signing,
-        ChainErrorKind::Rejected => TransactionErrorKind::Rejected,
-        ChainErrorKind::NotFound => TransactionErrorKind::InvalidTransaction,
-        ChainErrorKind::Other => TransactionErrorKind::Unknown,
-    };
-    transaction_error(kind, error)
+impl ChainError {
+    pub(crate) fn into_preparation(self) -> TransactionError {
+        let kind = match self.kind {
+            ChainErrorKind::InvalidAddress => TransactionErrorKind::InvalidAddress,
+            ChainErrorKind::InvalidTransaction => TransactionErrorKind::InvalidTransaction,
+            ChainErrorKind::InsufficientFunds => TransactionErrorKind::InsufficientFunds,
+            ChainErrorKind::FeeUnavailable => TransactionErrorKind::Fee,
+            ChainErrorKind::RpcUnavailable => TransactionErrorKind::Unavailable,
+            ChainErrorKind::Divergent => TransactionErrorKind::Divergent,
+            ChainErrorKind::Signer => TransactionErrorKind::Signing,
+            ChainErrorKind::Rejected => TransactionErrorKind::Rejected,
+            ChainErrorKind::NotFound => TransactionErrorKind::InvalidTransaction,
+            ChainErrorKind::Other => TransactionErrorKind::Unknown,
+        };
+        transaction_error(kind, self)
+    }
 }
 
 fn wallet_error(kind: WalletErrorKind, error: impl std::fmt::Display) -> WalletError {
@@ -649,8 +651,26 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_preparation_kinds_remain_terminal_wallet_errors() {
+    fn preparation_conversion_preserves_every_kind_message_and_absence_of_ambiguity() {
         for (chain, expected) in [
+            (
+                ChainErrorKind::InvalidAddress,
+                TransactionErrorKind::InvalidAddress,
+            ),
+            (
+                ChainErrorKind::InvalidTransaction,
+                TransactionErrorKind::InvalidTransaction,
+            ),
+            (
+                ChainErrorKind::RpcUnavailable,
+                TransactionErrorKind::Unavailable,
+            ),
+            (ChainErrorKind::Signer, TransactionErrorKind::Signing),
+            (
+                ChainErrorKind::NotFound,
+                TransactionErrorKind::InvalidTransaction,
+            ),
+            (ChainErrorKind::Other, TransactionErrorKind::Unknown),
             (
                 ChainErrorKind::InsufficientFunds,
                 TransactionErrorKind::InsufficientFunds,
@@ -659,17 +679,19 @@ mod tests {
             (ChainErrorKind::Rejected, TransactionErrorKind::Rejected),
             (ChainErrorKind::Divergent, TransactionErrorKind::Divergent),
         ] {
-            let mapped = preparation_error(ChainError {
+            let mapped = ChainError::into_preparation(ChainError {
                 kind: chain,
                 message: "terminal preparation failure".to_owned(),
             });
             assert_eq!(mapped.kind, expected);
+            assert_eq!(mapped.message, "terminal preparation failure");
+            assert_eq!(mapped.ambiguous_transaction_id, None);
         }
     }
 
     #[test]
     fn rpc_preparation_failures_remain_unavailable() {
-        let mapped = preparation_error(ChainError {
+        let mapped = ChainError::into_preparation(ChainError {
             kind: ChainErrorKind::RpcUnavailable,
             message: "RPC failed".to_owned(),
         });

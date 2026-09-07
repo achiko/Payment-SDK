@@ -46,6 +46,27 @@ pub(super) struct Instruction {
     pub data: String,
 }
 
+impl Instruction {
+    fn parse(wire: InstructionWire, key_count: usize) -> Result<Self, IndexError> {
+        let program = usize::from(wire.program_id_index);
+        let accounts = wire
+            .accounts
+            .into_iter()
+            .map(usize::from)
+            .collect::<Vec<_>>();
+        if program >= key_count || accounts.iter().any(|index| *index >= key_count) {
+            return Err(invalid_block(
+                "Solana compiled instruction contains an invalid account index",
+            ));
+        }
+        Ok(Self {
+            program,
+            accounts,
+            data: wire.data,
+        })
+    }
+}
+
 impl Transactions {
     pub fn parse(raw: &[u8]) -> Result<Self, IndexError> {
         let block: BlockWire = serde_json::from_slice(raw)
@@ -153,7 +174,11 @@ impl Transaction {
             ));
         }
 
-        let instructions = parse_instructions(message.instructions, keys.len())?;
+        let instructions = message
+            .instructions
+            .into_iter()
+            .map(|wire| Instruction::parse(wire, keys.len()))
+            .collect::<Result<Vec<_>, _>>()?;
         let inner = meta
             .inner_instructions
             .map(|groups| parse_inner(groups, instructions.len(), keys.len()))
@@ -241,33 +266,6 @@ impl Transaction {
     }
 }
 
-fn parse_instructions(
-    wires: Vec<InstructionWire>,
-    key_count: usize,
-) -> Result<Vec<Instruction>, IndexError> {
-    wires
-        .into_iter()
-        .map(|wire| {
-            let program = usize::from(wire.program_id_index);
-            let accounts = wire
-                .accounts
-                .into_iter()
-                .map(usize::from)
-                .collect::<Vec<_>>();
-            if program >= key_count || accounts.iter().any(|index| *index >= key_count) {
-                return Err(invalid_block(
-                    "Solana compiled instruction contains an invalid account index",
-                ));
-            }
-            Ok(Instruction {
-                program,
-                accounts,
-                data: wire.data,
-            })
-        })
-        .collect()
-}
-
 fn parse_inner(
     groups: Vec<InnerWire>,
     outer_count: usize,
@@ -276,11 +274,17 @@ fn parse_inner(
     let mut inner = BTreeMap::new();
     for group in groups {
         let index = usize::from(group.index);
-        if index >= outer_count
-            || inner
-                .insert(index, parse_instructions(group.instructions, key_count)?)
-                .is_some()
-        {
+        if index >= outer_count {
+            return Err(invalid_block(
+                "Solana transaction contains an invalid or duplicate inner-instruction group",
+            ));
+        }
+        let instructions = group
+            .instructions
+            .into_iter()
+            .map(|wire| Instruction::parse(wire, key_count))
+            .collect::<Result<Vec<_>, _>>()?;
+        if inner.insert(index, instructions).is_some() {
             return Err(invalid_block(
                 "Solana transaction contains an invalid or duplicate inner-instruction group",
             ));

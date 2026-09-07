@@ -62,19 +62,22 @@ pub(super) fn remote_failure_is_retryable(failure: &Failure) -> bool {
     .any(|needle| message.contains(needle))
 }
 
+// design-lint: allow unclassified-free-function -- shared Ethereum RPC u64 quantity codec validates strict wire syntax before bounded native decoding for block, nonce and gas values without inventing a numeric wrapper
 pub(super) fn parse_quantity_u64(value: &str) -> Result<u64, &'static str> {
     let digits = quantity_digits(value)?;
     u64::from_str_radix(digits, 16).map_err(|_| "hex quantity exceeds u64")
 }
 
-pub(super) fn parse_quantity_wei(value: &str) -> Result<Wei, &'static str> {
-    let digits = quantity_digits(value)?;
-    if digits.len() > 64 {
-        return Err("hex quantity exceeds 256 bits");
+impl Wei {
+    pub(super) fn from_quantity(value: &str) -> Result<Self, &'static str> {
+        let digits = quantity_digits(value)?;
+        if digits.len() > 64 {
+            return Err("hex quantity exceeds 256 bits");
+        }
+        U256::from_str_radix(digits, 16)
+            .map(|value| Self(value.to_be_bytes()))
+            .map_err(|_| "hex data contains invalid data")
     }
-    U256::from_str_radix(digits, 16)
-        .map(|value| Wei(value.to_be_bytes()))
-        .map_err(|_| "hex data contains invalid data")
 }
 
 pub(super) fn quantity_digits(value: &str) -> Result<&str, &'static str> {
@@ -120,13 +123,12 @@ pub(super) fn parse_data(value: &str) -> Result<Vec<u8>, &'static str> {
     hex::decode(value).map_err(|_| "hex data contains invalid data")
 }
 
-pub(super) fn parse_transaction_id(
-    value: &str,
-    method: &'static str,
-) -> Result<TransactionId, SourceError> {
-    parse_fixed_data::<32>(value, "transaction hash")
-        .map(TransactionId)
-        .map_err(|message| invalid_rpc_response(method, message))
+impl TransactionId {
+    pub(super) fn from_rpc(value: &str, method: &'static str) -> Result<Self, SourceError> {
+        parse_fixed_data::<32>(value, "transaction hash")
+            .map(Self)
+            .map_err(|message| invalid_rpc_response(method, message))
+    }
 }
 
 pub(super) fn wei_quantity(value: &Wei) -> String {
@@ -163,6 +165,58 @@ pub(super) fn source_error(message: impl Into<String>, retryable: bool) -> Sourc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quantities_validate_syntax_before_numeric_width() {
+        assert_eq!(parse_quantity_u64("0xffffffffffffffff"), Ok(u64::MAX));
+        assert_eq!(
+            parse_quantity_u64("0x10000000000000000"),
+            Err("hex quantity exceeds u64")
+        );
+        for (text, message) in [
+            ("0X1", "hex quantity has no 0x prefix"),
+            ("0x", "hex quantity is empty"),
+            ("0x0g", "hex quantity contains a leading zero"),
+            ("0x_", "hex quantity contains invalid data"),
+            ("0x1_0", "hex quantity contains invalid data"),
+            ("0xé", "hex quantity contains invalid data"),
+            ("0x0x1", "hex quantity contains a leading zero"),
+            ("0x10000000000000000g", "hex quantity contains invalid data"),
+        ] {
+            assert_eq!(parse_quantity_u64(text), Err(message));
+            assert_eq!(Wei::from_quantity(text), Err(message));
+        }
+    }
+
+    #[test]
+    fn rpc_transaction_id_keeps_mixed_case_bytes_and_method_errors() {
+        let value = format!("0x{}", "aB".repeat(32));
+        assert_eq!(
+            TransactionId::from_rpc(&value, "eth_sendRawTransaction").unwrap(),
+            TransactionId([0xab; 32])
+        );
+        for (text, reason) in [
+            ("0X00", "hex data has no 0x prefix"),
+            ("0xzz", "hex data has an invalid length"),
+        ] {
+            let error = TransactionId::from_rpc(text, "eth_getTransactionByHash").unwrap_err();
+            assert_eq!(
+                error.message,
+                format!(
+                    "Ethereum RPC eth_getTransactionByHash returned an invalid response: {reason}"
+                )
+            );
+            assert!(!error.retryable);
+        }
+        let error =
+            TransactionId::from_rpc(&format!("0x{}", "zz".repeat(32)), "eth_sendRawTransaction")
+                .unwrap_err();
+        assert_eq!(
+            error.message,
+            "Ethereum RPC eth_sendRawTransaction returned an invalid response: hex data contains invalid data"
+        );
+        assert!(!error.retryable);
+    }
 
     #[test]
     fn call_error_classification_uses_only_remote_ascii_message_matching() {
@@ -240,7 +294,7 @@ mod tests {
             (Wei([255; 32]), format!("0x{}", "f".repeat(64))),
         ] {
             assert_eq!(wei_quantity(&value), expected);
-            assert_eq!(parse_quantity_wei(&expected), Ok(value));
+            assert_eq!(Wei::from_quantity(&expected), Ok(value));
         }
         let mut value = [0; 32];
         value[0] = 1;
@@ -284,10 +338,10 @@ mod tests {
             ("0xf", Wei::from_u128(15)),
             ("0xAbC", Wei::from_u128(0xabc)),
         ] {
-            assert_eq!(parse_quantity_wei(encoded), Ok(expected));
+            assert_eq!(Wei::from_quantity(encoded), Ok(expected));
         }
         assert_eq!(
-            parse_quantity_wei(&format!("0x{}", "f".repeat(64))),
+            Wei::from_quantity(&format!("0x{}", "f".repeat(64))),
             Ok(Wei([255; 32]))
         );
         for (encoded, message) in [
@@ -297,10 +351,10 @@ mod tests {
             ("0xg", "hex quantity contains invalid data"),
             ("0xé", "hex quantity contains invalid data"),
         ] {
-            assert_eq!(parse_quantity_wei(encoded), Err(message));
+            assert_eq!(Wei::from_quantity(encoded), Err(message));
         }
         assert_eq!(
-            parse_quantity_wei(&format!("0x1{}", "0".repeat(64))),
+            Wei::from_quantity(&format!("0x1{}", "0".repeat(64))),
             Err("hex quantity exceeds 256 bits")
         );
     }

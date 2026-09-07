@@ -1,21 +1,10 @@
-use bitcoin::{ScriptBuf, hex::FromHex};
 use serde_json::{Map, Number, Value};
 
-use crate::{Satoshi, TransactionId};
+use crate::Satoshi;
 
 use super::ParseError;
 
 const SATOSHIS_PER_BITCOIN: u64 = 100_000_000;
-
-pub(super) fn parse_script(object: &Map<String, Value>) -> Result<ScriptBuf, ParseError> {
-    let hex = object
-        .get("hex")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ParseError::new("Bitcoin scriptPubKey hex is missing or invalid"))?;
-    let bytes = Vec::<u8>::from_hex(hex)
-        .map_err(|_| ParseError::new("Bitcoin scriptPubKey hex is invalid"))?;
-    Ok(ScriptBuf::from_bytes(bytes))
-}
 
 pub(super) fn required_string<'a>(
     object: &'a Map<String, Value>,
@@ -59,12 +48,6 @@ pub(super) fn required_bool(
         .get(field)
         .and_then(Value::as_bool)
         .ok_or_else(|| ParseError::new(format!("{context} is missing or invalid")))
-}
-
-pub(super) fn parse_txid(value: &str) -> Result<TransactionId, ParseError> {
-    value
-        .parse::<TransactionId>()
-        .map_err(|_| ParseError::new("Bitcoin transaction ID is invalid"))
 }
 
 impl Satoshi {

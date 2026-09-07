@@ -319,3 +319,85 @@ fn disappearing_position_is_optional_for_canonical_reference_and_retryable_for_t
     let error = block_on(tip.tip()).expect_err("tip height race must retry");
     assert!(error.retryable);
 }
+
+#[test]
+fn canonical_header_keeps_request_identity_and_complete_coordinates() {
+    for height in [0, 10] {
+        let mut replies = connect_replies();
+        replies.extend([
+            reply_for("getblockcount", json!([]), json!(10)),
+            reply_for("getblockhash", json!([height]), json!(hash(2))),
+            reply_for(
+                "getblockheader",
+                json!([hash(2), true]),
+                json!({"height": height, "hash": hash(2).to_uppercase(), "previousblockhash": hash(3), "time": 100}),
+            ),
+        ]);
+        let client = ScriptedClient::new(replies);
+        let calls = client.clone();
+        let source = block_on(Blocks::connect(client, config())).unwrap();
+        let header = block_on(source.canonical_at(BlockPosition(height)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(header.position, BlockPosition(height));
+        assert_eq!(header.height, BlockHeight(height));
+        assert_eq!(header.hash, parse_bitcoin_block_hash(&hash(2)).unwrap());
+        assert_eq!(header.timestamp, Some(100));
+        if height == 0 {
+            assert_eq!(header.parent, None);
+        } else {
+            let parent = header.parent.unwrap();
+            assert_eq!(parent.position, BlockPosition(height - 1));
+            assert_eq!(parent.hash, parse_bitcoin_block_hash(&hash(3)).unwrap());
+        }
+        calls.assert_exhausted();
+    }
+}
+
+#[test]
+fn header_validation_preserves_error_order_and_retryability() {
+    for (header, message) in [
+        (
+            Value::Null,
+            "Bitcoin getblockheader result must be an object",
+        ),
+        (
+            json!({}),
+            "Bitcoin block-header height is missing or invalid",
+        ),
+        (
+            json!({"height": 9}),
+            "Bitcoin block header does not match the requested height",
+        ),
+        (
+            json!({"height": 10, "hash": "invalid"}),
+            "Bitcoin RPC returned an invalid block hash",
+        ),
+        (
+            json!({"height": 10, "hash": hash(2)}),
+            "Bitcoin previous block hash is missing or invalid",
+        ),
+        (
+            json!({"height": 10, "hash": hash(4), "previousblockhash": hash(3)}),
+            "Bitcoin block-header timestamp is missing or invalid",
+        ),
+        (
+            json!({"height": 10, "hash": hash(4), "previousblockhash": hash(3), "time": 100}),
+            "Bitcoin header lookup returned a different block hash",
+        ),
+    ] {
+        let mut replies = connect_replies();
+        replies.extend([
+            reply_for("getblockcount", json!([]), json!(10)),
+            reply_for("getblockhash", json!([10]), json!(hash(2))),
+            reply_for("getblockheader", json!([hash(2), true]), header),
+        ]);
+        let client = ScriptedClient::new(replies);
+        let calls = client.clone();
+        let source = block_on(Blocks::connect(client, config())).unwrap();
+        let error = block_on(source.tip()).unwrap_err();
+        assert_eq!(error.message, message);
+        assert!(error.retryable);
+        calls.assert_exhausted();
+    }
+}

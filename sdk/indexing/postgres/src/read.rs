@@ -15,7 +15,7 @@ use indexing::{
 };
 use tokio_postgres::{IsolationLevel, Row};
 
-use crate::{Repository, prepare_in, row};
+use crate::{Repository, row};
 
 const MAX_PAGE: usize = 1_000;
 
@@ -92,7 +92,10 @@ impl Repository {
             ),
             None => (-1, String::new()),
         };
-        let statement = prepare_in(&transaction, HISTORY_PAGE).await?;
+        let statement = transaction
+            .prepare_cached(HISTORY_PAGE)
+            .await
+            .map_err(crate::store)?;
         let rows = transaction
             .query(
                 &statement,
@@ -167,7 +170,10 @@ impl Repository {
         let last_height: i64 = last.try_get("height").map_err(crate::store)?;
         let last_transaction: String = last.try_get("transaction_id").map_err(crate::store)?;
 
-        let statement = prepare_in(transaction, PAGE_MOVEMENTS).await?;
+        let statement = transaction
+            .prepare_cached(PAGE_MOVEMENTS)
+            .await
+            .map_err(crate::store)?;
         let rows = transaction
             .query(
                 &statement,
@@ -330,7 +336,10 @@ impl Repository {
         };
         let limit = i64::try_from(request.limit.saturating_add(1))
             .map_err(|_| row::store("page limit exceeds the query range"))?;
-        let statement = prepare_in(&transaction, OUTPUT_PAGE).await?;
+        let statement = transaction
+            .prepare_cached(OUTPUT_PAGE)
+            .await
+            .map_err(crate::store)?;
         let rows = transaction
             .query(
                 &statement,

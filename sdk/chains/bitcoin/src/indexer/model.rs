@@ -17,7 +17,7 @@ use super::Outpoint;
 #[path = "model_value.rs"]
 mod value;
 
-use value::{parse_script, parse_txid, required_bool, required_string, required_u32, required_u64};
+use value::{required_bool, required_string, required_u32, required_u64};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct BlockData {
@@ -184,7 +184,9 @@ impl Transaction {
         let object = value
             .as_object()
             .ok_or_else(|| ParseError::new("Bitcoin transaction must be an object"))?;
-        let txid = parse_txid(required_string(object, "txid", "Bitcoin transaction ID")?)?;
+        let txid = required_string(object, "txid", "Bitcoin transaction ID")?
+            .parse::<TransactionId>()
+            .map_err(|_| ParseError::new("Bitcoin transaction ID is invalid"))?;
         let raw = Vec::<u8>::from_hex(required_string(object, "hex", "Bitcoin raw transaction")?)
             .map_err(|_| ParseError::new("Bitcoin transaction hex is invalid"))?;
         let native: NativeTransaction = consensus::deserialize(&raw)
@@ -226,11 +228,10 @@ impl Transaction {
                     "Bitcoin coinbase transaction contains a non-coinbase input",
                 ));
             }
-            let previous_id = parse_txid(required_string(
-                object,
-                "txid",
-                "Bitcoin input previous transaction ID",
-            )?)?;
+            let previous_id =
+                required_string(object, "txid", "Bitcoin input previous transaction ID")?
+                    .parse::<TransactionId>()
+                    .map_err(|_| ParseError::new("Bitcoin transaction ID is invalid"))?;
             let output_index = required_u32(object, "vout", "Bitcoin input output index")?;
             if native_input.previous_output.txid != Txid::from(previous_id)
                 || native_input.previous_output.vout != output_index
@@ -298,12 +299,17 @@ impl Transaction {
                     "Bitcoin output value does not match its consensus bytes",
                 ));
             }
-            let script = parse_script(
-                object
-                    .get("scriptPubKey")
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| ParseError::new("Bitcoin output scriptPubKey is missing"))?,
-            )?;
+            let script = object
+                .get("scriptPubKey")
+                .and_then(Value::as_object)
+                .ok_or_else(|| ParseError::new("Bitcoin output scriptPubKey is missing"))?;
+            let hex = script
+                .get("hex")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ParseError::new("Bitcoin scriptPubKey hex is missing or invalid"))?;
+            let bytes = Vec::<u8>::from_hex(hex)
+                .map_err(|_| ParseError::new("Bitcoin scriptPubKey hex is invalid"))?;
+            let script = ScriptBuf::from_bytes(bytes);
             if native_output.script_pubkey != script {
                 return Err(ParseError::new(
                     "Bitcoin output script does not match its consensus bytes",
@@ -375,12 +381,17 @@ impl PreviousOutput {
                 .ok_or_else(|| ParseError::new("Bitcoin prevout value is missing"))?,
             "Bitcoin prevout value",
         )?;
-        let script = parse_script(
-            prevout
-                .get("scriptPubKey")
-                .and_then(Value::as_object)
-                .ok_or_else(|| ParseError::new("Bitcoin prevout scriptPubKey is missing"))?,
-        )?;
+        let script = prevout
+            .get("scriptPubKey")
+            .and_then(Value::as_object)
+            .ok_or_else(|| ParseError::new("Bitcoin prevout scriptPubKey is missing"))?;
+        let hex = script
+            .get("hex")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ParseError::new("Bitcoin scriptPubKey hex is missing or invalid"))?;
+        let bytes = Vec::<u8>::from_hex(hex)
+            .map_err(|_| ParseError::new("Bitcoin scriptPubKey hex is invalid"))?;
+        let script = ScriptBuf::from_bytes(bytes);
         let created_height = BlockHeight(required_u64(
             prevout,
             "height",

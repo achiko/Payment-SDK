@@ -11,12 +11,12 @@ use super::{
     transport::Client as Transport,
     wire::{
         CallError, invalid_rpc_response, map_json_rpc_error, parse_fixed_data, parse_quantity_u64,
-        parse_quantity_wei, parse_transaction_id, wei_quantity,
+        wei_quantity,
     },
 };
 use crate::{
     AssetKind, BuildContext, ChainError, ChainErrorKind, SignedTransaction, TransactionId,
-    TransferRequest, erc20,
+    TransferRequest, Wei, erc20,
 };
 
 pub type HttpAccounts = AccountClient<ProductionClient>;
@@ -191,7 +191,7 @@ where
                     ))
                 })
                 .and_then(|value| {
-                    parse_quantity_wei(value)
+                    Wei::from_quantity(value)
                         .map_err(|message| invalid_rpc_response("eth_getBlockByNumber", message))
                         .map_err(rpc_error)
                 })?;
@@ -286,7 +286,7 @@ where
                 .deserialize()
                 .map_err(map_json_rpc_error)
                 .map_err(|error| ambiguous_submission(&computed, error))?;
-            let returned = parse_transaction_id(&returned, "eth_sendRawTransaction")
+            let returned = TransactionId::from_rpc(&returned, "eth_sendRawTransaction")
                 .map_err(|error| ambiguous_submission(&computed, error))?;
             if returned != computed {
                 return Err(ambiguous_submission(

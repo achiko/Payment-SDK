@@ -264,6 +264,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn strict_authentication_precedes_body_limit_rejection() {
+        let config = loopback_config(
+            Some(BearerToken::new("fixture-bearer").expect("valid fixture")),
+            RequestLimits::new(4).expect("valid limit"),
+        );
+        let router = protected_router(
+            Router::new().route("/echo", post(|body: String| async move { body })),
+            &config,
+        )
+        .expect("valid router");
+        for (authorization, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some("Bearer wrong-fixture"), StatusCode::UNAUTHORIZED),
+            (Some("Bearer fixture-bearer"), StatusCode::PAYLOAD_TOO_LARGE),
+        ] {
+            let mut request = axum::http::Request::builder().method("POST").uri("/echo");
+            if let Some(authorization) = authorization {
+                request = request.header(axum::http::header::AUTHORIZATION, authorization);
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(Body::from("12345")).expect("valid request"))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::UNAUTHORIZED {
+                assert_eq!(
+                    response.headers()[axum::http::header::WWW_AUTHENTICATE],
+                    "Bearer"
+                );
+                assert!(
+                    to_bytes(response.into_body(), 1024)
+                        .await
+                        .expect("body")
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn protected_router_validates_transport_before_authentication() {
+        for (transport, expected) in [
+            (
+                TransportSecurity::PlaintextLoopback,
+                ConfigErrorKind::InsecureNonLoopbackBind,
+            ),
+            (
+                TransportSecurity::TlsTerminatedUpstream,
+                ConfigErrorKind::MissingBearerToken,
+            ),
+        ] {
+            let config = ServerConfig::new(
+                "0.0.0.0:8443".parse().expect("address"),
+                transport,
+                None,
+                RequestLimits::default(),
+            );
+            let expected_error = config.validate().expect_err("invalid configuration");
+            let error = protected_router(Router::new(), &config).expect_err("invalid router");
+            assert_eq!(error.kind, expected);
+            assert_eq!(error, expected_error);
+        }
+    }
+
+    #[tokio::test]
     async fn configured_body_limit_rejects_large_requests() {
         let limits = RequestLimits::new(4).expect("test limits must be valid");
         let router = service_router(

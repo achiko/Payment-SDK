@@ -102,6 +102,7 @@ pub fn service_router(
     Ok(protected.merge(health_routes))
 }
 
+// design-lint: allow unclassified-free-function -- public HTTP adapter composes application-supplied Axum routes with validated authentication and body-limit layers while preserving middleware order and application-owned health routes
 /// Applies configured authentication and request limits without adding routes.
 /// Applications that own their health resources use this to keep middleware
 /// outside handlers while generating one complete transport contract.

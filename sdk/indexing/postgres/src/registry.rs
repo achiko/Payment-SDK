@@ -6,7 +6,7 @@ use indexing::{
 };
 use tokio_postgres::Row;
 
-use crate::{Repository, prepare, row};
+use crate::{Repository, row};
 
 const REGISTER: &str = "\
 INSERT INTO payment_wallets (id, chain, network, address, start_height, secret)
@@ -21,7 +21,10 @@ impl Repository {
         self.check_scope(&entry.filter.address.scope)?;
         let position = row::as_i64(entry.filter.start_position.0, "start position")?;
         let client = self.client().await?;
-        let statement = prepare(&client, REGISTER).await?;
+        let statement = client
+            .prepare_cached(REGISTER)
+            .await
+            .map_err(crate::store)?;
         let written = client
             .execute(
                 &statement,
@@ -55,7 +58,10 @@ impl Repository {
     ) -> Result<Vec<RegisteredAddress>, IndexError> {
         self.check_scope(scope)?;
         let client = self.client().await?;
-        let statement = prepare(&client, REGISTERED).await?;
+        let statement = client
+            .prepare_cached(REGISTERED)
+            .await
+            .map_err(crate::store)?;
         let rows = client
             .query(&statement, &[&scope.chain.0, &scope.network])
             .await

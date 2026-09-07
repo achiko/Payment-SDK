@@ -6,7 +6,7 @@ use tokio_postgres::types::ToSql;
 
 use crate::{
     columns::{self, HistoryRows, OutputRows, SpendKeys},
-    prepare_in, row,
+    row,
 };
 
 const WRITE_HISTORY: &str = "\
@@ -84,7 +84,10 @@ pub(crate) async fn write_history(
         .timestamp
         .map(|value| row::as_i64(value, "block timestamp"))
         .transpose()?;
-    let statement = prepare_in(transaction, WRITE_HISTORY).await?;
+    let statement = transaction
+        .prepare_cached(WRITE_HISTORY)
+        .await
+        .map_err(crate::store)?;
     transaction
         .execute(
             &statement,
@@ -113,7 +116,10 @@ pub(crate) async fn write_history(
     if movements.is_empty() {
         return Ok(());
     }
-    let statement = prepare_in(transaction, WRITE_MOVEMENT).await?;
+    let statement = transaction
+        .prepare_cached(WRITE_MOVEMENT)
+        .await
+        .map_err(crate::store)?;
     transaction
         .execute(
             &statement,
@@ -149,7 +155,10 @@ pub(crate) async fn write_created(
         return Ok(());
     }
 
-    let statement = prepare_in(transaction, WRITE_CREATED).await?;
+    let statement = transaction
+        .prepare_cached(WRITE_CREATED)
+        .await
+        .map_err(crate::store)?;
     transaction
         .execute(
             &statement,
@@ -204,7 +213,10 @@ async fn spend(
     height: i64,
     keys: &SpendKeys,
 ) -> Result<u64, IndexError> {
-    let statement = prepare_in(transaction, SPEND_OUTPUTS).await?;
+    let statement = transaction
+        .prepare_cached(SPEND_OUTPUTS)
+        .await
+        .map_err(crate::store)?;
     let parameters: [&(dyn ToSql + Sync); 6] = [
         &scope.chain.0,
         &scope.network,

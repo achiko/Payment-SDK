@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use bitcoin::{BlockHash as NativeBlockHash, hashes::Hash};
-use indexing::{BlockHash, BlockHeight, BlockParent, BlockPosition, BlockRef, SourceError};
+use indexing::{BlockHash, SourceError};
 use serde_json::{Map, Number, Value};
 
 use crate::{FeeRate, Network, Satoshi};
@@ -56,49 +56,6 @@ impl Network {
     }
 }
 
-pub(crate) fn parse_header(
-    raw: &RawJson,
-    expected_height: Option<BlockHeight>,
-) -> Result<BlockRef, SourceError> {
-    let result = parse_object(raw, "Bitcoin getblockheader result")?;
-    let height = BlockHeight(required_u64(
-        &result,
-        "height",
-        "Bitcoin block-header height",
-    )?);
-    if expected_height.is_some_and(|expected| expected != height) {
-        return Err(source_error(
-            "Bitcoin block header does not match the requested height",
-            true,
-        ));
-    }
-    let hash = parse_bitcoin_block_hash(&required_string(
-        &result,
-        "hash",
-        "Bitcoin block-header hash",
-    )?)?;
-    let parent = if height.0 == 0 {
-        None
-    } else {
-        Some(BlockParent {
-            position: BlockPosition(height.0 - 1),
-            hash: parse_bitcoin_block_hash(&required_string(
-                &result,
-                "previousblockhash",
-                "Bitcoin previous block hash",
-            )?)?,
-        })
-    };
-    let timestamp = required_u64(&result, "time", "Bitcoin block-header timestamp")?;
-    Ok(BlockRef {
-        position: BlockPosition(height.0),
-        height,
-        hash,
-        parent,
-        timestamp: Some(timestamp),
-    })
-}
-
 // design-lint: allow unclassified-free-function -- public Bitcoin wire adapter delegates reversed hash display order to the native parser and preserves RPC errors while returning a foreign neutral BlockHash
 pub fn parse_bitcoin_block_hash(value: &str) -> Result<BlockHash, SourceError> {
     value
@@ -117,6 +74,7 @@ pub fn format_bitcoin_block_hash(hash: &BlockHash) -> Result<String, SourceError
     Ok(NativeBlockHash::from_byte_array(bytes).to_string())
 }
 
+// design-lint: allow unclassified-free-function -- shared Bitcoin RPC boundary validates foreign RawJson object results and preserves per-method SourceError context without wrapping foreign JSON types
 pub(super) fn parse_object(
     raw: &RawJson,
     context: &'static str,

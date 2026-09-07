@@ -1,8 +1,13 @@
-use indexing::{BlockHash, BlockHeight, SourceError};
+use indexing::{BlockHash, BlockHeight, BlockParent, BlockPosition, BlockRef, SourceError};
 
 use super::{
-    Client, error::map_json_rpc_error, transport::Client as Transport,
-    wire::parse_bitcoin_block_hash,
+    Client,
+    error::{map_json_rpc_error, source_error},
+    transport::Client as Transport,
+    wire::{
+        format_bitcoin_block_hash, parse_bitcoin_block_hash, parse_object, required_string,
+        required_u64,
+    },
 };
 
 impl<C> Client<C>
@@ -25,5 +30,62 @@ where
             parse_bitcoin_block_hash(&encoded)
         })
         .transpose()
+    }
+
+    pub(crate) async fn header(
+        &self,
+        expected_hash: &BlockHash,
+        expected_height: BlockHeight,
+    ) -> Result<BlockRef, SourceError> {
+        let raw = self
+            .request_result(
+                "getblockheader",
+                serde_json::json!([format_bitcoin_block_hash(expected_hash)?, true]),
+            )
+            .await?;
+        let result = parse_object(&raw, "Bitcoin getblockheader result")?;
+        let height = BlockHeight(required_u64(
+            &result,
+            "height",
+            "Bitcoin block-header height",
+        )?);
+        if expected_height != height {
+            return Err(source_error(
+                "Bitcoin block header does not match the requested height",
+                true,
+            ));
+        }
+        let hash = parse_bitcoin_block_hash(&required_string(
+            &result,
+            "hash",
+            "Bitcoin block-header hash",
+        )?)?;
+        let parent = if height.0 == 0 {
+            None
+        } else {
+            Some(BlockParent {
+                position: BlockPosition(height.0 - 1),
+                hash: parse_bitcoin_block_hash(&required_string(
+                    &result,
+                    "previousblockhash",
+                    "Bitcoin previous block hash",
+                )?)?,
+            })
+        };
+        let timestamp = required_u64(&result, "time", "Bitcoin block-header timestamp")?;
+        let header = BlockRef {
+            position: BlockPosition(height.0),
+            height,
+            hash,
+            parent,
+            timestamp: Some(timestamp),
+        };
+        if header.hash != *expected_hash {
+            return Err(source_error(
+                "Bitcoin header lookup returned a different block hash",
+                true,
+            ));
+        }
+        Ok(header)
     }
 }

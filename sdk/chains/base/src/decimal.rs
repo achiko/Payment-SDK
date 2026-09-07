@@ -200,9 +200,9 @@ impl Decimal {
 
         let coefficient = self.coefficient.magnitude();
         let units = if self.scale <= decimals {
-            coefficient * power_of_ten(decimals - self.scale)
+            coefficient * BigUint::from(10_u8).pow(decimals - self.scale)
         } else {
-            let divisor = power_of_ten(self.scale - decimals);
+            let divisor = BigUint::from(10_u8).pow(self.scale - decimals);
             if coefficient % &divisor != BigUint::ZERO {
                 return Err(DecimalError::new(
                     DecimalErrorKind::ExcessPrecision,
@@ -266,12 +266,12 @@ impl Decimal {
                 .magnitude()
                 .cmp(other.coefficient.magnitude()),
             Ordering::Less => (self.coefficient.magnitude()
-                * power_of_ten(other.scale - self.scale))
+                * BigUint::from(10_u8).pow(other.scale - self.scale))
             .cmp(other.coefficient.magnitude()),
-            Ordering::Greater => self
-                .coefficient
-                .magnitude()
-                .cmp(&(other.coefficient.magnitude() * power_of_ten(self.scale - other.scale))),
+            Ordering::Greater => self.coefficient.magnitude().cmp(
+                &(other.coefficient.magnitude()
+                    * BigUint::from(10_u8).pow(self.scale - other.scale)),
+            ),
         }
     }
 
@@ -353,10 +353,6 @@ impl fmt::Display for Decimal {
     }
 }
 
-fn power_of_ten(exponent: u32) -> BigUint {
-    BigUint::from(10_u8).pow(exponent)
-}
-
 fn scaled_coefficient(value: &Decimal, scale: u32) -> Result<BigInt, DecimalError> {
     let exponent = scale.checked_sub(value.scale).ok_or_else(|| {
         DecimalError::new(
@@ -364,7 +360,7 @@ fn scaled_coefficient(value: &Decimal, scale: u32) -> Result<BigInt, DecimalErro
             "target scale must not be smaller than the decimal scale",
         )
     })?;
-    Ok(&value.coefficient * BigInt::from(power_of_ten(exponent)))
+    Ok(&value.coefficient * BigInt::from(BigUint::from(10_u8).pow(exponent)))
 }
 
 #[cfg(test)]

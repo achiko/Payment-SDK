@@ -1,18 +1,6 @@
-use indexing::{
-    AddressFilter, FilterSource, IndexError, IndexErrorKind, IndexScope, PublicationPermit,
-    SyncPlan,
-};
+use indexing::{AddressFilter, FilterSource, IndexError, IndexErrorKind, IndexScope, SyncPlan};
 
 use crate::{Error, ErrorKind, Wallets};
-
-pub(crate) fn publication(permit: Option<PublicationPermit>) -> Result<PublicationPermit, Error> {
-    permit.ok_or_else(|| {
-        Error::new(
-            ErrorKind::Unavailable,
-            "runtime wallet storage has no publication permit",
-        )
-    })
-}
 
 pub(crate) fn publication_error() -> Error {
     Error::new(

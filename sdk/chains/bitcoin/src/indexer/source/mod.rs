@@ -13,7 +13,7 @@ use crate::{Network, TransactionId};
 use super::{Block, Outpoint};
 use crate::rpc::{
     Client as RpcClient, CoreConfig, format_bitcoin_block_hash, parse_bitcoin_block_hash,
-    parse_header, source_error,
+    source_error,
 };
 
 // Every non-coinbase input consumes at least a 36-byte outpoint, one-byte
@@ -144,24 +144,6 @@ where
                 true,
             )
         })
-    }
-
-    async fn header(&self, hash: &BlockHash, height: BlockHeight) -> Result<BlockRef, SourceError> {
-        let raw = self
-            .client
-            .request_result(
-                "getblockheader",
-                serde_json::json!([format_bitcoin_block_hash(hash)?, true]),
-            )
-            .await?;
-        let header = parse_header(&raw, Some(height))?;
-        if header.hash != *hash {
-            return Err(source_error(
-                "Bitcoin header lookup returned a different block hash",
-                true,
-            ));
-        }
-        Ok(header)
     }
 
     async fn raw_block(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, SourceError> {
@@ -431,7 +413,7 @@ where
         Box::pin(async move {
             let height = self.block_count().await?;
             let hash = self.hash_at(height).await?;
-            self.header(&hash, height).await
+            self.client.header(&hash, height).await
         })
     }
 
@@ -489,7 +471,7 @@ where
             let Some(hash) = self.optional_hash_at(height).await? else {
                 return Ok(None);
             };
-            self.header(&hash, height).await.map(Some)
+            self.client.header(&hash, height).await.map(Some)
         })
     }
 }

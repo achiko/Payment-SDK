@@ -30,6 +30,7 @@ pub(crate) fn height(value: i64) -> Result<BlockHeight, IndexError> {
     ))
 }
 
+// design-lint: allow unclassified-free-function -- shared PostgreSQL block and parent position decoding rejects negative persisted traversal coordinates with adapter-owned nonretryable Store errors
 pub(crate) fn position(value: i64) -> Result<BlockPosition, IndexError> {
     Ok(BlockPosition(
         u64::try_from(value).map_err(|_| store("stored block position is negative"))?,
@@ -117,6 +118,19 @@ pub(crate) fn store(message: impl Into<String>) -> IndexError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_positions_preserve_nonnegative_values_and_reject_negative_data() {
+        for value in [0, 1, i64::MAX] {
+            assert_eq!(position(value), Ok(BlockPosition(value as u64)));
+        }
+        for value in [-1, i64::MIN] {
+            let error = position(value).expect_err("negative stored position");
+            assert_eq!(error.kind, IndexErrorKind::Store);
+            assert_eq!(error.message, "stored block position is negative");
+            assert!(!error.retryable);
+        }
+    }
 
     #[test]
     fn stored_heights_preserve_nonnegative_values_and_reject_negative_data() {

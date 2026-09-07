@@ -475,3 +475,28 @@ fn block_hash_parse_rejects_invalid_text_as_retryable_rpc_data() {
         assert!(error.retryable);
     }
 }
+
+#[test]
+fn object_parser_keeps_json_values_and_contextual_shape_errors() {
+    let value: Value = serde_json::from_str(
+        r#"{"exact":18446744073709551616,"nested":{"values":[null,true,"text"]}}"#,
+    )
+    .unwrap();
+    let raw = RawJson::from_serializable(&value).unwrap();
+    assert_eq!(
+        wire::parse_object(&raw, "result").unwrap(),
+        *value.as_object().unwrap()
+    );
+    for value in [
+        Value::Null,
+        serde_json::json!(false),
+        serde_json::json!(1),
+        serde_json::json!("text"),
+        serde_json::json!([]),
+    ] {
+        let raw = RawJson::from_serializable(&value).unwrap();
+        let error = wire::parse_object(&raw, "Bitcoin boundary result").unwrap_err();
+        assert_eq!(error.message, "Bitcoin boundary result must be an object");
+        assert!(error.retryable);
+    }
+}

@@ -2,7 +2,7 @@
 
 use indexing::{BlockRef, IndexError, IndexErrorKind, IndexScope};
 
-use crate::{Repository, prepare_in, row, write::move_checkpoint};
+use crate::{Repository, row, write::move_checkpoint};
 
 const JOURNAL_ENTRY: &str = "\
 SELECT block_hash, previous_checkpoint_position AS previous_position,
@@ -56,7 +56,10 @@ impl Repository {
             ));
         }
         let height = row::as_i64(expected_tip.height.0, "block height")?;
-        let statement = prepare_in(&transaction, JOURNAL_ENTRY).await?;
+        let statement = transaction
+            .prepare_cached(JOURNAL_ENTRY)
+            .await
+            .map_err(crate::store)?;
         let entry = transaction
             .query_opt(&statement, &[&scope.chain.0, &scope.network, &height])
             .await
@@ -79,14 +82,20 @@ impl Repository {
         // block's height, so it is deleted by predicate rather than recorded in
         // the journal. Movements go first: nothing cascades them any more.
         for sql in [DELETE_MOVEMENT, DELETE_HISTORY, DELETE_CREATED] {
-            let statement = prepare_in(&transaction, sql).await?;
+            let statement = transaction
+                .prepare_cached(sql)
+                .await
+                .map_err(crate::store)?;
             transaction
                 .execute(&statement, &[&scope.chain.0, &scope.network, &height])
                 .await
                 .map_err(crate::store)?;
         }
         // Spent outputs are not recoverable, so they come back from the journal.
-        let statement = prepare_in(&transaction, RESTORE_SPENT).await?;
+        let statement = transaction
+            .prepare_cached(RESTORE_SPENT)
+            .await
+            .map_err(crate::store)?;
         transaction
             .execute(&statement, &[&scope.chain.0, &scope.network, &height])
             .await
@@ -101,7 +110,10 @@ impl Repository {
         match &previous {
             Some(block) => move_checkpoint(&transaction, scope, block).await?,
             None => {
-                let statement = prepare_in(&transaction, DROP_CHECKPOINT).await?;
+                let statement = transaction
+                    .prepare_cached(DROP_CHECKPOINT)
+                    .await
+                    .map_err(crate::store)?;
                 transaction
                     .execute(&statement, &[&scope.chain.0, &scope.network])
                     .await
@@ -109,7 +121,10 @@ impl Repository {
             }
         }
         // journal_output cascades with the journal row.
-        let statement = prepare_in(&transaction, DROP_JOURNAL).await?;
+        let statement = transaction
+            .prepare_cached(DROP_JOURNAL)
+            .await
+            .map_err(crate::store)?;
         transaction
             .execute(&statement, &[&scope.chain.0, &scope.network, &height])
             .await

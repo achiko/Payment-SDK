@@ -481,3 +481,111 @@ fn outputs_exceeding_resolved_inputs_remain_nonretryable_invalid_blocks() {
     );
     assert!(!error.retryable);
 }
+
+#[test]
+fn transaction_ids_and_scripts_keep_native_parsing_and_boundary_errors() {
+    let transaction = Transaction {
+        version: Version::ONE,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(
+                Txid::from_byte_array(std::array::from_fn(|i| i as u8)),
+                0,
+            ),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x6a]),
+        }],
+    };
+    let mut tx = transaction_json(
+        &transaction,
+        &[Some(PreviousEvidence {
+            value: 1_000,
+            script: ScriptBuf::from_bytes(vec![0x6a]),
+            height: 1,
+            coinbase: false,
+        })],
+    );
+    for path in [
+        "/txid",
+        "/vin/0/txid",
+        "/vout/0/scriptPubKey/hex",
+        "/vin/0/prevout/scriptPubKey/hex",
+    ] {
+        let text = tx.pointer(path).unwrap().as_str().unwrap().to_uppercase();
+        *tx.pointer_mut(path).unwrap() = json!(text);
+    }
+    let _parsed = block(vec![tx.clone()]);
+    let valid = json!({
+        "hash": "aa".repeat(32), "height": 10, "previousblockhash": "bb".repeat(32),
+        "time": 100, "nTx": 1, "tx": [tx],
+    });
+    for (path, invalid, message) in [
+        (
+            "/tx/0/txid",
+            json!("ff"),
+            "Bitcoin transaction ID is invalid",
+        ),
+        (
+            "/tx/0/vin/0/txid",
+            json!("ff"),
+            "Bitcoin transaction ID is invalid",
+        ),
+        (
+            "/tx/0/txid",
+            Value::Null,
+            "Bitcoin transaction ID is missing or invalid",
+        ),
+        (
+            "/tx/0/vin/0/txid",
+            Value::Null,
+            "Bitcoin input previous transaction ID is missing or invalid",
+        ),
+        (
+            "/tx/0/vout/0/scriptPubKey/hex",
+            Value::Null,
+            "Bitcoin scriptPubKey hex is missing or invalid",
+        ),
+        (
+            "/tx/0/vin/0/prevout/scriptPubKey/hex",
+            Value::Null,
+            "Bitcoin scriptPubKey hex is missing or invalid",
+        ),
+        (
+            "/tx/0/vout/0/scriptPubKey/hex",
+            json!("6"),
+            "Bitcoin scriptPubKey hex is invalid",
+        ),
+        (
+            "/tx/0/vin/0/prevout/scriptPubKey/hex",
+            json!("zz"),
+            "Bitcoin scriptPubKey hex is invalid",
+        ),
+        (
+            "/tx/0/vout/0/scriptPubKey",
+            Value::Null,
+            "Bitcoin output scriptPubKey is missing",
+        ),
+        (
+            "/tx/0/vin/0/prevout/scriptPubKey",
+            Value::Null,
+            "Bitcoin prevout scriptPubKey is missing",
+        ),
+    ] {
+        let mut value = valid.clone();
+        *value.pointer_mut(path).unwrap() = invalid;
+        let error = Block::parse(
+            &serde_json::to_vec(&value).unwrap(),
+            None,
+            None,
+            Network::Regtest,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, crate::ChainErrorKind::InvalidTransaction);
+        assert_eq!(error.message, message, "{path}");
+    }
+}

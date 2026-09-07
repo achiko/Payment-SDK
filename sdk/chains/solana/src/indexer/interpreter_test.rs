@@ -462,3 +462,61 @@ fn malformed_static_and_loaded_addresses_keep_context_before_balance_validation(
         );
     }
 }
+
+#[test]
+fn instruction_bounds_and_inner_group_validation_keep_error_precedence() {
+    let index_error = "Solana compiled instruction contains an invalid account index";
+    let group_error = "Solana transaction contains an invalid or duplicate inner-instruction group";
+    for (program, accounts) in [(3, vec![0]), (2, vec![3])] {
+        let invalid = json!({"programIdIndex":program,"accounts":accounts,"data":"opaque"});
+        let mut outer = baseline(35);
+        outer["transaction"]["message"]["instructions"] = json!([invalid.clone()]);
+        let mut inner = baseline(35);
+        inner["meta"]["innerInstructions"] = json!([{"index":0,"instructions":[invalid.clone()]}]);
+        let mut invalid_group = baseline(35);
+        invalid_group["meta"]["innerInstructions"] =
+            json!([{"index":1,"instructions":[invalid.clone()]}]);
+        let mut duplicate_group = baseline(35);
+        duplicate_group["meta"]["innerInstructions"] = json!([
+            {"index":0,"instructions":[]}, {"index":0,"instructions":[invalid]},
+        ]);
+        for (value, expected) in [
+            (outer, index_error),
+            (inner, index_error),
+            (invalid_group, group_error),
+            (duplicate_group, index_error),
+        ] {
+            let error = inspect(vec![value], &[selected(2)]).unwrap_err();
+            assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+            assert!(!error.retryable);
+            assert_eq!(error.message, expected);
+        }
+    }
+}
+
+#[test]
+fn instruction_conversion_preserves_account_order_duplicates_and_opaque_data() {
+    let mut value = baseline(36);
+    value["transaction"]["message"]["instructions"] = json!([
+        {"programIdIndex":2,"accounts":[2,0,2,1],"data":"opaque_1"},
+        {"programIdIndex":0,"accounts":[],"data":""},
+    ]);
+    value["meta"]["innerInstructions"] = json!([
+        {"index":1,"instructions":[{"programIdIndex":1,"accounts":[1,0],"data":"opaque_2"}]},
+    ]);
+    let block = block(vec![value]);
+    let parsed = Transactions::parse(block.raw()).unwrap();
+    let transaction = &parsed.values()[0];
+    let instructions = transaction.instructions();
+    assert_eq!(instructions.len(), 2);
+    assert_eq!(instructions[0].program, 2);
+    assert_eq!(instructions[0].accounts, [2, 0, 2, 1]);
+    assert_eq!(instructions[0].data, "opaque_1");
+    assert_eq!(instructions[1].program, 0);
+    assert!(instructions[1].accounts.is_empty());
+    assert!(instructions[1].data.is_empty());
+    let inner = &transaction.inner().unwrap()[&1][0];
+    assert_eq!(inner.program, 1);
+    assert_eq!(inner.accounts, [1, 0]);
+    assert_eq!(inner.data, "opaque_2");
+}

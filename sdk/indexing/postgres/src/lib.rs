@@ -36,7 +36,7 @@ use indexing::{
     BlockAddition, BlockOutcome, BlockRef, BlockSelector, Blocks, BoxFuture, CanonicalAddress,
     IndexError, IndexErrorKind, IndexScope,
 };
-use tokio_postgres::{NoTls, Statement};
+use tokio_postgres::NoTls;
 
 /// The scope's tip. Column aliases match [`row::block`] so every block-shaped
 /// row decodes through one function.
@@ -50,6 +50,7 @@ const RETAINED_BLOCK: &str = "SELECT block_position AS position, height, block_h
                               block_timestamp AS timestamp FROM journal \
                               WHERE chain = $1 AND network = $2 AND height = $3";
 
+// design-lint: allow unclassified-free-function -- public PostgreSQL factory validates connection configuration and constructs a foreign pool for process-wide injection without making scope-bound repositories own connection creation
 /// Builds a connection pool from a libpq-style URL.
 ///
 /// TLS is not configured: this is intended for a database reached over a
@@ -157,7 +158,10 @@ impl Repository {
         &self,
         client: &Client,
     ) -> Result<Option<BlockRef>, IndexError> {
-        let statement = prepare(client, CHECKPOINT).await?;
+        let statement = client
+            .prepare_cached(CHECKPOINT)
+            .await
+            .map_err(crate::store)?;
         let row = client
             .query_opt(&statement, &[&self.scope.chain.0, &self.scope.network])
             .await
@@ -170,7 +174,10 @@ impl Repository {
         &self,
         transaction: &Transaction<'_>,
     ) -> Result<Option<BlockRef>, IndexError> {
-        let statement = prepare_in(transaction, CHECKPOINT).await?;
+        let statement = transaction
+            .prepare_cached(CHECKPOINT)
+            .await
+            .map_err(crate::store)?;
         let row = transaction
             .query_opt(&statement, &[&self.scope.chain.0, &self.scope.network])
             .await
@@ -204,28 +211,16 @@ impl Repository {
             return self.checkpoint_on(&client).await;
         };
         let height = row::as_i64(height.0, "block height")?;
-        let statement = prepare(&client, RETAINED_BLOCK).await?;
+        let statement = client
+            .prepare_cached(RETAINED_BLOCK)
+            .await
+            .map_err(crate::store)?;
         let row = client
             .query_opt(&statement, &[&scope.chain.0, &scope.network, &height])
             .await
             .map_err(store)?;
         row.as_ref().map(|row| row::block(row, "")).transpose()
     }
-}
-
-/// Prepares through the connection's cache, so a repeated statement costs one
-/// round trip instead of a parse and a bind.
-pub(crate) async fn prepare(client: &Client, sql: &str) -> Result<Statement, IndexError> {
-    client.prepare_cached(sql).await.map_err(store)
-}
-
-/// The same cache, reached from inside a transaction. The cache belongs to the
-/// connection, so statements survive the transaction that first prepared them.
-pub(crate) async fn prepare_in(
-    transaction: &Transaction<'_>,
-    sql: &str,
-) -> Result<Statement, IndexError> {
-    transaction.prepare_cached(sql).await.map_err(store)
 }
 
 impl Clone for Repository {

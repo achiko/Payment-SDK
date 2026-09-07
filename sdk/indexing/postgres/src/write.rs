@@ -10,7 +10,7 @@
 //! so a block costs a fixed number of round trips no matter how many
 //! transactions, movements, or outputs it carries.
 
-use crate::{Repository, prepare_in, projection, row};
+use crate::{Repository, projection, row};
 use deadpool_postgres::Transaction;
 use indexing::{BlockAddition, BlockOutcome, BlockRef, IndexError, IndexErrorKind, IndexScope};
 
@@ -68,7 +68,10 @@ impl Repository {
         self.lock_scope(&transaction).await?;
         let current = self.locked_checkpoint(&transaction).await?;
         let height = row::as_i64(addition.block().height.0, "block height")?;
-        let statement = prepare_in(&transaction, JOURNALLED_HASH).await?;
+        let statement = transaction
+            .prepare_cached(JOURNALLED_HASH)
+            .await
+            .map_err(crate::store)?;
         let journalled = transaction
             .query_opt(
                 &statement,
@@ -120,7 +123,10 @@ impl Repository {
 
 impl Repository {
     pub(crate) async fn lock_scope(&self, transaction: &Transaction<'_>) -> Result<(), IndexError> {
-        let statement = prepare_in(transaction, LOCK_SCOPE).await?;
+        let statement = transaction
+            .prepare_cached(LOCK_SCOPE)
+            .await
+            .map_err(crate::store)?;
         transaction
             .query_one(&statement, &[&self.scope.chain.0, &self.scope.network])
             .await
@@ -132,7 +138,10 @@ impl Repository {
         &self,
         transaction: &Transaction<'_>,
     ) -> Result<Option<BlockRef>, IndexError> {
-        let statement = prepare_in(transaction, LOCK_CHECKPOINT).await?;
+        let statement = transaction
+            .prepare_cached(LOCK_CHECKPOINT)
+            .await
+            .map_err(crate::store)?;
         let row = transaction
             .query_opt(&statement, &[&self.scope.chain.0, &self.scope.network])
             .await
@@ -158,7 +167,10 @@ pub(crate) async fn move_checkpoint(
         .map(|parent| row::as_i64(parent.position.0, "parent block position"))
         .transpose()?;
     let parent = block.parent.as_ref().map(|parent| parent.hash.0.clone());
-    let statement = prepare_in(transaction, MOVE_CHECKPOINT).await?;
+    let statement = transaction
+        .prepare_cached(MOVE_CHECKPOINT)
+        .await
+        .map_err(crate::store)?;
     transaction
         .execute(
             &statement,
@@ -221,7 +233,10 @@ async fn write_journal(
         .as_ref()
         .map(|parent| row::as_i64(parent.position.0, "parent block position"))
         .transpose()?;
-    let statement = prepare_in(transaction, WRITE_JOURNAL).await?;
+    let statement = transaction
+        .prepare_cached(WRITE_JOURNAL)
+        .await
+        .map_err(crate::store)?;
     transaction
         .execute(
             &statement,
