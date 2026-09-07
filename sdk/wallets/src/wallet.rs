@@ -46,6 +46,19 @@ pub struct HistoryAsset {
 }
 
 impl HistoryAsset {
+    fn resolve<F>(asset_id: &AssetId, asset: &F) -> Result<Self, Error>
+    where
+        F: Fn(&AssetId) -> Result<HistoryAsset, Error>,
+    {
+        let metadata = asset(asset_id)?;
+        if metadata.id != *asset_id {
+            return Err(Error::history(
+                "wallet asset metadata does not match the indexed asset identity",
+            ));
+        }
+        Ok(metadata)
+    }
+
     pub fn display_amount(&self, atomic: &Decimal) -> Result<Decimal, Error> {
         let units = atomic.to_atomic(0).map_err(|error| {
             Error::new(
@@ -170,7 +183,7 @@ impl HistoryEntry {
                         "indexed fee payer does not belong to the transaction scope",
                     ));
                 }
-                let metadata = resolve_asset(&fee.asset, asset)?;
+                let metadata = HistoryAsset::resolve(&fee.asset, asset)?;
                 Ok(HistoryFee {
                     amount: metadata.display_amount(&fee.amount)?,
                     asset: metadata,
@@ -259,7 +272,7 @@ impl HistoryMovement {
                 "indexed movement address does not belong to the transaction scope",
             ));
         }
-        let metadata = resolve_asset(&asset_id, asset)?;
+        let metadata = HistoryAsset::resolve(&asset_id, asset)?;
         Ok(Self {
             id,
             kind,
@@ -269,19 +282,6 @@ impl HistoryMovement {
             to,
         })
     }
-}
-
-fn resolve_asset<F>(asset_id: &AssetId, asset: &F) -> Result<HistoryAsset, Error>
-where
-    F: Fn(&AssetId) -> Result<HistoryAsset, Error>,
-{
-    let metadata = asset(asset_id)?;
-    if metadata.id != *asset_id {
-        return Err(Error::history(
-            "wallet asset metadata does not match the indexed asset identity",
-        ));
-    }
-    Ok(metadata)
 }
 
 fn validate_asset_scope(asset: &AssetId, scope: &IndexScope) -> Result<(), Error> {
@@ -664,6 +664,45 @@ mod tests {
                 "indexed amount is not a non-negative integer: amount has more than 0 fractional digits"
             )
         );
+    }
+
+    #[test]
+    fn fee_resolution_runs_once_and_precedes_amount_validation() {
+        let mut observed = transaction(Vec::new());
+        observed.fee = Some(NetworkFee {
+            asset: asset("native", 8).id,
+            amount: "0.1".parse().unwrap(),
+            payer: None,
+        });
+        for (resolved, expected) in [
+            (
+                Err(Error::new(
+                    crate::ErrorKind::Unavailable,
+                    "metadata unavailable",
+                )),
+                Error::new(crate::ErrorKind::Unavailable, "metadata unavailable"),
+            ),
+            (
+                Ok(asset("other", 8)),
+                Error::history("wallet asset metadata does not match the indexed asset identity"),
+            ),
+            (
+                Ok(asset("native", 8)),
+                Error::history(
+                    "indexed amount is not a non-negative integer: amount has more than 0 fractional digits",
+                ),
+            ),
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let error = HistoryEntry::from_index(observed.clone(), &scope(), &|id| {
+                assert_eq!(id, &asset("native", 8).id);
+                calls.set(calls.get() + 1);
+                resolved.clone()
+            })
+            .unwrap_err();
+            assert_eq!(calls.get(), 1);
+            assert_eq!(error, expected);
+        }
     }
 
     #[test]

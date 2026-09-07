@@ -85,6 +85,16 @@ impl Cancellation {
         }
         Ok(())
     }
+
+    async fn race_acquisition<T>(
+        &self,
+        future: impl Future<Output = Result<T, crate::Error>>,
+    ) -> Result<T, SendError> {
+        tokio::select! {
+            result = future => result.map_err(|_| SendError::operation(WalletErrorKind::Unavailable, "Solana account acquisition failed")),
+            () = self.cancelled() => Err(SendError::operation(WalletErrorKind::Unavailable, "Solana account acquisition was cancelled")),
+        }
+    }
 }
 
 pub struct AcquiredAccounts {
@@ -171,22 +181,22 @@ where
         cancellation.ensure()?;
         let query = stable_query(items, &destinations);
 
-        raced(cancellation, self.rpc.health()).await?;
+        cancellation.race_acquisition(self.rpc.health()).await?;
         cancellation.ensure()?;
-        let opening = raced(cancellation, self.rpc.slot(RpcCommitment::Confirmed, None)).await?;
+        let opening = cancellation
+            .race_acquisition(self.rpc.slot(RpcCommitment::Confirmed, None))
+            .await?;
         cancellation.ensure()?;
-        let context = raced(
-            cancellation,
-            self.rpc
-                .accounts(&query, RpcCommitment::Confirmed, Some(opening)),
-        )
-        .await?;
+        let context = cancellation
+            .race_acquisition(
+                self.rpc
+                    .accounts(&query, RpcCommitment::Confirmed, Some(opening)),
+            )
+            .await?;
         cancellation.ensure()?;
-        let closing = raced(
-            cancellation,
-            self.rpc.slot(RpcCommitment::Confirmed, Some(context.slot)),
-        )
-        .await?;
+        let closing = cancellation
+            .race_acquisition(self.rpc.slot(RpcCommitment::Confirmed, Some(context.slot)))
+            .await?;
         cancellation.ensure()?;
 
         let observed = query
@@ -306,16 +316,6 @@ fn supported(account: &AccountSnapshot, system: &Address) -> bool {
     !account.executable() && account.owner() == system && account.data().is_empty()
 }
 
-pub(super) async fn raced<T>(
-    cancellation: &Cancellation,
-    future: impl Future<Output = Result<T, crate::Error>>,
-) -> Result<T, SendError> {
-    tokio::select! {
-        result = future => result.map_err(|_| SendError::operation(WalletErrorKind::Unavailable, "Solana account acquisition failed")),
-        () = cancellation.cancelled() => Err(SendError::operation(WalletErrorKind::Unavailable, "Solana account acquisition was cancelled")),
-    }
-}
-
 fn unsupported(index: usize, message: &'static str) -> SendError {
     SendError::item(
         index,
@@ -350,14 +350,15 @@ mod tests {
             classify(&items, std::slice::from_ref(&destination), &BTreeMap::new()).unwrap_err();
         let missing_destination =
             classify(&items, &[destination], &BTreeMap::from([(source, None)])).unwrap_err();
-        let transport = raced::<()>(&Cancellation::default(), async {
-            Err(crate::Error::new(
-                crate::ErrorKind::RpcTimeout,
-                "provider secret",
-            ))
-        })
-        .await
-        .unwrap_err();
+        let transport = Cancellation::default()
+            .race_acquisition::<()>(async {
+                Err(crate::Error::new(
+                    crate::ErrorKind::RpcTimeout,
+                    "provider secret",
+                ))
+            })
+            .await
+            .unwrap_err();
         for (failure, message) in [
             (missing_source, "Solana source observation is missing"),
             (

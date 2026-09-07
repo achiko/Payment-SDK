@@ -58,6 +58,7 @@ async fn create(
     Ok((StatusCode::CREATED, Json(wallet.into())))
 }
 
+// design-lint: allow unclassified-free-function -- Axum owns the state and path extractor signature; this handler delegates one wallet lookup and encodes its public metadata
 #[utoipa::path(
     get,
     path = "/v1/wallets/{id}",

@@ -60,6 +60,7 @@ struct ReadinessState {
     health: HealthState,
 }
 
+// design-lint: allow unclassified-free-function -- Axum owns the State extractor signature; this handler maps one shared health observation to detail-free HTTP status without adding responses to HealthState
 async fn readiness(State(state): State<ReadinessState>) -> Response {
     if state.health.is_ready() {
         StatusCode::NO_CONTENT.into_response()

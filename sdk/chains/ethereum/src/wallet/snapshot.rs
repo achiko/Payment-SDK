@@ -50,20 +50,22 @@ impl Asset {
     }
 }
 
-pub(super) fn restore(
-    wallet: &Wallet,
-    snapshot: &TransactionSnapshot,
-) -> Result<Builder, TransactionError> {
-    let (destination, amount) = decode(&wallet.config, &wallet.address, snapshot)?;
-    let mut builder = Builder::new(
-        wallet.config.clone(),
-        wallet.address.clone(),
-        wallet.signer.clone(),
-        wallet.coordinator.clone(),
-    );
-    builder.transfer = Some((destination, amount));
-    builder.validate()?;
-    Ok(builder)
+impl Builder {
+    pub(super) fn restore(
+        wallet: &Wallet,
+        snapshot: &TransactionSnapshot,
+    ) -> Result<Self, TransactionError> {
+        let (destination, amount) = decode(&wallet.config, &wallet.address, snapshot)?;
+        let mut builder = Self::new(
+            wallet.config.clone(),
+            wallet.address.clone(),
+            wallet.signer.clone(),
+            wallet.coordinator.clone(),
+        );
+        builder.transfer = Some((destination, amount));
+        builder.validate()?;
+        Ok(builder)
+    }
 }
 
 fn decode(

@@ -182,12 +182,11 @@ fn interpret(
     )
 }
 
-fn rate(count: f64, seconds: f64) -> f64 {
-    if seconds <= 0.0 { 0.0 } else { count / seconds }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let rate = |count: f64, seconds: f64| {
+        if seconds <= 0.0 { 0.0 } else { count / seconds }
+    };
     let url = env::args()
         .nth(1)
         .unwrap_or_else(|| "postgres://prop@127.0.0.1:5433/integration-test".to_owned());

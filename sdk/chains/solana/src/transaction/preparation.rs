@@ -65,7 +65,9 @@ where
     ) -> Result<PreparedBatch, SendError> {
         let (mut floor, transfers, balances, destinations, leases) = acquired.into_parts();
         cancellation.ensure()?;
-        let lifetime = race(cancellation, self.rpc.latest_blockhash(floor)).await?;
+        let lifetime = cancellation
+            .race_preparation(self.rpc.latest_blockhash(floor))
+            .await?;
         floor = lifetime.slot;
 
         let mut messages = Vec::with_capacity(transfers.len());
@@ -121,7 +123,9 @@ where
         let mut fees = Vec::with_capacity(messages.len());
         for (_, bytes) in &messages {
             cancellation.ensure()?;
-            let fee = race(cancellation, self.rpc.fee_for_message(bytes, floor)).await?;
+            let fee = cancellation
+                .race_preparation(self.rpc.fee_for_message(bytes, floor))
+                .await?;
             floor = fee.slot;
             fees.push(fee.value);
         }
@@ -244,13 +248,15 @@ fn check_sufficiency(
     Ok(())
 }
 
-async fn race<T>(
-    cancellation: &Cancellation,
-    future: impl std::future::Future<Output = Result<T, Error>>,
-) -> Result<T, SendError> {
-    tokio::select! {
-        result = future => result.map_err(|_| SendError::operation(WalletErrorKind::Unavailable, "Solana transaction preparation failed")),
-        () = cancellation.cancelled() => Err(SendError::operation(WalletErrorKind::Unavailable, "Solana transaction preparation was cancelled")),
+impl Cancellation {
+    async fn race_preparation<T>(
+        &self,
+        future: impl std::future::Future<Output = Result<T, Error>>,
+    ) -> Result<T, SendError> {
+        tokio::select! {
+            result = future => result.map_err(|_| SendError::operation(WalletErrorKind::Unavailable, "Solana transaction preparation failed")),
+            () = self.cancelled() => Err(SendError::operation(WalletErrorKind::Unavailable, "Solana transaction preparation was cancelled")),
+        }
     }
 }
 
@@ -301,14 +307,16 @@ mod tests {
 
     #[tokio::test]
     async fn preparation_rpc_failure_and_cancellation_have_no_submission_metadata() {
-        let failure = race::<()>(&Cancellation::default(), async {
-            Err(Error::new(ErrorKind::RpcTimeout, "provider secret"))
-        })
-        .await
-        .unwrap_err();
+        let failure = Cancellation::default()
+            .race_preparation::<()>(async {
+                Err(Error::new(ErrorKind::RpcTimeout, "provider secret"))
+            })
+            .await
+            .unwrap_err();
         let cancellation = Cancellation::default();
         cancellation.cancel();
-        let cancelled = race::<()>(&cancellation, std::future::pending())
+        let cancelled = cancellation
+            .race_preparation::<()>(std::future::pending())
             .await
             .unwrap_err();
         for (error, message) in [
@@ -322,6 +330,46 @@ mod tests {
             assert_eq!(error.ambiguous_transaction_id, None);
             assert_eq!(error.source.ambiguous_transaction_id, None);
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_pending_preparation_without_background_work() {
+        use std::{
+            sync::atomic::{AtomicBool, Ordering},
+            task::{Context, Poll, Waker},
+        };
+
+        struct PendingGuard(Arc<AtomicBool>);
+        impl Drop for PendingGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = PendingGuard(dropped.clone());
+        let cancellation = Cancellation::default();
+        let work = async move {
+            let _guard = guard;
+            std::future::pending::<Result<(), Error>>().await
+        };
+        let mut raced = Box::pin(cancellation.race_preparation(work));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            std::future::Future::poll(raced.as_mut(), &mut context),
+            Poll::Pending
+        ));
+        assert!(!dropped.load(Ordering::SeqCst));
+        cancellation.cancel();
+        let error = raced.await.unwrap_err();
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(
+            error.to_string(),
+            "Solana transaction preparation was cancelled"
+        );
+        assert!(error.accepted.is_empty());
+        assert_eq!(error.failed_index, None);
+        assert_eq!(error.ambiguous_transaction_id, None);
     }
 
     #[test]

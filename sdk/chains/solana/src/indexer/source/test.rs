@@ -195,13 +195,14 @@ async fn refuses_same_slot_omission_and_late_pruning() {
         enumeration(7, 7, 10, json!([])),
         ("getFirstAvailableBlock", json!([]), json!(8)),
     ]);
-    assert!(
-        Source::new(RpcClient::new(pruned.clone()))
-            .canonical_at(BlockPosition(7))
-            .await
-            .unwrap_err()
-            .message
-            .contains("pruned")
+    let error = Source::new(RpcClient::new(pruned.clone()))
+        .canonical_at(BlockPosition(7))
+        .await
+        .unwrap_err();
+    assert!(!error.retryable);
+    assert_eq!(
+        error.message,
+        "Solana required position was pruned during source acquisition"
     );
     pruned.assert_finished();
 }
@@ -364,4 +365,72 @@ async fn expired_attempt_rejects_before_spending_enumeration_budget_or_rpc() {
         assert_eq!(attempt.deadline, deadline);
     }
     scripted.assert_finished();
+}
+
+#[tokio::test]
+async fn selected_anchor_accepts_retention_equality_but_retries_later_pruning() {
+    for closing in [7, 8] {
+        let rpc = Scripted::new([
+            ("getSlot", json!([{"commitment":"finalized"}]), json!(10)),
+            ("getFirstAvailableBlock", json!([]), json!(1)),
+            enumeration(1, 10, 10, json!([7])),
+            full(7, block(7, 5, 6, 9, 8)),
+            ("getFirstAvailableBlock", json!([]), json!(closing)),
+        ]);
+        let result = Source::new(RpcClient::new(rpc.clone())).tip().await;
+        if closing == 7 {
+            assert_eq!(result.unwrap().position, BlockPosition(7));
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.retryable);
+            assert_eq!(
+                error.message,
+                "Solana selected anchor was pruned during source acquisition"
+            );
+        }
+        rpc.assert_finished();
+    }
+}
+
+#[tokio::test]
+async fn canonical_retention_equality_succeeds_and_opening_pruning_precedes_tip_check() {
+    let rpc = Scripted::new([
+        ("getSlot", json!([{"commitment":"finalized"}]), json!(10)),
+        ("getFirstAvailableBlock", json!([]), json!(7)),
+        enumeration(7, 7, 10, json!([7])),
+        full(7, block(7, 5, 6, 9, 8)),
+        ("getFirstAvailableBlock", json!([]), json!(7)),
+    ]);
+    let result = Source::new(RpcClient::new(rpc.clone()))
+        .canonical_at(BlockPosition(7))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.position, BlockPosition(7));
+    rpc.assert_finished();
+
+    let pruned = Scripted::new([
+        ("getSlot", json!([{"commitment":"finalized"}]), json!(6)),
+        ("getFirstAvailableBlock", json!([]), json!(8)),
+    ]);
+    let error = Source::new(RpcClient::new(pruned.clone()))
+        .canonical_at(BlockPosition(7))
+        .await
+        .unwrap_err();
+    assert!(!error.retryable);
+    assert_eq!(
+        error.message,
+        "Solana required position was pruned during source acquisition"
+    );
+    pruned.assert_finished();
+}
+
+#[test]
+fn produced_height_overflow_precedes_other_connection_errors() {
+    let previous =
+        Block::parse(7, serde_json::to_vec(&block(7, u64::MAX, 6, 7, 6)).unwrap()).unwrap();
+    let current = Block::parse(7, serde_json::to_vec(&block(7, 0, 6, 9, 8)).unwrap()).unwrap();
+    let error = current.require_connection(&previous).unwrap_err();
+    assert!(error.retryable);
+    assert_eq!(error.message, "Solana produced height is exhausted");
 }

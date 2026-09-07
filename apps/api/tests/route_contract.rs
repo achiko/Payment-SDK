@@ -461,6 +461,58 @@ async fn readiness_reflects_runtime_state_while_liveness_stays_available() {
 }
 
 #[tokio::test]
+async fn closed_readiness_is_unavailable_even_when_the_last_value_was_true() {
+    for last_value in [false, true] {
+        let fixture = fixture(last_value);
+        drop(fixture.ready);
+
+        let response = request(&fixture.app, "GET", "/health/ready", None, false).await;
+        assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.body.is_empty());
+        assert_eq!(
+            request(&fixture.app, "GET", "/health/live", None, false)
+                .await
+                .status,
+            StatusCode::NO_CONTENT
+        );
+    }
+}
+
+#[tokio::test]
+async fn openapi_serves_the_merged_contract_without_authentication() {
+    let fixture = fixture(false);
+    let response = request(&fixture.app, "GET", "/openapi.json", None, false).await;
+
+    assert_eq!(response.status, StatusCode::OK);
+    let document = json_body(&response);
+    for path in ["/openapi.json", "/health/ready", "/v1/wallets/{id}"] {
+        assert!(document["paths"][path]["get"].is_object(), "{path}");
+    }
+    assert!(document["components"]["schemas"]["Wallet"].is_object());
+    assert_no_transaction_calls(&fixture.calls);
+}
+
+#[tokio::test]
+async fn missing_wallet_read_preserves_the_not_found_error_contract() {
+    let fixture = fixture(true);
+    let response = request(
+        &fixture.app,
+        "GET",
+        "/v1/wallets/missing-wallet",
+        None,
+        true,
+    )
+    .await;
+
+    assert_eq!(response.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_body(&response),
+        json!({"message": "wallet does not exist"})
+    );
+    assert_no_transaction_calls(&fixture.calls);
+}
+
+#[tokio::test]
 async fn wallet_routes_delegate_to_the_wallet_collection() {
     let fixture = fixture(true);
     let unauthorized = request(

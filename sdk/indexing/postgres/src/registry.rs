@@ -4,7 +4,6 @@ use indexing::{
     AddressFilter, BlockPosition, BoxFuture, CanonicalAddress, IndexError, IndexErrorKind,
     IndexScope, RegisteredAddress, Registry,
 };
-use tokio_postgres::Row;
 
 use crate::{Repository, row};
 
@@ -66,7 +65,25 @@ impl Repository {
             .query(&statement, &[&scope.chain.0, &scope.network])
             .await
             .map_err(crate::store)?;
-        rows.iter().map(|entry| registered(scope, entry)).collect()
+        rows.iter()
+            .map(|entry| {
+                let start: i64 = entry.try_get("start_height").map_err(crate::store)?;
+                Ok(RegisteredAddress {
+                    id: entry.try_get("id").map_err(crate::store)?,
+                    filter: AddressFilter {
+                        address: CanonicalAddress {
+                            scope: scope.clone(),
+                            value: entry.try_get("address").map_err(crate::store)?,
+                        },
+                        start_position: BlockPosition(
+                            u64::try_from(start)
+                                .map_err(|_| row::store("stored start position is negative"))?,
+                        ),
+                    },
+                    material: entry.try_get("secret").map_err(crate::store)?,
+                })
+            })
+            .collect()
     }
 }
 
@@ -81,22 +98,4 @@ impl Registry for Repository {
     ) -> BoxFuture<'a, Result<Vec<RegisteredAddress>, IndexError>> {
         Box::pin(async move { self.read_registrations(scope).await })
     }
-}
-
-fn registered(scope: &IndexScope, entry: &Row) -> Result<RegisteredAddress, IndexError> {
-    let start: i64 = entry.try_get("start_height").map_err(crate::store)?;
-    Ok(RegisteredAddress {
-        id: entry.try_get("id").map_err(crate::store)?,
-        filter: AddressFilter {
-            address: CanonicalAddress {
-                scope: scope.clone(),
-                value: entry.try_get("address").map_err(crate::store)?,
-            },
-            start_position: BlockPosition(
-                u64::try_from(start)
-                    .map_err(|_| row::store("stored start position is negative"))?,
-            ),
-        },
-        material: entry.try_get("secret").map_err(crate::store)?,
-    })
 }

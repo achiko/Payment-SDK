@@ -120,17 +120,11 @@ where
         }
 
         let mut end = tip;
-        loop {
+        let candidate = loop {
             let start = end.saturating_sub(DESCENDING_WINDOW - 1).max(opening);
             let slots = self.enumerate(start, end, tip).await?;
             if let Some(candidate) = slots.last().copied() {
-                let block = self.required_block(candidate).await?;
-                let closing = self.first_available().await?;
-                require_anchor_retained(closing, candidate)?;
-                return Ok(Tip {
-                    block,
-                    lower_bound: closing,
-                });
+                break candidate;
             }
             if start == opening {
                 return Err(unavailable(
@@ -138,7 +132,18 @@ where
                 ));
             }
             end = start - 1;
+        };
+        let block = self.required_block(candidate).await?;
+        let closing = self.first_available().await?;
+        if closing > candidate {
+            return Err(unavailable(
+                "Solana selected anchor was pruned during source acquisition",
+            ));
         }
+        Ok(Tip {
+            block,
+            lower_bound: closing,
+        })
     }
 
     async fn sparse_blocks(
@@ -151,7 +156,12 @@ where
         if start > tip.block.reference().position {
             return Ok(Vec::new());
         }
-        require_history_retained(tip.lower_bound, start.0)?;
+        if tip.lower_bound > start.0 {
+            return Err(source_error(
+                "Solana required position was pruned during source acquisition",
+                false,
+            ));
+        }
 
         let bounded_end = end.0.min(tip.block.reference().position.0);
         let mut cursor = start.0;
@@ -177,7 +187,7 @@ where
             for slot in slots.into_iter().take(remaining) {
                 let block = self.required_block(slot).await?;
                 if let Some(previous) = blocks.last() {
-                    require_connection(previous, &block)?;
+                    block.require_connection(previous)?;
                 }
                 blocks.push(block);
             }
@@ -190,14 +200,24 @@ where
         }
 
         let closing = self.first_available().await?;
-        require_history_retained(closing, start.0)?;
+        if closing > start.0 {
+            return Err(source_error(
+                "Solana required position was pruned during source acquisition",
+                false,
+            ));
+        }
         Ok(blocks)
     }
 
     async fn canonical(&mut self, position: BlockPosition) -> Result<Option<Block>, SourceError> {
         let tip = self.finalized_slot().await?;
         let opening = self.first_available().await?;
-        require_history_retained(opening, position.0)?;
+        if opening > position.0 {
+            return Err(source_error(
+                "Solana required position was pruned during source acquisition",
+                false,
+            ));
+        }
         if position.0 > tip {
             return Err(unavailable(
                 "Solana canonical position is above the finalized slot",
@@ -216,7 +236,12 @@ where
             Some(self.required_block(position.0).await?)
         };
         let closing = self.first_available().await?;
-        require_history_retained(closing, position.0)?;
+        if closing > position.0 {
+            return Err(source_error(
+                "Solana required position was pruned during source acquisition",
+                false,
+            ));
+        }
         Ok(block)
     }
 
@@ -277,45 +302,28 @@ async fn within<T>(
         })
 }
 
-fn require_anchor_retained(first_available: u64, anchor: u64) -> Result<(), SourceError> {
-    if first_available > anchor {
-        return Err(unavailable(
-            "Solana selected anchor was pruned during source acquisition",
-        ));
+impl Block {
+    fn require_connection(&self, previous: &Self) -> Result<(), SourceError> {
+        let previous = previous.reference();
+        let current = self.reference();
+        let expected_height = previous
+            .height
+            .checked_successor()
+            .ok_or_else(|| unavailable("Solana produced height is exhausted"))?;
+        let expected_parent = BlockParent {
+            position: previous.position,
+            hash: previous.hash.clone(),
+        };
+        if current.position <= previous.position
+            || current.height != expected_height
+            || current.parent.as_ref() != Some(&expected_parent)
+        {
+            return Err(unavailable(
+                "Solana produced blocks are not a strict canonical sequence",
+            ));
+        }
+        Ok(())
     }
-    Ok(())
-}
-
-fn require_history_retained(first_available: u64, required: u64) -> Result<(), SourceError> {
-    if first_available > required {
-        return Err(source_error(
-            "Solana required position was pruned during source acquisition",
-            false,
-        ));
-    }
-    Ok(())
-}
-
-fn require_connection(previous: &Block, current: &Block) -> Result<(), SourceError> {
-    let previous = previous.reference();
-    let current = current.reference();
-    let expected_height = previous
-        .height
-        .checked_successor()
-        .ok_or_else(|| unavailable("Solana produced height is exhausted"))?;
-    let expected_parent = BlockParent {
-        position: previous.position,
-        hash: previous.hash.clone(),
-    };
-    if current.position <= previous.position
-        || current.height != expected_height
-        || current.parent.as_ref() != Some(&expected_parent)
-    {
-        return Err(unavailable(
-            "Solana produced blocks are not a strict canonical sequence",
-        ));
-    }
-    Ok(())
 }
 
 fn unavailable(message: &'static str) -> SourceError {

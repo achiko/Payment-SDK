@@ -162,11 +162,10 @@ fn interpret(
     )
 }
 
-fn rate(count: f64, seconds: f64) -> f64 {
-    if seconds <= 0.0 { 0.0 } else { count / seconds }
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let rate = |count: f64, seconds: f64| {
+        if seconds <= 0.0 { 0.0 } else { count / seconds }
+    };
     let profile = Profile::from_env();
     let directory = tempfile::TempDir::new()?;
     let storage = storage_redb::Redb::open(directory.path().join("index.redb"))?;

@@ -20,6 +20,7 @@ async fn live() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+// design-lint: allow unclassified-free-function -- Axum owns the state extractor signature; this health handler maps an open ready channel to 204 and unavailable or closed state to 503
 #[utoipa::path(
     get,
     path = "/health/ready",

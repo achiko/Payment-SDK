@@ -60,7 +60,11 @@ pub(crate) fn decode_physical_key(
         ));
     }
 
-    let namespace_len = read_u32(&physical[..4])? as usize;
+    let namespace_len = u32::from_be_bytes(
+        physical[..4]
+            .try_into()
+            .map_err(|_| Error::corrupt_data("invalid encoded u32 length"))?,
+    ) as usize;
     let key_offset = 4usize
         .checked_add(namespace_len)
         .ok_or_else(|| Error::corrupt_data("physical key namespace length overflows"))?;
@@ -239,7 +243,11 @@ fn validate_record_length(body: &[u8]) -> Result<(), Error> {
         ));
     }
 
-    let declared_payload_len = read_u64(&body[8..16])?;
+    let declared_payload_len = u64::from_be_bytes(
+        body[8..16]
+            .try_into()
+            .map_err(|_| Error::corrupt_data("invalid encoded u64 length"))?,
+    );
     let declared_payload_len = usize::try_from(declared_payload_len).map_err(|_| {
         Error::corrupt_data("storage value record payload length exceeds this platform")
     })?;
@@ -267,27 +275,50 @@ fn validate_payload_length(
     Ok(())
 }
 
-fn read_u32(bytes: &[u8]) -> Result<u32, Error> {
-    if bytes.len() != size_of::<u32>() {
-        return Err(Error::corrupt_data("invalid encoded u32 length"));
-    }
-    let mut value = [0_u8; size_of::<u32>()];
-    value.copy_from_slice(bytes);
-    Ok(u32::from_be_bytes(value))
-}
-
-fn read_u64(bytes: &[u8]) -> Result<u64, Error> {
-    if bytes.len() != size_of::<u64>() {
-        return Err(Error::corrupt_data("invalid encoded u64 length"));
-    }
-    let mut value = [0_u8; size_of::<u64>()];
-    value.copy_from_slice(bytes);
-    Ok(u64::from_be_bytes(value))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncated_fixed_fields_fail_before_integer_decoding() {
+        for length in 0..4 {
+            let error = decode_physical_key(&vec![0; length], &Namespace(String::new()))
+                .expect_err("short physical key header");
+            assert_eq!(error.kind, ErrorKind::CorruptData);
+            assert_eq!(error.message, "physical key is shorter than its header");
+        }
+        for length in 0..16 {
+            let mut frame = b"W3KV".to_vec();
+            frame.extend(vec![0; length]);
+            let error =
+                StoredRecord::try_from(frame.as_slice()).expect_err("short fixed record fields");
+            assert_eq!(error.kind, ErrorKind::CorruptData);
+            assert_eq!(
+                error.message,
+                "storage value record is shorter than its fixed fields"
+            );
+        }
+    }
+
+    #[test]
+    fn multibyte_lengths_and_version_keep_big_endian_encoding() -> Result<(), Error> {
+        let namespace = Namespace("n".repeat(256));
+        let logical = Key(vec![0, 255]);
+        let physical = encode_physical_key(&namespace, &logical)?;
+        assert_eq!(&physical[..4], b"\0\0\x01\0");
+        assert_eq!(decode_physical_key(&physical, &namespace)?, logical);
+
+        let value = Value(vec![0xff; 256]);
+        let version = Version(0x0102_0304_0506_0708);
+        let frame = StoredRecord::new(value.clone(), version)?.encode()?;
+        assert_eq!(&frame[4..12], b"\x01\x02\x03\x04\x05\x06\x07\x08");
+        assert_eq!(&frame[12..20], b"\0\0\0\0\0\0\x01\0");
+        assert_eq!(
+            StoredValue::from(StoredRecord::try_from(frame.as_slice())?),
+            StoredValue { value, version }
+        );
+        Ok(())
+    }
 
     #[test]
     fn record_construction_rejects_reserved_zero_version() {

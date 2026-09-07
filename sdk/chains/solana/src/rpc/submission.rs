@@ -9,7 +9,7 @@ use solana_signature::Signature;
 
 use crate::{BlockhashLifetime, Error, ErrorKind, Lamport};
 
-use super::{Client, Context};
+use super::{Client, Context, methods::ContextWire};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignatureStatus {
@@ -27,17 +27,6 @@ impl SignatureStatus {
     pub const fn failed(&self) -> bool {
         self.failed
     }
-}
-
-#[derive(Deserialize)]
-struct ContextWire<T> {
-    context: SlotWire,
-    value: T,
-}
-
-#[derive(Deserialize)]
-struct SlotWire {
-    slot: u64,
 }
 
 #[derive(Deserialize)]
@@ -72,7 +61,7 @@ where
                 json!([{"commitment":"confirmed", "minContextSlot":floor}]),
             )
             .await?;
-        require_floor(wire.context.slot, floor)?;
+        wire.require_floor(Some(floor))?;
         let blockhash = Hash::from_str(&wire.value.blockhash)
             .map_err(|_| Error::malformed_rpc("getLatestBlockhash"))?;
         if blockhash.to_string() != wire.value.blockhash {
@@ -95,7 +84,7 @@ where
                 json!([STANDARD.encode(message), {"commitment":"confirmed", "minContextSlot":floor}]),
             )
             .await?;
-        require_floor(wire.context.slot, floor)?;
+        wire.require_floor(Some(floor))?;
         let fee = wire
             .value
             .ok_or_else(|| Error::new(ErrorKind::MalformedRpc, "Solana fee is unavailable"))?;
@@ -118,7 +107,7 @@ where
                 }]),
             )
             .await?;
-        require_floor(wire.context.slot, floor)?;
+        wire.require_floor(Some(floor))?;
         if wire.value.err.is_some() {
             return Err(Error::new(
                 ErrorKind::Simulation,
@@ -173,7 +162,7 @@ where
                 json!([[local_id.as_str()], {"searchTransactionHistory":true}]),
             )
             .await?;
-        require_floor(wire.context.slot, floor)?;
+        wire.require_floor(Some(floor))?;
         let [status] = <[Option<StatusWire>; 1]>::try_from(wire.value)
             .map_err(|_| Error::malformed_rpc("getSignatureStatuses"))?;
         let status = status.map(|status| {
@@ -199,16 +188,6 @@ where
     }
 }
 
-fn require_floor(slot: u64, floor: u64) -> Result<(), Error> {
-    if slot < floor {
-        return Err(Error::new(
-            ErrorKind::BelowFloor,
-            "Solana RPC response is below its requested context floor",
-        ));
-    }
-    Ok(())
-}
-
 fn unknown(local_id: TransactionId) -> TransactionError {
     TransactionError::new(
         TransactionErrorKind::Unknown,
@@ -225,6 +204,59 @@ mod tests {
     use crate::rpc::test_support::Scripted;
 
     use super::*;
+
+    #[tokio::test]
+    async fn context_floor_precedes_fee_simulation_and_status_semantics() {
+        let id = TransactionId::new(Signature::from([7; 64]).to_string());
+        for slot in [3, 4] {
+            let rpc = Scripted::new([
+                (
+                    "getFeeForMessage",
+                    json!([STANDARD.encode([]), {"commitment":"confirmed", "minContextSlot":4}]),
+                    json!({"context":{"slot":slot},"value":null}),
+                ),
+                (
+                    "simulateTransaction",
+                    json!([STANDARD.encode([]), {"encoding":"base64","commitment":"confirmed","sigVerify":true,"replaceRecentBlockhash":false,"minContextSlot":4}]),
+                    json!({"context":{"slot":slot},"value":{"err":{"x":1}}}),
+                ),
+                (
+                    "getSignatureStatuses",
+                    json!([[id.as_str()], {"searchTransactionHistory":true}]),
+                    json!({"context":{"slot":slot},"value":[]}),
+                ),
+            ]);
+            let client = Client::new(rpc.clone());
+            let expected = if slot < 4 {
+                [(
+                    ErrorKind::BelowFloor,
+                    "Solana RPC response is below its requested context floor",
+                ); 3]
+            } else {
+                [
+                    (ErrorKind::MalformedRpc, "Solana fee is unavailable"),
+                    (
+                        ErrorKind::Simulation,
+                        "Solana transaction simulation failed",
+                    ),
+                    (
+                        ErrorKind::MalformedRpc,
+                        "Solana RPC getSignatureStatuses returned malformed data",
+                    ),
+                ]
+            };
+            let errors = [
+                client.fee_for_message(&[], 4).await.unwrap_err(),
+                client.simulate(&[], 4).await.unwrap_err(),
+                client.signature_status(&id, 4).await.unwrap_err(),
+            ];
+            for (error, (kind, message)) in errors.into_iter().zip(expected) {
+                assert_eq!(error.kind(), kind);
+                assert_eq!(error.to_string(), message);
+            }
+            rpc.assert_finished();
+        }
+    }
 
     #[tokio::test]
     async fn reads_lifetime_fee_simulation_and_height_with_exact_floors() {

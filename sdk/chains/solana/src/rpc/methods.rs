@@ -60,14 +60,14 @@ pub struct Context<T> {
 }
 
 #[derive(Deserialize)]
-struct ContextWire<T> {
-    context: SlotWire,
-    value: T,
+pub(super) struct ContextWire<T> {
+    pub(super) context: SlotWire,
+    pub(super) value: T,
 }
 
 #[derive(Deserialize)]
-struct SlotWire {
-    slot: u64,
+pub(super) struct SlotWire {
+    pub(super) slot: u64,
 }
 
 #[derive(Deserialize)]
@@ -107,7 +107,12 @@ where
             None => json!([{ "commitment": commitment.text() }]),
         };
         let slot = self.request::<u64>("getSlot", params).await?;
-        require_floor(slot, minimum)?;
+        if minimum.is_some_and(|floor| slot < floor) {
+            return Err(Error::new(
+                ErrorKind::BelowFloor,
+                "Solana RPC response is below its requested context floor",
+            ));
+        }
         Ok(slot)
     }
 
@@ -124,7 +129,7 @@ where
                 json!([address.to_string(), config]),
             )
             .await?;
-        require_floor(wire.context.slot, minimum)?;
+        wire.require_floor(minimum)?;
         Ok(Context {
             slot: wire.context.slot,
             value: wire.value.map(AccountSnapshot::try_from).transpose()?,
@@ -154,7 +159,7 @@ where
                 json!([texts, config]),
             )
             .await?;
-        require_floor(wire.context.slot, minimum)?;
+        wire.require_floor(minimum)?;
         if wire.value.len() != addresses.len() {
             return Err(Error::malformed_rpc("getMultipleAccounts"));
         }
@@ -183,7 +188,7 @@ where
         let wire = self
             .request::<ContextWire<u64>>("getBalance", params)
             .await?;
-        require_floor(wire.context.slot, minimum)?;
+        wire.require_floor(minimum)?;
         Ok(Context {
             slot: wire.context.slot,
             value: Lamport::from_atomic(wire.value),
@@ -234,14 +239,16 @@ fn account_config(commitment: Commitment, minimum: Option<u64>) -> serde_json::V
     }
 }
 
-fn require_floor(value: u64, floor: Option<u64>) -> Result<(), Error> {
-    if floor.is_some_and(|floor| value < floor) {
-        return Err(Error::new(
-            ErrorKind::BelowFloor,
-            "Solana RPC response is below its requested context floor",
-        ));
+impl<T> ContextWire<T> {
+    pub(super) fn require_floor(&self, floor: Option<u64>) -> Result<(), Error> {
+        if floor.is_some_and(|floor| self.context.slot < floor) {
+            return Err(Error::new(
+                ErrorKind::BelowFloor,
+                "Solana RPC response is below its requested context floor",
+            ));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -257,6 +264,41 @@ mod tests {
             "data":[data,"base64"],
             "space":space
         })
+    }
+
+    #[tokio::test]
+    async fn balance_context_floor_accepts_equal_maximum_and_optional_absence() {
+        let address = Address::from_bytes([7; 32]);
+        for (slot, minimum, accepted) in [
+            (0, None, true),
+            (0, Some(0), true),
+            (u64::MAX, Some(u64::MAX), true),
+            (u64::MAX - 1, Some(u64::MAX), false),
+        ] {
+            let mut config = json!({"commitment":"finalized"});
+            if let Some(floor) = minimum {
+                config["minContextSlot"] = json!(floor);
+            }
+            let rpc = Scripted::one(
+                "getBalance",
+                json!([address.to_string(), config]),
+                json!({"context":{"slot":slot},"value":u64::MAX}),
+            );
+            let result = Client::new(rpc.clone()).balance(&address, minimum).await;
+            if accepted {
+                let context = result.unwrap();
+                assert_eq!(context.slot, slot);
+                assert_eq!(context.value.atomic(), u64::MAX);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::BelowFloor);
+                assert_eq!(
+                    error.to_string(),
+                    "Solana RPC response is below its requested context floor"
+                );
+            }
+            rpc.assert_finished();
+        }
     }
 
     #[tokio::test]

@@ -264,10 +264,6 @@ struct Builder {
 }
 
 impl Builder {
-    fn restore(wallet: &Wallet, snapshot: &TransactionSnapshot) -> Result<Self, TransactionError> {
-        snapshot::restore(wallet, snapshot)
-    }
-
     fn new(
         config: WalletConfig,
         from: Address,
@@ -787,6 +783,18 @@ mod tests {
 
             let snapshot = builder.snapshot().expect("transfer must have a snapshot");
             assert_eq!(snapshot.value()["asset"], expected);
+            let restored_builder =
+                Builder::restore(&wallet, &snapshot).expect("snapshot must restore");
+            assert!(Arc::ptr_eq(&restored_builder.signer, &wallet.signer));
+            assert!(Arc::ptr_eq(
+                &restored_builder.coordinator,
+                &wallet.coordinator
+            ));
+            assert_eq!(restored_builder.from, wallet.address);
+            assert_eq!(
+                restored_builder.transfer,
+                Some((Address([0x22; 20]), "1.25".parse().unwrap()))
+            );
             let restored = wallet.restore(&snapshot).expect("snapshot must restore");
             assert_eq!(restored.snapshot().unwrap(), snapshot);
         }

@@ -33,33 +33,31 @@ impl CallError {
     pub(super) fn into_source(self, method: &'static str) -> SourceError {
         match self {
             Self::Local(error) => error,
-            Self::Remote(failure) => source_error(
-                format!(
-                    "Ethereum JSON-RPC {method} failed with code {}",
-                    failure.code
-                ),
-                remote_failure_is_retryable(&failure),
-            ),
+            Self::Remote(failure) => {
+                let retryable = matches!(failure.code, -32_605 | -32_603 | -32_005) || {
+                    let message = failure.message.to_ascii_lowercase();
+                    [
+                        "rate limit",
+                        "too many requests",
+                        "temporarily unavailable",
+                        "timeout",
+                        "timed out",
+                        "try again",
+                        "overloaded",
+                    ]
+                    .iter()
+                    .any(|needle| message.contains(needle))
+                };
+                source_error(
+                    format!(
+                        "Ethereum JSON-RPC {method} failed with code {}",
+                        failure.code
+                    ),
+                    retryable,
+                )
+            }
         }
     }
-}
-
-pub(super) fn remote_failure_is_retryable(failure: &Failure) -> bool {
-    if matches!(failure.code, -32_605 | -32_603 | -32_005) {
-        return true;
-    }
-    let message = failure.message.to_ascii_lowercase();
-    [
-        "rate limit",
-        "too many requests",
-        "temporarily unavailable",
-        "timeout",
-        "timed out",
-        "try again",
-        "overloaded",
-    ]
-    .iter()
-    .any(|needle| message.contains(needle))
 }
 
 // design-lint: allow unclassified-free-function -- shared Ethereum RPC u64 quantity codec validates strict wire syntax before bounded native decoding for block, nonce and gas values without inventing a numeric wrapper
@@ -80,6 +78,7 @@ impl Wei {
     }
 }
 
+// design-lint: allow unclassified-free-function -- shared Ethereum RPC QUANTITY grammar validates prefix, nonempty digits, leading zero and ASCII hex before distinct numeric width checks
 pub(super) fn quantity_digits(value: &str) -> Result<&str, &'static str> {
     let digits = value
         .strip_prefix("0x")
@@ -165,6 +164,51 @@ pub(super) fn source_error(message: impl Into<String>, retryable: bool) -> Sourc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_retry_policy_preserves_codes_ascii_substrings_and_redaction() {
+        for (code, message, retryable) in [
+            (-32_605, "unrelated", true),
+            (-32_603, "unrelated", true),
+            (-32_005, "unrelated", true),
+            (-32_000, "unrelated", false),
+            (429, "unrelated", false),
+            (3, "execution reverted", false),
+            (3, "RATE LIMIT", true),
+            (3, "prefix TOO MANY REQUESTS suffix", true),
+            (3, "TEMPORARILY UNAVAILABLE", true),
+            (3, "timeout", true),
+            (3, "timed out", true),
+            (3, "try again", true),
+            (3, "overloaded", true),
+            (3, "rate\tlimit", false),
+            (3, "tímeout", false),
+        ] {
+            let error = CallError::Remote(Failure {
+                code,
+                message: message.to_owned(),
+                data: Some(
+                    json_rpc::RawJson::from_serializable(&serde_json::json!({"secret":"hidden"}))
+                        .unwrap(),
+                ),
+            })
+            .into_source("eth_call");
+            assert_eq!(error.retryable, retryable, "{code}: {message}");
+            assert_eq!(
+                error.message,
+                format!("Ethereum JSON-RPC eth_call failed with code {code}")
+            );
+        }
+        for retryable in [false, true] {
+            let error = CallError::Local(SourceError {
+                message: "rate limit local message".into(),
+                retryable,
+            })
+            .into_source("eth_call");
+            assert_eq!(error.retryable, retryable);
+            assert_eq!(error.message, "rate limit local message");
+        }
+    }
 
     #[test]
     fn quantities_validate_syntax_before_numeric_width() {

@@ -2041,6 +2041,77 @@ async fn retained_height_conflict_does_not_change_committed_state() {
     assert!(database.registry_sentinel_unchanged().await);
 }
 
+#[tokio::test]
+async fn registry_preserves_birthday_bounds_and_rejects_negative_stored_positions() {
+    let scope = unique_scope();
+    let (database, repository) = repository(&scope).await;
+    let baseline_scope = IndexScope {
+        chain: ChainId("baseline-chain".into()),
+        network: "baseline-network".into(),
+    };
+    let baseline = Repository::new(database.pool(), baseline_scope.clone()).expect("baseline");
+    let before = baseline
+        .registered(&baseline_scope)
+        .await
+        .expect("baseline records");
+    assert_eq!(before.len(), 1);
+    let mut expected = Vec::new();
+    for (index, position) in [0, i64::MAX as u64].into_iter().enumerate() {
+        let entry = RegisteredAddress {
+            id: format!("{}-{index}", scope.chain.0),
+            filter: indexing::AddressFilter {
+                address: address(&scope, &format!("receiver-{index}")),
+                start_position: BlockPosition(position),
+            },
+            material: (0..=255).collect(),
+        };
+        repository
+            .register(entry.clone())
+            .await
+            .expect("registration");
+        expected.push(entry);
+    }
+    let restored = repository.registered(&scope).await.expect("registrations");
+    assert_eq!(restored.len(), expected.len());
+    for entry in &expected {
+        assert_eq!(
+            restored.iter().find(|stored| stored.id == entry.id),
+            Some(entry)
+        );
+    }
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("owned fixture connection");
+    for negative in [-1_i64, i64::MIN] {
+        assert_eq!(
+            client
+                .execute(
+                    "UPDATE payment_wallets SET start_height = $2 WHERE id = $1",
+                    &[&expected[0].id, &negative],
+                )
+                .await
+                .expect("set owned invalid birthday"),
+            1
+        );
+        let error = repository
+            .registered(&scope)
+            .await
+            .expect_err("negative birthday");
+        assert_eq!(error.kind, IndexErrorKind::Store);
+        assert!(!error.retryable);
+        assert_eq!(error.message, "stored start position is negative");
+    }
+    assert_eq!(
+        baseline
+            .registered(&baseline_scope)
+            .await
+            .expect("baseline records"),
+        before
+    );
+}
+
 /// The registry stores an address once and refuses a second registration of
 /// either the identity or the address.
 #[tokio::test]
