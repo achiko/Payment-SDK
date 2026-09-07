@@ -104,7 +104,11 @@ where
         let raw_genesis = self
             .request_result("eth_getBlockByNumber", serde_json::json!(["0x0", false]))
             .await?;
-        if is_json_null(&raw_genesis)? {
+        if raw_genesis
+            .deserialize::<Value>()
+            .map_err(map_json_rpc_error)?
+            .is_null()
+        {
             return Err(source_error(
                 "Ethereum RPC does not expose the genesis block",
                 false,
@@ -133,7 +137,11 @@ where
                 serde_json::json!([tag, full_transactions]),
             )
             .await?;
-        if is_json_null(&raw)? {
+        if raw
+            .deserialize::<Value>()
+            .map_err(map_json_rpc_error)?
+            .is_null()
+        {
             return Err(source_error(
                 "Ethereum RPC does not currently expose the requested block",
                 true,
@@ -210,7 +218,11 @@ where
                     Ok(raw) => raw,
                     Err(failure) => return Err(map_remote_failure(failure)),
                 };
-                if is_json_null(&raw)? {
+                if raw
+                    .deserialize::<Value>()
+                    .map_err(map_json_rpc_error)?
+                    .is_null()
+                {
                     return Err(source_error(
                         "Ethereum transaction receipt is temporarily unavailable",
                         true,
@@ -306,7 +318,11 @@ where
             let raw = self
                 .request_result("eth_getBlockByNumber", serde_json::json!([tag, false]))
                 .await?;
-            if is_json_null(&raw)? {
+            if raw
+                .deserialize::<Value>()
+                .map_err(map_json_rpc_error)?
+                .is_null()
+            {
                 return Ok(None);
             }
             let block = ParsedBlock::parse(raw.as_bytes(), Some(height), false)
@@ -343,12 +359,6 @@ fn map_remote_failure(failure: Failure) -> SourceError {
         ),
         failure.is_server_error(),
     )
-}
-
-fn is_json_null(raw: &RawJson) -> Result<bool, SourceError> {
-    raw.deserialize::<Value>()
-        .map(|value| value.is_null())
-        .map_err(map_json_rpc_error)
 }
 
 fn source_error(message: impl Into<String>, retryable: bool) -> SourceError {

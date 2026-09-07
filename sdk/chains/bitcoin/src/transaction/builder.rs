@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use crate::{ChainError, ChainErrorKind};
+use crate::ChainError;
 use base::{Decimal, DecimalError, TransactionFuture};
 use bitcoin::ScriptBuf;
 
@@ -35,11 +35,10 @@ impl FeeRate {
             .checked_mul(u128::from(virtual_size))
             .and_then(|value| value.checked_add(999))
             .ok_or_else(|| {
-                super::operations::invalid_transaction("Bitcoin transaction fee overflowed u128")
+                ChainError::invalid_transaction("Bitcoin transaction fee overflowed u128")
             })?;
-        u64::try_from(numerator / 1_000).map_err(|_| {
-            super::operations::invalid_transaction("Bitcoin transaction fee overflowed u64")
-        })
+        u64::try_from(numerator / 1_000)
+            .map_err(|_| ChainError::invalid_transaction("Bitcoin transaction fee overflowed u64"))
     }
 }
 
@@ -74,7 +73,7 @@ impl SpendSource {
         let expected = address.script_pubkey_for_network(network)?;
         let script = ScriptBuf::from_bytes(script_pubkey);
         if script != expected {
-            return Err(invalid_selection(
+            return Err(ChainError::invalid_transaction(
                 "Bitcoin selected output script does not match its address",
             ));
         }
@@ -83,7 +82,7 @@ impl SpendSource {
         } else if script.is_p2tr() {
             P2TR_SATISFACTION_WEIGHT
         } else {
-            return Err(invalid_selection(
+            return Err(ChainError::invalid_transaction(
                 "Bitcoin selected output must be P2WPKH or P2TR",
             ));
         };
@@ -211,15 +210,9 @@ impl Builder {
     }
 }
 
-fn invalid_selection(message: impl Into<String>) -> ChainError {
-    ChainError {
-        kind: ChainErrorKind::InvalidTransaction,
-        message: message.into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::ChainErrorKind;
     use bitcoin::{Address as NativeAddress, CompressedPublicKey, PublicKey, secp256k1::Secp256k1};
 
     use super::*;
@@ -339,6 +332,33 @@ mod tests {
         .expect_err("mismatched selection script must fail");
 
         assert_eq!(error.kind, ChainErrorKind::InvalidTransaction);
+        assert_eq!(
+            error.message,
+            "Bitcoin selected output script does not match its address"
+        );
+    }
+
+    #[test]
+    fn exact_selection_rejects_matching_legacy_script_with_transaction_classification() {
+        let address = Address::from_encoded("mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn");
+        let script = address
+            .script_pubkey_for_network(Network::Regtest)
+            .unwrap()
+            .into_bytes();
+        let error = SpendSource::from_exact_selection(
+            Network::Regtest,
+            &address,
+            TransactionId([7; 32]),
+            2,
+            Satoshi(42_000),
+            script,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, ChainErrorKind::InvalidTransaction);
+        assert_eq!(
+            error.message,
+            "Bitcoin selected output must be P2WPKH or P2TR"
+        );
     }
 
     #[test]

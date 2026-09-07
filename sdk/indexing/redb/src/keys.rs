@@ -20,6 +20,7 @@ pub(super) fn checkpoint(scope: &IndexScope) -> Key {
     Key(prefix(scope, CHECKPOINT))
 }
 
+// design-lint: allow unclassified-free-function -- shared redb journal-key encoding preserves scope framing and produced-height byte ordering for writes, retention and rollback without leaking backend format into domain values
 pub(super) fn journal(scope: &IndexScope, height: BlockHeight) -> Key {
     let mut key = prefix(scope, JOURNAL);
     key.extend_from_slice(&height.0.to_be_bytes());
@@ -33,6 +34,7 @@ pub(super) fn history_prefix(scope: &IndexScope, address: &CanonicalAddress) -> 
     key
 }
 
+// design-lint: allow unclassified-free-function -- redb rollback history-key classification checks the persisted format and exact scope prefix without exposing storage bytes on domain values
 pub(super) fn is_history(scope: &IndexScope, key: &[u8]) -> bool {
     key.starts_with(&prefix(scope, HISTORY))
 }
@@ -55,6 +57,7 @@ pub(super) fn output_prefix(scope: &IndexScope, address: &CanonicalAddress) -> V
     key
 }
 
+// design-lint: allow unclassified-free-function -- redb rollback output-key classification shares the persisted format and scope guard for removal and restoration while full record validation stays with the repository
 pub(super) fn is_output(scope: &IndexScope, key: &[u8]) -> bool {
     key.starts_with(&prefix(scope, OUTPUT))
 }
@@ -129,10 +132,59 @@ mod tests {
         };
         let heights = [0, 1, 255, 256, u32::MAX as u64, u64::MAX];
         let keys = heights.map(|height| journal(&scope, BlockHeight(height)).0);
+        assert_eq!(
+            journal(&scope, BlockHeight(42)).0,
+            b"\x01\x02\0\0\0\0\0\0\0\x01a\0\0\0\0\0\0\0\x02bc\0\0\0\0\0\0\0\x2a"
+        );
         assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
         for (key, height) in keys.iter().zip(heights) {
             assert!(key.starts_with(&prefix(&scope, JOURNAL)));
             assert_eq!(&key[key.len() - 8..], &height.to_be_bytes());
+        }
+    }
+
+    #[test]
+    fn rollback_key_classification_respects_format_tag_and_exact_scope() {
+        let scope = IndexScope {
+            chain: ChainId("a".into()),
+            network: "b".into(),
+        };
+        for (key, history, output) in [
+            (
+                b"\x01\x03\0\0\0\0\0\0\0\x01a\0\0\0\0\0\0\0\x01b".as_slice(),
+                true,
+                false,
+            ),
+            (
+                b"\x01\x04\0\0\0\0\0\0\0\x01a\0\0\0\0\0\0\0\x01b\x00\xff".as_slice(),
+                false,
+                true,
+            ),
+            (
+                b"\x01\x02\0\0\0\0\0\0\0\x01a\0\0\0\0\0\0\0\x01b".as_slice(),
+                false,
+                false,
+            ),
+            (
+                b"\x02\x03\0\0\0\0\0\0\0\x01a\0\0\0\0\0\0\0\x01b".as_slice(),
+                false,
+                false,
+            ),
+            (
+                b"\x01\x03\0\0\0\0\0\0\0\x01a\0\0\0\0\0\0\0\x01c".as_slice(),
+                false,
+                false,
+            ),
+            (
+                b"\x01\x04\0\0\0\0\0\0\0\x01c\0\0\0\0\0\0\0\x01b".as_slice(),
+                false,
+                false,
+            ),
+            (b"\x01\x03".as_slice(), false, false),
+            (b"".as_slice(), false, false),
+        ] {
+            assert_eq!(is_history(&scope, key), history);
+            assert_eq!(is_output(&scope, key), output);
         }
     }
 

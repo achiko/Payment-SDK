@@ -6,7 +6,8 @@
 //! row-shaped and leave column-shaped — and nothing else.
 
 use indexing::{
-    BlockAddition, CanonicalStatus, IndexError, IndexedOutput, OutputKey, ValueMovement,
+    BlockAddition, CanonicalAddress, CanonicalStatus, CanonicalTransaction, IndexError,
+    IndexedOutput, OutputKey, ValueMovement,
 };
 
 use crate::row;
@@ -49,6 +50,40 @@ pub(crate) struct MovementRows {
 impl MovementRows {
     pub(crate) fn is_empty(&self) -> bool {
         self.address.is_empty()
+    }
+
+    fn extend(
+        &mut self,
+        canonical: &CanonicalTransaction,
+        address: &CanonicalAddress,
+    ) -> Result<(), IndexError> {
+        for (ordinal, movement) in canonical.movements.iter().enumerate() {
+            let ordinal = i32::try_from(ordinal)
+                .map_err(|_| row::store("transaction has too many movements"))?;
+            self.address.push(address.value.clone());
+            self.transaction_id
+                .push(canonical.transaction_id.value.clone());
+            self.ordinal.push(ordinal);
+            self.kind.push(
+                match movement {
+                    ValueMovement::Transfer { .. } => "transfer",
+                    ValueMovement::Input { .. } => "input",
+                    ValueMovement::Output { .. } => "output",
+                    ValueMovement::Mint { .. } => "mint",
+                    ValueMovement::Burn { .. } => "burn",
+                }
+                .to_owned(),
+            );
+            self.movement_id.push(movement.id().0.clone());
+            self.asset_chain.push(movement.asset().chain.0.clone());
+            self.asset.push(movement.asset().asset.clone());
+            self.amount.push(movement.amount().to_string());
+            self.from_address
+                .push(movement.from().map(|value| value.value.clone()));
+            self.to_address
+                .push(movement.to().map(|value| value.value.clone()));
+        }
+        Ok(())
     }
 }
 
@@ -129,26 +164,7 @@ impl TryFrom<&BlockAddition> for HistoryRows {
                     .fee_payer
                     .push(fee.and_then(|fee| fee.payer.as_ref().map(|payer| payer.value.clone())));
 
-                for (ordinal, movement) in canonical.movements.iter().enumerate() {
-                    let ordinal = i32::try_from(ordinal)
-                        .map_err(|_| row::store("transaction has too many movements"))?;
-                    movements.address.push(address.value.clone());
-                    movements
-                        .transaction_id
-                        .push(canonical.transaction_id.value.clone());
-                    movements.ordinal.push(ordinal);
-                    movements.kind.push(kind(movement).to_owned());
-                    movements.movement_id.push(movement.id().0.clone());
-                    movements.asset_chain.push(movement.asset().chain.0.clone());
-                    movements.asset.push(movement.asset().asset.clone());
-                    movements.amount.push(movement.amount().to_string());
-                    movements
-                        .from_address
-                        .push(movement.from().map(|value| value.value.clone()));
-                    movements
-                        .to_address
-                        .push(movement.to().map(|value| value.value.clone()));
-                }
+                movements.extend(canonical, &address)?;
             }
         }
         Ok(history)
@@ -189,16 +205,6 @@ fn index(value: u32) -> Result<i32, IndexError> {
     i32::try_from(value).map_err(|_| row::store("output index exceeds the storage range"))
 }
 
-const fn kind(movement: &ValueMovement) -> &'static str {
-    match movement {
-        ValueMovement::Transfer { .. } => "transfer",
-        ValueMovement::Input { .. } => "input",
-        ValueMovement::Output { .. } => "output",
-        ValueMovement::Mint { .. } => "mint",
-        ValueMovement::Burn { .. } => "burn",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use indexing::{
@@ -234,6 +240,110 @@ mod tests {
             created_at: BlockHeight(42),
             coinbase: false,
         }
+    }
+
+    #[test]
+    fn movement_rows_keep_all_tags_and_restart_ordinals_for_each_address() {
+        let output = output("tx", 0, "0.5");
+        let owner = output.address.clone();
+        let other = CanonicalAddress {
+            value: "other".into(),
+            ..owner.clone()
+        };
+        let asset = output.asset;
+        let amount = output.amount;
+        let id = indexing::MovementId("movement".into());
+        let canonical = CanonicalTransaction {
+            scope: owner.scope.clone(),
+            transaction_id: output.id.transaction,
+            status: CanonicalStatus::Included {
+                block: indexing::BlockRef {
+                    position: indexing::BlockPosition(0),
+                    height: BlockHeight(0),
+                    hash: indexing::BlockHash(vec![0]),
+                    parent: None,
+                    timestamp: None,
+                },
+            },
+            movements: vec![
+                ValueMovement::Transfer {
+                    id: id.clone(),
+                    asset: asset.clone(),
+                    amount: amount.clone(),
+                    from: owner.clone(),
+                    to: other.clone(),
+                },
+                ValueMovement::Input {
+                    id: id.clone(),
+                    asset: asset.clone(),
+                    amount: amount.clone(),
+                    owner: Some(owner.clone()),
+                },
+                ValueMovement::Output {
+                    id: id.clone(),
+                    asset: asset.clone(),
+                    amount: amount.clone(),
+                    owner: None,
+                },
+                ValueMovement::Mint {
+                    id: id.clone(),
+                    asset: asset.clone(),
+                    amount: amount.clone(),
+                    to: other.clone(),
+                },
+                ValueMovement::Burn {
+                    id,
+                    asset,
+                    amount,
+                    from: owner.clone(),
+                },
+            ],
+            fee: None,
+        };
+        let mut rows = MovementRows::default();
+        rows.extend(&canonical, &owner)
+            .expect("first address movements");
+        rows.extend(&canonical, &other)
+            .expect("second address movements");
+        assert_eq!(rows.ordinal, [0, 1, 2, 3, 4, 0, 1, 2, 3, 4]);
+        assert_eq!(
+            rows.kind,
+            ["transfer", "input", "output", "mint", "burn"].repeat(2)
+        );
+        assert_eq!(
+            rows.address,
+            [vec![owner.value.clone(); 5], vec![other.value.clone(); 5]].concat()
+        );
+        assert_eq!(rows.transaction_id, vec!["tx"; 10]);
+        assert_eq!(rows.amount, vec!["0.5"; 10]);
+        assert_eq!(
+            rows.from_address,
+            [
+                Some(owner.value.clone()),
+                Some(owner.value.clone()),
+                None,
+                None,
+                Some(owner.value)
+            ]
+            .into_iter()
+            .cycle()
+            .take(10)
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rows.to_address,
+            [
+                Some(other.value.clone()),
+                None,
+                None,
+                Some(other.value),
+                None
+            ]
+            .into_iter()
+            .cycle()
+            .take(10)
+            .collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ use indexing::{BlockRef, IndexError, IndexErrorKind, IndexScope};
 
 use crate::{
     Repository, prepare_in, row,
-    write::{lock_scope, locked_checkpoint, move_checkpoint, optional_block},
+    write::{move_checkpoint, optional_block},
 };
 
 const JOURNAL_ENTRY: &str = "\
@@ -49,8 +49,8 @@ impl Repository {
         let mut client = self.client().await?;
         let transaction = client.transaction().await.map_err(crate::store)?;
 
-        lock_scope(&transaction, scope).await?;
-        let current = locked_checkpoint(&transaction, scope).await?;
+        self.lock_scope(&transaction).await?;
+        let current = self.locked_checkpoint(&transaction).await?;
         if current.as_ref() != Some(expected_tip) {
             return Err(IndexError::new(
                 IndexErrorKind::Conflict,

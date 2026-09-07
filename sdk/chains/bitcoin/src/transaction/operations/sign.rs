@@ -15,8 +15,8 @@ use bitcoin::{
 use crate::{ChainError, Network};
 
 use super::{
-    Input, SighashType, SignedTransaction, TransactionId, UnsignedTransaction, invalid_transaction,
-    native_network, signer_error, signer_error_message, taproot_sighash_type,
+    Input, SighashType, SignedTransaction, TransactionId, UnsignedTransaction, native_network,
+    signer_error, signer_error_message, taproot_sighash_type,
 };
 
 struct InputSigner<'a, S: ?Sized> {
@@ -46,7 +46,7 @@ pub(in crate::transaction) async fn sign_each<S: Signer + ?Sized>(
     signers: &[&S],
 ) -> Result<SignedTransaction, ChainError> {
     if transaction.inputs.len() != signers.len() {
-        return Err(invalid_transaction(
+        return Err(ChainError::invalid_transaction(
             "Bitcoin transaction needs exactly one signer per input",
         ));
     }
@@ -76,7 +76,7 @@ pub(in crate::transaction) async fn sign_each<S: Signer + ?Sized>(
         } else if script.is_p2tr() {
             signing.sign_p2tr_input(input_index).await?
         } else {
-            return Err(invalid_transaction(format!(
+            return Err(ChainError::invalid_transaction(format!(
                 "Bitcoin input {input_index} is neither P2WPKH nor P2TR"
             )));
         };
@@ -138,7 +138,9 @@ impl<S: Signer + ?Sized> InputSigner<'_, S> {
                 sighash_type,
             )
             .map_err(|error| {
-                invalid_transaction(format!("could not compute Bitcoin input sighash: {error}"))
+                ChainError::invalid_transaction(format!(
+                    "could not compute Bitcoin input sighash: {error}"
+                ))
             })?;
         let signed = self
             .signer
@@ -205,7 +207,9 @@ impl<S: Signer + ?Sized> InputSigner<'_, S> {
                 sighash_type,
             )
             .map_err(|error| {
-                invalid_transaction(format!("could not compute Taproot input sighash: {error}"))
+                ChainError::invalid_transaction(format!(
+                    "could not compute Taproot input sighash: {error}"
+                ))
             })?;
         let signed = self
             .signer

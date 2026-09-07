@@ -97,7 +97,8 @@ where
 
     pub async fn genesis_hash(&self) -> Result<GenesisHash, Error> {
         let text = self.request::<String>("getGenesisHash", json!([])).await?;
-        text.parse().map_err(|_| malformed("getGenesisHash"))
+        text.parse()
+            .map_err(|_| Error::malformed_rpc("getGenesisHash"))
     }
 
     pub async fn slot(&self, commitment: Commitment, minimum: Option<u64>) -> Result<u64, Error> {
@@ -155,7 +156,7 @@ where
             .await?;
         require_floor(wire.context.slot, minimum)?;
         if wire.value.len() != addresses.len() {
-            return Err(malformed("getMultipleAccounts"));
+            return Err(Error::malformed_rpc("getMultipleAccounts"));
         }
         let values = wire
             .value
@@ -197,15 +198,22 @@ impl TryFrom<AccountWire> for AccountSnapshot {
         let owner = wire
             .owner
             .parse::<Address>()
-            .map_err(|_| malformed("account"))?;
-        let tuple = wire.data.as_array().ok_or_else(|| malformed("account"))?;
+            .map_err(|_| Error::malformed_rpc("account"))?;
+        let tuple = wire
+            .data
+            .as_array()
+            .ok_or_else(|| Error::malformed_rpc("account"))?;
         if tuple.len() != 2 || tuple[1].as_str() != Some("base64") {
-            return Err(malformed("account"));
+            return Err(Error::malformed_rpc("account"));
         }
-        let encoded = tuple[0].as_str().ok_or_else(|| malformed("account"))?;
-        let data = STANDARD.decode(encoded).map_err(|_| malformed("account"))?;
+        let encoded = tuple[0]
+            .as_str()
+            .ok_or_else(|| Error::malformed_rpc("account"))?;
+        let data = STANDARD
+            .decode(encoded)
+            .map_err(|_| Error::malformed_rpc("account"))?;
         if STANDARD.encode(&data) != encoded || u64::try_from(data.len()) != Ok(wire.space) {
-            return Err(malformed("account"));
+            return Err(Error::malformed_rpc("account"));
         }
         Ok(AccountSnapshot::new(
             owner,
@@ -234,13 +242,6 @@ fn require_floor(value: u64, floor: Option<u64>) -> Result<(), Error> {
         ));
     }
     Ok(())
-}
-
-fn malformed(method: &str) -> Error {
-    Error::new(
-        ErrorKind::MalformedRpc,
-        format!("Solana RPC {method} returned malformed data"),
-    )
 }
 
 #[cfg(test)]
@@ -412,6 +413,48 @@ mod tests {
                     .kind(),
                 ErrorKind::MalformedRpc
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn account_shape_and_cardinality_errors_follow_context_floor() {
+        let address = Address::from_bytes([7; 32]);
+        for (slot, value, kind, message) in [
+            (
+                3,
+                json!([]),
+                ErrorKind::BelowFloor,
+                "Solana RPC response is below its requested context floor",
+            ),
+            (
+                4,
+                json!([]),
+                ErrorKind::MalformedRpc,
+                "Solana RPC getMultipleAccounts returned malformed data",
+            ),
+            (
+                4,
+                json!([{"lamports":1,"owner":"bad","executable":false,"data":["","base64"],"space":0}]),
+                ErrorKind::MalformedRpc,
+                "Solana RPC account returned malformed data",
+            ),
+        ] {
+            let rpc = Scripted::one(
+                "getMultipleAccounts",
+                json!([[address.to_string()], {"encoding":"base64", "commitment":"confirmed", "minContextSlot":4}]),
+                json!({"context":{"slot":slot},"value":value}),
+            );
+            let error = Client::new(rpc.clone())
+                .accounts(
+                    std::slice::from_ref(&address),
+                    Commitment::Confirmed,
+                    Some(4),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), message);
+            rpc.assert_finished();
         }
     }
 }

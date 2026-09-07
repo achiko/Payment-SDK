@@ -7,7 +7,7 @@ use crate::{ChainError, ChainErrorKind, FeeRate, Network, Satoshi};
 
 use super::{
     BuildRequest, Funding, Input, Output, SpendSource, UnsignedTransaction, checked_output,
-    invalid_transaction, sum_utxos, validate_unique_utxos,
+    sum_utxos, validate_unique_utxos,
 };
 
 const SEGWIT_MARKER_FLAG_WEIGHT: u64 = 2;
@@ -23,7 +23,9 @@ impl BuildRequest {
             ));
         }
         if self.recipients.is_empty() {
-            return Err(invalid_transaction("Bitcoin transfer has no recipients"));
+            return Err(ChainError::invalid_transaction(
+                "Bitcoin transfer has no recipients",
+            ));
         }
         if self.fee_rate.satoshis_per_kvb() == 0 {
             return Err(ChainError {
@@ -35,7 +37,7 @@ impl BuildRequest {
         for utxo in &self.available {
             let script = ScriptBuf::from_bytes(utxo.script_pubkey.clone());
             if !script.is_p2wpkh() && !script.is_p2tr() {
-                return Err(invalid_transaction(
+                return Err(ChainError::invalid_transaction(
                     "Bitcoin wallet supports P2WPKH and P2TR inputs only",
                 ));
             }
@@ -50,7 +52,7 @@ impl BuildRequest {
 
         if self.drain_wallet {
             if self.recipients.len() != 1 {
-                return Err(invalid_transaction(
+                return Err(ChainError::invalid_transaction(
                     "Bitcoin drain transfer requires exactly one recipient",
                 ));
             }
@@ -81,9 +83,9 @@ impl BuildRequest {
         });
 
         let recipient_total = self.recipients.iter().try_fold(0_u64, |total, output| {
-            total
-                .checked_add(output.value.0)
-                .ok_or_else(|| invalid_transaction("Bitcoin recipient amount overflowed u64"))
+            total.checked_add(output.value.0).ok_or_else(|| {
+                ChainError::invalid_transaction("Bitcoin recipient amount overflowed u64")
+            })
         })?;
         let mut selected = Vec::new();
         let mut selected_total = 0_u64;
@@ -91,14 +93,16 @@ impl BuildRequest {
 
         for utxo in self.available {
             selected_total = selected_total.checked_add(utxo.value.0).ok_or_else(|| {
-                invalid_transaction("Bitcoin selected input amount overflowed u64")
+                ChainError::invalid_transaction("Bitcoin selected input amount overflowed u64")
             })?;
             selected.push(utxo);
 
             let fee_without_change = predicted_fee(&selected, &recipient_scripts, self.fee_rate)?;
             let required = recipient_total
                 .checked_add(fee_without_change)
-                .ok_or_else(|| invalid_transaction("Bitcoin amount and fee overflowed u64"))?;
+                .ok_or_else(|| {
+                    ChainError::invalid_transaction("Bitcoin amount and fee overflowed u64")
+                })?;
             if selected_total < required {
                 continue;
             }
@@ -137,7 +141,7 @@ pub(in crate::transaction) fn build_grouped(
     fee_rate: FeeRate,
 ) -> Result<UnsignedTransaction, ChainError> {
     if groups.is_empty() || fee_rate.satoshis_per_kvb() == 0 {
-        return Err(invalid_transaction(
+        return Err(ChainError::invalid_transaction(
             "Bitcoin grouped transfer needs sources and a positive fee rate",
         ));
     }
@@ -147,15 +151,16 @@ pub(in crate::transaction) fn build_grouped(
     let mut change = Vec::with_capacity(groups.len());
     for group in &mut groups {
         if group.available.is_empty() || group.recipients.is_empty() {
-            return Err(invalid_transaction(
+            return Err(ChainError::invalid_transaction(
                 "each Bitcoin grouped source needs inputs and recipients",
             ));
         }
         group.available.sort_by(SpendSource::compare_outpoint);
         let input = sum_utxos(&group.available)?;
         let output = group.recipients.iter().try_fold(0_u64, |sum, value| {
-            sum.checked_add(value.value.0)
-                .ok_or_else(|| invalid_transaction("Bitcoin recipient amount overflowed u64"))
+            sum.checked_add(value.value.0).ok_or_else(|| {
+                ChainError::invalid_transaction("Bitcoin recipient amount overflowed u64")
+            })
         })?;
         surplus.push(input.checked_sub(output).ok_or_else(|| {
             ChainError::insufficient_funds(
@@ -273,16 +278,18 @@ fn predicted_fee(
             .collect(),
     };
     let satisfaction_weight = inputs.iter().try_fold(0_u64, |total, utxo| {
-        total
-            .checked_add(utxo.satisfaction_weight)
-            .ok_or_else(|| invalid_transaction("Bitcoin satisfaction weight overflowed u64"))
+        total.checked_add(utxo.satisfaction_weight).ok_or_else(|| {
+            ChainError::invalid_transaction("Bitcoin satisfaction weight overflowed u64")
+        })
     })?;
     let weight = transaction
         .weight()
         .to_wu()
         .checked_add(SEGWIT_MARKER_FLAG_WEIGHT)
         .and_then(|weight| weight.checked_add(satisfaction_weight))
-        .ok_or_else(|| invalid_transaction("Bitcoin transaction weight overflowed u64"))?;
+        .ok_or_else(|| {
+            ChainError::invalid_transaction("Bitcoin transaction weight overflowed u64")
+        })?;
     fee_rate.for_vsize(weight.div_ceil(4))
 }
 

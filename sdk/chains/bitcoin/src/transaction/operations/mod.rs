@@ -26,13 +26,6 @@ pub(crate) const fn native_network(network: Network) -> NativeNetwork {
     }
 }
 
-pub(super) fn invalid_transaction(message: impl Into<String>) -> ChainError {
-    ChainError {
-        kind: ChainErrorKind::InvalidTransaction,
-        message: message.into(),
-    }
-}
-
 fn signer_error(error: base::SignerError) -> ChainError {
     signer_error_message(format!("Bitcoin signing failed: {error}"))
 }

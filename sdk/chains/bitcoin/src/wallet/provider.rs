@@ -83,7 +83,7 @@ impl Factory {
         match generator() {
             Ok(secret) => self.create(secret),
             Err(error) => {
-                let error = map_error(WalletErrorKind::Generation, error);
+                let error = WalletError::new(WalletErrorKind::Generation, error.to_string());
                 Box::pin(async move { Err(error) })
             }
         }
@@ -106,26 +106,30 @@ impl Provider for Factory {
     fn create<'a>(&'a self, secret: SecretBytes) -> FutureResult<'a, Arc<dyn WalletContract>> {
         Box::pin(async move {
             self.config.validate()?;
-            let temporary = SecretKey::new(secret.as_bytes().to_vec())
-                .map_err(|error| map_error(WalletErrorKind::InvalidSecret, error))?;
+            let temporary = SecretKey::new(secret.as_bytes().to_vec()).map_err(|error| {
+                WalletError::new(WalletErrorKind::InvalidSecret, error.to_string())
+            })?;
             let format = match self.config.address_type {
                 AddressType::SegwitV0 => PublicKeyFormat::Compressed,
                 AddressType::Taproot => PublicKeyFormat::XOnly,
             };
-            let public = temporary
-                .public_key(format)
-                .map_err(|error| map_error(WalletErrorKind::InvalidSecret, error))?;
+            let public = temporary.public_key(format).map_err(|error| {
+                WalletError::new(WalletErrorKind::InvalidSecret, error.to_string())
+            })?;
             let native = match self.config.address_type {
                 AddressType::SegwitV0 => {
-                    let key = PublicKey::from_slice(&public.bytes)
-                        .map_err(|error| map_error(WalletErrorKind::InvalidSecret, error))?;
-                    let key = CompressedPublicKey::try_from(key)
-                        .map_err(|error| map_error(WalletErrorKind::InvalidSecret, error))?;
+                    let key = PublicKey::from_slice(&public.bytes).map_err(|error| {
+                        WalletError::new(WalletErrorKind::InvalidSecret, error.to_string())
+                    })?;
+                    let key = CompressedPublicKey::try_from(key).map_err(|error| {
+                        WalletError::new(WalletErrorKind::InvalidSecret, error.to_string())
+                    })?;
                     NativeAddress::p2wpkh(&key, self.config.network.native())
                 }
                 AddressType::Taproot => {
-                    let key = XOnlyPublicKey::from_slice(&public.bytes)
-                        .map_err(|error| map_error(WalletErrorKind::InvalidSecret, error))?;
+                    let key = XOnlyPublicKey::from_slice(&public.bytes).map_err(|error| {
+                        WalletError::new(WalletErrorKind::InvalidSecret, error.to_string())
+                    })?;
                     NativeAddress::p2tr(
                         &Secp256k1::verification_only(),
                         key,
@@ -135,8 +139,10 @@ impl Provider for Factory {
                 }
             };
             let address = Address::from_encoded(native.to_string());
-            let signer = KeyPair::new(address.clone(), secret.as_bytes().to_vec())
-                .map_err(|error| map_error(WalletErrorKind::InvalidSecret, error))?;
+            let signer =
+                KeyPair::new(address.clone(), secret.as_bytes().to_vec()).map_err(|error| {
+                    WalletError::new(WalletErrorKind::InvalidSecret, error.to_string())
+                })?;
             Ok(Arc::new(Wallet {
                 config: self.config.clone(),
                 address,
@@ -186,9 +192,11 @@ impl WalletAddressFormat for Wallet {
         })?;
         let parsed = text
             .parse::<NativeAddress<bitcoin::address::NetworkUnchecked>>()
-            .map_err(|error| map_error(WalletErrorKind::InvalidAddress, error))?
+            .map_err(|error| WalletError::new(WalletErrorKind::InvalidAddress, error.to_string()))?
             .require_network(self.config.network.native())
-            .map_err(|error| map_error(WalletErrorKind::InvalidAddress, error))?;
+            .map_err(|error| {
+                WalletError::new(WalletErrorKind::InvalidAddress, error.to_string())
+            })?;
         let encoding = match parsed.address_type() {
             Some(bitcoin::AddressType::P2pkh | bitcoin::AddressType::P2sh) => {
                 AddressEncoding::Base58Check
@@ -210,8 +218,10 @@ impl WalletAddressFormat for Wallet {
     }
 
     fn parse_address(&self, address: &AddressText) -> Result<BaseAddress, WalletError> {
-        let parsed = Address::parse_for_network(&address.text, self.config.network)
-            .map_err(|error| map_error(WalletErrorKind::InvalidAddress, error))?;
+        let parsed =
+            Address::parse_for_network(&address.text, self.config.network).map_err(|error| {
+                WalletError::new(WalletErrorKind::InvalidAddress, error.to_string())
+            })?;
         let canonical = self.address_text(&parsed.address())?;
         if canonical.encoding != address.encoding {
             return Err(WalletError::new(
@@ -230,7 +240,7 @@ impl BalanceReader for Wallet {
                 .utxos
                 .utxos(vec![self.address.clone()])
                 .await
-                .map_err(|error| map_error(WalletErrorKind::Balance, error))?;
+                .map_err(|error| WalletError::new(WalletErrorKind::Balance, error.to_string()))?;
             let atomic = set.outputs.iter().try_fold(0_u64, |sum, output| {
                 sum.checked_add(output.value.0).ok_or_else(|| {
                     WalletError::new(WalletErrorKind::Balance, "Bitcoin balance exceeds u64")
@@ -340,10 +350,6 @@ pub(super) fn transaction_error(
     error: impl std::fmt::Display,
 ) -> TransactionError {
     TransactionError::new(kind, error.to_string())
-}
-
-pub(super) fn map_error(kind: WalletErrorKind, error: impl std::fmt::Display) -> WalletError {
-    WalletError::new(kind, error.to_string())
 }
 
 #[cfg(test)]
@@ -872,5 +878,29 @@ mod tests {
 
     fn fixed_secret() -> Result<SecretBytes, crypto::Error> {
         Ok(SecretBytes::new([1_u8; 32]))
+    }
+
+    #[test]
+    fn wallet_context_keeps_invalid_secret_and_address_errors_distinct() {
+        let factory = factory(AddressType::SegwitV0);
+        let error = match block_on(factory.create(SecretBytes::new(Vec::new()))) {
+            Ok(_) => panic!("empty secret must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, WalletErrorKind::InvalidSecret);
+        assert_eq!(
+            error.message,
+            "secret key must be a valid 32-byte secp256k1 scalar"
+        );
+        assert_eq!(error.ambiguous_transaction_id, None);
+
+        let wallet = block_on(factory.create(SecretBytes::new([1_u8; 32]))).unwrap();
+        let expected = Address::parse_for_network("not-an-address", Network::Regtest).unwrap_err();
+        let error = wallet
+            .parse_address(&AddressText::new(AddressEncoding::Bech32, "not-an-address"))
+            .unwrap_err();
+        assert_eq!(error.kind, WalletErrorKind::InvalidAddress);
+        assert_eq!(error.message, expected.to_string());
+        assert_eq!(error.ambiguous_transaction_id, None);
     }
 }

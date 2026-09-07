@@ -4,8 +4,6 @@ use bitcoin::{ScriptBuf, TapSighashType};
 
 use crate::{ChainError, Network, Output, SighashType, SpendSource};
 
-use super::invalid_transaction;
-
 pub(super) fn checked_output(
     network: Network,
     output: &Output,
@@ -14,7 +12,7 @@ pub(super) fn checked_output(
     let script = output.address.script_pubkey_for_network(network)?;
     let minimum = script.minimal_non_dust().to_sat();
     if !allow_zero && output.value.0 < minimum {
-        return Err(invalid_transaction(format!(
+        return Err(ChainError::invalid_transaction(format!(
             "Bitcoin recipient output is dust: minimum is {minimum} satoshis"
         )));
     }
@@ -25,7 +23,7 @@ pub(super) fn validate_unique_utxos(utxos: &[SpendSource]) -> Result<(), ChainEr
     let mut seen = BTreeSet::new();
     for utxo in utxos {
         if !seen.insert((utxo.transaction_id, utxo.output_index)) {
-            return Err(invalid_transaction(
+            return Err(ChainError::invalid_transaction(
                 "Bitcoin transfer contains a duplicate UTXO",
             ));
         }
@@ -35,9 +33,9 @@ pub(super) fn validate_unique_utxos(utxos: &[SpendSource]) -> Result<(), ChainEr
 
 pub(super) fn sum_utxos(utxos: &[SpendSource]) -> Result<u64, ChainError> {
     utxos.iter().try_fold(0_u64, |total, utxo| {
-        total
-            .checked_add(utxo.value.0)
-            .ok_or_else(|| invalid_transaction("Bitcoin selected input amount overflowed u64"))
+        total.checked_add(utxo.value.0).ok_or_else(|| {
+            ChainError::invalid_transaction("Bitcoin selected input amount overflowed u64")
+        })
     })
 }
 

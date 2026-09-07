@@ -65,8 +65,8 @@ impl Repository {
         let mut client = self.client().await?;
         let transaction = client.transaction().await.map_err(crate::store)?;
 
-        lock_scope(&transaction, &self.scope).await?;
-        let current = locked_checkpoint(&transaction, &self.scope).await?;
+        self.lock_scope(&transaction).await?;
+        let current = self.locked_checkpoint(&transaction).await?;
         let height = row::as_i64(addition.block().height.0, "block height")?;
         let statement = prepare_in(&transaction, JOURNALLED_HASH).await?;
         let journalled = transaction
@@ -118,28 +118,27 @@ impl Repository {
     }
 }
 
-pub(crate) async fn lock_scope(
-    transaction: &Transaction<'_>,
-    scope: &IndexScope,
-) -> Result<(), IndexError> {
-    let statement = prepare_in(transaction, LOCK_SCOPE).await?;
-    transaction
-        .query_one(&statement, &[&scope.chain.0, &scope.network])
-        .await
-        .map_err(crate::store)?;
-    Ok(())
-}
+impl Repository {
+    pub(crate) async fn lock_scope(&self, transaction: &Transaction<'_>) -> Result<(), IndexError> {
+        let statement = prepare_in(transaction, LOCK_SCOPE).await?;
+        transaction
+            .query_one(&statement, &[&self.scope.chain.0, &self.scope.network])
+            .await
+            .map_err(crate::store)?;
+        Ok(())
+    }
 
-pub(crate) async fn locked_checkpoint(
-    transaction: &Transaction<'_>,
-    scope: &IndexScope,
-) -> Result<Option<BlockRef>, IndexError> {
-    let statement = prepare_in(transaction, LOCK_CHECKPOINT).await?;
-    let row = transaction
-        .query_opt(&statement, &[&scope.chain.0, &scope.network])
-        .await
-        .map_err(crate::store)?;
-    row.as_ref().map(|row| row::block(row, "")).transpose()
+    pub(crate) async fn locked_checkpoint(
+        &self,
+        transaction: &Transaction<'_>,
+    ) -> Result<Option<BlockRef>, IndexError> {
+        let statement = prepare_in(transaction, LOCK_CHECKPOINT).await?;
+        let row = transaction
+            .query_opt(&statement, &[&self.scope.chain.0, &self.scope.network])
+            .await
+            .map_err(crate::store)?;
+        row.as_ref().map(|row| row::block(row, "")).transpose()
+    }
 }
 
 pub(crate) fn optional_block(

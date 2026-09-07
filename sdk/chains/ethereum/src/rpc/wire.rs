@@ -13,6 +13,23 @@ pub(crate) enum CallError {
 }
 
 impl CallError {
+    pub(super) fn is_already_known(&self) -> bool {
+        let Self::Remote(failure) = self else {
+            return false;
+        };
+        let message = failure.message.to_ascii_lowercase();
+        message.contains("already known") || message.contains("known transaction")
+    }
+
+    pub(super) fn execution_revert_code(&self) -> Option<i64> {
+        let Self::Remote(failure) = self else {
+            return None;
+        };
+        let message = failure.message.to_ascii_lowercase();
+        (message.contains("execution reverted") || message.contains("execution revert"))
+            .then_some(failure.code)
+    }
+
     pub(super) fn into_source(self, method: &'static str) -> SourceError {
         match self {
             Self::Local(error) => error,
@@ -43,16 +60,6 @@ pub(super) fn remote_failure_is_retryable(failure: &Failure) -> bool {
     ]
     .iter()
     .any(|needle| message.contains(needle))
-}
-
-pub(super) fn is_already_known(failure: &Failure) -> bool {
-    let message = failure.message.to_ascii_lowercase();
-    message.contains("already known") || message.contains("known transaction")
-}
-
-pub(super) fn is_execution_revert(failure: &Failure) -> bool {
-    let message = failure.message.to_ascii_lowercase();
-    message.contains("execution reverted") || message.contains("execution revert")
 }
 
 pub(super) fn parse_quantity_u64(value: &str) -> Result<u64, &'static str> {
@@ -128,10 +135,12 @@ pub(super) fn transaction_id_hex(id: &TransactionId) -> String {
     hex::encode_prefixed(id.0)
 }
 
+// design-lint: allow unclassified-free-function -- translates foreign JSON-RPC errors into foreign indexing source errors while preserving display text and retryability at the Ethereum RPC boundary
 pub(super) fn map_json_rpc_error(error: Error) -> SourceError {
     source_error(error.to_string(), error.is_retryable())
 }
 
+// design-lint: allow unclassified-free-function -- shared Ethereum RPC response validation adds method context to foreign SourceError values and keeps malformed responses nonretryable
 pub(super) fn invalid_rpc_response(
     method: &'static str,
     message: impl fmt::Display,
@@ -152,6 +161,71 @@ pub(super) fn source_error(message: impl Into<String>, retryable: bool) -> Sourc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn call_error_classification_uses_only_remote_ascii_message_matching() {
+        for (message, known, revert) in [
+            ("ALREADY KNOWN", true, false),
+            ("prefix Known Transaction suffix", true, false),
+            ("unknown transaction", true, false),
+            ("EXECUTION REVERTED: reason", false, true),
+            ("prefix execution revert suffix", false, true),
+            ("execution failed", false, false),
+            ("already\tknown", false, false),
+            ("ÉXECUTION REVERTED", false, false),
+        ] {
+            let error = CallError::Remote(Failure {
+                code: -32_000,
+                message: message.to_owned(),
+                data: None,
+            });
+            assert_eq!(error.is_already_known(), known);
+            assert_eq!(error.execution_revert_code(), revert.then_some(-32_000));
+        }
+        let local = CallError::Local(SourceError {
+            message: "already known execution reverted".to_owned(),
+            retryable: true,
+        });
+        assert!(!local.is_already_known());
+        assert_eq!(local.execution_revert_code(), None);
+        let converted = local.into_source("eth_call");
+        assert_eq!(converted.message, "already known execution reverted");
+        assert!(converted.retryable);
+    }
+
+    #[test]
+    fn transport_adapter_preserves_message_and_exact_retryability() {
+        for (kind, retryable) in [
+            (json_rpc::ErrorKind::InvalidConfiguration, false),
+            (json_rpc::ErrorKind::InvalidRequest, false),
+            (json_rpc::ErrorKind::Timeout, true),
+            (json_rpc::ErrorKind::Unavailable, true),
+            (json_rpc::ErrorKind::HttpStatus(429), true),
+            (json_rpc::ErrorKind::HttpStatus(500), false),
+            (json_rpc::ErrorKind::HttpStatus(502), true),
+            (json_rpc::ErrorKind::HttpStatus(503), true),
+            (json_rpc::ErrorKind::HttpStatus(504), true),
+            (json_rpc::ErrorKind::ResponseTooLarge, false),
+            (json_rpc::ErrorKind::InvalidResponse, false),
+        ] {
+            let source = map_json_rpc_error(Error {
+                kind,
+                message: "transport result".to_owned(),
+            });
+            assert_eq!(source.message, "transport result");
+            assert_eq!(source.retryable, retryable);
+        }
+    }
+
+    #[test]
+    fn invalid_response_adapter_keeps_method_context_and_terminal_classification() {
+        let error = invalid_rpc_response("eth_call", "hex data has an invalid length");
+        assert_eq!(
+            error.message,
+            "Ethereum RPC eth_call returned an invalid response: hex data has an invalid length"
+        );
+        assert!(!error.retryable);
+    }
 
     #[test]
     fn quantities_encode_zero_odd_nibbles_and_the_entire_256_bit_range() {

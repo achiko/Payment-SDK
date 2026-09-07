@@ -161,7 +161,7 @@ impl Http {
                     .max_response_size(max_response)
                     .set_headers(headers.clone())
                     .build(endpoint)
-                    .map_err(map_error)
+                    .map_err(Error::from_rpc)
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(Self {
@@ -190,7 +190,7 @@ impl Client for Http {
                         Ok(value) => return Ok(Ok(RawJson(value.get().as_bytes().to_vec()))),
                         Err(RpcError::Call(error)) => return Ok(Err(Failure::from(error))),
                         Err(source) => {
-                            let error = map_error(source);
+                            let error = Error::from_rpc(source);
                             if !error.is_retryable() {
                                 return Err(error);
                             }
@@ -221,7 +221,7 @@ impl Client for Http {
             match client.request::<Box<RawValue>, _>(method, params).await {
                 Ok(value) => Ok(Ok(RawJson(value.get().as_bytes().to_vec()))),
                 Err(RpcError::Call(error)) => Ok(Err(Failure::from(error))),
-                Err(source) => Err(map_error(source)),
+                Err(source) => Err(Error::from_rpc(source)),
             }
         })
     }
@@ -266,7 +266,7 @@ impl Client for Http {
                                 .collect());
                         }
                         Err(source) => {
-                            let error = map_error(source);
+                            let error = Error::from_rpc(source);
                             if !error.is_retryable() {
                                 return Err(error);
                             }
@@ -326,38 +326,40 @@ impl From<ErrorObjectOwned> for Failure {
     }
 }
 
-fn map_error(error: RpcError) -> Error {
-    match error {
-        RpcError::Call(error) => Error::new(
-            ErrorKind::InvalidResponse,
-            format!("JSON-RPC call failed with code {}", error.code()),
-        ),
-        RpcError::RequestTimeout => Error::new(ErrorKind::Timeout, "JSON-RPC request timed out"),
-        RpcError::Transport(source) => {
-            if let Some(error) = source.downcast_ref::<transport::Error>() {
-                return match error {
-                    transport::Error::Rejected { status_code } => Error::new(
-                        ErrorKind::HttpStatus(*status_code),
-                        "JSON-RPC endpoint rejected the request",
-                    ),
-                    transport::Error::Http(HttpError::TooLarge) => Error::new(
-                        ErrorKind::ResponseTooLarge,
-                        "JSON-RPC response exceeded its configured limit",
-                    ),
-                    transport::Error::Http(HttpError::Malformed) => Error::new(
-                        ErrorKind::InvalidResponse,
-                        "JSON-RPC endpoint returned an invalid response",
-                    ),
-                    _ => Error::new(ErrorKind::Unavailable, "JSON-RPC transport is unavailable"),
-                };
+impl Error {
+    fn from_rpc(error: RpcError) -> Self {
+        match error {
+            RpcError::Call(error) => Self::new(
+                ErrorKind::InvalidResponse,
+                format!("JSON-RPC call failed with code {}", error.code()),
+            ),
+            RpcError::RequestTimeout => Self::new(ErrorKind::Timeout, "JSON-RPC request timed out"),
+            RpcError::Transport(source) => {
+                if let Some(error) = source.downcast_ref::<transport::Error>() {
+                    return match error {
+                        transport::Error::Rejected { status_code } => Self::new(
+                            ErrorKind::HttpStatus(*status_code),
+                            "JSON-RPC endpoint rejected the request",
+                        ),
+                        transport::Error::Http(HttpError::TooLarge) => Self::new(
+                            ErrorKind::ResponseTooLarge,
+                            "JSON-RPC response exceeded its configured limit",
+                        ),
+                        transport::Error::Http(HttpError::Malformed) => Self::new(
+                            ErrorKind::InvalidResponse,
+                            "JSON-RPC endpoint returned an invalid response",
+                        ),
+                        _ => Self::new(ErrorKind::Unavailable, "JSON-RPC transport is unavailable"),
+                    };
+                }
+                Self::new(ErrorKind::Unavailable, "JSON-RPC transport is unavailable")
             }
-            Error::new(ErrorKind::Unavailable, "JSON-RPC transport is unavailable")
+            RpcError::ParseError(_) | RpcError::InvalidRequestId(_) => Self::new(
+                ErrorKind::InvalidResponse,
+                "JSON-RPC endpoint returned an invalid response",
+            ),
+            _ => Self::new(ErrorKind::InvalidResponse, "JSON-RPC request failed"),
         }
-        RpcError::ParseError(_) | RpcError::InvalidRequestId(_) => Error::new(
-            ErrorKind::InvalidResponse,
-            "JSON-RPC endpoint returned an invalid response",
-        ),
-        _ => Error::new(ErrorKind::InvalidResponse, "JSON-RPC request failed"),
     }
 }
 
@@ -390,6 +392,111 @@ fn invalid_limit() -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rpc_error_conversion_preserves_classification_and_redacts_details() {
+        for (source, kind, message, retryable) in [
+            (
+                RpcError::Call(ErrorObjectOwned::owned(
+                    -32_000,
+                    "Bearer hidden",
+                    Some("hidden payload"),
+                )),
+                ErrorKind::InvalidResponse,
+                "JSON-RPC call failed with code -32000",
+                false,
+            ),
+            (
+                RpcError::RequestTimeout,
+                ErrorKind::Timeout,
+                "JSON-RPC request timed out",
+                true,
+            ),
+            (
+                RpcError::ParseError(serde_json::from_str::<Value>("hidden").unwrap_err()),
+                ErrorKind::InvalidResponse,
+                "JSON-RPC endpoint returned an invalid response",
+                false,
+            ),
+            (
+                RpcError::InvalidRequestId(jsonrpsee::types::InvalidRequestId::NotPendingRequest(
+                    "hidden".to_owned(),
+                )),
+                ErrorKind::InvalidResponse,
+                "JSON-RPC endpoint returned an invalid response",
+                false,
+            ),
+            (
+                RpcError::Custom("hidden".to_owned()),
+                ErrorKind::InvalidResponse,
+                "JSON-RPC request failed",
+                false,
+            ),
+            (
+                RpcError::Transport(Box::new(std::io::Error::other("hidden endpoint"))),
+                ErrorKind::Unavailable,
+                "JSON-RPC transport is unavailable",
+                true,
+            ),
+        ] {
+            let error = Error::from_rpc(source);
+            assert_eq!(error.kind, kind);
+            assert_eq!(error.message, message);
+            assert_eq!(error.is_retryable(), retryable);
+            assert!(!format!("{error:?}").contains("hidden"));
+        }
+    }
+
+    #[test]
+    fn http_transport_conversion_preserves_retryable_statuses_and_size_errors() {
+        for (source, kind, message, retryable) in [
+            (
+                transport::Error::Http(HttpError::TooLarge),
+                ErrorKind::ResponseTooLarge,
+                "JSON-RPC response exceeded its configured limit",
+                false,
+            ),
+            (
+                transport::Error::Http(HttpError::Malformed),
+                ErrorKind::InvalidResponse,
+                "JSON-RPC endpoint returned an invalid response",
+                false,
+            ),
+            (
+                transport::Error::Url("https://hidden@example.invalid".to_owned()),
+                ErrorKind::Unavailable,
+                "JSON-RPC transport is unavailable",
+                true,
+            ),
+            (
+                transport::Error::RequestTooLarge,
+                ErrorKind::Unavailable,
+                "JSON-RPC transport is unavailable",
+                true,
+            ),
+        ] {
+            let error = Error::from_rpc(RpcError::Transport(Box::new(source)));
+            assert_eq!(error.kind, kind);
+            assert_eq!(error.message, message);
+            assert_eq!(error.is_retryable(), retryable);
+        }
+        for (status, retryable) in [
+            (400, false),
+            (429, true),
+            (500, false),
+            (502, true),
+            (503, true),
+            (504, true),
+        ] {
+            let error =
+                Error::from_rpc(RpcError::Transport(Box::new(transport::Error::Rejected {
+                    status_code: status,
+                })));
+            assert_eq!(error.kind, ErrorKind::HttpStatus(status));
+            assert_eq!(error.message, "JSON-RPC endpoint rejected the request");
+            assert_eq!(error.is_retryable(), retryable);
+        }
+    }
 
     #[test]
     fn configured_headers_preserve_last_value_and_original_configuration() {

@@ -23,11 +23,14 @@ pub(crate) struct GlobalVersion {
 
 pub(crate) fn namespace_prefix(namespace: &Namespace) -> Result<Vec<u8>, Error> {
     let namespace_bytes = namespace.0.as_bytes();
-    let namespace_len = u32::try_from(namespace_bytes.len())
-        .map_err(|_| invalid_request("namespace length exceeds the storage key format limit"))?;
+    let namespace_len = u32::try_from(namespace_bytes.len()).map_err(|_| {
+        Error::invalid_request("namespace length exceeds the storage key format limit")
+    })?;
     let capacity = size_of::<u32>()
         .checked_add(namespace_bytes.len())
-        .ok_or_else(|| invalid_request("namespace length overflows the storage key format"))?;
+        .ok_or_else(|| {
+            Error::invalid_request("namespace length overflows the storage key format")
+        })?;
 
     let mut encoded = Vec::with_capacity(capacity);
     encoded.extend_from_slice(&namespace_len.to_be_bytes());
@@ -38,10 +41,9 @@ pub(crate) fn namespace_prefix(namespace: &Namespace) -> Result<Vec<u8>, Error> 
 // design-lint: allow unclassified-free-function -- adapter-owned physical key encoding combines foreign Namespace and Key values without leaking the redb wire format into neutral storage
 pub(crate) fn encode_physical_key(namespace: &Namespace, key: &Key) -> Result<Vec<u8>, Error> {
     let mut encoded = namespace_prefix(namespace)?;
-    encoded
-        .len()
-        .checked_add(key.0.len())
-        .ok_or_else(|| invalid_request("logical key length overflows the storage key format"))?;
+    encoded.len().checked_add(key.0.len()).ok_or_else(|| {
+        Error::invalid_request("logical key length overflows the storage key format")
+    })?;
     encoded.extend_from_slice(&key.0);
     Ok(encoded)
 }
@@ -78,12 +80,12 @@ pub(crate) fn decode_physical_key(
 impl StoredRecord {
     pub(crate) fn new(value: Value, version: Version) -> Result<Self, Error> {
         if version.0 == 0 {
-            return Err(invalid_request(
+            return Err(Error::invalid_request(
                 "storage version zero is reserved for an uninitialized database",
             ));
         }
         if value.0.len() > MAX_STORED_PAYLOAD_BYTES {
-            return Err(invalid_request(
+            return Err(Error::invalid_request(
                 "storage value exceeds the physical record size limit",
             ));
         }
@@ -145,7 +147,7 @@ impl From<StoredRecord> for StoredValue {
 impl GlobalVersion {
     pub(crate) fn new(version: Version) -> Result<Self, Error> {
         if version.0 == 0 {
-            return Err(invalid_request(
+            return Err(Error::invalid_request(
                 "persisted global version zero is not a valid commit version",
             ));
         }
@@ -279,13 +281,6 @@ fn read_u64(bytes: &[u8]) -> Result<u64, Error> {
     let mut value = [0_u8; size_of::<u64>()];
     value.copy_from_slice(bytes);
     Ok(u64::from_be_bytes(value))
-}
-
-fn invalid_request(message: impl Into<String>) -> Error {
-    Error {
-        kind: ErrorKind::InvalidRequest,
-        message: message.into(),
-    }
 }
 
 fn other(message: impl Into<String>) -> Error {

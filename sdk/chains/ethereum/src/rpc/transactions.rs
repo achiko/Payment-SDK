@@ -10,9 +10,8 @@ use super::{
     error::BuildError,
     transport::Client as Transport,
     wire::{
-        CallError, invalid_rpc_response, is_already_known, is_execution_revert, map_json_rpc_error,
-        parse_fixed_data, parse_quantity_u64, parse_quantity_wei, parse_transaction_id,
-        wei_quantity,
+        CallError, invalid_rpc_response, map_json_rpc_error, parse_fixed_data, parse_quantity_u64,
+        parse_quantity_wei, parse_transaction_id, wei_quantity,
     },
 };
 use crate::{
@@ -106,20 +105,16 @@ where
                     .await
                 {
                     Ok(raw) => raw,
-                    Err(CallError::Local(error)) => return Err(rpc_error(error)),
-                    Err(CallError::Remote(failure)) => {
-                        if is_execution_revert(&failure) {
+                    Err(error) => {
+                        if let Some(code) = error.execution_revert_code() {
                             return Err(ChainError::new(
                                 ChainErrorKind::Rejected,
                                 format!(
-                                    "Ethereum ERC-20 transfer simulation was rejected with code {}",
-                                    failure.code
+                                    "Ethereum ERC-20 transfer simulation was rejected with code {code}"
                                 ),
                             ));
                         }
-                        return Err(rpc_error(
-                            CallError::Remote(failure).into_source("eth_call"),
-                        ));
+                        return Err(rpc_error(error.into_source("eth_call")));
                     }
                 };
                 let value: String = raw.deserialize().map_err(|_| {
@@ -266,7 +261,7 @@ where
                 .await;
             let raw = match result {
                 Ok(raw) => raw,
-                Err(CallError::Remote(failure)) if is_already_known(&failure) => {
+                Err(error) if error.is_already_known() => {
                     match self.confirm_known_transaction(&computed).await {
                         Ok(true) => return Ok(computed),
                         Ok(false) => {}
@@ -338,20 +333,14 @@ where
             .await
         {
             Ok(raw) => raw,
-            Err(CallError::Local(error)) => return Err(rpc_error(error)),
-            Err(CallError::Remote(failure)) if is_execution_revert(&failure) => {
-                return Err(ChainError::new(
-                    ChainErrorKind::Rejected,
-                    format!(
-                        "Ethereum gas estimation was rejected with code {}",
-                        failure.code
-                    ),
-                ));
-            }
-            Err(CallError::Remote(failure)) => {
-                return Err(rpc_error(
-                    CallError::Remote(failure).into_source("eth_estimateGas"),
-                ));
+            Err(error) => {
+                if let Some(code) = error.execution_revert_code() {
+                    return Err(ChainError::new(
+                        ChainErrorKind::Rejected,
+                        format!("Ethereum gas estimation was rejected with code {code}"),
+                    ));
+                }
+                return Err(rpc_error(error.into_source("eth_estimateGas")));
             }
         };
         let value: String = raw

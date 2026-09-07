@@ -62,11 +62,21 @@ fn native_transaction(transaction: &UnsignedTransaction) -> Result<TxEip1559, Ch
     let max_fee_per_gas = transaction
         .max_fee_per_gas
         .checked_to_u128()
-        .ok_or_else(|| invalid_transaction("Ethereum max fee per gas exceeds u128"))?;
+        .ok_or_else(|| {
+            ChainError::new(
+                ChainErrorKind::InvalidTransaction,
+                "Ethereum max fee per gas exceeds u128",
+            )
+        })?;
     let max_priority_fee_per_gas = transaction
         .max_priority_fee_per_gas
         .checked_to_u128()
-        .ok_or_else(|| invalid_transaction("Ethereum priority fee exceeds u128"))?;
+        .ok_or_else(|| {
+            ChainError::new(
+                ChainErrorKind::InvalidTransaction,
+                "Ethereum priority fee exceeds u128",
+            )
+        })?;
 
     Ok(TxEip1559 {
         chain_id: transaction.chain_id,
@@ -83,13 +93,6 @@ fn native_transaction(transaction: &UnsignedTransaction) -> Result<TxEip1559, Ch
     })
 }
 
-fn invalid_transaction(message: impl Into<String>) -> ChainError {
-    ChainError {
-        kind: ChainErrorKind::InvalidTransaction,
-        message: message.into(),
-    }
-}
-
 fn signer_error(error: base::SignerError) -> ChainError {
     signer_error_message(format!("Ethereum signing failed: {error}"))
 }
@@ -98,5 +101,51 @@ fn signer_error_message(message: impl Into<String>) -> ChainError {
     ChainError {
         kind: ChainErrorKind::Signer,
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Wei;
+
+    struct MustNotSign;
+
+    impl Signer for MustNotSign {
+        fn sign<'a>(&'a self, _: SignRequest) -> base::SignFuture<'a> {
+            panic!("out-of-range fees must fail before signing")
+        }
+    }
+
+    #[test]
+    fn fee_width_errors_precede_signing_and_preserve_validation_order() {
+        for (max_fee, priority, message) in [
+            (
+                Wei([255; 32]),
+                Wei([255; 32]),
+                "Ethereum max fee per gas exceeds u128",
+            ),
+            (
+                Wei::from_u128(u128::MAX),
+                Wei([255; 32]),
+                "Ethereum priority fee exceeds u128",
+            ),
+        ] {
+            let transaction = UnsignedTransaction {
+                chain_id: 1,
+                nonce: 0,
+                from: crate::Address([1; 20]),
+                to: Some(crate::Address([2; 20])),
+                value: Wei::ZERO,
+                input: Vec::new(),
+                gas_limit: 21_000,
+                max_fee_per_gas: max_fee,
+                max_priority_fee_per_gas: priority,
+            };
+            let error = futures_executor::block_on(sign(transaction, &MustNotSign))
+                .expect_err("oversized fees must not reach the signer");
+            assert_eq!(error.kind, ChainErrorKind::InvalidTransaction);
+            assert_eq!(error.message, message);
+        }
     }
 }

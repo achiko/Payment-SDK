@@ -372,3 +372,32 @@ fn batched_receipt_fallback_restores_transaction_order() {
 
     assert_eq!(block.raw_receipts, vec![first_receipt, second_receipt]);
 }
+
+#[test]
+fn canonical_lookup_distinguishes_json_null_from_non_null_values() {
+    let client = ScriptedClient::new(vec![
+        success("eth_chainId", json!("0x7a69")),
+        success(
+            "eth_getBlockByNumber",
+            block(0, GENESIS_HASH, PARENT_HASH, Vec::new()),
+        ),
+        raw_success("eth_getBlockByNumber", b" \nnull\t ".to_vec()),
+        success("eth_getBlockByNumber", json!("null")),
+        success("eth_getBlockByNumber", json!({"value": null})),
+        success("eth_getBlockByNumber", json!(false)),
+    ]);
+    let source = block_on(BlockClient::connect(client, config())).expect("identity must match");
+    assert_eq!(
+        block_on(source.canonical_at(BlockPosition(10))).unwrap(),
+        None
+    );
+    for _ in 0..3 {
+        let error = block_on(source.canonical_at(BlockPosition(10)))
+            .expect_err("non-null results must pass through strict block parsing");
+        assert_eq!(
+            error.message,
+            "Ethereum block result does not match the RPC block shape"
+        );
+        assert!(error.retryable);
+    }
+}

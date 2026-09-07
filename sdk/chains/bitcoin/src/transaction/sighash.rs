@@ -2,8 +2,6 @@ use bitcoin::EcdsaSighashType;
 
 use crate::ChainError;
 
-use super::operations::invalid_transaction;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SighashType {
     All,
@@ -24,7 +22,7 @@ impl SighashType {
             SighashType::AllAnyoneCanPay => Ok(EcdsaSighashType::AllPlusAnyoneCanPay),
             SighashType::NoneAnyoneCanPay => Ok(EcdsaSighashType::NonePlusAnyoneCanPay),
             SighashType::SingleAnyoneCanPay => Ok(EcdsaSighashType::SinglePlusAnyoneCanPay),
-            SighashType::TaprootDefault => Err(invalid_transaction(
+            SighashType::TaprootDefault => Err(ChainError::invalid_transaction(
                 "Taproot default sighash cannot sign a P2WPKH input",
             )),
         }

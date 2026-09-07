@@ -1,4 +1,4 @@
-use crate::{ChainError, ChainErrorKind};
+use crate::ChainError;
 use bitcoin::{Transaction, Txid, consensus, hashes::Hash};
 use std::{fmt, str::FromStr};
 
@@ -88,13 +88,13 @@ impl SignedTransaction {
     ) -> Result<Self, ChainError> {
         let transaction: Transaction =
             consensus::deserialize(&consensus_bytes).map_err(|error| {
-                invalid_transaction(format!(
+                ChainError::invalid_transaction(format!(
                     "could not decode signed Bitcoin consensus bytes: {error}"
                 ))
             })?;
         let computed_id = Id::from(transaction.compute_txid());
         if computed_id != expected_id {
-            return Err(invalid_transaction(format!(
+            return Err(ChainError::invalid_transaction(format!(
                 "signed Bitcoin transaction ID mismatch: expected {expected_id}, computed {computed_id}"
             )));
         }
@@ -128,7 +128,7 @@ impl SignedTransaction {
     pub fn virtual_size(&self) -> Result<u64, ChainError> {
         let transaction = self.decode()?;
         u64::try_from(transaction.vsize())
-            .map_err(|_| invalid_transaction("signed Bitcoin virtual size exceeds u64"))
+            .map_err(|_| ChainError::invalid_transaction("signed Bitcoin virtual size exceeds u64"))
     }
 
     /// Decodes the retained exact consensus bytes into reviewable transaction
@@ -143,13 +143,14 @@ impl SignedTransaction {
         let transaction = self.decode()?;
         let transaction_id = Id::from(transaction.compute_txid());
         if transaction_id != self.id {
-            return Err(invalid_transaction(format!(
+            return Err(ChainError::invalid_transaction(format!(
                 "signed Bitcoin transaction ID mismatch: expected {}, computed {transaction_id}",
                 self.id
             )));
         }
-        let virtual_size = u64::try_from(transaction.vsize())
-            .map_err(|_| invalid_transaction("signed Bitcoin virtual size exceeds u64"))?;
+        let virtual_size = u64::try_from(transaction.vsize()).map_err(|_| {
+            ChainError::invalid_transaction("signed Bitcoin virtual size exceeds u64")
+        })?;
         let inputs = transaction
             .input
             .iter()
@@ -168,7 +169,7 @@ impl SignedTransaction {
             .map(|(output_index, output)| {
                 Ok(OutputInspection {
                     output_index: u32::try_from(output_index).map_err(|_| {
-                        invalid_transaction("signed Bitcoin output index exceeds u32")
+                        ChainError::invalid_transaction("signed Bitcoin output index exceeds u32")
                     })?,
                     value: Satoshi(output.value.to_sat()),
                     script_pubkey: output.script_pubkey.as_bytes().to_vec(),
@@ -187,7 +188,7 @@ impl SignedTransaction {
 
     fn decode(&self) -> Result<Transaction, ChainError> {
         consensus::deserialize(&self.consensus_bytes).map_err(|error| {
-            invalid_transaction(format!(
+            ChainError::invalid_transaction(format!(
                 "could not decode signed Bitcoin consensus bytes: {error}"
             ))
         })
@@ -215,16 +216,10 @@ impl fmt::Debug for RedactedBytes {
     }
 }
 
-fn invalid_transaction(message: impl Into<String>) -> ChainError {
-    ChainError {
-        kind: ChainErrorKind::InvalidTransaction,
-        message: message.into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ChainErrorKind;
     use bitcoin::{
         Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness, absolute, transaction::Version,
     };

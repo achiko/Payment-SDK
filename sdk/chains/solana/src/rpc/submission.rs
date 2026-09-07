@@ -73,10 +73,10 @@ where
             )
             .await?;
         require_floor(wire.context.slot, floor)?;
-        let blockhash =
-            Hash::from_str(&wire.value.blockhash).map_err(|_| malformed("getLatestBlockhash"))?;
+        let blockhash = Hash::from_str(&wire.value.blockhash)
+            .map_err(|_| Error::malformed_rpc("getLatestBlockhash"))?;
         if blockhash.to_string() != wire.value.blockhash {
-            return Err(malformed("getLatestBlockhash"));
+            return Err(Error::malformed_rpc("getLatestBlockhash"));
         }
         Ok(Context {
             slot: wire.context.slot,
@@ -175,7 +175,7 @@ where
             .await?;
         require_floor(wire.context.slot, floor)?;
         let [status] = <[Option<StatusWire>; 1]>::try_from(wire.value)
-            .map_err(|_| malformed("getSignatureStatuses"))?;
+            .map_err(|_| Error::malformed_rpc("getSignatureStatuses"))?;
         let status = status.map(|status| {
             if status.slot < floor
                 || status.slot > wire.context.slot
@@ -185,7 +185,7 @@ where
                 )
                 || (status.confirmation_status == "finalized" && status.confirmations.is_some())
             {
-                return Err(malformed("getSignatureStatuses"));
+                return Err(Error::malformed_rpc("getSignatureStatuses"));
             }
             Ok(SignatureStatus {
                 slot: status.slot,
@@ -207,13 +207,6 @@ fn require_floor(slot: u64, floor: u64) -> Result<(), Error> {
         ));
     }
     Ok(())
-}
-
-fn malformed(method: &str) -> Error {
-    Error::new(
-        ErrorKind::MalformedRpc,
-        format!("Solana RPC {method} returned malformed data"),
-    )
 }
 
 fn unknown(local_id: TransactionId) -> TransactionError {
@@ -371,5 +364,63 @@ mod tests {
         assert_eq!(status.slot(), 12);
         assert!(status.failed());
         rpc.assert_finished();
+    }
+
+    #[tokio::test]
+    async fn lifetime_content_errors_keep_method_context_after_floor_validation() {
+        for (slot, kind, message) in [
+            (
+                3,
+                ErrorKind::BelowFloor,
+                "Solana RPC response is below its requested context floor",
+            ),
+            (
+                4,
+                ErrorKind::MalformedRpc,
+                "Solana RPC getLatestBlockhash returned malformed data",
+            ),
+        ] {
+            let rpc = Scripted::one(
+                "getLatestBlockhash",
+                json!([{"commitment":"confirmed", "minContextSlot":4}]),
+                json!({"context":{"slot":slot},"value":{"blockhash":"bad","lastValidBlockHeight":9}}),
+            );
+            let error = Client::new(rpc.clone())
+                .latest_blockhash(4)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), message);
+            rpc.assert_finished();
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_historical_status_preserves_its_method_context() {
+        let id = TransactionId::new(Signature::from([7; 64]).to_string());
+        for value in [
+            json!([]),
+            json!([null, null]),
+            json!([{"slot":9,"confirmations":null,"err":null,"confirmationStatus":"finalized"}]),
+            json!([{"slot":16,"confirmations":null,"err":null,"confirmationStatus":"finalized"}]),
+            json!([{"slot":12,"confirmations":1,"err":null,"confirmationStatus":"finalized"}]),
+            json!([{"slot":12,"confirmations":null,"err":null,"confirmationStatus":"unknown"}]),
+        ] {
+            let rpc = Scripted::one(
+                "getSignatureStatuses",
+                json!([[id.as_str()], {"searchTransactionHistory":true}]),
+                json!({"context":{"slot":15},"value":value}),
+            );
+            let error = Client::new(rpc.clone())
+                .signature_status(&id, 10)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::MalformedRpc);
+            assert_eq!(
+                error.to_string(),
+                "Solana RPC getSignatureStatuses returned malformed data"
+            );
+            rpc.assert_finished();
+        }
     }
 }
