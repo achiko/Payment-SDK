@@ -83,6 +83,187 @@ async fn jsonrpsee_restores_batch_order() {
 }
 
 #[tokio::test]
+async fn batch_rejects_invalid_calls_before_http() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback server must bind");
+    listener
+        .set_nonblocking(true)
+        .expect("request observation must not block");
+    let address = listener.local_addr().expect("loopback address must exist");
+    let client = Http::new(Config::new(
+        format!("http://{address}"),
+        Duration::from_secs(2),
+    ))
+    .expect("loopback client must build");
+    for (calls, message) in [
+        (Vec::new(), "JSON-RPC batch must not be empty"),
+        (
+            vec![
+                Call::new("valid", json!([])),
+                Call::new("invalid", Value::Null),
+            ],
+            "JSON-RPC parameters must be an array or object",
+        ),
+    ] {
+        let pending = client.batch(calls);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let error = pending.await.expect_err("invalid calls must fail locally");
+        assert_eq!(error.kind, ErrorKind::InvalidRequest);
+        assert_eq!(error.message, message);
+        assert!(!error.is_retryable());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+
+#[tokio::test]
+async fn batch_call_failure_preserves_data_and_stops_failover() {
+    let selected_executions = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&selected_executions);
+    let selected = serve_once(move |request| {
+        count.fetch_add(1, Ordering::SeqCst);
+        json!([
+            {"jsonrpc":"2.0", "id":request[1]["id"], "error":{
+                "code":-32001, "message":"call rejected", "data":{"reason":"retained"}
+            }},
+            {"jsonrpc":"2.0", "id":request[0]["id"], "result":"accepted"}
+        ])
+    });
+    let fallback = std::net::TcpListener::bind("127.0.0.1:0").expect("fallback must bind");
+    fallback
+        .set_nonblocking(true)
+        .expect("fallback observation must not block");
+    let mut config = Config::new(selected, Duration::from_secs(2));
+    config.endpoints.push(format!(
+        "http://{}",
+        fallback.local_addr().expect("fallback address must exist")
+    ));
+    config.retry = Retry::new(
+        NonZeroU32::new(2).expect("two is nonzero"),
+        Duration::ZERO,
+        Duration::ZERO,
+    )
+    .expect("zero backoff is valid");
+    let client = Http::new(config).expect("failover client must build");
+    let results = client
+        .batch(vec![
+            Call::new("success", json!([])),
+            Call::new("failure", json!({"input":42})),
+        ])
+        .await
+        .expect("per-call failure must remain a batch result");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].as_ref().unwrap().as_bytes(), br#""accepted""#);
+    let failure = results[1].as_ref().unwrap_err();
+    assert_eq!(failure.code, -32001);
+    assert_eq!(failure.message, "call rejected");
+    assert_eq!(
+        failure.data.as_ref().unwrap().as_bytes(),
+        br#"{"reason":"retained"}"#
+    );
+    assert_eq!(selected_executions.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fallback.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[tokio::test]
+async fn batch_terminal_http_error_stops_failover() {
+    let selected_executions = Arc::new(AtomicUsize::new(0));
+    let selected = serve_status_once(Arc::clone(&selected_executions), "400 Bad Request");
+    let fallback = std::net::TcpListener::bind("127.0.0.1:0").expect("fallback must bind");
+    fallback
+        .set_nonblocking(true)
+        .expect("fallback observation must not block");
+    let mut config = Config::new(selected, Duration::from_secs(2));
+    config.endpoints.push(format!(
+        "http://{}",
+        fallback.local_addr().expect("fallback address must exist")
+    ));
+    config.retry = Retry::new(
+        NonZeroU32::new(2).expect("two is nonzero"),
+        Duration::ZERO,
+        Duration::ZERO,
+    )
+    .expect("zero backoff is valid");
+    let client = Http::new(config).expect("failover client must build");
+    let error = client
+        .batch(vec![Call::new("answer", json!([]))])
+        .await
+        .expect_err("terminal rejection must stop the batch");
+    assert_eq!(error.kind, ErrorKind::HttpStatus(400));
+    assert_eq!(error.message, "JSON-RPC endpoint rejected the request");
+    assert!(!error.is_retryable());
+    assert_eq!(selected_executions.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fallback.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[tokio::test]
+async fn batch_retry_rounds_preserve_endpoint_order_and_last_error() {
+    let (events, observed) = mpsc::channel();
+    let first = serve_batch_rejections(
+        "first",
+        ["503 Service Unavailable", "429 Too Many Requests"],
+        events.clone(),
+    );
+    let second =
+        serve_batch_rejections("second", ["502 Bad Gateway", "504 Gateway Timeout"], events);
+    let mut config = Config::new(first, Duration::from_secs(2));
+    config.endpoints.push(second);
+    config.retry = Retry::new(
+        NonZeroU32::new(2).expect("two is nonzero"),
+        Duration::ZERO,
+        Duration::ZERO,
+    )
+    .expect("zero backoff is valid");
+    let client = Http::new(config).expect("retrying client must build");
+    let error = client
+        .batch(vec![Call::new("answer", json!([42]))])
+        .await
+        .expect_err("all attempts must exhaust");
+    assert_eq!(error.kind, ErrorKind::HttpStatus(504));
+    assert_eq!(error.message, "JSON-RPC endpoint rejected the request");
+    assert!(error.is_retryable());
+    assert_eq!(
+        observed.try_iter().collect::<Vec<_>>(),
+        ["first", "second", "first", "second"]
+    );
+}
+
+fn serve_batch_rejections(
+    name: &'static str,
+    statuses: [&'static str; 2],
+    events: mpsc::Sender<&'static str>,
+) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback server must bind");
+    let address = listener.local_addr().expect("loopback address must exist");
+    thread::spawn(move || {
+        for status in statuses {
+            let (mut stream, _) = listener.accept().expect("batch client must connect");
+            let request = read_request(&mut stream);
+            assert_eq!(request.as_array().unwrap().len(), 1);
+            assert_eq!(request[0]["method"], "answer");
+            assert_eq!(request[0]["params"], json!([42]));
+            events.send(name).expect("attempt must be observed");
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .expect("status response must write");
+        }
+    });
+    format!("http://{address}")
+}
+
+#[tokio::test]
 async fn failover_advances_after_transport_failure() {
     let unavailable = std::net::TcpListener::bind("127.0.0.1:0")
         .expect("ephemeral address must bind")

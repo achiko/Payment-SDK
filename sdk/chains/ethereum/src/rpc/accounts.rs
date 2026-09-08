@@ -69,47 +69,45 @@ where
         Box::pin(async move {
             let block = match at {
                 None => json!("pending"),
-                Some(block) => {
-                    if block.hash.0.len() != 32 {
-                        return Err(source_error(
-                            "Ethereum balance block hash must contain exactly 32 bytes",
-                            false,
-                        ));
-                    }
-                    json!({
-                        "blockHash": hex::encode_prefixed(&block.hash.0),
-                        "requireCanonical": true,
-                    })
+                Some(block) if block.hash.0.len() != 32 => {
+                    return Err(source_error(
+                        "Ethereum balance block hash must contain exactly 32 bytes",
+                        false,
+                    ));
                 }
+                Some(block) => json!({
+                    "blockHash": hex::encode_prefixed(&block.hash.0),
+                    "requireCanonical": true,
+                }),
             };
-            match asset {
+            let token = match asset {
                 AssetKind::Native => {
-                    self.rpc_wei("eth_getBalance", json!([address.to_string(), block]))
-                        .await
+                    return self
+                        .rpc_wei("eth_getBalance", json!([address.to_string(), block]))
+                        .await;
                 }
-                AssetKind::Erc20(token) => {
-                    if token.is_zero() {
-                        return Err(source_error(
-                            "Ethereum ERC-20 token address must not be zero",
-                            false,
-                        ));
-                    }
-                    let raw = self
-                        .request_result(
-                            "eth_call",
-                            json!([{
-                                "to": token.to_string(),
-                                "data": hex::encode_prefixed(erc20::balance_of(&address)),
-                            }, block]),
-                        )
-                        .await?;
-                    let value: String = raw.deserialize().map_err(map_json_rpc_error)?;
-                    let word = parse_fixed_data::<32>(&value, "ERC-20 balance result")
-                        .map_err(|message| invalid_rpc_response("eth_call", message))?;
-                    erc20::decode_balance(&word)
-                        .map_err(|_| invalid_rpc_response("eth_call", "invalid balanceOf result"))
-                }
+                AssetKind::Erc20(token) => token,
+            };
+            if token.is_zero() {
+                return Err(source_error(
+                    "Ethereum ERC-20 token address must not be zero",
+                    false,
+                ));
             }
+            let raw = self
+                .request_result(
+                    "eth_call",
+                    json!([{
+                        "to": token.to_string(),
+                        "data": hex::encode_prefixed(erc20::balance_of(&address)),
+                    }, block]),
+                )
+                .await?;
+            let value: String = raw.deserialize().map_err(map_json_rpc_error)?;
+            let word = parse_fixed_data::<32>(&value, "ERC-20 balance result")
+                .map_err(|message| invalid_rpc_response("eth_call", message))?;
+            erc20::decode_balance(&word)
+                .map_err(|_| invalid_rpc_response("eth_call", "invalid balanceOf result"))
         })
     }
 

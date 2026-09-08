@@ -152,6 +152,19 @@ where
         Ok((raw, parsed))
     }
 
+    async fn fetch_complete_block(&self, height: BlockHeight) -> Result<Block, SourceError> {
+        let tag = format!("0x{:x}", height.0);
+        let (raw_block, parsed) = self.fetch_block(tag, Some(height), true).await?;
+        let raw_receipts = self.fetch_receipts(&parsed).await?;
+        ParsedReceipt::parse_all(&raw_receipts, &parsed)
+            .map_err(|error| source_error(error.to_string(), true))?;
+        Ok(Block {
+            reference: parsed.reference,
+            raw_block: raw_block.into_bytes(),
+            raw_receipts,
+        })
+    }
+
     async fn fetch_receipts(
         &self,
         block: &super::model::ParsedBlock,
@@ -286,16 +299,7 @@ where
             let mut blocks = Vec::with_capacity(limit.min(64));
             while position <= end.0 && blocks.len() < limit {
                 let height = BlockHeight(position);
-                let tag = format!("0x{:x}", height.0);
-                let (raw_block, parsed) = self.fetch_block(tag, Some(height), true).await?;
-                let raw_receipts = self.fetch_receipts(&parsed).await?;
-                ParsedReceipt::parse_all(&raw_receipts, &parsed)
-                    .map_err(|error| source_error(error.to_string(), true))?;
-                blocks.push(Block {
-                    reference: parsed.reference,
-                    raw_block: raw_block.into_bytes(),
-                    raw_receipts,
-                });
+                blocks.push(self.fetch_complete_block(height).await?);
                 let Some(next) = position.checked_add(1) else {
                     break;
                 };

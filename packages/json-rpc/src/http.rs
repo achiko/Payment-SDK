@@ -189,6 +189,36 @@ impl Http {
             header_names: config.headers.into_iter().map(|(name, _)| name).collect(),
         })
     }
+
+    async fn execute_batch(&self, calls: Vec<Call>) -> std::result::Result<Vec<CallResult>, Error> {
+        let batch = Batch::new(calls)?;
+        let mut last = None;
+        for attempt in 1..=self.retry.max_attempts.get() {
+            match self.batch_attempt(&batch).await {
+                Err(error) if error.is_retryable() => last = Some(error),
+                result => return result,
+            }
+            if attempt < self.retry.max_attempts.get() {
+                tokio::time::sleep(self.retry.backoff(attempt)).await;
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            Error::new(ErrorKind::Unavailable, "JSON-RPC endpoints are unavailable")
+        }))
+    }
+
+    async fn batch_attempt(&self, batch: &Batch) -> std::result::Result<Vec<CallResult>, Error> {
+        let mut last = None;
+        for client in &self.clients {
+            match batch.request(client).await {
+                Err(error) if error.is_retryable() => last = Some(error),
+                result => return result,
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            Error::new(ErrorKind::Unavailable, "JSON-RPC endpoints are unavailable")
+        }))
+    }
 }
 
 impl Client for Http {
@@ -249,58 +279,47 @@ impl Client for Http {
         &'a self,
         calls: Vec<Call>,
     ) -> BoxFuture<'a, std::result::Result<Vec<CallResult>, Error>> {
-        Box::pin(async move {
-            if calls.is_empty() {
-                return Err(Error::new(
-                    ErrorKind::InvalidRequest,
-                    "JSON-RPC batch must not be empty",
-                ));
-            }
-            let build = || {
-                let mut batch = BatchRequestBuilder::new();
-                for call in &calls {
-                    batch
-                        .insert(call.method.as_str(), Params::new(call.params.clone())?)
-                        .map_err(|_| {
-                            Error::new(
-                                ErrorKind::InvalidRequest,
-                                "JSON-RPC parameters could not be serialized",
-                            )
-                        })?;
-                }
-                Ok(batch)
-            };
-            let mut last = None;
-            for attempt in 1..=self.retry.max_attempts.get() {
-                for client in &self.clients {
-                    let batch = build()?;
-                    match client.batch_request::<Box<RawValue>>(batch).await {
-                        Ok(responses) => {
-                            return Ok(responses
-                                .into_iter()
-                                .map(|entry| match entry {
-                                    Ok(value) => Ok(RawJson(value.get().as_bytes().to_vec())),
-                                    Err(error) => Err(Failure::from(error.into_owned())),
-                                })
-                                .collect());
-                        }
-                        Err(source) => {
-                            let error = Error::from_rpc(source);
-                            if !error.is_retryable() {
-                                return Err(error);
-                            }
-                            last = Some(error);
-                        }
-                    }
-                }
-                if attempt < self.retry.max_attempts.get() {
-                    tokio::time::sleep(self.retry.backoff(attempt)).await;
-                }
-            }
-            Err(last.unwrap_or_else(|| {
-                Error::new(ErrorKind::Unavailable, "JSON-RPC endpoints are unavailable")
-            }))
-        })
+        Box::pin(self.execute_batch(calls))
+    }
+}
+
+#[derive(Debug)]
+struct Batch(Vec<Call>);
+
+impl Batch {
+    fn new(calls: Vec<Call>) -> std::result::Result<Self, Error> {
+        if calls.is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidRequest,
+                "JSON-RPC batch must not be empty",
+            ));
+        }
+        Ok(Self(calls))
+    }
+
+    async fn request(&self, client: &HttpClient) -> std::result::Result<Vec<CallResult>, Error> {
+        let mut batch = BatchRequestBuilder::new();
+        for call in &self.0 {
+            batch
+                .insert(call.method.as_str(), Params::new(call.params.clone())?)
+                .map_err(|_| {
+                    Error::new(
+                        ErrorKind::InvalidRequest,
+                        "JSON-RPC parameters could not be serialized",
+                    )
+                })?;
+        }
+        let responses = client
+            .batch_request::<Box<RawValue>>(batch)
+            .await
+            .map_err(Error::from_rpc)?;
+        Ok(responses
+            .into_iter()
+            .map(|entry| match entry {
+                Ok(value) => Ok(RawJson(value.get().as_bytes().to_vec())),
+                Err(error) => Err(Failure::from(error.into_owned())),
+            })
+            .collect())
     }
 }
 

@@ -130,22 +130,13 @@ impl TransactionCoordinator {
         loop {
             let mut notified = Box::pin(self.core.changed.notified());
             notified.as_mut().enable();
-            match self.core.admission(senders) {
+            let (id, index) = match self.core.admission(senders) {
                 Admission::Acquired(operation) => return Ok(operation),
-                Admission::Wait => notified.await,
-                Admission::Recover { id, index } => {
-                    self.submit(None, id).await.map_err(|source| {
-                        PreparationError::new(
-                            index,
-                            ChainError::new(
-                                ChainErrorKind::RpcUnavailable,
-                                format!(
-                                    "Ethereum sender is blocked by an ambiguous transaction: {source}"
-                                ),
-                            ),
-                        )
-                    })?;
+                Admission::Wait => {
+                    notified.await;
+                    continue;
                 }
+                Admission::Recover { id, index } => (id, index),
                 Admission::Exhausted(index) => {
                     return Err(PreparationError::new(
                         index,
@@ -155,7 +146,16 @@ impl TransactionCoordinator {
                         ),
                     ));
                 }
-            }
+            };
+            self.submit(None, id).await.map_err(|source| {
+                PreparationError::new(
+                    index,
+                    ChainError::new(
+                        ChainErrorKind::RpcUnavailable,
+                        format!("Ethereum sender is blocked by an ambiguous transaction: {source}"),
+                    ),
+                )
+            })?;
         }
     }
 

@@ -241,11 +241,13 @@ impl BalanceReader for Wallet {
                 .utxos(vec![self.address.clone()])
                 .await
                 .map_err(|error| WalletError::new(WalletErrorKind::Balance, error.to_string()))?;
-            let atomic = set.outputs.iter().try_fold(0_u64, |sum, output| {
-                sum.checked_add(output.value.0).ok_or_else(|| {
+            let atomic = set
+                .outputs
+                .iter()
+                .try_fold(0_u64, |sum, output| sum.checked_add(output.value.0))
+                .ok_or_else(|| {
                     WalletError::new(WalletErrorKind::Balance, "Bitcoin balance exceeds u64")
-                })
-            })?;
+                })?;
             Ok(Balance {
                 amount: Satoshi(atomic).decimal(),
                 observed_at: Some(set.checkpoint),

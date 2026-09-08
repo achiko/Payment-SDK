@@ -58,13 +58,12 @@ fn artifacts() -> Result<Vec<Artifact<'static>>, io::Error> {
                 name: fields.next().ok_or_else(invalid_manifest)?,
                 sha256: fields.next().ok_or_else(invalid_manifest)?,
             };
-            if fields.next().is_some()
-                || artifact.sha256.len() != 64
-                || !artifact
+            let checksum_is_canonical = artifact.sha256.len() == 64
+                && artifact
                     .sha256
                     .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+            if fields.next().is_some() || !checksum_is_canonical {
                 return Err(invalid_manifest());
             }
             Ok(artifact)

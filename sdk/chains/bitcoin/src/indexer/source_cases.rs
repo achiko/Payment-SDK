@@ -319,6 +319,28 @@ fn external_prevout_bound_is_above_consensus_maximum_and_fails_before_growth() {
 }
 
 #[test]
+fn missing_block_fails_before_the_canonical_hash_recheck() {
+    let mut replies = connect_replies();
+    replies.extend([
+        reply_for("getblockhash", json!([10]), Value::String(hash(2))),
+        failure("getblock", -5),
+    ]);
+    let client = ScriptedClient::new(replies);
+    let calls = client.clone();
+    let source = block_on(Blocks::connect(client, config())).expect("valid source setup");
+
+    let error = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 1))
+        .expect_err("a disappeared block must stop ingestion before rechecking its hash");
+
+    assert_eq!(
+        error.message,
+        "Bitcoin Core no longer exposes the requested block"
+    );
+    assert!(error.retryable);
+    calls.assert_exhausted();
+}
+
+#[test]
 fn numbered_block_fetch_rejects_same_height_reorg_race() {
     let mut replies = connect_replies();
     replies.extend([

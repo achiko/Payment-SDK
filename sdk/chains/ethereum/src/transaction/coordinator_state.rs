@@ -43,22 +43,20 @@ impl Core {
             if sender.active.is_some() {
                 return Admission::Wait;
             }
-            for id in &sender.records {
-                let Some(record) = state.records.get(id) else {
-                    continue;
-                };
-                match record.status {
-                    RecordStatus::Unknown => {
-                        return Admission::Recover {
-                            id: id.clone(),
-                            index: *index,
-                        };
-                    }
-                    RecordStatus::Prepared | RecordStatus::Reconciling => {
-                        return Admission::Wait;
-                    }
-                }
-            }
+            let Some((id, record)) = sender
+                .records
+                .iter()
+                .find_map(|id| state.records.get_key_value(id))
+            else {
+                continue;
+            };
+            return match record.status {
+                RecordStatus::Unknown => Admission::Recover {
+                    id: id.clone(),
+                    index: *index,
+                },
+                RecordStatus::Prepared | RecordStatus::Reconciling => Admission::Wait,
+            };
         }
         let id = state.next_operation;
         let Some(next) = id.checked_add(1) else {

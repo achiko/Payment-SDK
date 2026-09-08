@@ -388,18 +388,31 @@ where
             .map_err(|_| source_error("Bitcoin enriched block JSON could not be encoded", true))
     }
 
-    async fn fetch_block(
-        &self,
-        hash: &BlockHash,
-        expected_height: Option<BlockHeight>,
-    ) -> Result<Option<Block>, SourceError> {
-        let Some(raw_block) = self.raw_block(hash).await? else {
-            return Ok(None);
+    async fn fetch_block(&self, height: BlockHeight) -> Result<Block, SourceError> {
+        let first_hash = self.hash_at(height).await?;
+        let Some(raw_block) = self.raw_block(&first_hash).await? else {
+            return Err(source_error(
+                "Bitcoin Core no longer exposes the requested block",
+                true,
+            ));
         };
         let raw_block = self.enrich_prevouts(raw_block).await?;
-        Block::parse(&raw_block, expected_height, Some(hash), self.config.network)
-            .map(Some)
-            .map_err(|error| source_error(error.to_string(), true))
+        let block = Block::parse(
+            &raw_block,
+            Some(height),
+            Some(&first_hash),
+            self.config.network,
+        )
+        .map_err(|error| source_error(error.to_string(), true))?;
+        drop(raw_block);
+        let second_hash = self.hash_at(height).await?;
+        if first_hash != second_hash {
+            return Err(source_error(
+                "Bitcoin canonical block changed while it was being fetched",
+                true,
+            ));
+        }
+        Ok(block)
     }
 }
 
@@ -437,21 +450,7 @@ where
             let end = end.0;
             let mut blocks = Vec::with_capacity(limit.min(64));
             while position <= end && blocks.len() < limit {
-                let height = BlockHeight(position);
-                let first_hash = self.hash_at(height).await?;
-                let block = self
-                    .fetch_block(&first_hash, Some(height))
-                    .await?
-                    .ok_or_else(|| {
-                        source_error("Bitcoin Core no longer exposes the requested block", true)
-                    })?;
-                let second_hash = self.hash_at(height).await?;
-                if first_hash != second_hash {
-                    return Err(source_error(
-                        "Bitcoin canonical block changed while it was being fetched",
-                        true,
-                    ));
-                }
+                let block = self.fetch_block(BlockHeight(position)).await?;
                 blocks.push(block);
                 let Some(next) = position.checked_add(1) else {
                     break;
