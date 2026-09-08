@@ -227,11 +227,9 @@ mod tests {
             let headers = std::str::from_utf8(&bytes[..split]).unwrap();
             let length = headers
                 .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                })
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .map(|(_, value)| value.trim().parse::<usize>().unwrap())
                 .expect("content length");
             let start = split + 4;
             if bytes.len() >= start + length {

@@ -32,16 +32,16 @@ impl Repository {
             BlockSelector::Height { scope, height } => (scope, Some(height)),
         };
         self.check_scope(&scope)?;
-        match height {
+        Ok(match height {
             Some(height) => self
                 .get::<record::JournalRecord>(&keys::journal(&scope, height))
-                .await
-                .map(|value| value.map(|stored| stored.value.block())),
+                .await?
+                .map(|stored| stored.value.block()),
             None => self
                 .get::<record::BlockRecord>(&keys::checkpoint(&scope))
-                .await
-                .map(|value| value.map(|stored| stored.value.into_domain())),
-        }
+                .await?
+                .map(|stored| stored.value.into_domain()),
+        })
     }
 
     async fn write_block(&self, addition: BlockAddition) -> Result<BlockOutcome, IndexError> {

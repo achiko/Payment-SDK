@@ -97,15 +97,15 @@ impl BlockData {
                 "Bitcoin block hash does not match the requested hash",
             ));
         }
+        let has_parent = object
+            .get("previousblockhash")
+            .is_some_and(|value| !value.is_null());
+        if height.0 == 0 && has_parent {
+            return Err(ParseError::new(
+                "Bitcoin genesis block unexpectedly has a parent hash",
+            ));
+        }
         let parent = if height.0 == 0 {
-            if object
-                .get("previousblockhash")
-                .is_some_and(|value| !value.is_null())
-            {
-                return Err(ParseError::new(
-                    "Bitcoin genesis block unexpectedly has a parent hash",
-                ));
-            }
             None
         } else {
             Some(BlockParent {
@@ -140,8 +140,9 @@ impl BlockData {
                 ));
             }
             for (index, output) in transaction.outputs.iter().enumerate() {
-                let output_index = u32::try_from(index)
-                    .map_err(|_| ParseError::new("Bitcoin output index exceeds u32"))?;
+                let Ok(output_index) = u32::try_from(index) else {
+                    return Err(ParseError::new("Bitcoin output index exceeds u32"));
+                };
                 let script = ScriptBuf::from_bytes(output.script_pubkey.clone());
                 same_block_outputs.insert(
                     Outpoint {
@@ -358,42 +359,50 @@ impl PreviousOutput {
         spending_height: BlockHeight,
         network: Network,
     ) -> Result<Self, ParseError> {
-        if let Some(value) = prevout.get("value_satoshis") {
-            let value = value
-                .as_u64()
-                .ok_or_else(|| ParseError::new("Bitcoin compact prevout value is invalid"))?;
-            let address = match prevout
-                .get("address")
-                .ok_or_else(|| ParseError::new("Bitcoin compact prevout address fact is missing"))?
-            {
-                Value::Null => None,
-                Value::String(address) => {
-                    let canonical =
-                        crate::Address::parse_for_network(address, network).map_err(|_| {
-                            ParseError::new(
-                                "Bitcoin compact prevout address is invalid or wrong-network",
-                            )
-                        })?;
-                    if canonical.encoded() != address {
-                        return Err(ParseError::new(
-                            "Bitcoin compact prevout address is not canonical",
-                        ));
-                    }
-                    Some(canonical)
-                }
-                _ => {
+        let Some(value) = prevout.get("value_satoshis") else {
+            return Self::parse_verbose(prevout, outpoint, spending_height, network);
+        };
+        let value = value
+            .as_u64()
+            .ok_or_else(|| ParseError::new("Bitcoin compact prevout value is invalid"))?;
+        let address = match prevout
+            .get("address")
+            .ok_or_else(|| ParseError::new("Bitcoin compact prevout address fact is missing"))?
+        {
+            Value::Null => None,
+            Value::String(address) => {
+                let canonical =
+                    crate::Address::parse_for_network(address, network).map_err(|_| {
+                        ParseError::new(
+                            "Bitcoin compact prevout address is invalid or wrong-network",
+                        )
+                    })?;
+                if canonical.encoded() != address {
                     return Err(ParseError::new(
-                        "Bitcoin compact prevout address fact is invalid",
+                        "Bitcoin compact prevout address is not canonical",
                     ));
                 }
-            };
-            return Ok(Self {
-                outpoint,
-                value: Satoshi(value),
-                address,
-            });
-        }
+                Some(canonical)
+            }
+            _ => {
+                return Err(ParseError::new(
+                    "Bitcoin compact prevout address fact is invalid",
+                ));
+            }
+        };
+        Ok(Self {
+            outpoint,
+            value: Satoshi(value),
+            address,
+        })
+    }
 
+    fn parse_verbose(
+        prevout: &Map<String, Value>,
+        outpoint: Outpoint,
+        spending_height: BlockHeight,
+        network: Network,
+    ) -> Result<Self, ParseError> {
         // Direct Block::parse callers may supply Bitcoin Core's
         // verbosity-3-compatible previous-output shape.
         let value = Satoshi::from_block_json(
@@ -437,6 +446,147 @@ mod tests {
     use bitcoin::hex::DisplayHex;
 
     use super::*;
+
+    #[test]
+    fn genesis_parent_rules_preserve_identity_validation_order() {
+        let original = serde_json::json!({
+            "height": 0, "hash": "00".repeat(32), "time": 2, "tx": [], "nTx": 0,
+        });
+        for parent in [None, Some(Value::Null)] {
+            let mut value = original.clone();
+            if let Some(parent) = parent {
+                value["previousblockhash"] = parent;
+            }
+            let block = BlockData::parse(
+                &serde_json::to_vec(&value).unwrap(),
+                Some(BlockHeight(0)),
+                Some(&BlockHash(vec![0; 32])),
+                Network::Regtest,
+            )
+            .unwrap();
+            assert_eq!(block.reference.parent, None);
+            assert_eq!(block.reference.position, BlockPosition(0));
+        }
+
+        for parent in [serde_json::json!("invalid"), serde_json::json!(false)] {
+            let mut value = original.clone();
+            value["previousblockhash"] = parent;
+            value["time"] = Value::Null;
+            let raw = serde_json::to_vec(&value).unwrap();
+            let error = BlockData::parse(&raw, None, None, Network::Regtest).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Bitcoin genesis block unexpectedly has a parent hash"
+            );
+            let error =
+                BlockData::parse(&raw, None, Some(&BlockHash(vec![1; 32])), Network::Regtest)
+                    .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Bitcoin block hash does not match the requested hash"
+            );
+        }
+    }
+
+    #[test]
+    fn prevout_formats_preserve_compact_priority_and_validation() {
+        let outpoint = Outpoint {
+            transaction_id: TransactionId([3; 32]),
+            output_index: 2,
+        };
+        let script = ScriptBuf::from_bytes([vec![0, 20], vec![7; 20]].concat());
+        let address = crate::Address::from_script_for_network(&script, Network::Regtest).unwrap();
+        let wrong_network =
+            crate::Address::from_script_for_network(&script, Network::Mainnet).unwrap();
+        let verbose = serde_json::json!({
+            "value": "0.00000010".parse::<serde_json::Number>().unwrap(),
+            "scriptPubKey": { "hex": script.as_bytes().to_lower_hex_string() },
+            "height": 10, "generated": false,
+        });
+        let parsed = PreviousOutput::parse(
+            verbose.as_object().unwrap(),
+            outpoint,
+            BlockHeight(10),
+            Network::Regtest,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            PreviousOutput {
+                outpoint,
+                value: Satoshi(10),
+                address: Some(address.clone()),
+            }
+        );
+
+        let mut compact = verbose.clone();
+        compact["value_satoshis"] = serde_json::json!(u64::MAX);
+        compact["address"] = serde_json::json!(address.encoded());
+        compact["height"] = Value::Null;
+        assert_eq!(
+            PreviousOutput::parse(
+                compact.as_object().unwrap(),
+                outpoint,
+                BlockHeight(10),
+                Network::Regtest,
+            )
+            .unwrap(),
+            PreviousOutput {
+                outpoint,
+                value: Satoshi(u64::MAX),
+                address: Some(address.clone()),
+            }
+        );
+
+        for (field, value, message) in [
+            (
+                "value_satoshis",
+                Value::Null,
+                "Bitcoin compact prevout value is invalid",
+            ),
+            (
+                "address",
+                serde_json::json!(false),
+                "Bitcoin compact prevout address fact is invalid",
+            ),
+            (
+                "address",
+                serde_json::json!(wrong_network.encoded()),
+                "Bitcoin compact prevout address is invalid or wrong-network",
+            ),
+            (
+                "address",
+                serde_json::json!(address.encoded().to_uppercase()),
+                "Bitcoin compact prevout address is not canonical",
+            ),
+        ] {
+            let mut invalid = compact.clone();
+            invalid[field] = value;
+            let error = PreviousOutput::parse(
+                invalid.as_object().unwrap(),
+                outpoint,
+                BlockHeight(10),
+                Network::Regtest,
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), message);
+        }
+
+        let mut invalid = verbose;
+        invalid["height"] = serde_json::json!(11);
+        invalid["generated"] = Value::Null;
+        let error = PreviousOutput::parse(
+            invalid.as_object().unwrap(),
+            outpoint,
+            BlockHeight(10),
+            Network::Regtest,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Bitcoin input previous output was created after the spending block"
+        );
+    }
 
     #[test]
     fn transaction_inputs_validate_supplied_prevouts_before_local_comparison() {

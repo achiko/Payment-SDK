@@ -149,27 +149,23 @@ impl BaseBuilder for Builder {
                         output.value,
                         output.script_pubkey,
                     )
-                    .map_err(|error| {
-                        TransactionError::new(
-                            TransactionErrorKind::InvalidTransaction,
-                            error.to_string(),
-                        )
-                    })
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    TransactionError::new(
+                        TransactionErrorKind::InvalidTransaction,
+                        error.to_string(),
+                    )
+                })?;
             let recipients = self
                 .recipients
                 .iter()
                 .cloned()
-                .map(|(address, amount)| {
-                    Output::new(address, amount).map_err(|error| {
-                        TransactionError::new(
-                            TransactionErrorKind::InvalidAmount,
-                            error.to_string(),
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+                .map(|(address, amount)| Output::new(address, amount))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    TransactionError::new(TransactionErrorKind::InvalidAmount, error.to_string())
+                })?;
             let fee_rate = self
                 .fees
                 .estimate(self.fee_target_blocks)

@@ -92,11 +92,11 @@ impl Core {
                     "Ethereum signed transaction is already coordinated",
                 ));
             }
-            if state
+            let admission_lost = state
                 .senders
                 .get(&entry.source)
-                .is_none_or(|sender| sender.active != Some(operation))
-            {
+                .is_none_or(|sender| sender.active != Some(operation));
+            if admission_lost {
                 return Err(ChainError::new(
                     ChainErrorKind::Other,
                     "Ethereum sender lost its atomic coordinator admission",

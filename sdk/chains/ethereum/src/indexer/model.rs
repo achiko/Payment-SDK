@@ -193,119 +193,138 @@ impl ParsedReceipt {
         for (position, (raw, transaction)) in
             raw_receipts.iter().zip(&block.transactions).enumerate()
         {
-            let value: Value = serde_json::from_slice(raw)
-                .map_err(|_| ParseError::new("Ethereum receipt result is not valid JSON"))?;
-            let object = value
-                .as_object()
-                .ok_or_else(|| ParseError::new("Ethereum receipt must be an object"))?;
-            let transaction_hash = required_hash(object, "transactionHash", "receipt transaction")?;
-            if transaction_hash != transaction.hash {
-                return Err(ParseError::new(
-                    "Ethereum receipt transaction hash does not match block order",
-                ));
-            }
-            let transaction_index =
-                required_quantity_u64(object, "transactionIndex", "receipt transaction index")?;
-            if transaction_index != transaction.index
-                || transaction_index
-                    != u64::try_from(position)
-                        .map_err(|_| ParseError::new("Ethereum receipt position exceeds u64"))?
-            {
-                return Err(ParseError::new(
-                    "Ethereum receipt transaction index does not match block order",
-                ));
-            }
-            if required_hash(object, "blockHash", "receipt block hash")? != block_hash {
-                return Err(ParseError::new(
-                    "Ethereum receipt block hash does not match its block",
-                ));
-            }
-            if required_quantity_u64(object, "blockNumber", "receipt block number")?
-                != block.reference.height.0
-            {
-                return Err(ParseError::new(
-                    "Ethereum receipt block number does not match its block",
-                ));
-            }
-            if required_address(object, "from", "receipt sender")? != transaction.from {
-                return Err(ParseError::new(
-                    "Ethereum receipt sender does not match its transaction",
-                ));
-            }
-            if optional_address(object, "to", "receipt recipient")? != transaction.to {
-                return Err(ParseError::new(
-                    "Ethereum receipt recipient does not match its transaction",
-                ));
-            }
-
-            let status = required_quantity(object, "status", "receipt status")?;
-            let succeeded = if status == U256::ZERO {
-                false
-            } else if status == U256::from(1_u8) {
-                true
-            } else {
-                return Err(ParseError::new(
-                    "Ethereum receipt status must be zero or one",
-                ));
-            };
-            let gas_used = required_quantity_u64(object, "gasUsed", "receipt gas used")?;
-            let effective_gas_price =
-                required_quantity(object, "effectiveGasPrice", "receipt effective gas price")?;
-            let contract_address =
-                optional_address(object, "contractAddress", "receipt contract address")?;
-            if transaction.to.is_some() && contract_address.is_some() {
-                return Err(ParseError::new(
-                    "non-creation receipt unexpectedly contains a contract address",
-                ));
-            }
-            if succeeded
-                && transaction.to.is_none()
-                && !transaction.value.is_zero()
-                && contract_address.is_none()
-            {
-                return Err(ParseError::new(
-                    "successful value-bearing contract creation has no contract address",
-                ));
-            }
-
-            let log_values = object
-                .get("logs")
-                .and_then(Value::as_array)
-                .ok_or_else(|| ParseError::new("Ethereum receipt logs must be an array"))?;
-            let mut logs = Vec::with_capacity(log_values.len());
-            for log_value in log_values {
-                let log = ParsedLog::parse(
-                    log_value,
-                    block.reference.height,
-                    block_hash,
-                    transaction_hash,
-                    transaction_index,
-                )?;
-                if !seen_log_indexes.insert(log.log_index) {
-                    return Err(ParseError::new(
-                        "Ethereum block contains duplicate log indexes",
-                    ));
-                }
-                if previous_log_index.is_some_and(|previous| log.log_index <= previous) {
-                    return Err(ParseError::new(
-                        "Ethereum logs are not ordered by log index",
-                    ));
-                }
-                previous_log_index = Some(log.log_index);
-                logs.push(log);
-            }
-
-            receipts.push(Self {
-                transaction_hash,
-                transaction_index,
-                succeeded,
-                gas_used,
-                effective_gas_price,
-                contract_address,
-                logs,
-            });
+            receipts.push(Self::parse(
+                raw,
+                transaction,
+                position,
+                block.reference.height,
+                block_hash,
+                &mut seen_log_indexes,
+                &mut previous_log_index,
+            )?);
         }
         Ok(receipts)
+    }
+
+    fn parse(
+        raw: &[u8],
+        transaction: &ParsedTransaction,
+        position: usize,
+        block_height: BlockHeight,
+        block_hash: [u8; 32],
+        seen_log_indexes: &mut BTreeSet<u64>,
+        previous_log_index: &mut Option<u64>,
+    ) -> Result<Self, ParseError> {
+        let value: Value = serde_json::from_slice(raw)
+            .map_err(|_| ParseError::new("Ethereum receipt result is not valid JSON"))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| ParseError::new("Ethereum receipt must be an object"))?;
+        let transaction_hash = required_hash(object, "transactionHash", "receipt transaction")?;
+        if transaction_hash != transaction.hash {
+            return Err(ParseError::new(
+                "Ethereum receipt transaction hash does not match block order",
+            ));
+        }
+        let transaction_index =
+            required_quantity_u64(object, "transactionIndex", "receipt transaction index")?;
+        if transaction_index != transaction.index
+            || transaction_index
+                != u64::try_from(position)
+                    .map_err(|_| ParseError::new("Ethereum receipt position exceeds u64"))?
+        {
+            return Err(ParseError::new(
+                "Ethereum receipt transaction index does not match block order",
+            ));
+        }
+        if required_hash(object, "blockHash", "receipt block hash")? != block_hash {
+            return Err(ParseError::new(
+                "Ethereum receipt block hash does not match its block",
+            ));
+        }
+        if required_quantity_u64(object, "blockNumber", "receipt block number")? != block_height.0 {
+            return Err(ParseError::new(
+                "Ethereum receipt block number does not match its block",
+            ));
+        }
+        if required_address(object, "from", "receipt sender")? != transaction.from {
+            return Err(ParseError::new(
+                "Ethereum receipt sender does not match its transaction",
+            ));
+        }
+        if optional_address(object, "to", "receipt recipient")? != transaction.to {
+            return Err(ParseError::new(
+                "Ethereum receipt recipient does not match its transaction",
+            ));
+        }
+
+        let status = required_quantity(object, "status", "receipt status")?;
+        let succeeded = if status == U256::ZERO {
+            false
+        } else if status == U256::from(1_u8) {
+            true
+        } else {
+            return Err(ParseError::new(
+                "Ethereum receipt status must be zero or one",
+            ));
+        };
+        let gas_used = required_quantity_u64(object, "gasUsed", "receipt gas used")?;
+        let effective_gas_price =
+            required_quantity(object, "effectiveGasPrice", "receipt effective gas price")?;
+        let contract_address =
+            optional_address(object, "contractAddress", "receipt contract address")?;
+        if transaction.to.is_some() && contract_address.is_some() {
+            return Err(ParseError::new(
+                "non-creation receipt unexpectedly contains a contract address",
+            ));
+        }
+        if succeeded
+            && transaction.to.is_none()
+            && !transaction.value.is_zero()
+            && contract_address.is_none()
+        {
+            return Err(ParseError::new(
+                "successful value-bearing contract creation has no contract address",
+            ));
+        }
+
+        let log_values = object
+            .get("logs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ParseError::new("Ethereum receipt logs must be an array"))?;
+        let mut logs = Vec::with_capacity(log_values.len());
+        for log_value in log_values {
+            let log = ParsedLog::parse(
+                log_value,
+                block_height,
+                block_hash,
+                transaction_hash,
+                transaction_index,
+            )?;
+            if !seen_log_indexes.insert(log.log_index) {
+                return Err(ParseError::new(
+                    "Ethereum block contains duplicate log indexes",
+                ));
+            }
+            let out_of_order = previous_log_index.is_some_and(|previous| log.log_index <= previous);
+            if out_of_order {
+                return Err(ParseError::new(
+                    "Ethereum logs are not ordered by log index",
+                ));
+            }
+            *previous_log_index = Some(log.log_index);
+            logs.push(log);
+        }
+
+        Ok(Self {
+            transaction_hash,
+            transaction_index,
+            succeeded,
+            gas_used,
+            effective_gas_price,
+            contract_address,
+            logs,
+        })
     }
 }
 
@@ -495,6 +514,104 @@ mod tests {
                 index: 0,
             }],
         }
+    }
+
+    fn receipt(transaction: &ParsedTransaction, log_indexes: &[u64]) -> Value {
+        let logs = log_indexes
+            .iter()
+            .map(|index| {
+                json!({
+                    "blockHash": B256::from([0xaa; 32]).to_string(),
+                    "blockNumber": "0xa",
+                    "transactionHash": B256::from(transaction.hash).to_string(),
+                    "transactionIndex": format!("0x{:x}", transaction.index),
+                    "removed": false,
+                    "address": Address::from([0x33; 20]).to_string(),
+                    "topics": [],
+                    "data": "0x00abff",
+                    "logIndex": format!("0x{index:x}")
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "transactionHash": B256::from(transaction.hash).to_string(),
+            "transactionIndex": format!("0x{:x}", transaction.index),
+            "blockHash": B256::from([0xaa; 32]).to_string(),
+            "blockNumber": "0xa",
+            "from": Address::from(transaction.from).to_string(),
+            "to": transaction.to.map(|address| Address::from(address).to_string()),
+            "contractAddress": null,
+            "status": "0x1",
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x3",
+            "logs": logs
+        })
+    }
+
+    #[test]
+    fn receipt_log_order_and_uniqueness_are_block_wide() {
+        let mut block = block(vec![0xaa; 32]);
+        block.transactions.push(ParsedTransaction {
+            hash: [0xdd; 32],
+            index: 1,
+            ..block.transactions[0].clone()
+        });
+        let first = serde_json::to_vec(&receipt(&block.transactions[0], &[0, 4])).unwrap();
+        let second = serde_json::to_vec(&receipt(&block.transactions[1], &[7, 9])).unwrap();
+        let receipts = ParsedReceipt::parse_all(&[first.clone(), second], &block).unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0].transaction_hash, [0xcc; 32]);
+        assert_eq!(receipts[1].transaction_hash, [0xdd; 32]);
+        assert_eq!(receipts[1].transaction_index, 1);
+        assert_eq!(
+            receipts
+                .iter()
+                .flat_map(|receipt| &receipt.logs)
+                .map(|log| (log.log_index, log.data.as_slice()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, &[0, 0xab, 0xff][..]),
+                (4, &[0, 0xab, 0xff][..]),
+                (7, &[0, 0xab, 0xff][..]),
+                (9, &[0, 0xab, 0xff][..]),
+            ]
+        );
+
+        for (index, expected) in [
+            (4, "Ethereum block contains duplicate log indexes"),
+            (0, "Ethereum block contains duplicate log indexes"),
+            (3, "Ethereum logs are not ordered by log index"),
+        ] {
+            let second = serde_json::to_vec(&receipt(&block.transactions[1], &[index])).unwrap();
+            let error = ParsedReceipt::parse_all(&[first.clone(), second], &block).unwrap_err();
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn receipt_log_validation_stops_at_the_first_invalid_log() {
+        let block = block(vec![0xaa; 32]);
+        let mut value = receipt(&block.transactions[0], &[4, 4, 5]);
+        value["logs"][2]["data"] = json!("0xgg");
+        let error =
+            ParsedReceipt::parse_all(&[serde_json::to_vec(&value).unwrap()], &block).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Ethereum block contains duplicate log indexes"
+        );
+
+        value["logs"][1]["data"] = json!("0xgg");
+        let error =
+            ParsedReceipt::parse_all(&[serde_json::to_vec(&value).unwrap()], &block).unwrap_err();
+        assert_eq!(error.to_string(), "Ethereum log data is not valid hex");
+
+        value["transactionHash"] = json!(B256::from([0xdd; 32]).to_string());
+        let error =
+            ParsedReceipt::parse_all(&[serde_json::to_vec(&value).unwrap()], &block).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Ethereum receipt transaction hash does not match block order"
+        );
     }
 
     #[test]

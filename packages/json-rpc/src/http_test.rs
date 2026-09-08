@@ -472,11 +472,9 @@ fn read_request(stream: &mut std::net::TcpStream) -> Value {
         let header = String::from_utf8_lossy(&bytes[..split]);
         let length = header
             .lines()
-            .find_map(|line| {
-                line.split_once(':')
-                    .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-            })
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .find_map(|(_, value)| value.trim().parse::<usize>().ok())
             .expect("request must declare content length");
         let body_start = split + 4;
         if bytes.len() < body_start + length {

@@ -87,19 +87,18 @@ impl ScopeAdmission {
         loop {
             let wait = {
                 let mut state = self.lock()?;
-                if state.commit || state.publication {
+                let busy = state.commit || state.publication;
+                if busy {
                     reload = None;
-                    let (send, receive) = oneshot::channel();
-                    state.waiters.push(send);
-                    Some(receive)
-                } else {
-                    if let Some(persisted) = reload.take()
-                        && (!state.initialized || state.recovery || state.persisted != persisted)
-                    {
-                        state.persisted = persisted;
-                        state.initialized = true;
-                        state.recovery = false;
-                    }
+                }
+                if let Some(persisted) = reload.take()
+                    && (!state.initialized || state.recovery || state.persisted != persisted)
+                {
+                    state.persisted = persisted;
+                    state.initialized = true;
+                    state.recovery = false;
+                }
+                if !busy {
                     state.publication = true;
                     return Ok(PublicationPermit {
                         admission: self.clone(),
@@ -107,14 +106,10 @@ impl ScopeAdmission {
                         finished: false,
                     });
                 }
+                let (send, receive) = oneshot::channel();
+                state.waiters.push(send);
+                receive
             };
-            let wait = wait.ok_or_else(|| {
-                IndexError::new(
-                    IndexErrorKind::Store,
-                    "busy admission did not create a waiter",
-                    false,
-                )
-            })?;
             wait.await.map_err(|_| {
                 IndexError::new(
                     IndexErrorKind::Store,
@@ -553,6 +548,28 @@ mod tests {
             .expect("reloaded plan can commit")
             .complete(Some(block(8)))
             .expect("complete reloaded plan");
+    }
+
+    #[test]
+    fn idle_publication_reloads_after_a_cancelled_commit_even_for_an_empty_checkpoint() {
+        for persisted in [Some(block(8)), None] {
+            let admission = Arc::new(ScopeAdmission::new());
+            let plan = admission
+                .plan(Some(block(7)), || Ok(Vec::new()))
+                .expect("initial plan");
+            let mut commit = plan.begin().expect("commit permit");
+            commit.start();
+            drop(commit);
+
+            let publication = block_on(admission.publication(persisted.clone()))
+                .expect("publication reloads the repository checkpoint");
+            assert_eq!(publication.checkpoint(), persisted.as_ref());
+            let state = admission.lock().expect("admission state");
+            assert!(state.initialized);
+            assert!(!state.recovery);
+            assert!(state.publication);
+            assert_eq!(state.persisted, persisted);
+        }
     }
 
     #[test]
