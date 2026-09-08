@@ -69,10 +69,8 @@ where
         position: BlockPosition,
     ) -> BoxFuture<'a, Result<Option<BlockRef>, SourceError>> {
         Box::pin(async move {
-            Attempt::new(&self.rpc)
-                .canonical(position)
-                .await
-                .map(|block| block.map(|value| value.reference().clone()))
+            let block = Attempt::new(&self.rpc).canonical(position).await?;
+            Ok(block.map(|value| value.reference().clone()))
         })
     }
 }

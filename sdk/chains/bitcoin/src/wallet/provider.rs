@@ -48,6 +48,32 @@ impl Config {
         }
         Ok(())
     }
+
+    fn address(&self, public: &crypto::PublicKey) -> Result<Address, WalletError> {
+        let native = match self.address_type {
+            AddressType::SegwitV0 => {
+                let key = PublicKey::from_slice(&public.bytes).map_err(|error| {
+                    WalletError::new(WalletErrorKind::InvalidSecret, error.to_string())
+                })?;
+                let key = CompressedPublicKey::try_from(key).map_err(|error| {
+                    WalletError::new(WalletErrorKind::InvalidSecret, error.to_string())
+                })?;
+                NativeAddress::p2wpkh(&key, self.network.native())
+            }
+            AddressType::Taproot => {
+                let key = XOnlyPublicKey::from_slice(&public.bytes).map_err(|error| {
+                    WalletError::new(WalletErrorKind::InvalidSecret, error.to_string())
+                })?;
+                NativeAddress::p2tr(
+                    &Secp256k1::verification_only(),
+                    key,
+                    None,
+                    self.network.native(),
+                )
+            }
+        };
+        Ok(Address::from_encoded(native.to_string()))
+    }
 }
 
 pub struct Factory {
@@ -116,29 +142,7 @@ impl Provider for Factory {
             let public = temporary.public_key(format).map_err(|error| {
                 WalletError::new(WalletErrorKind::InvalidSecret, error.to_string())
             })?;
-            let native = match self.config.address_type {
-                AddressType::SegwitV0 => {
-                    let key = PublicKey::from_slice(&public.bytes).map_err(|error| {
-                        WalletError::new(WalletErrorKind::InvalidSecret, error.to_string())
-                    })?;
-                    let key = CompressedPublicKey::try_from(key).map_err(|error| {
-                        WalletError::new(WalletErrorKind::InvalidSecret, error.to_string())
-                    })?;
-                    NativeAddress::p2wpkh(&key, self.config.network.native())
-                }
-                AddressType::Taproot => {
-                    let key = XOnlyPublicKey::from_slice(&public.bytes).map_err(|error| {
-                        WalletError::new(WalletErrorKind::InvalidSecret, error.to_string())
-                    })?;
-                    NativeAddress::p2tr(
-                        &Secp256k1::verification_only(),
-                        key,
-                        None,
-                        self.config.network.native(),
-                    )
-                }
-            };
-            let address = Address::from_encoded(native.to_string());
+            let address = self.config.address(&public)?;
             let signer =
                 KeyPair::new(address.clone(), secret.as_bytes().to_vec()).map_err(|error| {
                     WalletError::new(WalletErrorKind::InvalidSecret, error.to_string())

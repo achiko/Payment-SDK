@@ -22,29 +22,26 @@ impl Movements {
     pub fn decode(transaction: &Transaction) -> Result<Self, IndexError> {
         let mut values = Vec::new();
         for (outer_index, instruction) in transaction.instructions().iter().enumerate() {
-            if let Some(movement) = Movement::decode(
+            values.extend(Movement::decode(
                 transaction,
                 instruction,
                 format!("{}:ix:{outer_index}", transaction.signature()),
-            )? {
-                values.push(movement);
-            }
-            if let Some(inner) = transaction
+            )?);
+            let Some(inner) = transaction
                 .inner()
                 .and_then(|groups| groups.get(&outer_index))
-            {
-                for (inner_ordinal, instruction) in inner.iter().enumerate() {
-                    if let Some(movement) = Movement::decode(
-                        transaction,
-                        instruction,
-                        format!(
-                            "{}:ix:{outer_index}:inner:{inner_ordinal}",
-                            transaction.signature()
-                        ),
-                    )? {
-                        values.push(movement);
-                    }
-                }
+            else {
+                continue;
+            };
+            for (inner_ordinal, instruction) in inner.iter().enumerate() {
+                values.extend(Movement::decode(
+                    transaction,
+                    instruction,
+                    format!(
+                        "{}:ix:{outer_index}:inner:{inner_ordinal}",
+                        transaction.signature()
+                    ),
+                )?);
             }
         }
         Ok(Self(values))

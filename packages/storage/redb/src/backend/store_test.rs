@@ -435,6 +435,48 @@ async fn concurrent_compare_and_swap_has_one_winner() -> Result<(), Error> {
 }
 
 #[tokio::test]
+async fn mixed_operations_preserve_input_order_and_one_commit_version() -> Result<(), Error> {
+    let directory = TempDir::new().map_err(|error| other(error.to_string()))?;
+    let storage = Redb::open(database_path(&directory))?;
+    let records = namespace("records");
+    let primary = key("primary");
+    let removed = key("removed");
+    let result = storage
+        .commit(WriteBatch {
+            conditions: vec![Condition::Missing {
+                namespace: records.clone(),
+                key: primary.clone(),
+            }],
+            operations: vec![
+                put(&records, &primary, "first"),
+                put(&records, &primary, "replaced"),
+                Operation::Delete {
+                    namespace: records.clone(),
+                    key: primary.clone(),
+                },
+                put(&records, &primary, "last"),
+                put(&records, &removed, "temporary"),
+                Operation::Delete {
+                    namespace: records.clone(),
+                    key: removed.clone(),
+                },
+            ],
+        })
+        .await?;
+
+    assert_eq!(result.version, Version(1));
+    assert_eq!(
+        storage.get(&records, &primary).await?,
+        Some(StoredValue {
+            value: value("last"),
+            version: Version(1),
+        })
+    );
+    assert_eq!(storage.get(&records, &removed).await?, None);
+    Ok(())
+}
+
+#[tokio::test]
 async fn delete_removes_the_value() -> Result<(), Error> {
     let directory = TempDir::new().map_err(|error| other(error.to_string()))?;
     let storage = Redb::open(database_path(&directory))?;

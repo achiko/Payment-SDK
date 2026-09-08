@@ -228,10 +228,10 @@ fn check_sufficiency(
     let mut available = BTreeMap::<Address, Lamport>::new();
     let mut required = BTreeMap::<Address, Lamport>::new();
     for ((transfer, balance), fee) in transfers.iter().zip(balances).zip(fees) {
-        if available
+        let inconsistent = available
             .insert(transfer.source().clone(), *balance)
-            .is_some_and(|previous| previous != *balance)
-        {
+            .is_some_and(|previous| previous != *balance);
+        if inconsistent {
             return Err(SendError::operation(
                 WalletErrorKind::Unavailable,
                 "Solana source balance witness is inconsistent",

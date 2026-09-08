@@ -96,53 +96,8 @@ where
 
             if request.erc20_transfer().is_some() {
                 self.ensure_token_amount(request).await?;
-                let raw = match self
-                    .request_result_detailed(
-                        "eth_call",
-                        json!([Value::Object(transaction.clone()), "pending"]),
-                    )
-                    .await
-                {
-                    Ok(raw) => raw,
-                    Err(error) => {
-                        if let Some(code) = error.execution_revert_code() {
-                            return Err(ChainError::new(
-                                ChainErrorKind::Rejected,
-                                format!(
-                                    "Ethereum ERC-20 transfer simulation was rejected with code {code}"
-                                ),
-                            ));
-                        }
-                        return Err(ChainError::from_rpc(error.into_source("eth_call")));
-                    }
-                };
-                let value: String = raw.deserialize().map_err(|_| {
-                    ChainError::new(
-                        ChainErrorKind::Rejected,
-                        "Ethereum ERC-20 transfer simulation returned an invalid JSON value",
-                    )
-                })?;
-                let word = parse_fixed_data::<32>(&value, "ERC-20 transfer result")
-                    .map_err(|message| {
-                        ChainError::new(
-                            ChainErrorKind::Rejected,
-                            format!(
-                                "Ethereum ERC-20 transfer simulation returned invalid data: {message}"
-                            ),
-                        )
-                    })?;
-                let transferred = erc20::decode_transfer(&word).map_err(|_| {
-                    ChainError::new(
-                        ChainErrorKind::Rejected,
-                        "Ethereum ERC-20 transfer simulation returned an invalid ABI result",
-                    )
-                })?;
-                if !transferred {
-                    return Err(ChainError::new(
-                        ChainErrorKind::Rejected,
-                        "Ethereum ERC-20 transfer simulation returned false",
-                    ));
-                }
+                self.simulate_token_transfer(Value::Object(transaction.clone()))
+                    .await?;
             }
 
             let estimated_gas_limit = self.estimate_gas(Value::Object(transaction)).await?;
@@ -188,12 +143,10 @@ where
                         "eth_getBlockByNumber",
                         "latest block has no EIP-1559 baseFeePerGas",
                     ))
-                })
-                .and_then(|value| {
-                    Wei::from_quantity(value)
-                        .map_err(|message| invalid_rpc_response("eth_getBlockByNumber", message))
-                        .map_err(ChainError::from_rpc)
                 })?;
+            let base_fee = Wei::from_quantity(base_fee)
+                .map_err(|message| invalid_rpc_response("eth_getBlockByNumber", message))
+                .map_err(ChainError::from_rpc)?;
             let max_fee_per_gas = base_fee
                 .checked_mul_u64(2)
                 .and_then(|fee| fee.checked_add(&max_priority_fee_per_gas))
@@ -259,18 +212,8 @@ where
                 )
                 .await;
             let raw = match result {
-                Ok(raw) => raw,
-                Err(error) if error.is_already_known() => {
-                    match self.confirm_known_transaction(&computed).await {
-                        Ok(true) => return Ok(computed),
-                        Ok(false) => {}
-                        Err(error) => return Err(ambiguous_submission(&computed, error)),
-                    }
-                    return Err(ambiguous_submission(
-                        &computed,
-                        "Ethereum RPC reported an already-known transaction but did not expose the matching hash",
-                    ));
-                }
+                Ok(raw) => Some(raw),
+                Err(error) if error.is_already_known() => None,
                 Err(CallError::Remote(failure)) => {
                     return Err(ambiguous_submission(
                         &computed,
@@ -280,6 +223,16 @@ where
                 Err(CallError::Local(error)) => {
                     return Err(ambiguous_submission(&computed, error));
                 }
+            };
+            let Some(raw) = raw else {
+                return match self.confirm_known_transaction(&computed).await {
+                    Ok(true) => Ok(computed),
+                    Ok(false) => Err(ambiguous_submission(
+                        &computed,
+                        "Ethereum RPC reported an already-known transaction but did not expose the matching hash",
+                    )),
+                    Err(error) => Err(ambiguous_submission(&computed, error)),
+                };
             };
             let returned: String = raw
                 .deserialize()
@@ -349,6 +302,51 @@ where
         parse_quantity_u64(&value)
             .map_err(|message| invalid_rpc_response("eth_estimateGas", message))
             .map_err(ChainError::from_rpc)
+    }
+
+    async fn simulate_token_transfer(&self, transaction: Value) -> Result<(), ChainError> {
+        let raw = match self
+            .request_result_detailed("eth_call", json!([transaction, "pending"]))
+            .await
+        {
+            Ok(raw) => raw,
+            Err(error) => {
+                if let Some(code) = error.execution_revert_code() {
+                    return Err(ChainError::new(
+                        ChainErrorKind::Rejected,
+                        format!(
+                            "Ethereum ERC-20 transfer simulation was rejected with code {code}"
+                        ),
+                    ));
+                }
+                return Err(ChainError::from_rpc(error.into_source("eth_call")));
+            }
+        };
+        let value: String = raw.deserialize().map_err(|_| {
+            ChainError::new(
+                ChainErrorKind::Rejected,
+                "Ethereum ERC-20 transfer simulation returned an invalid JSON value",
+            )
+        })?;
+        let word = parse_fixed_data::<32>(&value, "ERC-20 transfer result").map_err(|message| {
+            ChainError::new(
+                ChainErrorKind::Rejected,
+                format!("Ethereum ERC-20 transfer simulation returned invalid data: {message}"),
+            )
+        })?;
+        let transferred = erc20::decode_transfer(&word).map_err(|_| {
+            ChainError::new(
+                ChainErrorKind::Rejected,
+                "Ethereum ERC-20 transfer simulation returned an invalid ABI result",
+            )
+        })?;
+        if !transferred {
+            return Err(ChainError::new(
+                ChainErrorKind::Rejected,
+                "Ethereum ERC-20 transfer simulation returned false",
+            ));
+        }
+        Ok(())
     }
 
     async fn ensure_token_amount(&self, request: &TransferRequest) -> Result<(), ChainError> {

@@ -815,6 +815,45 @@ mod tests {
     }
 
     #[test]
+    fn already_known_without_visible_transaction_remains_ambiguous() {
+        let envelope = vec![0x02, 0xaa, 0xbb];
+        let id = TransactionId(keccak256(&envelope).0);
+        let client = ScriptedClient::new(vec![
+            failure("eth_sendRawTransaction", -32_000, "already known"),
+            success("eth_getTransactionByHash", Value::Null),
+        ]);
+
+        let error = block_on(rpc(client.clone()).broadcast(SignedTransaction {
+            id: id.clone(),
+            envelope: envelope.clone(),
+        }))
+        .expect_err("already-known without a matching lookup must remain ambiguous");
+
+        assert_eq!(error.kind, base::TransactionErrorKind::Unavailable);
+        assert_eq!(
+            error.ambiguous_transaction_id,
+            Some(base::TransactionId::new(id.to_string()))
+        );
+        assert_eq!(
+            error.message,
+            "Ethereum submission outcome is ambiguous: Ethereum RPC reported an already-known transaction but did not expose the matching hash"
+        );
+        assert_eq!(
+            client.requests(),
+            [
+                (
+                    "eth_sendRawTransaction".to_owned(),
+                    json!([hex::encode_prefixed(&envelope)]),
+                ),
+                (
+                    "eth_getTransactionByHash".to_owned(),
+                    json!([id.to_string()])
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn known_requires_the_exact_transaction_hash() {
         let id = TransactionId([0xaa; 32]);
         let absent = ScriptedClient::new(vec![success("eth_getTransactionByHash", Value::Null)]);

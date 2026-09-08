@@ -68,7 +68,7 @@ impl Backend {
             })?);
 
             for operation in batch.operations {
-                match operation {
+                let (result, context) = match operation {
                     Operation::Put {
                         namespace,
                         key,
@@ -76,20 +76,20 @@ impl Backend {
                     } => {
                         let physical_key = encode_physical_key(&namespace, &key)?;
                         let frame = StoredRecord::new(value, next_version)?.encode()?;
-                        drop(
-                            data.insert(physical_key.as_slice(), frame.as_slice())
-                                .map_err(|error| {
-                                    storage_error(error, "failed to write redb data record")
-                                })?,
-                        );
+                        (
+                            data.insert(physical_key.as_slice(), frame.as_slice()),
+                            "failed to write redb data record",
+                        )
                     }
                     Operation::Delete { namespace, key } => {
                         let physical_key = encode_physical_key(&namespace, &key)?;
-                        drop(data.remove(physical_key.as_slice()).map_err(|error| {
-                            storage_error(error, "failed to delete redb data record")
-                        })?);
+                        (
+                            data.remove(physical_key.as_slice()),
+                            "failed to delete redb data record",
+                        )
                     }
-                }
+                };
+                drop(result.map_err(|error| storage_error(error, context))?);
             }
             let encoded_version = GlobalVersion::new(next_version)?.encode()?;
             drop(

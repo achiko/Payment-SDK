@@ -239,7 +239,8 @@ impl TransactionCoordinator {
         let mut insufficient = None;
         for requirement in requirements.values {
             let first_index = requirement.first_index();
-            if insufficient.is_some_and(|index| first_index >= index) {
+            let earliest_failure_known = insufficient.is_some_and(|index| first_index >= index);
+            if earliest_failure_known {
                 break;
             }
             let asset = match &requirement.asset {
@@ -252,11 +253,11 @@ impl TransactionCoordinator {
                 .balance(requirement.source.clone(), &asset, None)
                 .await
                 .map_err(|error| PreparationError::new(first_index, ChainError::from_rpc(error)))?;
-            if balance < requirement.amount {
-                let index = requirement.failure_index(&balance);
-                insufficient =
-                    Some(insufficient.map_or(index, |current: usize| current.min(index)));
+            if balance >= requirement.amount {
+                continue;
             }
+            let index = requirement.failure_index(&balance);
+            insufficient = Some(insufficient.map_or(index, |current: usize| current.min(index)));
         }
         if let Some(index) = insufficient {
             return Err(PreparationError::new(

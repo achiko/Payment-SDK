@@ -131,9 +131,8 @@ impl BuildRequest {
                 .checked_sub(recipient_total)
                 .and_then(|value| value.checked_sub(fee_with_change));
             let mut outputs = self.recipients.clone();
-            if let Some(change) =
-                change.filter(|value| *value >= change_script.minimal_non_dust().to_sat())
-            {
+            let change = change.filter(|value| *value >= change_script.minimal_non_dust().to_sat());
+            if let Some(change) = change {
                 outputs.push(Output {
                     address: self.change_address.clone(),
                     value: Satoshi(change),
@@ -180,11 +179,13 @@ pub(in crate::transaction) fn build_grouped(
             .ok_or_else(|| {
                 ChainError::invalid_transaction("Bitcoin selected input amount overflowed u64")
             })?;
-        let output = group.recipients.iter().try_fold(0_u64, |sum, value| {
-            sum.checked_add(value.value.0).ok_or_else(|| {
+        let output = group
+            .recipients
+            .iter()
+            .try_fold(0_u64, |sum, value| sum.checked_add(value.value.0))
+            .ok_or_else(|| {
                 ChainError::invalid_transaction("Bitcoin recipient amount overflowed u64")
-            })
-        })?;
+            })?;
         surplus.push(input.checked_sub(output).ok_or_else(|| {
             ChainError::insufficient_funds(
                 "a Bitcoin grouped source cannot fund its requested outputs",
@@ -212,7 +213,7 @@ pub(in crate::transaction) fn build_grouped(
         .zip(&change)
         .map(|(value, script)| *value >= script.minimal_non_dust().to_sat())
         .collect::<Vec<_>>();
-    loop {
+    let remaining = loop {
         let mut scripts = recipient_scripts.clone();
         scripts.extend(
             change
@@ -230,18 +231,19 @@ pub(in crate::transaction) fn build_grouped(
             })
             .collect::<Vec<_>>();
         if next == active {
-            for ((group, value), keep) in groups.iter().zip(remaining).zip(next) {
-                if keep {
-                    recipients.push(Output::from_atomic(
-                        group.change_address.clone(),
-                        Satoshi(value),
-                    ));
-                }
-            }
-            return Ok(UnsignedTransaction::from_selected(available, recipients));
+            break remaining;
         }
         active = next;
+    };
+    for ((group, value), keep) in groups.iter().zip(remaining).zip(active) {
+        if keep {
+            recipients.push(Output::from_atomic(
+                group.change_address.clone(),
+                Satoshi(value),
+            ));
+        }
     }
+    Ok(UnsignedTransaction::from_selected(available, recipients))
 }
 
 // design-lint: allow single-use-free-function -- isolates deterministic source-ordered fee allocation from grouped transaction assembly
@@ -311,6 +313,124 @@ fn predicted_fee(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normal_change_keeps_the_dust_boundary_and_donates_smaller_remainders() {
+        let script = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([7; 20]));
+        let address = crate::Address::from_encoded(
+            bitcoin::Address::from_script(&script, Network::Regtest.native())
+                .unwrap()
+                .to_string(),
+        );
+        let source = SpendSource {
+            transaction_id: [1; 32],
+            output_index: 2,
+            value: Satoshi(100_000),
+            script_pubkey: script.into_bytes(),
+            satisfaction_weight: 109,
+        };
+        // One P2WPKH input with two outputs costs 141 satoshis at 1 sat/vB;
+        // its change output is retained at exactly 294 satoshis.
+        for (amount, change, fee) in [
+            (99_565, Some(294), 141),
+            (99_566, None, 434),
+            (99_860, None, 140),
+        ] {
+            let transaction = BuildRequest {
+                available: vec![source.clone()],
+                recipients: vec![Output::from_atomic(address.clone(), Satoshi(amount))],
+                change_address: address.clone(),
+                fee_rate: FeeRate::new(1_000),
+                drain_wallet: false,
+            }
+            .build(Network::Regtest)
+            .expect("recipient and network fee must be funded");
+
+            assert_eq!(transaction.inputs.len(), 1);
+            assert_eq!(transaction.inputs[0].utxo, source);
+            let mut expected = vec![Output::from_atomic(address.clone(), Satoshi(amount))];
+            if let Some(change) = change {
+                expected.push(Output::from_atomic(address.clone(), Satoshi(change)));
+            }
+            assert_eq!(transaction.outputs, expected);
+            assert_eq!(
+                100_000
+                    - transaction
+                        .outputs
+                        .iter()
+                        .map(|output| output.value.0)
+                        .sum::<u64>(),
+                fee
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_change_stays_disabled_after_fee_recalculation_and_preserves_source_order() {
+        let address = |byte| {
+            let script = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([byte; 20]));
+            let address = crate::Address::from_encoded(
+                bitcoin::Address::from_script(&script, Network::Regtest.native())
+                    .unwrap()
+                    .to_string(),
+            );
+            (address, script.into_bytes())
+        };
+        let (first, first_script) = address(7);
+        let (second, second_script) = address(8);
+        let (recipient, _) = address(9);
+
+        // Two inputs and four P2WPKH outputs cost 271 satoshis. Dropping
+        // the first change lowers that estimate to 240, but must not reactivate it.
+        for (first_amount, first_change, fee) in [(99_435, Some(294), 271), (99_440, None, 560)] {
+            let groups = [
+                (first.clone(), first_script.clone(), 2, first_amount),
+                (second.clone(), second_script.clone(), 1, 99_000),
+            ]
+            .into_iter()
+            .map(|(change_address, script_pubkey, id, amount)| Funding {
+                available: vec![SpendSource {
+                    transaction_id: [id; 32],
+                    output_index: 0,
+                    value: Satoshi(100_000),
+                    script_pubkey,
+                    satisfaction_weight: 109,
+                }],
+                recipients: vec![Output::from_atomic(recipient.clone(), Satoshi(amount))],
+                change_address,
+            })
+            .collect();
+            let transaction = build_grouped(Network::Regtest, groups, FeeRate::new(1_000))
+                .expect("each source must fund its own recipient and allocated fee");
+
+            assert_eq!(
+                transaction
+                    .inputs
+                    .iter()
+                    .map(|input| input.utxo.transaction_id)
+                    .collect::<Vec<_>>(),
+                [[2; 32], [1; 32]]
+            );
+            let mut expected = vec![
+                Output::from_atomic(recipient.clone(), Satoshi(first_amount)),
+                Output::from_atomic(recipient.clone(), Satoshi(99_000)),
+            ];
+            if let Some(change) = first_change {
+                expected.push(Output::from_atomic(first.clone(), Satoshi(change)));
+            }
+            expected.push(Output::from_atomic(second.clone(), Satoshi(1_000)));
+            assert_eq!(transaction.outputs, expected);
+            assert_eq!(
+                200_000
+                    - transaction
+                        .outputs
+                        .iter()
+                        .map(|output| output.value.0)
+                        .sum::<u64>(),
+                fee
+            );
+        }
+    }
 
     #[test]
     fn drain_and_grouped_funding_keep_checked_input_total_and_overflow_error() {

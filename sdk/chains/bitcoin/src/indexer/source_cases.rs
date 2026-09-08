@@ -251,6 +251,65 @@ fn external_prevouts_are_resolved_once_into_bounded_parsed_facts() {
 }
 
 #[test]
+fn in_block_forward_reference_fails_before_external_prevout_requests() {
+    let (mut block, _, _, _) = external_prevout_block();
+    block["tx"].as_array_mut().unwrap().swap(0, 1);
+    let mut replies = connect_replies();
+    replies.extend([
+        reply("getblockhash", Value::String(hash(2))),
+        reply_for("getblock", json!([hash(2), 2]), block),
+    ]);
+    let client = ScriptedClient::new(replies);
+    let calls = client.clone();
+    let source = block_on(Blocks::connect(client, config())).expect("valid source setup");
+
+    let error = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 1))
+        .expect_err("a child cannot spend a later transaction's output");
+
+    assert_eq!(
+        error.message,
+        "Bitcoin block transaction spends an output that was not created earlier in the block"
+    );
+    assert!(error.retryable);
+    calls.assert_exhausted();
+}
+
+#[test]
+fn enrichment_replaces_external_prevouts_and_removes_in_block_claims() {
+    let (mut block, previous, _, _) = external_prevout_block();
+    block["tx"][0]["vin"][0]["prevout"] = json!({"untrusted": true});
+    block["tx"][1]["vin"][0]["prevout"] = json!({"untrusted": true});
+    let mut replies = connect_replies();
+    replies.push(reply_for(
+        "getrawtransaction",
+        json!([previous.compute_txid().to_string(), true]),
+        json!({
+            "txid": previous.compute_txid().to_string(),
+            "hex": consensus::serialize(&previous).to_lower_hex_string(),
+            "blockhash": hash(5),
+        }),
+    ));
+    let client = ScriptedClient::new(replies);
+    let calls = client.clone();
+    let source = block_on(Blocks::connect(client, config())).expect("valid source setup");
+
+    let enriched = block_on(source.enrich_prevouts(serde_json::to_vec(&block).unwrap()))
+        .expect("validated external outputs must replace raw RPC claims");
+    let enriched: Value = serde_json::from_slice(&enriched).unwrap();
+    let address = crate::Address::from_script_for_network(
+        &previous.output[0].script_pubkey,
+        Network::Regtest,
+    )
+    .unwrap();
+    assert_eq!(
+        enriched["tx"][0]["vin"][0]["prevout"],
+        json!({"value_satoshis": 123_456_789, "address": address.encoded()})
+    );
+    assert!(enriched["tx"][1]["vin"][0].get("prevout").is_none());
+    calls.assert_exhausted();
+}
+
+#[test]
 fn external_prevout_lookup_must_return_confirmed_transaction_data() {
     let (block_result, previous, _, _) = external_prevout_block();
     let mut replies = connect_replies();
@@ -289,26 +348,33 @@ fn external_prevout_bound_is_above_consensus_maximum_and_fails_before_growth() {
     assert_eq!(MAX_COMPACT_PREVOUT_TOTAL_BYTES, 4_800_000);
 
     let transaction_id = TransactionId([0x33; 32]);
-    let mut outputs = BTreeMap::new();
-    let mut count = 0;
+    let mut outputs = RequiredPrevouts::default();
     for output_index in 0..MAX_EXTERNAL_PREVOUTS_PER_BLOCK {
-        record_external_prevout(
-            &mut outputs,
-            &mut count,
-            transaction_id,
-            u32::try_from(output_index).expect("test output index must fit u32"),
-        )
-        .expect("consensus-complete safety window must remain accepted");
+        outputs
+            .record(
+                transaction_id,
+                u32::try_from(output_index).expect("test output index must fit u32"),
+            )
+            .expect("consensus-complete safety window must remain accepted");
     }
-    let error = record_external_prevout(
-        &mut outputs,
-        &mut count,
-        transaction_id,
-        u32::try_from(MAX_EXTERNAL_PREVOUTS_PER_BLOCK).expect("test output index must fit u32"),
-    )
-    .expect_err("the first out-of-bound prevout must fail before insertion");
+    let duplicate = outputs
+        .record(transaction_id, 0)
+        .expect_err("duplicate validation must precede the full-capacity check");
+    assert_eq!(
+        duplicate.message,
+        "Bitcoin block spends the same external outpoint more than once"
+    );
+    assert!(!duplicate.retryable);
+    assert_eq!(outputs.len(), MAX_EXTERNAL_PREVOUTS_PER_BLOCK);
+    let error = outputs
+        .record(
+            transaction_id,
+            u32::try_from(MAX_EXTERNAL_PREVOUTS_PER_BLOCK).expect("test output index must fit u32"),
+        )
+        .expect_err("the first out-of-bound prevout must fail before insertion");
     assert!(!error.retryable);
-    assert_eq!(count, MAX_EXTERNAL_PREVOUTS_PER_BLOCK);
+    assert_eq!(outputs.len(), MAX_EXTERNAL_PREVOUTS_PER_BLOCK);
+    let outputs = outputs.into_iter().collect::<BTreeMap<_, _>>();
     assert_eq!(
         outputs
             .get(&transaction_id)

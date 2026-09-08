@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use bitcoin::{Transaction, consensus, hex::FromHex};
+use bitcoin::{Transaction, TxIn, consensus, hex::FromHex};
 use indexing::SourceError;
 use serde_json::{Map, Value};
 
 use crate::rpc::source_error;
-use crate::{Address, TransactionId};
+use crate::{Address, TransactionId, indexer::Outpoint};
 
 use super::{
     MAX_COMPACT_ADDRESS_BYTES, MAX_COMPACT_PREVOUT_JSON_BYTES, MAX_EXTERNAL_PREVOUTS_PER_BLOCK,
@@ -105,37 +105,139 @@ pub(super) fn validate_input_claims(
     Ok(())
 }
 
-pub(super) fn record_external_prevout(
-    outputs: &mut BTreeMap<TransactionId, BTreeSet<u32>>,
-    count: &mut usize,
-    transaction_id: TransactionId,
-    output_index: u32,
-) -> Result<(), SourceError> {
-    if outputs
-        .get(&transaction_id)
-        .is_some_and(|indexes| indexes.contains(&output_index))
-    {
-        return Err(source_error(
-            "Bitcoin block spends the same external outpoint more than once",
-            false,
-        ));
+#[derive(Debug, Default)]
+pub(super) struct RequiredPrevouts {
+    by_transaction: BTreeMap<TransactionId, BTreeSet<u32>>,
+    count: usize,
+}
+
+impl RequiredPrevouts {
+    pub(super) fn len(&self) -> usize {
+        self.count
     }
-    if *count >= MAX_EXTERNAL_PREVOUTS_PER_BLOCK {
-        return Err(source_error(
-            format!(
-                "Bitcoin block exceeds the {MAX_EXTERNAL_PREVOUTS_PER_BLOCK} external-prevout safety bound"
-            ),
-            false,
-        ));
+
+    pub(super) fn observe(
+        &mut self,
+        input: &TxIn,
+        earlier_outputs: &BTreeSet<Outpoint>,
+        transaction_ids: &BTreeSet<TransactionId>,
+    ) -> Result<(), SourceError> {
+        if input.previous_output.is_null() {
+            return Ok(());
+        }
+        let previous_id = TransactionId::from(input.previous_output.txid);
+        let outpoint = Outpoint {
+            transaction_id: previous_id,
+            output_index: input.previous_output.vout,
+        };
+        if earlier_outputs.contains(&outpoint) {
+            return Ok(());
+        }
+        if transaction_ids.contains(&previous_id) {
+            return Err(source_error(
+                "Bitcoin block transaction spends an output that was not created earlier in the block",
+                true,
+            ));
+        }
+        self.record(previous_id, input.previous_output.vout)
     }
-    outputs
-        .entry(transaction_id)
-        .or_default()
-        .insert(output_index);
-    *count = count
-        .checked_add(1)
-        .ok_or_else(|| source_error("Bitcoin external prevout count overflowed", false))?;
-    Ok(())
+
+    pub(super) fn record(
+        &mut self,
+        transaction_id: TransactionId,
+        output_index: u32,
+    ) -> Result<(), SourceError> {
+        if self
+            .by_transaction
+            .get(&transaction_id)
+            .is_some_and(|indexes| indexes.contains(&output_index))
+        {
+            return Err(source_error(
+                "Bitcoin block spends the same external outpoint more than once",
+                false,
+            ));
+        }
+        if self.count >= MAX_EXTERNAL_PREVOUTS_PER_BLOCK {
+            return Err(source_error(
+                format!(
+                    "Bitcoin block exceeds the {MAX_EXTERNAL_PREVOUTS_PER_BLOCK} external-prevout safety bound"
+                ),
+                false,
+            ));
+        }
+        self.by_transaction
+            .entry(transaction_id)
+            .or_default()
+            .insert(output_index);
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or_else(|| source_error("Bitcoin external prevout count overflowed", false))?;
+        Ok(())
+    }
+}
+
+impl IntoIterator for RequiredPrevouts {
+    type Item = (TransactionId, BTreeSet<u32>);
+    type IntoIter = std::collections::btree_map::IntoIter<TransactionId, BTreeSet<u32>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.by_transaction.into_iter()
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct ResolvedPrevouts {
+    values: BTreeMap<TransactionId, BTreeMap<u32, ResolvedOutput>>,
+}
+
+impl ResolvedPrevouts {
+    pub(super) fn insert(
+        &mut self,
+        transaction_id: TransactionId,
+        outputs: BTreeMap<u32, ResolvedOutput>,
+    ) {
+        self.values.insert(transaction_id, outputs);
+    }
+
+    pub(super) fn enrich_input(
+        &self,
+        input: &mut Value,
+        native_input: &TxIn,
+        earlier_outputs: &BTreeSet<Outpoint>,
+    ) -> Result<(), SourceError> {
+        if native_input.previous_output.is_null() {
+            return Ok(());
+        }
+        let input = input
+            .as_object_mut()
+            .ok_or_else(|| source_error("Bitcoin transaction input must be an object", true))?;
+        // Verbosity 2 does not include this field. Removing any unexpected
+        // value ensures parsing sees only the compact, source-owned shape.
+        input.remove("prevout");
+        let previous_id = TransactionId::from(native_input.previous_output.txid);
+        let outpoint = Outpoint {
+            transaction_id: previous_id,
+            output_index: native_input.previous_output.vout,
+        };
+        if earlier_outputs.contains(&outpoint) {
+            return Ok(());
+        }
+        let previous_transaction = self.values.get(&previous_id).ok_or_else(|| {
+            source_error(
+                "Bitcoin external previous transaction was not resolved",
+                true,
+            )
+        })?;
+        let output = previous_transaction
+            .get(&native_input.previous_output.vout)
+            .ok_or_else(|| {
+                source_error("Bitcoin external previous output was not resolved", true)
+            })?;
+        let prevout = output.compact_json()?;
+        input.insert("prevout".to_owned(), prevout);
+        Ok(())
+    }
 }
 
 impl Address {

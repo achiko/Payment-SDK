@@ -272,9 +272,9 @@ fn classify(
                 "Solana source observation is missing",
             )
         })?;
-        if source
+        if !source
             .as_ref()
-            .is_some_and(|account| !account.supports_native_transfer())
+            .is_none_or(AccountSnapshot::supports_native_transfer)
         {
             return Err(SendError::item(
                 item.index,
@@ -291,9 +291,9 @@ fn classify(
                 "Solana destination observation is missing",
             )
         })?;
-        if destination
+        if !destination
             .as_ref()
-            .is_some_and(|account| !account.supports_native_transfer())
+            .is_none_or(AccountSnapshot::supports_native_transfer)
         {
             return Err(SendError::item(
                 item.index,
@@ -760,11 +760,11 @@ mod tests {
                     &observed,
                 );
                 assert_eq!(result.is_err(), failed);
-                if !failed {
-                    let balances = result.unwrap();
-                    let expected = if failing_address == &source { 1 } else { 0 };
-                    assert_eq!(balances[0].atomic(), expected);
-                }
+                let Ok(balances) = result else {
+                    continue;
+                };
+                let expected = u64::from(failing_address == &source);
+                assert_eq!(balances[0].atomic(), expected);
             }
         }
     }

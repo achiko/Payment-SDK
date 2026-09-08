@@ -63,7 +63,8 @@ impl HistoryCursor {
                     parent: block
                         .parent
                         .map(|parent| {
-                            CursorBlock::decode_hash(&parent.hash).map(|hash| base::BlockParent {
+                            let hash = CursorBlock::decode_hash(&parent.hash)?;
+                            Ok::<_, ApiError>(base::BlockParent {
                                 position: base::BlockPosition(parent.position),
                                 hash: base::BlockHash(hash),
                             })

@@ -265,44 +265,23 @@ where
         }
 
         let mut earlier_outputs = BTreeSet::new();
-        let mut external_outputs: BTreeMap<TransactionId, BTreeSet<u32>> = BTreeMap::new();
-        let mut external_prevout_count = 0_usize;
+        let mut external_outputs = RequiredPrevouts::default();
         for (transaction_id, transaction) in &transactions {
             for input in &transaction.input {
-                if input.previous_output.is_null() {
-                    continue;
-                }
-                let previous_id = TransactionId::from(input.previous_output.txid);
-                let outpoint = Outpoint {
-                    transaction_id: previous_id,
-                    output_index: input.previous_output.vout,
-                };
-                if earlier_outputs.contains(&outpoint) {
-                    continue;
-                }
-                if transaction_ids.contains(&previous_id) {
-                    return Err(source_error(
-                        "Bitcoin block transaction spends an output that was not created earlier in the block",
-                        true,
-                    ));
-                }
-                record_external_prevout(
-                    &mut external_outputs,
-                    &mut external_prevout_count,
-                    previous_id,
-                    input.previous_output.vout,
-                )?;
+                external_outputs.observe(input, &earlier_outputs, &transaction_ids)?;
             }
             for output_index in 0..transaction.output.len() {
-                let output_index = u32::try_from(output_index)
-                    .map_err(|_| source_error("Bitcoin block output index exceeds u32", true))?;
+                let Ok(output_index) = u32::try_from(output_index) else {
+                    return Err(source_error("Bitcoin block output index exceeds u32", true));
+                };
                 earlier_outputs.insert(Outpoint {
                     transaction_id: *transaction_id,
                     output_index,
                 });
             }
         }
-        let compact_data_budget = external_prevout_count
+        let compact_data_budget = external_outputs
+            .len()
             .checked_mul(MAX_COMPACT_PREVOUT_JSON_BYTES)
             .ok_or_else(|| source_error("Bitcoin compact prevout data budget overflowed", false))?;
         if compact_data_budget > MAX_COMPACT_PREVOUT_TOTAL_BYTES {
@@ -312,14 +291,15 @@ where
             ));
         }
 
-        let mut resolved = BTreeMap::new();
+        let mut resolved = ResolvedPrevouts::default();
         let requests =
             external_outputs
                 .into_iter()
                 .map(|(transaction_id, output_indexes)| async move {
-                    self.resolve_outputs(transaction_id, &output_indexes)
-                        .await
-                        .map(|data| (transaction_id, data))
+                    let data = self
+                        .resolve_outputs(transaction_id, &output_indexes)
+                        .await?;
+                    Ok::<_, SourceError>((transaction_id, data))
                 });
         let mut requests = stream::iter(requests).buffer_unordered(MAX_IN_FLIGHT_PREVOUT_REQUESTS);
         while let Some(result) = requests.next().await {
@@ -342,41 +322,12 @@ where
                 .and_then(Value::as_array_mut)
                 .ok_or_else(|| source_error("Bitcoin transaction inputs must be an array", true))?;
             for (input, native_input) in inputs.iter_mut().zip(&transaction.input) {
-                if native_input.previous_output.is_null() {
-                    continue;
-                }
-                let input = input.as_object_mut().ok_or_else(|| {
-                    source_error("Bitcoin transaction input must be an object", true)
-                })?;
-                // Verbosity 2 does not include this field. Removing any
-                // unexpected value ensures parsing sees only the compact,
-                // source-owned previous-output shape.
-                input.remove("prevout");
-                let previous_id = TransactionId::from(native_input.previous_output.txid);
-                let outpoint = Outpoint {
-                    transaction_id: previous_id,
-                    output_index: native_input.previous_output.vout,
-                };
-                if earlier_outputs.contains(&outpoint) {
-                    continue;
-                }
-                let previous_transaction = resolved.get(&previous_id).ok_or_else(|| {
-                    source_error(
-                        "Bitcoin external previous transaction was not resolved",
-                        true,
-                    )
-                })?;
-                let output = previous_transaction
-                    .get(&native_input.previous_output.vout)
-                    .ok_or_else(|| {
-                        source_error("Bitcoin external previous output was not resolved", true)
-                    })?;
-                let prevout = output.compact_json()?;
-                input.insert("prevout".to_owned(), prevout);
+                resolved.enrich_input(input, native_input, &earlier_outputs)?;
             }
             for output_index in 0..transaction.output.len() {
-                let output_index = u32::try_from(output_index)
-                    .map_err(|_| source_error("Bitcoin block output index exceeds u32", true))?;
+                let Ok(output_index) = u32::try_from(output_index) else {
+                    return Err(source_error("Bitcoin block output index exceeds u32", true));
+                };
                 earlier_outputs.insert(Outpoint {
                     transaction_id: *transaction_id,
                     output_index,
