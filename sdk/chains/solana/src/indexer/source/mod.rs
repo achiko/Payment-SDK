@@ -186,13 +186,8 @@ where
                 ));
             }
 
-            for slot in slots.into_iter().take(remaining) {
-                let block = self.required_block(slot).await?;
-                if let Some(previous) = blocks.last() {
-                    block.require_connection(previous)?;
-                }
-                blocks.push(block);
-            }
+            self.extend_blocks(slots.into_iter().take(remaining), &mut blocks)
+                .await?;
             if blocks.len() == limit || window_end == bounded_end {
                 break;
             }
@@ -209,6 +204,21 @@ where
             ));
         }
         Ok(blocks)
+    }
+
+    async fn extend_blocks(
+        &self,
+        slots: impl Iterator<Item = u64>,
+        blocks: &mut Vec<Block>,
+    ) -> Result<(), SourceError> {
+        for slot in slots {
+            let block = self.required_block(slot).await?;
+            if let Some(previous) = blocks.last() {
+                block.require_connection(previous)?;
+            }
+            blocks.push(block);
+        }
+        Ok(())
     }
 
     async fn canonical(&mut self, position: BlockPosition) -> Result<Option<Block>, SourceError> {

@@ -276,49 +276,44 @@ impl TransactionCoordinator {
         expected: Option<&SignedTransaction>,
         id: TransactionId,
     ) -> Result<TransactionId, TransactionError> {
-        loop {
+        let claim = loop {
             let mut notified = Box::pin(self.core.changed.notified());
             notified.as_mut().enable();
-            let claim = match self
+            match self
                 .core
                 .claim(&id, expected)
                 .map_err(definite_submission_error)?
             {
-                Claim::Ready(claim) => claim,
-                Claim::Wait => {
-                    notified.await;
-                    continue;
-                }
-            };
-            if claim.recovery {
-                match self.core.transactions.known(&id).await {
-                    Ok(true) => return claim.guard.accept().map_err(definite_submission_error),
-                    Ok(false) => {}
-                    Err(error) => return Err(ambiguous_submission_error(&id, error)),
-                }
+                Claim::Ready(claim) => break claim,
+                Claim::Wait => notified.await,
             }
-
-            match self
-                .core
-                .transactions
-                .broadcast(claim.transaction.clone())
-                .await
-            {
-                Ok(returned) if returned == id => {
-                    return claim.guard.accept().map_err(definite_submission_error);
-                }
-                Ok(_) => {
-                    return Err(ambiguous_submission_error(
-                        &id,
-                        "Ethereum node returned a different hash for the exact signed envelope",
-                    ));
-                }
-                Err(error) if !claim.recovery && error.ambiguous_transaction_id.is_none() => {
-                    claim.guard.reject();
-                    return Err(error);
-                }
+        };
+        if claim.recovery {
+            match self.core.transactions.known(&id).await {
+                Ok(true) => return claim.guard.accept().map_err(definite_submission_error),
+                Ok(false) => {}
                 Err(error) => return Err(ambiguous_submission_error(&id, error)),
             }
+        }
+
+        match self
+            .core
+            .transactions
+            .broadcast(claim.transaction.clone())
+            .await
+        {
+            Ok(returned) if returned == id => {
+                claim.guard.accept().map_err(definite_submission_error)
+            }
+            Ok(_) => Err(ambiguous_submission_error(
+                &id,
+                "Ethereum node returned a different hash for the exact signed envelope",
+            )),
+            Err(error) if !claim.recovery && error.ambiguous_transaction_id.is_none() => {
+                claim.guard.reject();
+                Err(error)
+            }
+            Err(error) => Err(ambiguous_submission_error(&id, error)),
         }
     }
 }

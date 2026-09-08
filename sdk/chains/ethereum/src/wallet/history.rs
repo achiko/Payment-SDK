@@ -37,11 +37,12 @@ impl super::WalletConfig {
         wallet: &CanonicalAddress,
         mut history: History,
     ) -> Result<History, WalletError> {
-        if history.transactions.iter().any(|transaction| {
+        let non_native_fee = history.transactions.iter().any(|transaction| {
             transaction.fee.as_ref().is_some_and(|fee| {
                 fee.asset.id.chain != self.scope.chain || fee.asset.id.asset != "native"
             })
-        }) {
+        });
+        if non_native_fee {
             return Err(WalletError::new(
                 WalletErrorKind::History,
                 "Ethereum history contains a non-native network fee",

@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use futures_executor::block_on;
 use indexing::{
@@ -278,4 +281,63 @@ fn partitions_filters_and_combines_statuses_from_every_indexer() {
     assert_eq!(first.calls(), vec![Call::Sync(vec![first_filter])]);
     assert_eq!(second.calls(), vec![Call::Sync(vec![second_filter])]);
     assert_eq!(idle.calls(), vec![Call::Sync(Vec::new())]);
+}
+
+#[test]
+fn validates_the_complete_selection_when_polled_before_any_child_sync() {
+    struct Selection {
+        filters: Vec<AddressFilter>,
+        reads: AtomicUsize,
+    }
+
+    impl FilterSource for Selection {
+        fn filters(&self) -> Result<Vec<AddressFilter>, IndexError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(self.filters.clone())
+        }
+    }
+
+    let configured = scope("configured");
+    let first = Arc::new(Probe::new(configured.clone(), 1));
+    let second = Arc::new(Probe::new(scope("second"), 2));
+    let composer = Composer::new(vec![first.clone(), second.clone()]).unwrap();
+    let valid = AddressFilter {
+        address: address(&configured, "owner"),
+        start_position: BlockPosition(0),
+    };
+    for (invalid, kind, message) in [
+        (
+            address(&configured, ""),
+            IndexErrorKind::InvalidRequest,
+            "address filters must be non-empty and unique",
+        ),
+        (
+            valid.address.clone(),
+            IndexErrorKind::InvalidRequest,
+            "address filters must be non-empty and unique",
+        ),
+        (
+            address(&scope("unknown"), ""),
+            IndexErrorKind::ScopeMismatch,
+            "index scope is not configured",
+        ),
+    ] {
+        let selection = Selection {
+            filters: vec![
+                valid.clone(),
+                AddressFilter {
+                    address: invalid,
+                    start_position: BlockPosition(0),
+                },
+            ],
+            reads: AtomicUsize::new(0),
+        };
+        let pending = composer.sync(&selection);
+        assert_eq!(selection.reads.load(Ordering::Relaxed), 0);
+        let error = block_on(pending).expect_err("complete selection must be valid first");
+        assert_eq!(error, IndexError::new(kind, message, false));
+        assert_eq!(selection.reads.load(Ordering::Relaxed), 1);
+        assert!(first.calls().is_empty());
+        assert!(second.calls().is_empty());
+    }
 }

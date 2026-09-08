@@ -346,17 +346,16 @@ where
         } else {
             None
         };
-        let start_position = match (start_position, publication.as_ref()) {
+        let checkpoint = publication.as_ref().map(PublicationPermit::checkpoint);
+        let start_position = match (start_position, checkpoint) {
             (Some(position), _) => position,
-            (None, Some(permit)) => match permit.checkpoint() {
-                Some(block) => block.position.checked_successor().ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::Unavailable,
-                        "checkpoint position has no successor for wallet publication",
-                    )
-                })?,
-                None => BlockPosition(0),
-            },
+            (None, Some(Some(block))) => block.position.checked_successor().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unavailable,
+                    "checkpoint position has no successor for wallet publication",
+                )
+            })?,
+            (None, Some(None)) => BlockPosition(0),
             (None, None) => return Err(publication_error()),
         };
         let entry = self

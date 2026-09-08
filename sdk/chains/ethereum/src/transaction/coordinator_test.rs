@@ -403,6 +403,72 @@ async fn ambiguous_submission_reconciles_and_replays_the_exact_envelope() {
 }
 
 #[tokio::test]
+async fn known_recovery_accepts_without_rebroadcast_and_advances_the_nonce_floor() {
+    let signer = signer(4);
+    let accounts = Arc::new(AccountStub::default());
+    accounts.set_nonce(signer.address.clone(), 5);
+    let transactions = Arc::new(TransactionStub::default());
+    transactions.actions([BroadcastAction::Ambiguous]);
+    transactions.known([Ok(true)]);
+    let coordinator = coordinator(accounts, transactions.clone());
+    let old = coordinator
+        .prepare_one(Preparation::signer(
+            transfer(&signer.address, 1),
+            CHAIN_ID,
+            &signer,
+        ))
+        .await
+        .expect("old transaction must prepare");
+    coordinator
+        .broadcast(old.clone())
+        .await
+        .expect_err("initial broadcast must be ambiguous");
+    assert_eq!(
+        coordinator
+            .broadcast(old.clone())
+            .await
+            .expect("known exact hash resolves acceptance without replay"),
+        old.id
+    );
+    assert_eq!(
+        transactions.broadcasts.lock().unwrap().as_slice(),
+        std::slice::from_ref(&old)
+    );
+    assert_eq!(
+        transactions.known_ids.lock().unwrap().as_slice(),
+        std::slice::from_ref(&old.id)
+    );
+
+    let new = coordinator
+        .prepare_one(Preparation::signer(
+            transfer(&signer.address, 2),
+            CHAIN_ID,
+            &signer,
+        ))
+        .await
+        .expect("the accepted nonce cannot be reused despite the unchanged RPC nonce");
+    assert_eq!(
+        transactions
+            .contexts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, nonce)| *nonce)
+            .collect::<Vec<_>>(),
+        [5, 6]
+    );
+    coordinator
+        .broadcast(new.clone())
+        .await
+        .expect("the next prepared transaction submits normally");
+    assert_eq!(
+        transactions.broadcasts.lock().unwrap().as_slice(),
+        [old, new]
+    );
+    assert_eq!(transactions.known_ids.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn recovery_lookup_failure_preserves_the_message_local_id_and_exact_replay() {
     let signer = signer(4);
     let accounts = Arc::new(AccountStub::default());

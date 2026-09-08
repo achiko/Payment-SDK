@@ -88,11 +88,11 @@ impl Backend {
             }
 
             let logical_key = decode_physical_key(physical_key.value(), &request.namespace)?;
-            if request
+            let before_or_at_cursor = request
                 .after
                 .as_ref()
-                .is_some_and(|after| logical_key <= *after)
-            {
+                .is_some_and(|after| logical_key <= *after);
+            if before_or_at_cursor {
                 continue;
             }
             entries.push((

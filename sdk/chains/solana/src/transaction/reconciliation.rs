@@ -123,11 +123,11 @@ where
                 Ok(page) if page.checkpoint.as_ref() == Some(checkpoint) => page,
                 _ => return Scan::Unstable,
             };
-            if page
+            let present = page
                 .transactions
                 .iter()
-                .any(|transaction| transaction.transaction_id.value == envelope.id().as_str())
-            {
+                .any(|transaction| transaction.transaction_id.value == envelope.id().as_str());
+            if present {
                 return Scan::Present;
             }
             match page.next {

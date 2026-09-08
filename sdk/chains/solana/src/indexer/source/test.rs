@@ -256,6 +256,49 @@ async fn rejects_broken_produced_height_or_parent_sequence() {
 }
 
 #[tokio::test]
+async fn validates_parent_connections_across_sparse_enumeration_windows() {
+    for parent in [100, 99] {
+        let second = block(10_103, 3, parent, 3, 2);
+        let rpc = Scripted::new([
+            (
+                "getSlot",
+                json!([{"commitment":"finalized"}]),
+                json!(10_103),
+            ),
+            ("getFirstAvailableBlock", json!([]), json!(1)),
+            enumeration(104, 10_103, 10_103, json!([10_103])),
+            full(10_103, second.clone()),
+            ("getFirstAvailableBlock", json!([]), json!(1)),
+            enumeration(100, 10_099, 10_103, json!([100])),
+            full(100, block(100, 2, 1, 2, 1)),
+            enumeration(10_100, 10_103, 10_103, json!([10_103])),
+            full(10_103, second),
+            ("getFirstAvailableBlock", json!([]), json!(1)),
+        ]);
+        let client = RpcClient::new(rpc.clone());
+        let result = Source::new(client.clone())
+            .blocks(BlockPosition(100), BlockPosition(10_103), 2)
+            .await;
+        if parent == 100 {
+            let blocks = result.expect("connected blocks across windows");
+            assert_eq!(blocks.len(), 2);
+            assert_eq!(blocks[0].reference().position, BlockPosition(100));
+            assert_eq!(blocks[1].reference().position, BlockPosition(10_103));
+            assert_eq!(blocks[1].reference().height, BlockHeight(3));
+        } else {
+            let error = result.expect_err("cross-window parent mismatch");
+            assert!(error.retryable);
+            assert_eq!(
+                error.message,
+                "Solana produced blocks are not a strict canonical sequence"
+            );
+            assert_eq!(client.first_available_block().await.unwrap(), 1);
+        }
+        rpc.assert_finished();
+    }
+}
+
+#[tokio::test]
 async fn within_preserves_rpc_error_messages_and_retryability() {
     let rpc = RpcClient::new(Scripted::new([]));
     let attempt = Attempt::new(&rpc);

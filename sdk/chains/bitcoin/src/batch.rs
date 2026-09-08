@@ -58,7 +58,8 @@ impl Batch {
             let (wallet, address, output) = self
                 .parse(transfer)
                 .map_err(|error| SendError::item(index, Vec::new(), error))?;
-            if let Some(source) = sources.iter_mut().find(|source| source.address == address) {
+            let existing = sources.iter_mut().find(|source| source.address == address);
+            if let Some(source) = existing {
                 source.recipients.push(output);
             } else {
                 sources.push(Source {
@@ -70,100 +71,98 @@ impl Batch {
         }
         Ok(sources)
     }
+
+    async fn execute(&self, transfers: Vec<Transfer>) -> Result<Vec<BaseId>, SendError> {
+        if transfers.is_empty() {
+            return Err(SendError::collection(
+                ErrorKind::InvalidBatch,
+                "at least one transfer is required",
+            ));
+        }
+        if transfers.len() > MAX_TRANSFERS {
+            return Err(SendError::collection(
+                ErrorKind::InvalidBatch,
+                "at most 50 transfers are allowed",
+            ));
+        }
+        let sources = self.sources(transfers)?;
+        let fee_rate = self
+            .fees
+            .estimate(self.fee_target_blocks)
+            .await
+            .map_err(|error| SendError::operation(ErrorKind::Transaction, error.to_string()))?;
+        if fee_rate > self.max_fee_rate {
+            return Err(SendError::operation(
+                ErrorKind::Transaction,
+                "estimated fee rate exceeds the configured maximum",
+            ));
+        }
+
+        let mut funding = Vec::with_capacity(sources.len());
+        let mut owners = Vec::new();
+        let mut checkpoint = None;
+        for source in &sources {
+            let set = self
+                .utxos
+                .utxos(vec![source.address.clone()])
+                .await
+                .map_err(|error| SendError::operation(ErrorKind::Transaction, error.to_string()))?;
+            let checkpoint_changed = checkpoint
+                .as_ref()
+                .is_some_and(|expected| expected != &set.checkpoint);
+            if checkpoint_changed {
+                return Err(SendError::operation(
+                    ErrorKind::Transaction,
+                    "indexed output snapshot changed while building the transaction",
+                ));
+            }
+            checkpoint.get_or_insert(set.checkpoint);
+            let available = set
+                .outputs
+                .into_iter()
+                .map(|output| {
+                    SpendSource::from_exact_selection(
+                        self.network,
+                        &source.address,
+                        TransactionId(output.transaction_id),
+                        output.output_index,
+                        output.value,
+                        output.script_pubkey,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| SendError::operation(ErrorKind::Transaction, error.to_string()))?;
+            owners.extend(std::iter::repeat_n(source.wallet.as_ref(), available.len()));
+            funding.push(Funding {
+                available,
+                recipients: source.recipients.clone(),
+                change_address: source.address.clone(),
+            });
+        }
+
+        let signed = BatchBuilder::new(self.network, funding, fee_rate)
+            .sign_each(&owners)
+            .await
+            .map_err(|error| SendError::operation(ErrorKind::Transaction, error.to_string()))?;
+        let prepared = Prepared::new(
+            PREPARED_KIND,
+            BaseId::new(signed.id().to_string()),
+            Envelope::new(signed.consensus_bytes().to_vec()),
+        );
+        let submitted = crate::wallet::broadcast_prepared(
+            self.transactions.as_ref(),
+            self.max_fee_rate,
+            &prepared,
+        )
+        .await
+        .map_err(|error| SendError::grouped(Vec::new(), error.into()))?;
+        Ok(vec![submitted.id])
+    }
 }
 
 impl Sender for Batch {
     fn send<'a>(&'a self, transfers: Vec<Transfer>) -> SendFuture<'a> {
-        Box::pin(async move {
-            if transfers.is_empty() {
-                return Err(SendError::collection(
-                    ErrorKind::InvalidBatch,
-                    "at least one transfer is required",
-                ));
-            }
-            if transfers.len() > MAX_TRANSFERS {
-                return Err(SendError::collection(
-                    ErrorKind::InvalidBatch,
-                    "at most 50 transfers are allowed",
-                ));
-            }
-            let sources = self.sources(transfers)?;
-            let fee_rate = self
-                .fees
-                .estimate(self.fee_target_blocks)
-                .await
-                .map_err(|error| SendError::operation(ErrorKind::Transaction, error.to_string()))?;
-            if fee_rate > self.max_fee_rate {
-                return Err(SendError::operation(
-                    ErrorKind::Transaction,
-                    "estimated fee rate exceeds the configured maximum",
-                ));
-            }
-
-            let mut funding = Vec::with_capacity(sources.len());
-            let mut owners = Vec::new();
-            let mut checkpoint = None;
-            for source in &sources {
-                let set = self
-                    .utxos
-                    .utxos(vec![source.address.clone()])
-                    .await
-                    .map_err(|error| {
-                        SendError::operation(ErrorKind::Transaction, error.to_string())
-                    })?;
-                if checkpoint
-                    .as_ref()
-                    .is_some_and(|expected| expected != &set.checkpoint)
-                {
-                    return Err(SendError::operation(
-                        ErrorKind::Transaction,
-                        "indexed output snapshot changed while building the transaction",
-                    ));
-                }
-                checkpoint.get_or_insert(set.checkpoint);
-                let available = set
-                    .outputs
-                    .into_iter()
-                    .map(|output| {
-                        SpendSource::from_exact_selection(
-                            self.network,
-                            &source.address,
-                            TransactionId(output.transaction_id),
-                            output.output_index,
-                            output.value,
-                            output.script_pubkey,
-                        )
-                        .map_err(|error| {
-                            SendError::operation(ErrorKind::Transaction, error.to_string())
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                owners.extend(std::iter::repeat_n(source.wallet.as_ref(), available.len()));
-                funding.push(Funding {
-                    available,
-                    recipients: source.recipients.clone(),
-                    change_address: source.address.clone(),
-                });
-            }
-
-            let signed = BatchBuilder::new(self.network, funding, fee_rate)
-                .sign_each(&owners)
-                .await
-                .map_err(|error| SendError::operation(ErrorKind::Transaction, error.to_string()))?;
-            let prepared = Prepared::new(
-                PREPARED_KIND,
-                BaseId::new(signed.id().to_string()),
-                Envelope::new(signed.consensus_bytes().to_vec()),
-            );
-            let submitted = crate::wallet::broadcast_prepared(
-                self.transactions.as_ref(),
-                self.max_fee_rate,
-                &prepared,
-            )
-            .await
-            .map_err(|error| SendError::grouped(Vec::new(), error.into()))?;
-            Ok(vec![submitted.id])
-        })
+        Box::pin(self.execute(transfers))
     }
 }
 
@@ -244,20 +243,26 @@ mod tests {
     }
 
     fn direct_sender_with_fees(fees: Arc<dyn Fees>) -> (Arc<dyn Sender>, Arc<dyn Wallet>) {
+        let provider = provider(fees, Arc::new(InactiveDependencies));
+        let wallet = block_on(provider.create(SecretBytes::new([1_u8; 32])))
+            .expect("fixed valid secret must create a Bitcoin wallet");
+        (provider.transactions(), wallet)
+    }
+
+    fn provider(fees: Arc<dyn Fees>, outputs: Arc<dyn Outputs>) -> WalletProvider {
         let network = Network::Regtest;
         let scope = IndexScope {
             chain: ChainId(crate::CHAIN.to_owned()),
             network: network.canonical_name().to_owned(),
         };
         let dependencies = Arc::new(InactiveDependencies);
-        let outputs: Arc<dyn Outputs> = dependencies.clone();
         let transactions: Arc<dyn Transactions> = dependencies.clone();
         let history: Arc<dyn History> = dependencies;
         let utxos = Arc::new(
             IndexUtxos::new(scope.clone(), network, outputs)
                 .expect("fixture scope must match the Bitcoin network"),
         );
-        let provider = WalletProvider::new(
+        WalletProvider::new(
             WalletConfig {
                 scope,
                 network,
@@ -269,10 +274,7 @@ mod tests {
             fees,
             transactions,
             history,
-        );
-        let wallet = block_on(provider.create(SecretBytes::new([1_u8; 32])))
-            .expect("fixed valid secret must create a Bitcoin wallet");
-        (provider.transactions(), wallet)
+        )
     }
 
     fn assert_invalid_batch(failure: SendError, message: &str) {
@@ -385,6 +387,100 @@ mod tests {
             assert_eq!(failure.source.kind, ErrorKind::Transaction);
             assert_eq!(failure.source.message, message);
             assert_eq!(failure.to_string(), message);
+        }
+    }
+
+    #[test]
+    fn grouped_sources_read_fees_then_first_seen_addresses_at_one_checkpoint() {
+        struct Reads {
+            events: std::sync::Mutex<Vec<String>>,
+            change_checkpoint: bool,
+        }
+
+        impl Fees for Reads {
+            fn estimate<'a>(
+                &'a self,
+                target_blocks: u16,
+            ) -> BoxFuture<'a, Result<FeeRate, SourceError>> {
+                Box::pin(async move {
+                    assert_eq!(target_blocks, 6);
+                    self.events.lock().unwrap().push("fees".to_owned());
+                    Ok(FeeRate::new(1_000))
+                })
+            }
+        }
+
+        impl Outputs for Reads {
+            fn list<'a>(
+                &'a self,
+                request: OutputRequest,
+            ) -> BoxFuture<'a, Result<OutputPage, IndexError>> {
+                Box::pin(async move {
+                    assert!(request.after.is_none());
+                    let mut events = self.events.lock().unwrap();
+                    events.push(request.address.value);
+                    let height = if self.change_checkpoint {
+                        u64::try_from(events.len()).unwrap()
+                    } else {
+                        1
+                    };
+                    Ok(OutputPage {
+                        checkpoint: Some(base::BlockRef {
+                            position: base::BlockPosition(height),
+                            height: base::BlockHeight(height),
+                            hash: base::BlockHash(vec![height as u8; 32]),
+                            parent: None,
+                            timestamp: None,
+                        }),
+                        outputs: Vec::new(),
+                        next: None,
+                    })
+                })
+            }
+        }
+
+        for (change_checkpoint, expected_error) in [
+            (
+                true,
+                "indexed output snapshot changed while building the transaction",
+            ),
+            (
+                false,
+                "each Bitcoin grouped source needs inputs and recipients",
+            ),
+        ] {
+            let reads = Arc::new(Reads {
+                events: std::sync::Mutex::new(Vec::new()),
+                change_checkpoint,
+            });
+            let provider = provider(reads.clone(), reads.clone());
+            let first = block_on(provider.create(SecretBytes::new([1_u8; 32]))).unwrap();
+            let second = block_on(provider.create(SecretBytes::new([2_u8; 32]))).unwrap();
+            let first_address = first.address_text(&first.address()).unwrap();
+            let second_address = second.address_text(&second.address()).unwrap();
+            let transfers = [first.clone(), second, first]
+                .into_iter()
+                .map(|wallet| Transfer {
+                    wallet,
+                    to: first_address.clone(),
+                    amount: "0.00001000".parse().unwrap(),
+                })
+                .collect();
+            let sender = provider.transactions();
+            let submission = sender.send(transfers);
+            assert!(reads.events.lock().unwrap().is_empty());
+            let failure = block_on(submission).unwrap_err();
+
+            assert_eq!(
+                reads.events.lock().unwrap().as_slice(),
+                ["fees", &first_address.text, &second_address.text]
+            );
+            assert!(failure.accepted.is_empty());
+            assert_eq!(failure.failed_index, None);
+            assert_eq!(failure.ambiguous_transaction_id, None);
+            assert_eq!(failure.source.ambiguous_transaction_id, None);
+            assert_eq!(failure.source.kind, ErrorKind::Transaction);
+            assert_eq!(failure.source.message, expected_error);
         }
     }
 

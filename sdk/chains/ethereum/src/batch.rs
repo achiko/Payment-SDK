@@ -35,47 +35,53 @@ impl Batch {
             transfer.wallet.as_ref(),
         ))
     }
+
+    async fn execute(
+        &self,
+        transfers: Vec<Transfer>,
+    ) -> Result<Vec<base::TransactionId>, SendError> {
+        if transfers.is_empty() {
+            return Err(SendError::collection(
+                ErrorKind::InvalidBatch,
+                "at least one transfer is required",
+            ));
+        }
+        if transfers.len() > MAX_TRANSFERS {
+            return Err(SendError::collection(
+                ErrorKind::InvalidBatch,
+                "at most 50 transfers are allowed",
+            ));
+        }
+        let preparations = transfers
+            .iter()
+            .enumerate()
+            .map(|(index, transfer)| {
+                self.preparation(transfer)
+                    .map_err(|error| SendError::item(index, Vec::new(), error))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut prepared = self
+            .coordinator
+            .prepare_batch(preparations)
+            .await
+            .map_err(PreparationError::into_send)?;
+        let mut accepted = Vec::with_capacity(prepared.len());
+        loop {
+            let id = prepared
+                .next()
+                .await
+                .map_err(|error| SendError::item(accepted.len(), accepted.clone(), error.into()))?;
+            let Some(id) = id else {
+                return Ok(accepted);
+            };
+            accepted.push(base::Id::new(id.to_string()));
+        }
+    }
 }
 
 impl Sender for Batch {
     fn send<'a>(&'a self, transfers: Vec<Transfer>) -> SendFuture<'a> {
-        Box::pin(async move {
-            if transfers.is_empty() {
-                return Err(SendError::collection(
-                    ErrorKind::InvalidBatch,
-                    "at least one transfer is required",
-                ));
-            }
-            if transfers.len() > MAX_TRANSFERS {
-                return Err(SendError::collection(
-                    ErrorKind::InvalidBatch,
-                    "at most 50 transfers are allowed",
-                ));
-            }
-            let preparations = transfers
-                .iter()
-                .enumerate()
-                .map(|(index, transfer)| {
-                    self.preparation(transfer)
-                        .map_err(|error| SendError::item(index, Vec::new(), error))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut prepared = self
-                .coordinator
-                .prepare_batch(preparations)
-                .await
-                .map_err(PreparationError::into_send)?;
-            let mut accepted = Vec::with_capacity(prepared.len());
-            loop {
-                let id = prepared.next().await.map_err(|error| {
-                    SendError::item(accepted.len(), accepted.clone(), error.into())
-                })?;
-                let Some(id) = id else {
-                    return Ok(accepted);
-                };
-                accepted.push(base::Id::new(id.to_string()));
-            }
-        })
+        Box::pin(self.execute(transfers))
     }
 }
 
@@ -293,6 +299,27 @@ mod tests {
             .expect_err("the concrete Ethereum sender must reject 51 items");
 
         assert_invalid_batch(failure, "at most 50 transfers are allowed");
+        assert_no_chain_io(&dependencies);
+    }
+
+    #[test]
+    fn item_preflight_reports_the_first_authored_error_before_chain_io() {
+        let (sender, wallet, dependencies) = direct_sender();
+        let first = transfer(wallet.clone());
+        let mut second = transfer(wallet.clone());
+        second.amount = base::Decimal::zero();
+        let mut third = transfer(wallet);
+        third.to.text = "not-an-address".to_owned();
+
+        let failure = block_on(sender.send(vec![first, second, third]))
+            .expect_err("the earlier invalid amount must win before any chain I/O");
+
+        assert_eq!(failure.failed_index, Some(1));
+        assert!(failure.accepted.is_empty());
+        assert_eq!(failure.source.kind, ErrorKind::InvalidAmount);
+        assert_eq!(failure.source.message, "amount must be positive");
+        assert_eq!(failure.ambiguous_transaction_id, None);
+        assert_eq!(failure.source.ambiguous_transaction_id, None);
         assert_no_chain_io(&dependencies);
     }
 

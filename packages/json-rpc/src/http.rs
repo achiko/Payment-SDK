@@ -190,6 +190,52 @@ impl Http {
         })
     }
 
+    async fn execute_request(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> std::result::Result<CallResult, Error> {
+        let params = Params::new(params)?;
+        let mut last = None;
+        for attempt in 1..=self.retry.max_attempts.get() {
+            match self.request_attempt(method, &params).await {
+                Err(error) if error.is_retryable() => last = Some(error),
+                result => return result,
+            }
+            if attempt < self.retry.max_attempts.get() {
+                tokio::time::sleep(self.retry.backoff(attempt)).await;
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            Error::new(ErrorKind::Unavailable, "JSON-RPC endpoints are unavailable")
+        }))
+    }
+
+    async fn request_attempt(
+        &self,
+        method: &str,
+        params: &Params,
+    ) -> std::result::Result<CallResult, Error> {
+        let mut last = None;
+        for client in &self.clients {
+            let result = match client
+                .request::<Box<RawValue>, _>(method, params.clone())
+                .await
+            {
+                Ok(value) => Ok(Ok(RawJson(value.get().as_bytes().to_vec()))),
+                Err(RpcError::Call(error)) => Ok(Err(Failure::from(error))),
+                Err(source) => Err(Error::from_rpc(source)),
+            };
+            match result {
+                Err(error) if error.is_retryable() => last = Some(error),
+                result => return result,
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            Error::new(ErrorKind::Unavailable, "JSON-RPC endpoints are unavailable")
+        }))
+    }
+
     async fn execute_batch(&self, calls: Vec<Call>) -> std::result::Result<Vec<CallResult>, Error> {
         let batch = Batch::new(calls)?;
         let mut last = None;
@@ -227,34 +273,7 @@ impl Client for Http {
         method: &'a str,
         params: Value,
     ) -> BoxFuture<'a, std::result::Result<CallResult, Error>> {
-        Box::pin(async move {
-            let params = Params::new(params)?;
-            let mut last = None;
-            for attempt in 1..=self.retry.max_attempts.get() {
-                for client in &self.clients {
-                    match client
-                        .request::<Box<RawValue>, _>(method, params.clone())
-                        .await
-                    {
-                        Ok(value) => return Ok(Ok(RawJson(value.get().as_bytes().to_vec()))),
-                        Err(RpcError::Call(error)) => return Ok(Err(Failure::from(error))),
-                        Err(source) => {
-                            let error = Error::from_rpc(source);
-                            if !error.is_retryable() {
-                                return Err(error);
-                            }
-                            last = Some(error);
-                        }
-                    }
-                }
-                if attempt < self.retry.max_attempts.get() {
-                    tokio::time::sleep(self.retry.backoff(attempt)).await;
-                }
-            }
-            Err(last.unwrap_or_else(|| {
-                Error::new(ErrorKind::Unavailable, "JSON-RPC endpoints are unavailable")
-            }))
-        })
+        Box::pin(self.execute_request(method, params))
     }
 
     fn request_once<'a>(

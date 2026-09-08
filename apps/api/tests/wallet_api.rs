@@ -465,7 +465,18 @@ async fn send_batch(
     transfers: &[(&str, &str, String, &str)],
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let response = batch_response(root, transfers).await?;
-    let response: Value = response.error_for_status()?.json().await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body: Value = response.json().await?;
+        let message = body["message"]
+            .as_str()
+            .unwrap_or("missing public error message");
+        return Err(std::io::Error::other(format!(
+            "batch submission returned {status}: {message}"
+        ))
+        .into());
+    }
+    let response: Value = response.json().await?;
     Ok(response["transaction_ids"]
         .as_array()
         .expect("batch response must contain transaction IDs")

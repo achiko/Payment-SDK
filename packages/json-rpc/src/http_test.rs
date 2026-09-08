@@ -282,6 +282,168 @@ async fn failover_advances_after_transport_failure() {
 }
 
 #[tokio::test]
+async fn request_rejects_invalid_parameters_before_http() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback server must bind");
+    listener.set_nonblocking(true).unwrap();
+    let client = Http::new(Config::new(
+        format!("http://{}", listener.local_addr().unwrap()),
+        Duration::from_secs(2),
+    ))
+    .unwrap();
+    for params in [Value::Null, json!(true), json!(42), json!("invalid")] {
+        let pending = client.request("answer", params);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let error = pending
+            .await
+            .expect_err("scalar parameters must fail locally");
+        assert_eq!(error.kind, ErrorKind::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "JSON-RPC parameters must be an array or object"
+        );
+        assert!(!error.is_retryable());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+
+#[tokio::test]
+async fn request_preserves_raw_results_and_call_failures_without_failover() {
+    const RAW: &str = r#"{ "amount": 1.2300, "large": 18446744073709551616, "tag": "\u0061" }"#;
+    for failed in [false, true] {
+        let selected_executions = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&selected_executions);
+        let payload = if failed {
+            format!(r#""error":{{"code":-32001,"message":"call rejected","data":{RAW}}}"#)
+        } else {
+            format!(r#""result":{RAW}"#)
+        };
+        let selected = serve_once(move |request| {
+            count.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(request["method"], "answer");
+            assert_eq!(request["params"], json!({"input":42}));
+            serde_json::value::RawValue::from_string(format!(
+                r#"{{"jsonrpc":"2.0","id":{}, {payload}}}"#,
+                request["id"],
+            ))
+            .expect("exact wire response")
+        });
+        let fallback = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        fallback.set_nonblocking(true).unwrap();
+        let mut config = Config::new(selected, Duration::from_secs(2));
+        config
+            .endpoints
+            .push(format!("http://{}", fallback.local_addr().unwrap()));
+        config.retry =
+            Retry::new(NonZeroU32::new(2).unwrap(), Duration::ZERO, Duration::ZERO).unwrap();
+        let result = Http::new(config)
+            .unwrap()
+            .request("answer", json!({"input":42}))
+            .await
+            .expect("received call results stop transport retries");
+        match result {
+            Ok(value) => {
+                assert!(!failed);
+                assert_eq!(value.as_bytes(), RAW.as_bytes());
+            }
+            Err(error) => {
+                assert!(failed);
+                assert_eq!(error.code, -32001);
+                assert_eq!(error.message, "call rejected");
+                assert_eq!(error.data.unwrap().as_bytes(), RAW.as_bytes());
+            }
+        }
+        assert_eq!(selected_executions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fallback.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+
+#[tokio::test]
+async fn request_terminal_http_error_stops_failover() {
+    let selected_executions = Arc::new(AtomicUsize::new(0));
+    let selected = serve_status_once(Arc::clone(&selected_executions), "400 Bad Request");
+    let fallback = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    fallback.set_nonblocking(true).unwrap();
+    let mut config = Config::new(selected, Duration::from_secs(2));
+    config
+        .endpoints
+        .push(format!("http://{}", fallback.local_addr().unwrap()));
+    config.retry = Retry::new(NonZeroU32::new(2).unwrap(), Duration::ZERO, Duration::ZERO).unwrap();
+    let error = Http::new(config)
+        .unwrap()
+        .request("answer", json!([]))
+        .await
+        .expect_err("terminal HTTP rejection must stop the request");
+    assert_eq!(error.kind, ErrorKind::HttpStatus(400));
+    assert_eq!(error.message, "JSON-RPC endpoint rejected the request");
+    assert!(!error.is_retryable());
+    assert_eq!(selected_executions.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fallback.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[tokio::test]
+async fn request_retry_rounds_preserve_endpoint_order_and_last_error() {
+    let (events, observed) = mpsc::channel();
+    let first = serve_request_rejections(
+        "first",
+        ["503 Service Unavailable", "429 Too Many Requests"],
+        events.clone(),
+    );
+    let second =
+        serve_request_rejections("second", ["502 Bad Gateway", "504 Gateway Timeout"], events);
+    let mut config = Config::new(first, Duration::from_secs(2));
+    config.endpoints.push(second);
+    config.retry = Retry::new(NonZeroU32::new(2).unwrap(), Duration::ZERO, Duration::ZERO).unwrap();
+    let error = Http::new(config)
+        .unwrap()
+        .request("answer", json!([42]))
+        .await
+        .expect_err("all endpoint rounds must exhaust");
+    assert_eq!(error.kind, ErrorKind::HttpStatus(504));
+    assert_eq!(error.message, "JSON-RPC endpoint rejected the request");
+    assert!(error.is_retryable());
+    assert_eq!(
+        observed.try_iter().collect::<Vec<_>>(),
+        ["first", "second", "first", "second"]
+    );
+}
+
+fn serve_request_rejections(
+    name: &'static str,
+    statuses: [&'static str; 2],
+    events: mpsc::Sender<&'static str>,
+) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback server must bind");
+    let address = listener.local_addr().expect("loopback address must exist");
+    thread::spawn(move || {
+        for status in statuses {
+            let (mut stream, _) = listener.accept().expect("request client must connect");
+            let request = read_request(&mut stream);
+            assert_eq!(request["method"], "answer");
+            assert_eq!(request["params"], json!([42]));
+            events.send(name).expect("attempt must be observed");
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .expect("status response must write");
+        }
+    });
+    format!("http://{address}")
+}
+
+#[tokio::test]
 async fn request_once_executes_only_the_selected_endpoint() {
     let selected_executions = Arc::new(AtomicUsize::new(0));
     let selected = serve_status_once(Arc::clone(&selected_executions), "503 Service Unavailable");
@@ -397,7 +559,7 @@ async fn request_once_rejects_a_mismatched_wire_id() {
     assert_eq!(error.kind, ErrorKind::InvalidResponse);
 }
 
-fn serve_once(response: impl FnOnce(Value) -> Value + Send + 'static) -> String {
+fn serve_once<T: serde::Serialize>(response: impl FnOnce(Value) -> T + Send + 'static) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback server must bind");
     let address = listener.local_addr().expect("loopback address must exist");
     std::thread::spawn(move || {
@@ -485,7 +647,10 @@ fn read_request(stream: &mut std::net::TcpStream) -> Value {
     }
 }
 
-fn write_json_response(stream: &mut std::net::TcpStream, response: &Value) -> std::io::Result<()> {
+fn write_json_response(
+    stream: &mut std::net::TcpStream,
+    response: &impl serde::Serialize,
+) -> std::io::Result<()> {
     let body = serde_json::to_vec(response).expect("response must encode");
     write!(
         stream,

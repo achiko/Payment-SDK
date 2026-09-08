@@ -148,59 +148,70 @@ where
 {
     let mut accepted = Vec::with_capacity(envelopes.len());
     for (position, envelope) in envelopes.into_iter().enumerate() {
-        if position != 0 {
-            let height = match rpc.block_height(floor).await {
-                Ok(height) => height,
-                Err(_) => {
-                    return Outcome::Complete(Err(definite(
-                        envelope.index(),
-                        accepted.clone(),
-                        "Solana block height is unavailable before dispatch",
-                    )));
-                }
-            };
-            if height > envelope.lifetime().last_valid_block_height() {
+        let height = match position {
+            0 => Ok(None),
+            _ => rpc.block_height(floor).await.map(Some),
+        };
+        match height {
+            Err(_) => {
+                return Outcome::Complete(Err(definite(
+                    envelope.index(),
+                    accepted,
+                    "Solana block height is unavailable before dispatch",
+                )));
+            }
+            Ok(Some(height)) if height > envelope.lifetime().last_valid_block_height() => {
                 return Outcome::Complete(Err(definite(
                     envelope.index(),
                     accepted,
                     "Solana transaction lifetime expired before dispatch",
                 )));
             }
+            Ok(_) => {}
         }
 
-        let mut submitted = false;
-        for attempt in 0..3 {
-            match rpc
-                .send_transaction(envelope.signed_bytes(), floor, envelope.id().clone())
-                .await
-            {
-                Ok(()) => {
-                    submitted = true;
-                    break;
-                }
-                Err(_) => match rpc.signature_status(envelope.id(), floor).await {
-                    Ok(status) if status.value.is_some() => {
-                        submitted = true;
-                        break;
-                    }
-                    Ok(_) if attempt < 2 => match rpc.block_height(floor).await {
-                        Ok(height) if height <= envelope.lifetime().last_valid_block_height() => {}
-                        _ => {
-                            return ambiguous_outcome(envelope, accepted, guarded);
-                        }
-                    },
-                    _ => {
-                        return ambiguous_outcome(envelope, accepted, guarded);
-                    }
-                },
-            }
-        }
-        if !submitted {
-            return ambiguous_outcome(envelope, accepted, guarded);
+        if !envelope.submit_and_observe(&rpc, floor).await {
+            guarded.retain_ambiguity(envelope.source());
+            let error = TransactionError::new(
+                TransactionErrorKind::Unknown,
+                "Solana submission outcome is unknown",
+            )
+            .with_ambiguous_transaction_id(envelope.id().clone());
+            return Outcome::Ambiguous {
+                error: SendError::item(envelope.index(), accepted, WalletError::from(error)),
+                envelope: Box::new(envelope),
+            };
         }
         accepted.push(envelope.id().clone());
     }
     Outcome::Complete(Ok(accepted))
+}
+
+impl Envelope {
+    async fn submit_and_observe<C>(&self, rpc: &RpcClient<C>, floor: u64) -> bool
+    where
+        C: json_rpc::Client,
+    {
+        for attempt in 0..3 {
+            if rpc
+                .send_transaction(self.signed_bytes(), floor, self.id().clone())
+                .await
+                .is_ok()
+            {
+                return true;
+            }
+            match rpc.signature_status(self.id(), floor).await {
+                Ok(status) if status.value.is_some() => return true,
+                Ok(_) if attempt < 2 => {}
+                _ => return false,
+            }
+            match rpc.block_height(floor).await {
+                Ok(height) if height <= self.lifetime().last_valid_block_height() => {}
+                _ => return false,
+            }
+        }
+        false
+    }
 }
 
 #[cfg(test)]
@@ -222,23 +233,6 @@ enum Outcome {
         error: SendError,
         envelope: Box<Envelope>,
     },
-}
-
-fn ambiguous_outcome(
-    envelope: Envelope,
-    accepted: Vec<TransactionId>,
-    guarded: GuardedSources,
-) -> Outcome {
-    guarded.retain_ambiguity(envelope.source());
-    let error = TransactionError::new(
-        TransactionErrorKind::Unknown,
-        "Solana submission outcome is unknown",
-    )
-    .with_ambiguous_transaction_id(envelope.id().clone());
-    Outcome::Ambiguous {
-        error: SendError::item(envelope.index(), accepted, WalletError::from(error)),
-        envelope: Box::new(envelope),
-    }
 }
 
 fn definite(index: usize, accepted: Vec<TransactionId>, message: &'static str) -> SendError {
@@ -591,6 +585,165 @@ mod tests {
             .expect("ambiguous source must remain guarded for reconciliation");
         assert_eq!(retained.source.kind, WalletErrorKind::SourceBusy);
         rpc.assert_finished();
+    }
+
+    #[tokio::test]
+    async fn failed_dispatch_requires_valid_status_and_live_height_before_replay() {
+        let absent = json!({"context":{"slot":15},"value":[null]});
+        for (status, height, observed) in [
+            (
+                json!({"context":{"slot":15},"value":[{"slot":12,"confirmations":null,"err":{"InstructionError":[0,"Custom"]},"confirmationStatus":"finalized"}]}),
+                None,
+                true,
+            ),
+            (json!({"context":{"slot":10},"value":[null]}), None, false),
+            (absent.clone(), Some(json!(45)), false),
+            (absent, Some(json!("unavailable")), false),
+        ] {
+            let coordinator = SourceCoordinator::default();
+            let (floor, envelopes, leases) = prepared(&coordinator).into_parts();
+            let envelope = envelopes[0].clone();
+            let send = (
+                "sendTransaction",
+                json!([STANDARD.encode(envelope.signed_bytes()), {"encoding":"base64","skipPreflight":false,"preflightCommitment":"confirmed","minContextSlot":floor,"maxRetries":0}]),
+                json!(Signature::from([8; 64]).to_string()),
+            );
+            let status = (
+                "getSignatureStatuses",
+                json!([[envelope.id().as_str()], {"searchTransactionHistory":true}]),
+                status,
+            );
+            let sentinel = ("getHealth", json!([]), json!("ok"));
+            let rpc = match height {
+                Some(height) => Scripted::new([
+                    send,
+                    status,
+                    (
+                        "getBlockHeight",
+                        json!([{"commitment":"confirmed", "minContextSlot":floor}]),
+                        height,
+                    ),
+                    sentinel,
+                ]),
+                None => Scripted::new([send, status, sentinel]),
+            };
+            let client = RpcClient::new(rpc.clone());
+            let outcome = run(client.clone(), floor, envelopes, leases.guard()).await;
+            match outcome {
+                Outcome::Complete(result) => {
+                    assert!(observed);
+                    assert_eq!(
+                        result.expect("observed execution failure"),
+                        [envelope.id().clone()]
+                    );
+                }
+                Outcome::Ambiguous {
+                    error,
+                    envelope: retained,
+                } => {
+                    assert!(!observed);
+                    assert_eq!(*retained, envelope);
+                    assert_eq!(error.failed_index, Some(envelope.index()));
+                    assert!(error.accepted.is_empty());
+                    assert_eq!(error.ambiguous_transaction_id, Some(envelope.id().clone()));
+                    assert_eq!(error.source.kind, WalletErrorKind::Unavailable);
+                    assert_eq!(error.source.message, "Solana submission outcome is unknown");
+                }
+            }
+            let lease = coordinator.lease(
+                &[ResolvedTransfer::new(
+                    0,
+                    envelope.source().clone(),
+                    String::new(),
+                    Lamport::from_atomic(1),
+                )],
+                false,
+            );
+            assert_eq!(lease.is_ok(), observed);
+            client
+                .health()
+                .await
+                .expect("no extra status, height, or replay calls");
+            rpc.assert_finished();
+        }
+    }
+
+    #[tokio::test]
+    async fn later_item_lifetime_failure_preserves_the_accepted_prefix_and_releases_sources() {
+        for (height, message) in [
+            (
+                json!(45),
+                "Solana transaction lifetime expired before dispatch",
+            ),
+            (
+                json!("unavailable"),
+                "Solana block height is unavailable before dispatch",
+            ),
+        ] {
+            let coordinator = SourceCoordinator::default();
+            let (floor, mut envelopes, leases) = prepared(&coordinator).into_parts();
+            let first = envelopes[0].clone();
+            let second_message = Message::native_transfer(
+                first.source(),
+                &Address::from_bytes([8; 32]),
+                Lamport::from_atomic(3),
+                Memo::from_bytes([4; Memo::LENGTH]),
+                first.lifetime(),
+            )
+            .expect("second message");
+            envelopes.push(
+                Envelope::sign(
+                    first.source().clone(),
+                    7,
+                    second_message,
+                    floor,
+                    first.lifetime().clone(),
+                    &key(),
+                )
+                .expect("second envelope"),
+            );
+            let rpc = Scripted::new([
+                (
+                    "sendTransaction",
+                    json!([STANDARD.encode(first.signed_bytes()), {"encoding":"base64","skipPreflight":false,"preflightCommitment":"confirmed","minContextSlot":floor,"maxRetries":0}]),
+                    json!(first.id().as_str()),
+                ),
+                (
+                    "getBlockHeight",
+                    json!([{"commitment":"confirmed", "minContextSlot":floor}]),
+                    height,
+                ),
+                ("getHealth", json!([]), json!("ok")),
+            ]);
+            let client = RpcClient::new(rpc.clone());
+            let Outcome::Complete(result) =
+                run(client.clone(), floor, envelopes, leases.guard()).await
+            else {
+                panic!("an undispatched second item has no ambiguous outcome");
+            };
+            let error = result.expect_err("second item lifetime unavailable");
+            assert_eq!(error.failed_index, Some(7));
+            assert_eq!(error.accepted, [first.id().clone()]);
+            assert_eq!(error.source.kind, WalletErrorKind::Unavailable);
+            assert_eq!(error.source.message, message);
+            assert!(error.ambiguous_transaction_id.is_none());
+            coordinator
+                .lease(
+                    &[ResolvedTransfer::new(
+                        0,
+                        first.source().clone(),
+                        String::new(),
+                        Lamport::from_atomic(1),
+                    )],
+                    false,
+                )
+                .expect("completed dispatch releases sources");
+            client
+                .health()
+                .await
+                .expect("second envelope was never dispatched");
+            rpc.assert_finished();
+        }
     }
 
     #[tokio::test]
