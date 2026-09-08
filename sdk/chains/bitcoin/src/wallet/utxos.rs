@@ -4,8 +4,8 @@ use std::{
 };
 
 use indexing::{
-    AssetId, BlockRef, CanonicalAddress, ChainId, IndexScope, OutputCursor, OutputRequest, Outputs,
-    SourceError,
+    AssetId, BlockRef, CanonicalAddress, ChainId, IndexScope, IndexedOutput, OutputCursor,
+    OutputRequest, Outputs, SourceError,
 };
 
 use crate::{Address, Network, Satoshi, TransactionId, UnspentOutput, UtxoSet};
@@ -74,65 +74,20 @@ impl IndexUtxos {
             let checkpoint = page.checkpoint.as_ref().ok_or_else(|| {
                 source_error("indexed outputs have no canonical checkpoint", true)
             })?;
-            if expected_checkpoint.get_or_insert_with(|| checkpoint.clone()) != checkpoint {
+            let expected = expected_checkpoint.get_or_insert_with(|| checkpoint.clone());
+            if expected != checkpoint {
                 return Err(source_error(
                     "indexed output checkpoint changed while loading Bitcoin outputs",
                     true,
                 ));
             }
             for output in page.outputs {
-                if output.address != canonical
-                    || output.asset != *NATIVE_ASSET
-                    || !output.id.transaction.belongs_to(&self.scope)
-                {
-                    return Err(source_error(
-                        "indexed output does not belong to the requested Bitcoin address and asset",
-                        false,
-                    ));
-                }
-                if output.evidence != expected_script {
-                    return Err(source_error(
-                        "indexed output locking script does not match its Bitcoin address",
-                        false,
-                    ));
-                }
-                let transaction_id = output
-                    .id
-                    .transaction
-                    .value
-                    .parse::<TransactionId>()
-                    .map_err(|_| {
-                        source_error(
-                            "indexed output has an invalid Bitcoin transaction ID",
-                            false,
-                        )
-                    })?;
-                let value = Satoshi::from_indexed_amount(&output.amount)?;
-                let confirmations = checkpoint
-                    .height
-                    .0
-                    .checked_sub(output.created_at.0)
-                    .and_then(|depth| depth.checked_add(1))
-                    .ok_or_else(|| {
-                        source_error(
-                            "indexed output was created after the canonical checkpoint",
-                            false,
-                        )
-                    })?;
-                if output.coinbase && confirmations < COINBASE_MATURITY {
+                let Some(output) =
+                    self.unspent(output, &canonical, &expected_script, checkpoint, seen)?
+                else {
                     continue;
-                }
-                if !seen.insert((transaction_id.0, output.id.index)) {
-                    return Err(source_error("indexed output is duplicated", false));
-                }
-                outputs.push(UnspentOutput {
-                    transaction_id: transaction_id.0,
-                    output_index: output.id.index,
-                    value,
-                    script_pubkey: output.evidence,
-                    confirmations,
-                    coinbase: output.coinbase,
-                });
+                };
+                outputs.push(output);
             }
             let Some(next) = page.next else {
                 break;
@@ -141,6 +96,68 @@ impl IndexUtxos {
             after = Some(next);
         }
         Ok(outputs)
+    }
+
+    fn unspent(
+        &self,
+        output: IndexedOutput,
+        canonical: &CanonicalAddress,
+        expected_script: &[u8],
+        checkpoint: &BlockRef,
+        seen: &mut BTreeSet<([u8; 32], u32)>,
+    ) -> Result<Option<UnspentOutput>, SourceError> {
+        if output.address != *canonical
+            || output.asset != *NATIVE_ASSET
+            || !output.id.transaction.belongs_to(&self.scope)
+        {
+            return Err(source_error(
+                "indexed output does not belong to the requested Bitcoin address and asset",
+                false,
+            ));
+        }
+        if output.evidence != expected_script {
+            return Err(source_error(
+                "indexed output locking script does not match its Bitcoin address",
+                false,
+            ));
+        }
+        let transaction_id = output
+            .id
+            .transaction
+            .value
+            .parse::<TransactionId>()
+            .map_err(|_| {
+                source_error(
+                    "indexed output has an invalid Bitcoin transaction ID",
+                    false,
+                )
+            })?;
+        let value = Satoshi::from_indexed_amount(&output.amount)?;
+        let confirmations = checkpoint
+            .height
+            .0
+            .checked_sub(output.created_at.0)
+            .and_then(|depth| depth.checked_add(1))
+            .ok_or_else(|| {
+                source_error(
+                    "indexed output was created after the canonical checkpoint",
+                    false,
+                )
+            })?;
+        if output.coinbase && confirmations < COINBASE_MATURITY {
+            return Ok(None);
+        }
+        if !seen.insert((transaction_id.0, output.id.index)) {
+            return Err(source_error("indexed output is duplicated", false));
+        }
+        Ok(Some(UnspentOutput {
+            transaction_id: transaction_id.0,
+            output_index: output.id.index,
+            value,
+            script_pubkey: output.evidence,
+            confirmations,
+            coinbase: output.coinbase,
+        }))
     }
 }
 
@@ -337,6 +354,76 @@ mod tests {
             assert_eq!(
                 error.message,
                 "indexed output checkpoint changed while loading Bitcoin outputs"
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_coinbase_maturity_precedes_duplicate_tracking() {
+        let scope = IndexScope {
+            chain: ChainId(crate::CHAIN.to_owned()),
+            network: "mainnet".to_owned(),
+        };
+        let address = Address::from_encoded("1BitcoinEaterAddressDontSendf59kuE");
+        let script = address
+            .script_pubkey_for_network(Network::Mainnet)
+            .unwrap()
+            .into_bytes();
+        let mature = IndexedOutput {
+            id: indexing::OutputId {
+                transaction: indexing::TransactionRef {
+                    scope: scope.clone(),
+                    value: TransactionId([7; 32]).to_string(),
+                },
+                index: 3,
+            },
+            address: CanonicalAddress {
+                scope: scope.clone(),
+                value: address.encoded().to_owned(),
+            },
+            asset: (*NATIVE_ASSET).clone(),
+            amount: Decimal::from(100_000_u64),
+            evidence: script.clone(),
+            created_at: indexing::BlockHeight(1),
+            coinbase: true,
+        };
+        let mut immature = mature.clone();
+        immature.created_at = indexing::BlockHeight(2);
+
+        for duplicate_mature in [false, true] {
+            let mut page_outputs = vec![immature.clone(), immature.clone(), mature.clone()];
+            if duplicate_mature {
+                page_outputs.push(mature.clone());
+            }
+            let pages = Arc::new(ScriptedOutputs(Mutex::new(VecDeque::from([(
+                None,
+                OutputPage {
+                    checkpoint: Some(checkpoint(100)),
+                    outputs: page_outputs,
+                    next: None,
+                },
+            )]))));
+            let outputs = IndexUtxos::new(scope.clone(), Network::Mainnet, pages.clone()).unwrap();
+            let result = block_on(outputs.utxos(vec![address.clone()]));
+            assert!(pages.0.lock().unwrap().is_empty());
+            if duplicate_mature {
+                let error = result.unwrap_err();
+                assert_eq!(error.message, "indexed output is duplicated");
+                assert!(!error.retryable);
+                continue;
+            }
+            let result = result.unwrap();
+            assert_eq!(result.checkpoint, checkpoint(100));
+            assert_eq!(
+                result.outputs,
+                vec![UnspentOutput {
+                    transaction_id: [7; 32],
+                    output_index: 3,
+                    value: Satoshi(100_000),
+                    script_pubkey: script.clone(),
+                    confirmations: 100,
+                    coinbase: true,
+                }]
             );
         }
     }

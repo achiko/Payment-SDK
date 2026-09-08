@@ -519,11 +519,11 @@ async fn native_sol_submission_indexing_and_central_storage() {
             .history(&"source".to_owned(), HistoryRequest::first(100))
             .await
             .expect("history during retained rollback");
-        if history
+        let transaction_absent = history
             .transactions
             .iter()
-            .all(|entry| entry.transaction_id.value != transaction.as_str())
-        {
+            .all(|entry| entry.transaction_id.value != transaction.as_str());
+        if transaction_absent {
             break;
         }
         let tip = repository

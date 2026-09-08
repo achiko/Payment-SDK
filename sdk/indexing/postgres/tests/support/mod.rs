@@ -207,16 +207,18 @@ fn unique_identity() -> String {
 fn mapped_port(container: &str) -> u16 {
     for _ in 0..100 {
         let output = docker(&["port", container, "5432/tcp"]);
-        if output.status.success() {
-            let text = String::from_utf8(output.stdout).expect("docker port output is UTF-8");
-            if let Some(port) = text
-                .trim()
-                .rsplit(':')
-                .next()
-                .and_then(|value| value.parse().ok())
-            {
-                return port;
-            }
+        if !output.status.success() {
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        let text = String::from_utf8(output.stdout).expect("docker port output is UTF-8");
+        let port = text
+            .trim()
+            .rsplit(':')
+            .next()
+            .and_then(|value| value.parse().ok());
+        if let Some(port) = port {
+            return port;
         }
         thread::sleep(Duration::from_millis(50));
     }

@@ -271,6 +271,19 @@ impl EthereumConfig {
     pub(crate) fn limits(&self) -> Result<chain_ethereum::Limits, AnyError> {
         self.limits.build()
     }
+
+    pub(crate) async fn validate_usdc(
+        &self,
+        accounts: &chain_ethereum::HttpAccounts,
+        expected_decimals: u8,
+    ) -> Result<(), indexing::SourceError> {
+        if let Some(usdc) = &self.usdc {
+            accounts
+                .validate_token(&usdc.contract, expected_decimals)
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]

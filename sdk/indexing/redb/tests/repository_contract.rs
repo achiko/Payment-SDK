@@ -190,6 +190,90 @@ fn duplicate_output_identity_is_rejected_before_repository_add() {
 }
 
 #[test]
+fn history_and_output_pages_preserve_order_and_reject_stale_cursors() {
+    let directory = TempDir::new().expect("temporary directory");
+    let repository = open(&directory.path().join("index.redb"));
+    let first = block(1, 1, 0);
+    let second = block(2, 2, 1);
+    let first_output = output("one");
+    let mut second_output = output("two");
+    second_output.created_at = second.height;
+    for (block, expected, id, output) in [
+        (first.clone(), None, "one", first_output.clone()),
+        (second.clone(), Some(first), "two", second_output.clone()),
+    ] {
+        block_on(repository.add(addition(
+            block,
+            expected,
+            id,
+            OutputChanges {
+                created: vec![output],
+                ..OutputChanges::default()
+            },
+        )))
+        .expect("seed block");
+    }
+    let history_page = |after| {
+        block_on(Transactions::list(
+            &repository,
+            HistoryQuery {
+                scope: scope(),
+                address: address("receiver"),
+                after,
+                limit: 1,
+            },
+        ))
+    };
+    let output_page = |after| {
+        block_on(Outputs::list(
+            &repository,
+            OutputRequest {
+                scope: scope(),
+                address: address("receiver"),
+                after,
+                limit: 1,
+            },
+        ))
+    };
+
+    let page = history_page(None).expect("first history page");
+    assert_eq!(page.checkpoint, Some(second.clone()));
+    assert_eq!(page.transactions.len(), 1);
+    assert_eq!(page.transactions[0].transaction_id, transaction("one"));
+    let history_cursor = page.next.expect("history continuation");
+    let page = history_page(Some(history_cursor.clone())).expect("final history page");
+    assert_eq!(page.checkpoint, Some(second.clone()));
+    assert_eq!(page.transactions.len(), 1);
+    assert_eq!(page.transactions[0].transaction_id, transaction("two"));
+    assert_eq!(page.next, None);
+
+    let page = output_page(None).expect("first output page");
+    assert_eq!(page.checkpoint, Some(second.clone()));
+    assert_eq!(page.outputs, vec![first_output]);
+    let output_cursor = page.next.expect("output continuation");
+    let page = output_page(Some(output_cursor.clone())).expect("final output page");
+    assert_eq!(page.checkpoint, Some(second.clone()));
+    assert_eq!(page.outputs, vec![second_output]);
+    assert_eq!(page.next, None);
+
+    block_on(repository.add(addition(
+        block(3, 3, 2),
+        Some(second),
+        "three",
+        OutputChanges::default(),
+    )))
+    .expect("advance checkpoint");
+    let error = history_page(Some(history_cursor)).expect_err("stale history cursor");
+    assert_eq!(error.kind, IndexErrorKind::Conflict);
+    assert!(error.retryable);
+    assert_eq!(error.message, "history changed during pagination");
+    let error = output_page(Some(output_cursor)).expect_err("stale output cursor");
+    assert_eq!(error.kind, IndexErrorKind::Conflict);
+    assert!(error.retryable);
+    assert_eq!(error.message, "outputs changed during pagination");
+}
+
+#[test]
 fn restart_and_reorg_preserve_atomic_canonical_state() {
     let directory = TempDir::new().expect("temporary directory");
     let database = directory.path().join("index.redb");

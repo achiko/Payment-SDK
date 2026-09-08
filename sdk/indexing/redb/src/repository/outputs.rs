@@ -11,11 +11,11 @@ impl Outputs for Repository {
             self.check_address(&request.address)?;
             Self::validate_limit(request.limit)?;
             let checkpoint = self.current_checkpoint().await?;
-            if request
+            let checkpoint_changed = request
                 .after
                 .as_ref()
-                .is_some_and(|cursor| cursor.checkpoint != checkpoint)
-            {
+                .is_some_and(|cursor| cursor.checkpoint != checkpoint);
+            if checkpoint_changed {
                 return Err(IndexError::new(
                     IndexErrorKind::Conflict,
                     "outputs changed during pagination",
@@ -43,11 +43,12 @@ impl Outputs for Repository {
                 .collect::<Result<Vec<_>, IndexError>>()?;
             self.ensure_checkpoint(&checkpoint).await?;
             let next = if has_more {
+                let Some(position) = position else {
+                    return Err(Self::record_error("paginated output page has no final key"));
+                };
                 Some(OutputCursor {
                     checkpoint: checkpoint.clone(),
-                    position: position.ok_or_else(|| {
-                        Self::record_error("paginated output page has no final key")
-                    })?,
+                    position,
                 })
             } else {
                 None

@@ -80,14 +80,16 @@ impl Redb {
         let (startup_tx, startup_rx) = std_mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("storage-redb-owner".to_owned())
-            .spawn(move || match Backend::open(&path) {
-                Ok(backend) => {
-                    if startup_tx.send(Ok(())).is_ok() {
-                        backend.run(command_rx);
+            .spawn(move || {
+                let backend = match Backend::open(&path) {
+                    Ok(backend) => backend,
+                    Err(error) => {
+                        drop(startup_tx.send(Err(error)));
+                        return;
                     }
-                }
-                Err(error) => {
-                    drop(startup_tx.send(Err(error)));
+                };
+                if startup_tx.send(Ok(())).is_ok() {
+                    backend.run(command_rx);
                 }
             })
             .map_err(|error| unavailable(format!("failed to spawn redb owner thread: {error}")))?;

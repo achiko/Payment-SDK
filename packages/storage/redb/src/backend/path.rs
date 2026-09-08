@@ -87,14 +87,12 @@ fn normalized_absolute_path(path: &Path) -> Result<PathBuf, Error> {
             Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
                 normalized.push(component.as_os_str());
             }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(Error::invalid_request(
-                        "redb path escapes the filesystem root",
-                    ));
-                }
+            Component::ParentDir if !normalized.pop() => {
+                return Err(Error::invalid_request(
+                    "redb path escapes the filesystem root",
+                ));
             }
+            Component::CurDir | Component::ParentDir => {}
         }
     }
     Ok(normalized)
@@ -148,6 +146,23 @@ mod tests {
         assert!(validated.initialize);
         assert!(!directory.path().join("missing").exists());
         assert!(!validated.path.exists());
+    }
+
+    #[test]
+    fn repeated_parent_components_stop_at_the_filesystem_root() {
+        let directory = TempDir::new().expect("temporary directory");
+        let absolute = directory.path().canonicalize().expect("absolute directory");
+        let root = absolute.ancestors().last().expect("filesystem root");
+        assert_eq!(
+            normalized_absolute_path(&root.join("one/two/../../database.redb"))
+                .expect("parent components may return to the root"),
+            root.join("database.redb")
+        );
+
+        let error = normalized_absolute_path(&root.join("one/two/../../../database.redb"))
+            .expect_err("one more parent component must escape the root");
+        assert_eq!(error.kind, storage::ErrorKind::InvalidRequest);
+        assert_eq!(error.message, "redb path escapes the filesystem root");
     }
 
     #[test]

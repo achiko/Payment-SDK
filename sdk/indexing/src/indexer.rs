@@ -67,45 +67,7 @@ impl<R> Index<R> {
             .transactions
             .into_iter()
             .map(|transaction| {
-                let status = match transaction.status {
-                    CanonicalStatus::Included { block } => {
-                        let confirmations = match page.checkpoint.as_ref() {
-                            Some(tip) => tip
-                                .height
-                                .0
-                                .checked_sub(block.height.0)
-                                .and_then(|value| value.checked_add(1))
-                                .ok_or_else(|| {
-                                    IndexError::new(
-                                        IndexErrorKind::Store,
-                                        "history contains a transaction beyond its checkpoint",
-                                        false,
-                                    )
-                                })?,
-                            None => {
-                                return Err(IndexError::new(
-                                    IndexErrorKind::Store,
-                                    "history exists without a checkpoint",
-                                    false,
-                                ));
-                            }
-                        };
-                        if confirmations >= self.confirmations {
-                            TransactionStatus::Confirmed {
-                                block,
-                                confirmations,
-                            }
-                        } else {
-                            TransactionStatus::Included {
-                                block,
-                                confirmations,
-                            }
-                        }
-                    }
-                    CanonicalStatus::Failed { block, reason } => {
-                        TransactionStatus::Failed { block, reason }
-                    }
-                };
+                let status = self.observe_status(transaction.status, page.checkpoint.as_ref())?;
                 Ok(ObservedTransaction {
                     scope: transaction.scope,
                     transaction_id: transaction.transaction_id,
@@ -114,11 +76,54 @@ impl<R> Index<R> {
                     fee: transaction.fee,
                 })
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, IndexError>>()?;
         Ok(TransactionPage {
             checkpoint: page.checkpoint,
             transactions,
             next: page.next,
+        })
+    }
+
+    fn observe_status(
+        &self,
+        status: CanonicalStatus,
+        checkpoint: Option<&BlockRef>,
+    ) -> Result<TransactionStatus, IndexError> {
+        let block = match status {
+            CanonicalStatus::Included { block } => block,
+            CanonicalStatus::Failed { block, reason } => {
+                return Ok(TransactionStatus::Failed { block, reason });
+            }
+        };
+        let tip = checkpoint.ok_or_else(|| {
+            IndexError::new(
+                IndexErrorKind::Store,
+                "history exists without a checkpoint",
+                false,
+            )
+        })?;
+        let confirmations = tip
+            .height
+            .0
+            .checked_sub(block.height.0)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| {
+                IndexError::new(
+                    IndexErrorKind::Store,
+                    "history contains a transaction beyond its checkpoint",
+                    false,
+                )
+            })?;
+        Ok(if confirmations >= self.confirmations {
+            TransactionStatus::Confirmed {
+                block,
+                confirmations,
+            }
+        } else {
+            TransactionStatus::Included {
+                block,
+                confirmations,
+            }
         })
     }
 }

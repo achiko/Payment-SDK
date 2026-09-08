@@ -209,61 +209,15 @@ impl Transaction {
         }
         let mut inputs = Vec::with_capacity(input_values.len());
         for (index, (input, native_input)) in input_values.iter().zip(&native.input).enumerate() {
-            let object = input
-                .as_object()
-                .ok_or_else(|| ParseError::new("Bitcoin transaction input must be an object"))?;
-            if native_input.previous_output.is_null() {
-                if !coinbase || object.get("coinbase").and_then(Value::as_str).is_none() {
-                    return Err(ParseError::new(
-                        "Bitcoin null input is not a valid coinbase input",
-                    ));
-                }
-                inputs.push(Input {
-                    previous_output: None,
-                });
-                continue;
-            }
-            if coinbase {
-                return Err(ParseError::new(
-                    "Bitcoin coinbase transaction contains a non-coinbase input",
-                ));
-            }
-            let previous_id =
-                required_string(object, "txid", "Bitcoin input previous transaction ID")?
-                    .parse::<TransactionId>()
-                    .map_err(|_| ParseError::new("Bitcoin transaction ID is invalid"))?;
-            let output_index = required_u32(object, "vout", "Bitcoin input output index")?;
-            if native_input.previous_output.txid != Txid::from(previous_id)
-                || native_input.previous_output.vout != output_index
-            {
-                return Err(ParseError::new(format!(
-                    "Bitcoin input {index} outpoint does not match its consensus bytes"
-                )));
-            }
-            let outpoint = Outpoint {
-                transaction_id: previous_id,
-                output_index,
-            };
-            let local = same_block_outputs.get(&outpoint);
-            let previous_output = match object.get("prevout").and_then(Value::as_object) {
-                Some(prevout) => {
-                    let resolved = PreviousOutput::parse(prevout, outpoint, block_height, network)?;
-                    if local.is_some_and(|local| local != &resolved) {
-                        return Err(ParseError::new(format!(
-                            "Bitcoin input {index} prevout conflicts with an earlier same-block output"
-                        )));
-                    }
-                    resolved
-                }
-                None => local.cloned().ok_or_else(|| {
-                    ParseError::new(format!(
-                        "Bitcoin input {index} has no resolved previous output"
-                    ))
-                })?,
-            };
-            inputs.push(Input {
-                previous_output: Some(previous_output),
-            });
+            inputs.push(Input::parse(
+                input,
+                native_input,
+                index,
+                coinbase,
+                block_height,
+                network,
+                same_block_outputs,
+            )?);
         }
 
         let output_values = object
@@ -326,6 +280,73 @@ impl Transaction {
             inputs,
             outputs,
             coinbase,
+        })
+    }
+}
+
+impl Input {
+    fn parse(
+        input: &Value,
+        native_input: &bitcoin::TxIn,
+        index: usize,
+        coinbase: bool,
+        block_height: BlockHeight,
+        network: Network,
+        same_block_outputs: &BTreeMap<Outpoint, PreviousOutput>,
+    ) -> Result<Self, ParseError> {
+        let object = input
+            .as_object()
+            .ok_or_else(|| ParseError::new("Bitcoin transaction input must be an object"))?;
+        if native_input.previous_output.is_null() {
+            if !coinbase || object.get("coinbase").and_then(Value::as_str).is_none() {
+                return Err(ParseError::new(
+                    "Bitcoin null input is not a valid coinbase input",
+                ));
+            }
+            return Ok(Self {
+                previous_output: None,
+            });
+        }
+        if coinbase {
+            return Err(ParseError::new(
+                "Bitcoin coinbase transaction contains a non-coinbase input",
+            ));
+        }
+        let previous_id = required_string(object, "txid", "Bitcoin input previous transaction ID")?
+            .parse::<TransactionId>()
+            .map_err(|_| ParseError::new("Bitcoin transaction ID is invalid"))?;
+        let output_index = required_u32(object, "vout", "Bitcoin input output index")?;
+        if native_input.previous_output.txid != Txid::from(previous_id)
+            || native_input.previous_output.vout != output_index
+        {
+            return Err(ParseError::new(format!(
+                "Bitcoin input {index} outpoint does not match its consensus bytes"
+            )));
+        }
+        let outpoint = Outpoint {
+            transaction_id: previous_id,
+            output_index,
+        };
+        let local = same_block_outputs.get(&outpoint);
+        let previous_output = match object.get("prevout").and_then(Value::as_object) {
+            Some(prevout) => {
+                let resolved = PreviousOutput::parse(prevout, outpoint, block_height, network)?;
+                let conflicts = local.is_some_and(|local| local != &resolved);
+                if conflicts {
+                    return Err(ParseError::new(format!(
+                        "Bitcoin input {index} prevout conflicts with an earlier same-block output"
+                    )));
+                }
+                resolved
+            }
+            None => local.cloned().ok_or_else(|| {
+                ParseError::new(format!(
+                    "Bitcoin input {index} has no resolved previous output"
+                ))
+            })?,
+        };
+        Ok(Self {
+            previous_output: Some(previous_output),
         })
     }
 }
@@ -413,7 +434,99 @@ impl PreviousOutput {
 
 #[cfg(test)]
 mod tests {
+    use bitcoin::hex::DisplayHex;
+
     use super::*;
+
+    #[test]
+    fn transaction_inputs_validate_supplied_prevouts_before_local_comparison() {
+        let outpoint = Outpoint {
+            transaction_id: TransactionId([3; 32]),
+            output_index: 2,
+        };
+        let local = PreviousOutput {
+            outpoint,
+            value: Satoshi(10),
+            address: None,
+        };
+        let same_block_outputs = BTreeMap::from([(outpoint, local.clone())]);
+        let native = NativeTransaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::new(
+                    Txid::from(outpoint.transaction_id),
+                    outpoint.output_index,
+                ),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: Vec::new(),
+        };
+        let original = serde_json::json!({
+            "txid": native.compute_txid().to_string(),
+            "hex": consensus::serialize(&native).to_lower_hex_string(),
+            "vin": [{"txid": outpoint.transaction_id.to_string(), "vout": 2}],
+            "vout": [],
+        });
+        for (prevout, expected_error) in [
+            (None, None),
+            (Some(Value::Null), None),
+            (
+                Some(serde_json::json!({"value_satoshis": 10, "address": null})),
+                None,
+            ),
+            (
+                Some(serde_json::json!({"value_satoshis": 11, "address": null})),
+                Some("Bitcoin input 0 prevout conflicts with an earlier same-block output"),
+            ),
+            (
+                Some(serde_json::json!({"value_satoshis": "invalid", "address": null})),
+                Some("Bitcoin compact prevout value is invalid"),
+            ),
+            (
+                Some(serde_json::json!({"value_satoshis": 11})),
+                Some("Bitcoin compact prevout address fact is missing"),
+            ),
+        ] {
+            let mut transaction = original.clone();
+            if let Some(prevout) = prevout {
+                transaction["vin"][0]["prevout"] = prevout;
+            }
+            let result = Transaction::parse(
+                &transaction,
+                BlockHeight(10),
+                Network::Regtest,
+                &same_block_outputs,
+            );
+            if let Some(message) = expected_error {
+                assert_eq!(result.unwrap_err().to_string(), message);
+                continue;
+            }
+            assert_eq!(
+                result.unwrap().inputs,
+                vec![Input {
+                    previous_output: Some(local.clone()),
+                }]
+            );
+        }
+
+        let mut invalid_outpoint = original;
+        invalid_outpoint["vin"][0]["vout"] = serde_json::json!(3);
+        invalid_outpoint["vin"][0]["prevout"] = serde_json::json!({"value_satoshis": "invalid"});
+        let error = Transaction::parse(
+            &invalid_outpoint,
+            BlockHeight(10),
+            Network::Regtest,
+            &same_block_outputs,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Bitcoin input 0 outpoint does not match its consensus bytes"
+        );
+    }
 
     #[test]
     fn block_hashes_keep_native_byte_order_and_case_acceptance() {
