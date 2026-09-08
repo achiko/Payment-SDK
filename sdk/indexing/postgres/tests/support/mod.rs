@@ -235,11 +235,11 @@ fn wait_until_ready(container: &str) {
         .success()
         {
             consecutive += 1;
-            if consecutive == 3 {
-                return;
-            }
         } else {
             consecutive = 0;
+        }
+        if consecutive == 3 {
+            return;
         }
         thread::sleep(Duration::from_millis(100));
     }

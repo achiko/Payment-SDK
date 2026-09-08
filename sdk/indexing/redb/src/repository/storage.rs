@@ -17,13 +17,13 @@ impl Repository {
     pub(super) async fn get<T: Decode<()>>(
         &self,
         key: &Key,
-    ) -> Result<Option<Stored<T>>, IndexError> {
+    ) -> Result<Option<VersionedRecord<T>>, IndexError> {
         self.storage
             .get(&keys::namespace(), key)
             .await
             .map_err(Self::storage_error)?
             .map(|stored| {
-                Ok(Stored {
+                Ok(VersionedRecord {
                     value: Self::decode(&stored.value.0)?,
                     version: stored.version,
                 })
@@ -51,7 +51,7 @@ impl Repository {
         });
     }
 
-    pub(super) fn expect<T>(batch: &mut WriteBatch, key: Key, value: Option<&Stored<T>>) {
+    pub(super) fn expect<T>(batch: &mut WriteBatch, key: Key, value: Option<&VersionedRecord<T>>) {
         batch.conditions.push(match value {
             Some(value) => Condition::Version {
                 namespace: keys::namespace(),

@@ -78,15 +78,17 @@ pub(super) fn validate_input_claims(
         let object = input
             .as_object()
             .ok_or_else(|| source_error("Bitcoin transaction input must be an object", true))?;
-        if native_input.previous_output.is_null() {
-            if !transaction.is_coinbase()
-                || object.get("coinbase").and_then(Value::as_str).is_none()
-            {
-                return Err(source_error(
-                    "Bitcoin null input is not a valid coinbase input",
-                    true,
-                ));
-            }
+        let null_outpoint = native_input.previous_output.is_null();
+        if null_outpoint
+            && (!transaction.is_coinbase()
+                || object.get("coinbase").and_then(Value::as_str).is_none())
+        {
+            return Err(source_error(
+                "Bitcoin null input is not a valid coinbase input",
+                true,
+            ));
+        }
+        if null_outpoint {
             continue;
         }
         let previous_id = required_string(object, "txid", "Bitcoin input previous transaction ID")?
@@ -286,6 +288,56 @@ pub(super) fn required_u32(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coinbase_claims_keep_the_null_outpoint_exemption_and_error_precedence() {
+        let mut transaction = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                ..TxIn::default()
+            }],
+            output: Vec::new(),
+        };
+        for marker in ["", "01"] {
+            let value = serde_json::json!({
+                "vin": [{"coinbase": marker, "txid": false, "vout": null}]
+            });
+            validate_input_claims(&value, &transaction)
+                .expect("coinbase inputs do not require regular outpoint claims");
+        }
+        for input in [
+            serde_json::json!({}),
+            serde_json::json!({"coinbase": null}),
+            serde_json::json!({"coinbase": false}),
+            serde_json::json!({"coinbase": 1}),
+        ] {
+            let error = validate_input_claims(&serde_json::json!({"vin": [input]}), &transaction)
+                .unwrap_err();
+            assert_eq!(
+                error.message,
+                "Bitcoin null input is not a valid coinbase input"
+            );
+            assert!(error.retryable);
+        }
+        let error =
+            validate_input_claims(&serde_json::json!({"vin": [null]}), &transaction).unwrap_err();
+        assert_eq!(error.message, "Bitcoin transaction input must be an object");
+        assert!(error.retryable);
+
+        transaction.input.push(TxIn::default());
+        let error = validate_input_claims(
+            &serde_json::json!({"vin": [{"coinbase": "01"}, null]}),
+            &transaction,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.message,
+            "Bitcoin null input is not a valid coinbase input"
+        );
+        assert!(error.retryable);
+    }
 
     #[test]
     fn compact_prevout_preserves_optional_address_and_exact_satoshis() {

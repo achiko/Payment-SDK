@@ -430,6 +430,119 @@ fn sparse_sync_uses_actual_blocks_and_resumes_a_bounded_prefix() {
 }
 
 #[test]
+fn sparse_birthday_anchor_consumes_the_only_batch_slot_and_survives_restart() {
+    let own_scope = scope("anchor-prefix");
+    let owner = address(&own_scope, "owner");
+    let filters = vec![AddressFilter {
+        address: owner.clone(),
+        start_position: BlockPosition(102),
+    }];
+    let source = Source::sparse(sparse_chain());
+    let interpreter = Interpreter::default();
+    let repository = Repository::default();
+    let initial = Service::new(
+        source.clone(),
+        interpreter.clone(),
+        repository.clone(),
+        bounded_config(own_scope.clone(), 4, 1),
+    );
+    let status = block_on(initial.sync(&filters)).expect("anchor-only prefix");
+    assert_eq!(status[0].phase, SyncPhase::CatchingUp);
+    assert_eq!(status[0].checkpoint, Some(sparse_chain()[1].clone()));
+    assert_eq!(source.requests(), [BlockHeight(51), BlockHeight(50)]);
+    assert_eq!(interpreter.inspections(), [(BlockHeight(50), Vec::new())]);
+    drop(initial);
+
+    let restarted_source = Source::sparse(sparse_chain());
+    let restarted = Service::new(
+        restarted_source.clone(),
+        interpreter.clone(),
+        repository,
+        bounded_config(own_scope, 4, 1),
+    );
+    let next = block_on(restarted.sync(&filters)).expect("first selected block after restart");
+    assert_eq!(next[0].phase, SyncPhase::CatchingUp);
+    assert_eq!(next[0].checkpoint, Some(sparse_chain()[2].clone()));
+    let last = block_on(restarted.sync(&filters)).expect("remaining sparse block");
+    assert_eq!(last[0].phase, SyncPhase::Ready);
+    assert_eq!(last[0].checkpoint, Some(sparse_chain()[3].clone()));
+    assert_eq!(
+        restarted_source.requests(),
+        [BlockHeight(51), BlockHeight(52)]
+    );
+    assert_eq!(
+        interpreter.inspections(),
+        [
+            (BlockHeight(50), Vec::new()),
+            (BlockHeight(51), vec![owner.clone()]),
+            (BlockHeight(52), vec![owner]),
+        ]
+    );
+}
+
+#[test]
+fn mismatched_birthday_anchor_fails_before_effects_and_allows_a_retry() {
+    let own_scope = scope("anchor-mismatch");
+    let filters = vec![AddressFilter {
+        address: address(&own_scope, "owner"),
+        start_position: BlockPosition(102),
+    }];
+    let mut invalid = sparse_chain();
+    invalid[2].parent.as_mut().unwrap().hash = BlockHash(vec![99]);
+    let source = Source::sparse(invalid);
+    let interpreter = Interpreter::default();
+    let repository = Repository::default();
+    let service = Service::new(
+        source.clone(),
+        interpreter.clone(),
+        repository.clone(),
+        config(own_scope.clone()),
+    );
+    let error = block_on(service.sync(&filters)).expect_err("parent hash must match the anchor");
+    assert_eq!(
+        error,
+        IndexError::new(
+            IndexErrorKind::CannotConnect,
+            "birthday anchor does not match the first block parent",
+            true,
+        )
+    );
+    assert_eq!(source.requests(), [BlockHeight(51), BlockHeight(50)]);
+    assert!(interpreter.inspections().is_empty());
+    assert_eq!(
+        block_on(repository.get(BlockSelector::Tip(own_scope))).unwrap(),
+        None
+    );
+
+    source.replace(sparse_chain());
+    let retry = block_on(service.sync(&filters)).expect("failed bootstrap releases running guard");
+    assert_eq!(retry[0].phase, SyncPhase::Ready);
+    assert_eq!(retry[0].checkpoint, Some(sparse_chain()[3].clone()));
+}
+
+#[test]
+fn future_birthday_establishes_only_an_empty_tip_anchor() {
+    let own_scope = scope("future-birthday");
+    let source = Source::new(4);
+    let interpreter = Interpreter::default();
+    let service = Service::new(
+        source.clone(),
+        interpreter.clone(),
+        Repository::default(),
+        config(own_scope.clone()),
+    );
+    let status = block_on(service.sync(&vec![AddressFilter {
+        address: address(&own_scope, "future"),
+        start_position: BlockPosition(5),
+    }]))
+    .expect("future selection can establish its checkpoint");
+    assert_eq!(status[0].phase, SyncPhase::Ready);
+    assert_eq!(status[0].checkpoint, Some(block(BlockHeight(4))));
+    assert_eq!(source.requests(), [BlockHeight(4)]);
+    assert_eq!(interpreter.inspections(), [(BlockHeight(4), Vec::new())]);
+}
+
+#[test]
 fn malformed_source_parent_is_retryable_before_interpretation_or_commit() {
     let mut genesis_with_parent = block(BlockHeight(0));
     genesis_with_parent.parent = Some(BlockParent {

@@ -61,17 +61,7 @@ impl Config {
             if !ids.insert(&wallet.id) {
                 return Err("configured wallet IDs must be unique".into());
             }
-            let configured = match wallet.asset {
-                WalletAsset::Btc => self.indexes.bitcoin.is_some(),
-                WalletAsset::Eth => self.indexes.ethereum.is_some(),
-                WalletAsset::Usdc => self
-                    .indexes
-                    .ethereum
-                    .as_ref()
-                    .is_some_and(|ethereum| ethereum.usdc.is_some()),
-                WalletAsset::Sol => self.indexes.solana.is_some(),
-            };
-            if !configured {
+            if !self.indexes.supports(wallet.asset) {
                 return Err("configured wallet references a disabled asset".into());
             }
         }
@@ -143,6 +133,18 @@ pub(crate) struct IndexConfig {
 }
 
 impl IndexConfig {
+    fn supports(&self, asset: WalletAsset) -> bool {
+        match asset {
+            WalletAsset::Btc => self.bitcoin.is_some(),
+            WalletAsset::Eth => self.ethereum.is_some(),
+            WalletAsset::Usdc => self
+                .ethereum
+                .as_ref()
+                .is_some_and(|ethereum| ethereum.usdc.is_some()),
+            WalletAsset::Sol => self.solana.is_some(),
+        }
+    }
+
     pub(crate) fn interval(&self) -> Duration {
         let millis = self
             .bitcoin
@@ -447,6 +449,135 @@ mod tests {
     const CONTRACT: &str = "0x1111111111111111111111111111111111111111";
 
     #[test]
+    fn defaulted_rpc_and_sync_fields_reach_ethereum_runtime_settings() {
+        let config = parse(ethereum(None), json!([])).expect("configuration JSON");
+        config.validate().expect("defaulted bounds");
+        let settings = config
+            .indexes
+            .ethereum
+            .as_ref()
+            .unwrap()
+            .settings()
+            .unwrap();
+        assert_eq!(settings.endpoints, ["http://127.0.0.1:8545"]);
+        assert!(settings.headers.is_empty());
+        assert_eq!(settings.request_timeout, Duration::from_secs(15));
+        assert_eq!(settings.max_response_bytes, 64 * 1024 * 1024);
+        assert_eq!(settings.batch_size, 100);
+        assert_eq!(config.indexes.interval(), Duration::from_millis(1_000));
+
+        let mut indexes = ethereum(None);
+        indexes["ethereum"]["rpc"] = json!({
+            "endpoints": ["http://127.0.0.1:9545", "http://127.0.0.1:8545"],
+            "headers": [["x-fixture", "first"], ["x-fixture", "second"]],
+            "timeout_seconds": 3,
+            "max_response_bytes": 8_192
+        });
+        indexes["ethereum"]["poll_millis"] = json!(17);
+        indexes["ethereum"]["batch_size"] = json!(7);
+        let config = parse(indexes, json!([])).expect("explicit configuration");
+        config.validate().expect("explicit bounds");
+        let settings = config
+            .indexes
+            .ethereum
+            .as_ref()
+            .unwrap()
+            .settings()
+            .unwrap();
+        assert_eq!(
+            settings.endpoints,
+            ["http://127.0.0.1:9545", "http://127.0.0.1:8545"]
+        );
+        assert_eq!(
+            settings.headers,
+            [
+                ("x-fixture".to_owned(), "first".to_owned()),
+                ("x-fixture".to_owned(), "second".to_owned())
+            ]
+        );
+        assert_eq!(settings.request_timeout, Duration::from_secs(3));
+        assert_eq!(settings.max_response_bytes, 8_192);
+        assert_eq!(settings.batch_size, 7);
+        assert_eq!(config.indexes.interval(), Duration::from_millis(17));
+    }
+
+    #[test]
+    fn plural_rpc_wire_contract_rejects_duplicate_unknown_and_null_fields() {
+        for (raw, expected) in [
+            (
+                r#"{"endpoints":["a"],"endpoints":["b"]}"#,
+                "duplicate field `endpoints`",
+            ),
+            (
+                r#"{"endpoints":["a"],"timeout_seconds":1,"timeout_seconds":2}"#,
+                "duplicate field `timeout_seconds`",
+            ),
+            (
+                r#"{"endpoints":["a"],"endpoint":"b"}"#,
+                "unknown field `endpoint`",
+            ),
+            (
+                r#"{"endpoints":["a"],"headers":null}"#,
+                "invalid type: null",
+            ),
+            (
+                r#"{"endpoints":["a"],"max_response_bytes":"8192"}"#,
+                "invalid type: string",
+            ),
+            (
+                r#"{"endpoints":["a"],"timeout_seconds":null}"#,
+                "invalid type: null",
+            ),
+        ] {
+            serde_json::from_str::<Value>(raw).expect("syntactically valid raw JSON");
+            let error = serde_json::from_str::<RpcConfig>(raw)
+                .err()
+                .expect("strict RPC schema");
+            assert!(error.to_string().starts_with(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn flattened_sync_rejects_raw_duplicate_keys_and_keeps_rpc_error_precedence() {
+        let indexes = ethereum(None);
+        let raw = serde_json::to_string(&indexes["ethereum"]).unwrap();
+        let prefix = raw.strip_suffix('}').unwrap();
+        for (field, first, second) in [("poll_millis", 1, 2), ("batch_size", 3, 4)] {
+            let raw = format!(r#"{prefix},"{field}":{first},"{field}":{second}}}"#);
+            serde_json::from_str::<Value>(&raw).expect("a Value alone would collapse duplicates");
+            let error = serde_json::from_str::<EthereumConfig>(&raw)
+                .err()
+                .expect("duplicate flattened field");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(&format!("duplicate field `{field}`")),
+                "{error}"
+            );
+        }
+
+        let mut config = parse(indexes, json!([])).expect("configuration JSON");
+        let ethereum = config.indexes.ethereum.as_mut().unwrap();
+        ethereum.rpc.timeout_seconds = 0;
+        ethereum.sync.batch_size = 0;
+        assert_eq!(
+            config.validate().unwrap_err().to_string(),
+            "invalid database or RPC configuration"
+        );
+        config
+            .indexes
+            .ethereum
+            .as_mut()
+            .unwrap()
+            .rpc
+            .timeout_seconds = 1;
+        assert_eq!(
+            config.validate().unwrap_err().to_string(),
+            "index confirmation, retention, polling, and batch values must be positive"
+        );
+    }
+
+    #[test]
     fn accepts_canonical_nonzero_usdc_contract() {
         let config = parse(ethereum(Some(CONTRACT)), json!([])).expect("configuration JSON");
         config.validate().expect("valid USDC configuration");
@@ -500,6 +631,48 @@ mod tests {
             error.to_string(),
             "configured wallet references a disabled asset"
         );
+    }
+
+    #[test]
+    fn wallet_validation_preserves_field_duplicate_and_asset_error_precedence() {
+        let valid = json!({
+            "id": "treasury",
+            "asset": "eth",
+            "secret_env": "UNREAD_SECRET_ENVIRONMENT",
+            "start_position": 1
+        });
+        let disabled = json!({
+            "id": "treasury",
+            "asset": "usdc",
+            "secret_env": "UNREAD_SECRET_ENVIRONMENT",
+            "start_position": 1
+        });
+        let missing_secret = json!({
+            "id": "treasury",
+            "asset": "usdc",
+            "secret_env": " ",
+            "start_position": 1
+        });
+        for (wallets, expected) in [
+            (
+                json!([valid.clone(), missing_secret.clone()]),
+                "wallet ID and secret environment name must not be empty",
+            ),
+            (
+                json!([valid, disabled.clone()]),
+                "configured wallet IDs must be unique",
+            ),
+            (
+                json!([disabled, missing_secret]),
+                "configured wallet references a disabled asset",
+            ),
+        ] {
+            let error = parse(ethereum(None), wallets)
+                .expect("configuration JSON")
+                .validate()
+                .expect_err("first wallet violation must win");
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     #[test]

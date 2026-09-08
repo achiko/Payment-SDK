@@ -451,10 +451,10 @@ where
             let entry = self
                 .entry(&request.wallet)
                 .map_err(|error| SendError::item(index, Vec::new(), error))?;
-            if family
+            let family_mismatch = family
                 .as_ref()
-                .is_some_and(|expected| expected != &entry.info.family)
-            {
+                .is_some_and(|expected| expected != &entry.info.family);
+            if family_mismatch {
                 return Err(SendError::item(
                     index,
                     Vec::new(),

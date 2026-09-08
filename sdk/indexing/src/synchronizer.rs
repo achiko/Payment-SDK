@@ -129,33 +129,7 @@ where
         }
         let mut applied = 0_usize;
         if checkpoint.is_none() {
-            let birthday = plan.earliest_position();
-            if birthday.is_none_or(|position| position > observed_tip.position) {
-                let anchor = self
-                    .one_block(observed_tip.position, observed_tip.position)
-                    .await?;
-                checkpoint = Some(self.apply(anchor, &[], None, &mut plan).await?);
-                applied += 1;
-            } else if let Some(start) = birthday {
-                let first = self.one_block(start, observed_tip.position).await?;
-                let first_ref = first.block_ref();
-                if let Some(parent) = &first_ref.parent {
-                    let anchor = self.one_block(parent.position, parent.position).await?;
-                    let anchor_ref = anchor.block_ref();
-                    if anchor_ref.position != parent.position || anchor_ref.hash != parent.hash {
-                        return Err(IndexError::cannot_connect(
-                            "birthday anchor does not match the first block parent",
-                        ));
-                    }
-                    checkpoint = Some(self.apply(anchor, &[], None, &mut plan).await?);
-                    applied += 1;
-                }
-                if applied < self.config.batch_size {
-                    let addresses = plan.active_addresses(first_ref.position);
-                    checkpoint = Some(self.apply(first, &addresses, checkpoint, &mut plan).await?);
-                    applied += 1;
-                }
-            }
+            (checkpoint, applied) = self.initialize_checkpoint(&observed_tip, &mut plan).await?;
         }
 
         if applied < self.config.batch_size
@@ -200,6 +174,44 @@ where
                 SyncPhase::CatchingUp
             },
         })
+    }
+
+    async fn initialize_checkpoint(
+        &self,
+        observed_tip: &BlockRef,
+        plan: &mut crate::SyncPlan,
+    ) -> Result<(Option<BlockRef>, usize), IndexError> {
+        let start = match plan.earliest_position() {
+            Some(position) if position <= observed_tip.position => position,
+            _ => {
+                let anchor = self
+                    .one_block(observed_tip.position, observed_tip.position)
+                    .await?;
+                let checkpoint = self.apply(anchor, &[], None, plan).await?;
+                return Ok((Some(checkpoint), 1));
+            }
+        };
+        let first = self.one_block(start, observed_tip.position).await?;
+        let first_ref = first.block_ref();
+        let mut checkpoint = None;
+        let mut applied = 0;
+        if let Some(parent) = &first_ref.parent {
+            let anchor = self.one_block(parent.position, parent.position).await?;
+            let anchor_ref = anchor.block_ref();
+            if anchor_ref.position != parent.position || anchor_ref.hash != parent.hash {
+                return Err(IndexError::cannot_connect(
+                    "birthday anchor does not match the first block parent",
+                ));
+            }
+            checkpoint = Some(self.apply(anchor, &[], None, plan).await?);
+            applied += 1;
+        }
+        if applied < self.config.batch_size {
+            let addresses = plan.active_addresses(first_ref.position);
+            checkpoint = Some(self.apply(first, &addresses, checkpoint, plan).await?);
+            applied += 1;
+        }
+        Ok((checkpoint, applied))
     }
 
     fn enter(&self) -> Result<RunningGuard<'_>, IndexError> {

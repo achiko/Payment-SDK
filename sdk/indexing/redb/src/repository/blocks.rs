@@ -83,30 +83,34 @@ impl Repository {
         Self::expect(&mut batch, checkpoint_key.clone(), checkpoint.as_ref());
         Self::expect::<record::JournalRecord>(&mut batch, journal_key.clone(), None);
         let mut history_keys = Vec::new();
-        for transaction in addition.transactions() {
-            for address in transaction.addresses() {
-                let key = keys::history(
-                    &self.scope,
-                    &address,
-                    transaction.block().height,
-                    &transaction.transaction_id,
-                );
-                let existing = self.get::<record::TransactionRecord>(&key).await?;
-                if existing.is_some() {
-                    return Err(IndexError::new(
-                        IndexErrorKind::Conflict,
-                        "canonical history entry already exists",
-                        true,
-                    ));
-                }
-                Self::expect::<record::TransactionRecord>(&mut batch, key.clone(), None);
-                Self::put(
-                    &mut batch,
-                    key.clone(),
-                    &record::TransactionRecord::from_domain(transaction),
-                )?;
-                history_keys.push(key.0);
+        let history = addition.transactions().iter().flat_map(|transaction| {
+            transaction
+                .addresses()
+                .into_iter()
+                .map(move |address| (transaction, address))
+        });
+        for (transaction, address) in history {
+            let key = keys::history(
+                &self.scope,
+                &address,
+                transaction.block().height,
+                &transaction.transaction_id,
+            );
+            let existing = self.get::<record::TransactionRecord>(&key).await?;
+            if existing.is_some() {
+                return Err(IndexError::new(
+                    IndexErrorKind::Conflict,
+                    "canonical history entry already exists",
+                    true,
+                ));
             }
+            Self::expect::<record::TransactionRecord>(&mut batch, key.clone(), None);
+            Self::put(
+                &mut batch,
+                key.clone(),
+                &record::TransactionRecord::from_domain(transaction),
+            )?;
+            history_keys.push(key.0);
         }
 
         let mut remove_output_keys = Vec::new();

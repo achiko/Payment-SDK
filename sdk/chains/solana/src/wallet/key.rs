@@ -41,7 +41,7 @@ impl Key {
     }
 
     pub fn sign_message(&self, message: &[u8]) -> Result<SignedMessage, Error> {
-        let signature = self.native_key()?.sign_message(message);
+        let signature = self.native()?.sign_message(message);
         SignedMessage::verified(&self.address, message, signature)
     }
 
@@ -76,7 +76,7 @@ impl Key {
         Ok(SecretBytes::new(*bytes))
     }
 
-    fn native_key(&self) -> Result<Keypair, Error> {
+    fn native(&self) -> Result<Keypair, Error> {
         let bytes: [u8; 32] = self
             .secret
             .as_bytes()

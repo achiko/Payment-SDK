@@ -147,6 +147,11 @@ impl TryFrom<&BlockAddition> for HistoryRows {
                 CanonicalStatus::Failed { reason, .. } => ("failed", reason.clone()),
             };
             let fee = canonical.fee.as_ref();
+            let fee_asset = fee.map(|fee| fee.asset.asset.clone());
+            let fee_amount = fee.map(|fee| fee.amount.to_string());
+            let fee_payer = fee
+                .and_then(|fee| fee.payer.as_ref())
+                .map(|payer| payer.value.clone());
             for address in canonical.addresses() {
                 history.address.push(address.value.clone());
                 history
@@ -154,15 +159,9 @@ impl TryFrom<&BlockAddition> for HistoryRows {
                     .push(canonical.transaction_id.value.clone());
                 history.status.push(status.to_owned());
                 history.failure_reason.push(reason.clone());
-                history
-                    .fee_asset
-                    .push(fee.map(|fee| fee.asset.asset.clone()));
-                history
-                    .fee_amount
-                    .push(fee.map(|fee| fee.amount.to_string()));
-                history
-                    .fee_payer
-                    .push(fee.and_then(|fee| fee.payer.as_ref().map(|payer| payer.value.clone())));
+                history.fee_asset.push(fee_asset.clone());
+                history.fee_amount.push(fee_amount.clone());
+                history.fee_payer.push(fee_payer.clone());
 
                 movements.extend(canonical, &address)?;
             }
@@ -244,6 +243,112 @@ mod tests {
             created_at: BlockHeight(42),
             coinbase: false,
         }
+    }
+
+    #[test]
+    fn history_rows_preserve_address_order_fee_nulls_and_exact_fee_amounts() {
+        let output = output("tx", 0, "0.5");
+        let own_scope = output.address.scope.clone();
+        let address = |value: &str| CanonicalAddress {
+            scope: own_scope.clone(),
+            value: value.to_owned(),
+        };
+        let exact_fee = "123456789012345678901234567890.000000000000000001";
+        let fee = indexing::NetworkFee {
+            asset: output.asset.clone(),
+            amount: exact_fee.parse().unwrap(),
+            payer: None,
+        };
+        let base = indexing::ObservationDraft {
+            scope: own_scope.clone(),
+            transaction_id: TransactionRef {
+                scope: own_scope.clone(),
+                value: "z-no-fee".to_owned(),
+            },
+            status: indexing::ObservationDraftStatus::Included,
+            movements: vec![ValueMovement::Transfer {
+                id: indexing::MovementId("movement".to_owned()),
+                asset: output.asset,
+                amount: output.amount,
+                from: address("z-owner"),
+                to: address("a-other"),
+            }],
+            fee: None,
+        };
+        let mut no_payer = base.clone();
+        no_payer.transaction_id.value = "a-no-payer".to_owned();
+        no_payer.fee = Some(fee.clone());
+        let mut with_payer = base.clone();
+        with_payer.transaction_id.value = "m-with-payer".to_owned();
+        with_payer.fee = Some(indexing::NetworkFee {
+            payer: Some(address("m-payer")),
+            ..fee
+        });
+        let mut failed = with_payer.clone();
+        failed.transaction_id.value = "f-failed".to_owned();
+        failed.status = indexing::ObservationDraftStatus::Failed {
+            reason: Some("rejected".to_owned()),
+        };
+        failed.movements.clear();
+        let addition = BlockAddition::new(
+            own_scope,
+            None,
+            4,
+            indexing::InterpretedBlock {
+                block: indexing::BlockRef {
+                    position: indexing::BlockPosition(0),
+                    height: BlockHeight(0),
+                    hash: indexing::BlockHash(vec![0]),
+                    parent: None,
+                    timestamp: None,
+                },
+                transactions: vec![base, no_payer, with_payer, failed],
+                outputs: indexing::OutputChanges::default(),
+            },
+        )
+        .expect("validated canonical facts");
+        let rows = HistoryRows::try_from(&addition).expect("history columns");
+        assert_eq!(
+            rows.address,
+            [
+                "a-other", "z-owner", "a-other", "z-owner", "a-other", "m-payer", "z-owner",
+                "m-payer"
+            ]
+        );
+        assert_eq!(
+            rows.transaction_id,
+            [
+                "z-no-fee",
+                "z-no-fee",
+                "a-no-payer",
+                "a-no-payer",
+                "m-with-payer",
+                "m-with-payer",
+                "m-with-payer",
+                "f-failed"
+            ]
+        );
+        assert_eq!(rows.status, [vec!["included"; 7], vec!["failed"]].concat());
+        assert_eq!(
+            rows.failure_reason,
+            [vec![None; 7], vec![Some("rejected".to_owned())]].concat()
+        );
+        assert_eq!(
+            rows.fee_asset,
+            [vec![None; 2], vec![Some("native".to_owned()); 6]].concat()
+        );
+        assert_eq!(
+            rows.fee_amount,
+            [vec![None; 2], vec![Some(exact_fee.to_owned()); 6]].concat()
+        );
+        assert_eq!(
+            rows.fee_payer,
+            [vec![None; 4], vec![Some("m-payer".to_owned()); 4]].concat()
+        );
+        assert_eq!(rows.movements.address, rows.address[..7]);
+        assert_eq!(rows.movements.transaction_id, rows.transaction_id[..7]);
+        assert_eq!(rows.movements.ordinal, vec![0; 7]);
+        assert_eq!(rows.movements.amount, vec!["0.5"; 7]);
     }
 
     #[test]

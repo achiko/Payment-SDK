@@ -15,7 +15,7 @@ use indexing::{
 
 const MAX_PAGE: usize = 1_000;
 
-pub(super) struct Stored<T> {
+pub(super) struct VersionedRecord<T> {
     value: T,
     version: Version,
 }

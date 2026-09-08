@@ -516,10 +516,10 @@ async fn wait_balance(root: &str, wallet: &str, expected: &str) {
     let url = format!("{root}/v1/wallets/{wallet}/balance");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if get(&url)
+        let reached = get(&url)
             .await
-            .is_some_and(|value| value["amount"] == expected)
-        {
+            .is_some_and(|value| value["amount"] == expected);
+        if reached {
             return;
         }
         assert!(
@@ -535,18 +535,18 @@ async fn wait_atomic_below(root: &str, wallet: &str, decimals: u32, ceiling: u64
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut last = None;
     loop {
-        if let Some(amount) = get(&url).await.and_then(|value| {
+        let amount = get(&url).await.and_then(|value| {
             value["amount"]
                 .as_str()?
                 .parse::<base::Decimal>()
                 .ok()?
                 .to_atomic_u64(decimals)
                 .ok()
-        }) {
-            if amount < ceiling {
-                return amount;
-            }
-            last = Some(amount);
+        });
+        match amount {
+            Some(amount) if amount < ceiling => return amount,
+            Some(amount) => last = Some(amount),
+            None => {}
         }
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -561,15 +561,18 @@ async fn wait_history(root: &str, wallet: &str, transaction: &str) -> Value {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let mut last = None;
     loop {
-        if let Some(value) = get(&url).await {
-            if value["transactions"].as_array().is_some_and(|items| {
-                items
-                    .iter()
-                    .any(|item| item["transaction_id"] == transaction)
-            }) {
-                return value;
-            }
-            last = Some(value);
+        let response = get(&url).await;
+        let transactions = response
+            .as_ref()
+            .and_then(|value| value["transactions"].as_array());
+        let present = transactions
+            .into_iter()
+            .flatten()
+            .any(|item| item["transaction_id"] == transaction);
+        match response {
+            Some(value) if present => return value,
+            Some(value) => last = Some(value),
+            None => {}
         }
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -606,10 +609,10 @@ async fn wait_ready(root: &str) {
     let url = format!("{root}/health/ready");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if reqwest::get(&url)
+        let ready = reqwest::get(&url)
             .await
-            .is_ok_and(|response| response.status().is_success())
-        {
+            .is_ok_and(|response| response.status().is_success());
+        if ready {
             return;
         }
         assert!(
