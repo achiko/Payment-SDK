@@ -375,6 +375,7 @@ async fn ambiguous_submission_reconciles_and_replays_the_exact_envelope() {
         .await
         .expect_err("first submission must be ambiguous");
     assert_eq!(first.kind, base::TransactionErrorKind::Unavailable);
+    assert_eq!(first.message, "ambiguous submission");
     assert_eq!(
         first.ambiguous_transaction_id,
         Some(base::TransactionId::new(signed.id.to_string()))
@@ -399,6 +400,133 @@ async fn ambiguous_submission_reconciles_and_replays_the_exact_envelope() {
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn known_recovery_accepts_without_rebroadcast_and_advances_the_nonce_floor() {
+    let signer = signer(4);
+    let accounts = Arc::new(AccountStub::default());
+    accounts.set_nonce(signer.address.clone(), 5);
+    let transactions = Arc::new(TransactionStub::default());
+    transactions.actions([BroadcastAction::Ambiguous]);
+    transactions.known([Ok(true)]);
+    let coordinator = coordinator(accounts, transactions.clone());
+    let old = coordinator
+        .prepare_one(Preparation::signer(
+            transfer(&signer.address, 1),
+            CHAIN_ID,
+            &signer,
+        ))
+        .await
+        .expect("old transaction must prepare");
+    coordinator
+        .broadcast(old.clone())
+        .await
+        .expect_err("initial broadcast must be ambiguous");
+    assert_eq!(
+        coordinator
+            .broadcast(old.clone())
+            .await
+            .expect("known exact hash resolves acceptance without replay"),
+        old.id
+    );
+    assert_eq!(
+        transactions.broadcasts.lock().unwrap().as_slice(),
+        std::slice::from_ref(&old)
+    );
+    assert_eq!(
+        transactions.known_ids.lock().unwrap().as_slice(),
+        std::slice::from_ref(&old.id)
+    );
+
+    let new = coordinator
+        .prepare_one(Preparation::signer(
+            transfer(&signer.address, 2),
+            CHAIN_ID,
+            &signer,
+        ))
+        .await
+        .expect("the accepted nonce cannot be reused despite the unchanged RPC nonce");
+    assert_eq!(
+        transactions
+            .contexts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, nonce)| *nonce)
+            .collect::<Vec<_>>(),
+        [5, 6]
+    );
+    coordinator
+        .broadcast(new.clone())
+        .await
+        .expect("the next prepared transaction submits normally");
+    assert_eq!(
+        transactions.broadcasts.lock().unwrap().as_slice(),
+        [old, new]
+    );
+    assert_eq!(transactions.known_ids.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn recovery_lookup_failure_preserves_the_message_local_id_and_exact_replay() {
+    let signer = signer(4);
+    let accounts = Arc::new(AccountStub::default());
+    let transactions = Arc::new(TransactionStub::default());
+    transactions.actions([BroadcastAction::Ambiguous, BroadcastAction::Accept]);
+    transactions.known([
+        Err(SourceError {
+            message: "recovery lookup failed".to_owned(),
+            retryable: false,
+        }),
+        Ok(false),
+    ]);
+    let coordinator = coordinator(accounts, transactions.clone());
+    let signed = coordinator
+        .prepare_one(Preparation::signer(
+            transfer(&signer.address, 1),
+            CHAIN_ID,
+            &signer,
+        ))
+        .await
+        .expect("transaction must prepare");
+    coordinator
+        .broadcast(signed.clone())
+        .await
+        .expect_err("first submission must be ambiguous");
+
+    let error = coordinator
+        .broadcast(signed.clone())
+        .await
+        .expect_err("failed lookup must leave the original submission unresolved");
+    assert_eq!(error.kind, base::TransactionErrorKind::Unavailable);
+    assert_eq!(error.message, "recovery lookup failed");
+    assert_eq!(
+        error.ambiguous_transaction_id,
+        Some(base::TransactionId::new(signed.id.to_string()))
+    );
+    assert_eq!(
+        transactions
+            .broadcasts
+            .lock()
+            .expect("broadcast lock must be healthy")
+            .len(),
+        1,
+        "a failed lookup must not issue another broadcast"
+    );
+
+    assert_eq!(
+        coordinator
+            .broadcast(signed.clone())
+            .await
+            .expect("a later lookup must allow the retained exact envelope to replay"),
+        signed.id
+    );
+    let broadcasts = transactions
+        .broadcasts
+        .lock()
+        .expect("broadcast lock must be healthy");
+    assert_eq!(broadcasts.as_slice(), [signed.clone(), signed]);
 }
 
 #[tokio::test]
@@ -621,4 +749,20 @@ async fn concurrent_same_sender_operations_never_reuse_a_nonce() {
             .collect::<Vec<_>>(),
         [5, 6]
     );
+}
+
+#[test]
+fn definite_submission_errors_preserve_retryability_without_an_ambiguous_id() {
+    for (retryable, kind) in [
+        (true, TransactionErrorKind::Unavailable),
+        (false, TransactionErrorKind::Rejected),
+    ] {
+        let error = definite_submission_error(SourceError {
+            message: "coordinator claim failed".to_owned(),
+            retryable,
+        });
+        assert_eq!(error.kind, kind);
+        assert_eq!(error.message, "coordinator claim failed");
+        assert!(error.ambiguous_transaction_id.is_none());
+    }
 }

@@ -1,14 +1,13 @@
 use redb::{Durability, ReadableDatabase, ReadableTable};
-use storage::{CommitResult, Condition, Error, ErrorKind, Operation, Version, WriteBatch};
-
-use crate::codec::{
-    decode_global_version, decode_stored_value, encode_global_version, encode_physical_key,
-    encode_stored_value,
+use storage::{
+    CommitResult, Condition, Error, ErrorKind, Operation, StoredValue, Version, WriteBatch,
 };
 
+use crate::codec::{GlobalVersion, StoredRecord, encode_physical_key};
+
 use super::{
-    Backend, DATA_TABLE, GLOBAL_VERSION_KEY, META_TABLE, commit_error, conflict, corrupt_data,
-    durability_error, operation_error, other, table_error, transaction_error,
+    Backend, DATA_TABLE, GLOBAL_VERSION_KEY, META_TABLE, commit_error, storage_error, table_error,
+    transaction_error,
 };
 
 impl Backend {
@@ -38,7 +37,10 @@ impl Backend {
             .map_err(|error| transaction_error(error, "failed to begin redb write transaction"))?;
         transaction
             .set_durability(Durability::Immediate)
-            .map_err(|error| durability_error(error, "failed to configure redb commit"))?;
+            .map_err(|error| Error {
+                kind: ErrorKind::Other,
+                message: format!("failed to configure redb commit: {error}"),
+            })?;
 
         let next_version;
         {
@@ -55,48 +57,44 @@ impl Backend {
 
             let current_version = match meta
                 .get(GLOBAL_VERSION_KEY)
-                .map_err(|error| operation_error(error, "failed to read redb global version"))?
+                .map_err(|error| storage_error(error, "failed to read redb global version"))?
             {
-                Some(raw) => decode_global_version(raw.value())?,
+                Some(raw) => Version::from(GlobalVersion::try_from(raw.value())?),
                 None => Version(0),
             };
-            next_version = Version(
-                current_version
-                    .0
-                    .checked_add(1)
-                    .ok_or_else(|| other("global storage version is exhausted"))?,
-            );
+            next_version = Version(current_version.0.checked_add(1).ok_or_else(|| Error {
+                kind: ErrorKind::Other,
+                message: "global storage version is exhausted".into(),
+            })?);
 
             for operation in batch.operations {
-                match operation {
+                let (result, context) = match operation {
                     Operation::Put {
                         namespace,
                         key,
                         value,
                     } => {
                         let physical_key = encode_physical_key(&namespace, &key)?;
-                        let frame = encode_stored_value(&value, next_version)?;
-                        drop(
-                            data.insert(physical_key.as_slice(), frame.as_slice())
-                                .map_err(|error| {
-                                    operation_error(error, "failed to write redb data record")
-                                })?,
-                        );
+                        let frame = StoredRecord::new(value, next_version)?.encode()?;
+                        (
+                            data.insert(physical_key.as_slice(), frame.as_slice()),
+                            "failed to write redb data record",
+                        )
                     }
                     Operation::Delete { namespace, key } => {
                         let physical_key = encode_physical_key(&namespace, &key)?;
-                        drop(data.remove(physical_key.as_slice()).map_err(|error| {
-                            operation_error(error, "failed to delete redb data record")
-                        })?);
+                        (
+                            data.remove(physical_key.as_slice()),
+                            "failed to delete redb data record",
+                        )
                     }
-                }
+                };
+                drop(result.map_err(|error| storage_error(error, context))?);
             }
-            let encoded_version = encode_global_version(next_version)?;
+            let encoded_version = GlobalVersion::new(next_version)?.encode()?;
             drop(
                 meta.insert(GLOBAL_VERSION_KEY, encoded_version.as_slice())
-                    .map_err(|error| {
-                        operation_error(error, "failed to write redb global version")
-                    })?,
+                    .map_err(|error| storage_error(error, "failed to write redb global version"))?,
             );
         }
 
@@ -124,9 +122,9 @@ impl Backend {
             .map_err(|error| table_error(error, "redb metadata table is incompatible"))?;
         if let Some(raw) = meta
             .get(GLOBAL_VERSION_KEY)
-            .map_err(|error| operation_error(error, "failed to read redb global version"))?
+            .map_err(|error| storage_error(error, "failed to read redb global version"))?
         {
-            return decode_global_version(raw.value());
+            return GlobalVersion::try_from(raw.value()).map(Version::from);
         }
         drop(meta);
 
@@ -135,10 +133,10 @@ impl Backend {
             .map_err(|error| table_error(error, "redb data table is incompatible"))?;
         if data
             .first()
-            .map_err(|error| operation_error(error, "failed to inspect redb data table"))?
+            .map_err(|error| storage_error(error, "failed to inspect redb data table"))?
             .is_some()
         {
-            return Err(corrupt_data(
+            return Err(Error::corrupt_data(
                 "redb database contains data records but has no global version",
             ));
         }
@@ -146,6 +144,8 @@ impl Backend {
     }
 }
 
+// design-lint: allow single-use-free-function -- isolates redb-specific Missing and Version checks before any batch mutation in the same write transaction
+// design-lint: allow unclassified-free-function -- transaction-local algorithm evaluates foreign storage conditions against the redb table before any batch mutation
 fn evaluate_condition(
     data: &impl ReadableTable<&'static [u8], &'static [u8]>,
     condition: &Condition,
@@ -153,12 +153,12 @@ fn evaluate_condition(
     match condition {
         Condition::Missing { namespace, key } => {
             let physical_key = encode_physical_key(namespace, key)?;
-            if data
+            let exists = data
                 .get(physical_key.as_slice())
-                .map_err(|error| operation_error(error, "failed to evaluate redb condition"))?
-                .is_some()
-            {
-                return Err(conflict(format!(
+                .map_err(|error| storage_error(error, "failed to evaluate redb condition"))?
+                .is_some();
+            if exists {
+                return Err(Error::conflict(format!(
                     "missing condition failed in namespace `{}` because the key exists",
                     namespace.0
                 )));
@@ -172,16 +172,16 @@ fn evaluate_condition(
             let physical_key = encode_physical_key(namespace, key)?;
             let raw = data
                 .get(physical_key.as_slice())
-                .map_err(|error| operation_error(error, "failed to evaluate redb condition"))?
+                .map_err(|error| storage_error(error, "failed to evaluate redb condition"))?
                 .ok_or_else(|| {
-                    conflict(format!(
+                    Error::conflict(format!(
                         "version condition failed in namespace `{}` because the key is missing",
                         namespace.0
                     ))
                 })?;
-            let actual = decode_stored_value(raw.value())?;
+            let actual = StoredValue::from(StoredRecord::try_from(raw.value())?);
             if actual.version != *expected {
-                return Err(conflict(format!(
+                return Err(Error::conflict(format!(
                     "version condition failed in namespace `{}`: expected {}, found {}",
                     namespace.0, expected.0, actual.version.0
                 )));
@@ -189,4 +189,47 @@ fn evaluate_condition(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exhausted_version_rejects_commit_without_writing_or_wrapping() -> Result<(), Error> {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("exhausted.redb");
+        let mut backend = Backend::open(&path)?;
+        let transaction = backend.database()?.begin_write().expect("seed transaction");
+        {
+            let mut meta = transaction.open_table(META_TABLE).expect("metadata table");
+            let encoded = GlobalVersion::new(Version(u64::MAX))?.encode()?;
+            meta.insert(GLOBAL_VERSION_KEY, encoded.as_slice())
+                .expect("maximum version");
+        }
+        transaction.commit().expect("seed commit");
+
+        let namespace = storage::Namespace("records".into());
+        let key = storage::Key(b"new".to_vec());
+        let error = backend
+            .commit(WriteBatch {
+                conditions: vec![],
+                operations: vec![Operation::Put {
+                    namespace: namespace.clone(),
+                    key: key.clone(),
+                    value: storage::Value(b"must not persist".to_vec()),
+                }],
+            })
+            .expect_err("version cannot wrap");
+        assert_eq!(error.kind, ErrorKind::Other);
+        assert_eq!(error.message, "global storage version is exhausted");
+        assert_eq!(backend.global_version()?, Version(u64::MAX));
+        assert_eq!(backend.get(&namespace, &key)?, None);
+        drop(backend);
+
+        let mut reopened = Backend::open(&path)?;
+        assert_eq!(reopened.global_version()?, Version(u64::MAX));
+        assert_eq!(reopened.get(&namespace, &key)?, None);
+        Ok(())
+    }
 }

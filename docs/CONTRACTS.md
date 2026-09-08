@@ -144,6 +144,12 @@ capability.
 address boundary decodes exactly 32 bytes and requires canonical plain-Base58
 round trips; Bitcoin encodings keep their existing network and checksum rules.
 
+`chain_ethereum::Address::try_from(&base_address)` converts a borrowed
+`base::Address` into the native 20-byte representation. It preserves the bytes
+and returns `AddressParseError::InvalidLength` for any other width. The generic
+address carries bytes only; chain and network compatibility remain with the
+wallet/provider composition described above.
+
 `chain_solana::SOL` is the canonical native asset metadata: name `Solana`,
 ticker `SOL`, and nine decimal places. `chain_solana::AssetKind` currently
 contains only `Native`; `chain_solana::WalletConfig` binds that kind to one
@@ -434,6 +440,13 @@ rollback state.
 lifecycle. A persistence implementation may use redb, PostgreSQL, or another
 transactional backend, but backend records never cross these contracts.
 
+Generic storage adapters use `storage::Error::conflict(message)` for
+compare-and-swap conflicts and `storage::Error::corrupt_data(message)` for
+malformed persisted data. These constructors preserve the supplied message and
+set the corresponding `ErrorKind`. Backend-specific translation stays in the
+adapter; an ambiguous redb commit remains `Unavailable` and requires
+reconciliation, even when its underlying error describes corruption.
+
 The application composition opens one PostgreSQL database/schema and
 one process-wide pool. It clones that pool into one
 `indexing_postgres::Repository` handle per exact `(chain, network)` scope. A
@@ -488,6 +501,16 @@ exact atomic values into exact display decimals.
 History and output cursors carry the checkpoint snapshot from their first
 page. A changed checkpoint produces a conflict and requires pagination to
 restart.
+
+The HTTP history cursor is an opaque URL-safe Base64 JSON value. Its checkpoint
+composes the API `Block` representation under `block` with a separate
+`timestamp`, preserving the complete SDK checkpoint on round-trip. Decoding
+rejects unknown fields, malformed or empty block/parent hashes, and incomplete
+parent references. The previous pre-release flat checkpoint encoding is not
+accepted; callers holding one must restart pagination. Public transaction and
+page checkpoint responses retain their existing block fields. Shared `Block`
+and parent deserialization reject unknown fields, which their OpenAPI schemas
+also express with `additionalProperties: false`.
 
 ## Address coverage contract
 
@@ -566,6 +589,22 @@ scopes and `payment_wallets` unchanged. Solana system evidence must additionally
 prove singular endpoint configuration and redaction, genesis/Memo probes,
 tracked registration before dispatch, shutdown races and indefinite ambiguity,
 the pinned/checksummed owned validator, and the explicit `solana_stack` target.
+
+## Storage input errors
+
+`storage::Error::invalid_request(message)` constructs the existing
+`ErrorKind::InvalidRequest` with the caller's exact message, alongside the
+existing `conflict` and `corrupt_data` constructors. Backend adapters retain
+their validation rules and supply the context; the constructor performs no
+storage access.
+
+## JSON-RPC failures
+
+`json_rpc::Failure::from(jsonrpsee::types::ErrorObjectOwned)` preserves the
+remote error code, message, and optional raw JSON data. Absent data remains
+absent; present data retains its exact bytes, including explicit `null`.
+This representation conversion does not classify retryability or change
+single-request and batch execution policy.
 
 ## HTTP contract
 

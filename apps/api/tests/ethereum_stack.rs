@@ -589,12 +589,12 @@ fn transaction_receipt(state: &StateHandle, params: &Value) -> Value {
     let hash = params[0].as_str().expect("transaction hash must be text");
     let node = state.0.lock().expect("Ethereum node lock must be healthy");
     for (height, block) in node.blocks.iter().enumerate() {
-        if let Some((index, transaction)) = block
+        let found = block
             .transactions
             .iter()
             .enumerate()
-            .find(|(_, transaction)| transaction.hash == hash)
-        {
+            .find(|(_, transaction)| transaction.hash == hash);
+        if let Some((index, transaction)) = found {
             return receipt(
                 transaction,
                 height as u64 + 1,

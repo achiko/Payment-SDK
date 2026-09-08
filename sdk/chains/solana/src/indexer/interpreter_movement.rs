@@ -1,11 +1,11 @@
 use std::collections::BTreeSet;
 
-use indexing::{AssetId, IndexError, IndexScope, MovementId, ValueMovement};
+use indexing::{AssetId, CanonicalAddress, IndexError, IndexScope, MovementId, ValueMovement};
 use solana_system_interface::{instruction::SystemInstruction, program::ID as SYSTEM_ID};
 
 use crate::Address;
 
-use super::{canonical, invalid_block, wire::Transaction};
+use super::{invalid_block, wire::Transaction};
 
 #[derive(Debug, Default)]
 pub(super) struct Movements(Vec<Movement>);
@@ -22,29 +22,26 @@ impl Movements {
     pub fn decode(transaction: &Transaction) -> Result<Self, IndexError> {
         let mut values = Vec::new();
         for (outer_index, instruction) in transaction.instructions().iter().enumerate() {
-            if let Some(movement) = Movement::decode(
+            values.extend(Movement::decode(
                 transaction,
                 instruction,
                 format!("{}:ix:{outer_index}", transaction.signature()),
-            )? {
-                values.push(movement);
-            }
-            if let Some(inner) = transaction
+            )?);
+            let Some(inner) = transaction
                 .inner()
                 .and_then(|groups| groups.get(&outer_index))
-            {
-                for (inner_ordinal, instruction) in inner.iter().enumerate() {
-                    if let Some(movement) = Movement::decode(
-                        transaction,
-                        instruction,
-                        format!(
-                            "{}:ix:{outer_index}:inner:{inner_ordinal}",
-                            transaction.signature()
-                        ),
-                    )? {
-                        values.push(movement);
-                    }
-                }
+            else {
+                continue;
+            };
+            for (inner_ordinal, instruction) in inner.iter().enumerate() {
+                values.extend(Movement::decode(
+                    transaction,
+                    instruction,
+                    format!(
+                        "{}:ix:{outer_index}:inner:{inner_ordinal}",
+                        transaction.signature()
+                    ),
+                )?);
             }
         }
         Ok(Self(values))
@@ -86,8 +83,14 @@ impl Movements {
                 id: MovementId(movement.id),
                 asset: asset.clone(),
                 amount: base::Decimal::from_atomic(movement.lamports.into(), 0),
-                from: canonical(&movement.source, scope),
-                to: canonical(&movement.destination, scope),
+                from: CanonicalAddress {
+                    scope: scope.clone(),
+                    value: movement.source.to_string(),
+                },
+                to: CanonicalAddress {
+                    scope: scope.clone(),
+                    value: movement.destination.to_string(),
+                },
             })
             .collect()
     }

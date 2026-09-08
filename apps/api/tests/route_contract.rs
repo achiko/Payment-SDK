@@ -48,6 +48,7 @@ impl Checkpoint for FixtureCheckpoint {
 
 struct FixtureProvider {
     calls: Arc<Calls>,
+    generation_error: Option<wallets::ErrorKind>,
 }
 
 impl Provider for FixtureProvider {
@@ -59,6 +60,14 @@ impl Provider for FixtureProvider {
     }
 
     fn generate(&self) -> FutureResult<'_, Arc<dyn wallets::Wallet>> {
+        if let Some(kind) = self.generation_error {
+            return Box::pin(async move {
+                Err(wallets::Error::new(
+                    kind,
+                    "fixture wallet generation failed",
+                ))
+            });
+        }
         self.create(SecretBytes::new([7_u8; 32]))
     }
 }
@@ -266,6 +275,14 @@ fn fixture(initially_ready: bool) -> Fixture {
 }
 
 fn fixture_with_usdc(initially_ready: bool, usdc: bool) -> Fixture {
+    fixture_with_generation_error(initially_ready, usdc, None)
+}
+
+fn fixture_with_generation_error(
+    initially_ready: bool,
+    usdc: bool,
+    generation_error: Option<wallets::ErrorKind>,
+) -> Fixture {
     let calls = Arc::new(Calls::default());
     let checkpoint: Arc<dyn Checkpoint> = Arc::new(FixtureCheckpoint::Value);
     let mut wallets = Wallets::<String, WalletAsset>::new(checkpoint);
@@ -275,6 +292,7 @@ fn fixture_with_usdc(initially_ready: bool, usdc: bool) -> Fixture {
             scope(),
             FixtureProvider {
                 calls: Arc::clone(&calls),
+                generation_error,
             },
             Arc::new(FixtureSender {
                 calls: Arc::clone(&calls),
@@ -288,6 +306,7 @@ fn fixture_with_usdc(initially_ready: bool, usdc: bool) -> Fixture {
             solana_scope(),
             FixtureProvider {
                 calls: Arc::clone(&calls),
+                generation_error: None,
             },
             Arc::new(FixtureSender {
                 calls: Arc::clone(&calls),
@@ -302,6 +321,7 @@ fn fixture_with_usdc(initially_ready: bool, usdc: bool) -> Fixture {
                 ethereum_scope(),
                 FixtureProvider {
                     calls: Arc::clone(&calls),
+                    generation_error: None,
                 },
                 Arc::new(FixtureSender {
                     calls: Arc::clone(&calls),
@@ -343,6 +363,55 @@ async fn unconfigured_wallet_asset_is_not_found() {
         json_body(&response)["message"],
         "wallet asset is not configured"
     );
+}
+
+#[tokio::test]
+async fn wallet_generation_errors_preserve_status_and_message() {
+    for (kind, status, message) in [
+        (
+            wallets::ErrorKind::Unsupported,
+            StatusCode::NOT_FOUND,
+            "wallet asset is not configured",
+        ),
+        (
+            wallets::ErrorKind::Generation,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "fixture wallet generation failed",
+        ),
+        (
+            wallets::ErrorKind::Conflict,
+            StatusCode::CONFLICT,
+            "fixture wallet generation failed",
+        ),
+        (
+            wallets::ErrorKind::InvalidAddress,
+            StatusCode::BAD_REQUEST,
+            "fixture wallet generation failed",
+        ),
+        (
+            wallets::ErrorKind::NotFound,
+            StatusCode::NOT_FOUND,
+            "fixture wallet generation failed",
+        ),
+    ] {
+        let fixture = fixture_with_generation_error(true, false, Some(kind));
+        let response = request(
+            &fixture.app,
+            "POST",
+            "/v1/wallets",
+            Some(json!({"asset": "btc"})),
+            true,
+        )
+        .await;
+
+        assert_eq!(response.status, status, "{kind:?}");
+        assert_eq!(
+            json_body(&response),
+            json!({"message": message}),
+            "{kind:?}"
+        );
+        assert_no_transaction_calls(&fixture.calls);
+    }
 }
 
 #[tokio::test]
@@ -389,6 +458,58 @@ async fn readiness_reflects_runtime_state_while_liveness_stays_available() {
             .status,
         StatusCode::NO_CONTENT
     );
+}
+
+#[tokio::test]
+async fn closed_readiness_is_unavailable_even_when_the_last_value_was_true() {
+    for last_value in [false, true] {
+        let fixture = fixture(last_value);
+        drop(fixture.ready);
+
+        let response = request(&fixture.app, "GET", "/health/ready", None, false).await;
+        assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.body.is_empty());
+        assert_eq!(
+            request(&fixture.app, "GET", "/health/live", None, false)
+                .await
+                .status,
+            StatusCode::NO_CONTENT
+        );
+    }
+}
+
+#[tokio::test]
+async fn openapi_serves_the_merged_contract_without_authentication() {
+    let fixture = fixture(false);
+    let response = request(&fixture.app, "GET", "/openapi.json", None, false).await;
+
+    assert_eq!(response.status, StatusCode::OK);
+    let document = json_body(&response);
+    for path in ["/openapi.json", "/health/ready", "/v1/wallets/{id}"] {
+        assert!(document["paths"][path]["get"].is_object(), "{path}");
+    }
+    assert!(document["components"]["schemas"]["Wallet"].is_object());
+    assert_no_transaction_calls(&fixture.calls);
+}
+
+#[tokio::test]
+async fn missing_wallet_read_preserves_the_not_found_error_contract() {
+    let fixture = fixture(true);
+    let response = request(
+        &fixture.app,
+        "GET",
+        "/v1/wallets/missing-wallet",
+        None,
+        true,
+    )
+    .await;
+
+    assert_eq!(response.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_body(&response),
+        json!({"message": "wallet does not exist"})
+    );
+    assert_no_transaction_calls(&fixture.calls);
 }
 
 #[tokio::test]

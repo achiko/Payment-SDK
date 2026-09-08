@@ -64,10 +64,11 @@ impl WalletConfig {
         destination: Address,
         amount: &Decimal,
     ) -> Result<TransferRequest, TransactionError> {
-        self.validate()
-            .map_err(|error| transaction_error(TransactionErrorKind::InvalidSnapshot, error))?;
+        self.validate().map_err(|error| {
+            TransactionError::new(TransactionErrorKind::InvalidSnapshot, error.to_string())
+        })?;
         if amount <= &Decimal::zero() {
-            return Err(transaction_error(
+            return Err(TransactionError::new(
                 TransactionErrorKind::InvalidAmount,
                 "amount must be positive",
             ));
@@ -75,7 +76,9 @@ impl WalletConfig {
         let value = amount
             .to_atomic_be_bytes(self.decimals)
             .map(Wei)
-            .map_err(|error| transaction_error(TransactionErrorKind::InvalidAmount, error))?;
+            .map_err(|error| {
+                TransactionError::new(TransactionErrorKind::InvalidAmount, error.to_string())
+            })?;
         Ok(match &self.asset {
             AssetKind::Native => TransferRequest::native_atomic(from, destination, value),
             AssetKind::Erc20(token) => {
@@ -115,7 +118,7 @@ impl WalletProvider {
         match generator() {
             Ok(secret) => self.create(secret),
             Err(error) => {
-                let error = wallet_error(WalletErrorKind::Generation, error);
+                let error = WalletError::new(WalletErrorKind::Generation, error.to_string());
                 Box::pin(async move { Err(error) })
             }
         }
@@ -134,17 +137,20 @@ impl Provider for WalletProvider {
     fn create<'a>(&'a self, secret: SecretBytes) -> FutureResult<'a, Arc<dyn WalletContract>> {
         Box::pin(async move {
             self.config.validate()?;
-            let key = SecretKey::new(secret.as_bytes().to_vec())
-                .map_err(|error| wallet_error(WalletErrorKind::InvalidSecret, error))?;
-            let public = key
-                .public_key(PublicKeyFormat::Raw)
-                .map_err(|error| wallet_error(WalletErrorKind::InvalidSecret, error))?;
+            let key = SecretKey::new(secret.as_bytes().to_vec()).map_err(|error| {
+                WalletError::new(WalletErrorKind::InvalidSecret, error.to_string())
+            })?;
+            let public = key.public_key(PublicKeyFormat::Raw).map_err(|error| {
+                WalletError::new(WalletErrorKind::InvalidSecret, error.to_string())
+            })?;
             let hash = keccak256(&public.bytes);
             let mut bytes = [0_u8; 20];
             bytes.copy_from_slice(&hash[12..]);
             let address = Address(bytes);
-            let signer = KeyPair::new(address.clone(), secret.as_bytes().to_vec())
-                .map_err(|error| wallet_error(WalletErrorKind::InvalidSecret, error))?;
+            let signer =
+                KeyPair::new(address.clone(), secret.as_bytes().to_vec()).map_err(|error| {
+                    WalletError::new(WalletErrorKind::InvalidSecret, error.to_string())
+                })?;
             Ok(Arc::new(Wallet {
                 config: self.config.clone(),
                 address,
@@ -184,16 +190,10 @@ impl base::Signer for Wallet {
 
 impl AddressFormat for Wallet {
     fn address_text(&self, address: &BaseAddress) -> Result<AddressText, WalletError> {
-        let bytes: [u8; 20] = address.as_bytes().try_into().map_err(|_| {
-            WalletError::new(
-                WalletErrorKind::InvalidAddress,
-                "Ethereum address must contain exactly 20 bytes",
-            )
+        let address = Address::try_from(address).map_err(|error| {
+            WalletError::new(WalletErrorKind::InvalidAddress, error.to_string())
         })?;
-        Ok(AddressText::new(
-            AddressEncoding::Hex,
-            Address(bytes).to_string(),
-        ))
+        Ok(AddressText::new(AddressEncoding::Hex, address.to_string()))
     }
 
     fn parse_address(&self, address: &AddressText) -> Result<BaseAddress, WalletError> {
@@ -207,7 +207,7 @@ impl AddressFormat for Wallet {
             .text
             .parse::<Address>()
             .map(|parsed| parsed.address())
-            .map_err(|error| wallet_error(WalletErrorKind::InvalidAddress, error))
+            .map_err(|error| WalletError::new(WalletErrorKind::InvalidAddress, error.to_string()))
     }
 }
 
@@ -218,7 +218,7 @@ impl BalanceReader for Wallet {
                 .accounts
                 .balance(self.address.clone(), &self.config.asset, None)
                 .await
-                .map_err(|error| wallet_error(WalletErrorKind::Balance, error))?;
+                .map_err(|error| WalletError::new(WalletErrorKind::Balance, error.to_string()))?;
             Ok(Balance {
                 amount: Decimal::from_atomic(
                     num_bigint::BigUint::from_bytes_be(&amount.0),
@@ -271,10 +271,6 @@ struct Builder {
 }
 
 impl Builder {
-    fn restore(wallet: &Wallet, snapshot: &TransactionSnapshot) -> Result<Self, TransactionError> {
-        snapshot::restore(wallet, snapshot)
-    }
-
     fn new(
         config: WalletConfig,
         from: Address,
@@ -293,7 +289,7 @@ impl Builder {
     fn request(&self) -> Result<TransferRequest, TransactionError> {
         self.validate()?;
         let (destination, amount) = self.transfer.clone().ok_or_else(|| {
-            transaction_error(
+            TransactionError::new(
                 TransactionErrorKind::InvalidTransaction,
                 "transfer is not configured",
             )
@@ -303,9 +299,9 @@ impl Builder {
     }
 
     fn validate(&self) -> Result<(), TransactionError> {
-        self.config
-            .validate()
-            .map_err(|error| transaction_error(TransactionErrorKind::InvalidSnapshot, error))
+        self.config.validate().map_err(|error| {
+            TransactionError::new(TransactionErrorKind::InvalidSnapshot, error.to_string())
+        })
     }
 }
 
@@ -316,20 +312,22 @@ impl BaseBuilder for Builder {
         amount: Decimal,
     ) -> Result<(), TransactionError> {
         if self.transfer.is_some() {
-            return Err(transaction_error(
+            return Err(TransactionError::new(
                 TransactionErrorKind::Unsupported,
                 "Ethereum transaction builder supports exactly one transfer",
             ));
         }
         let bytes: [u8; 20] = destination.as_bytes().try_into().map_err(|_| {
-            transaction_error(
+            TransactionError::new(
                 TransactionErrorKind::InvalidAddress,
                 "Ethereum destination must contain exactly 20 bytes",
             )
         })?;
         amount
             .to_atomic_be_bytes::<32>(self.config.decimals)
-            .map_err(|error| transaction_error(TransactionErrorKind::InvalidAmount, error))?;
+            .map_err(|error| {
+                TransactionError::new(TransactionErrorKind::InvalidAmount, error.to_string())
+            })?;
         self.transfer = Some((Address(bytes), amount));
         Ok(())
     }
@@ -337,11 +335,23 @@ impl BaseBuilder for Builder {
     fn snapshot(&self) -> Result<TransactionSnapshot, TransactionError> {
         self.validate()?;
         let (destination, amount) = self.transfer.as_ref().ok_or_else(|| {
-            transaction_error(
+            TransactionError::new(
                 TransactionErrorKind::InvalidTransaction,
                 "transfer is not configured",
             )
         })?;
+        let asset = match &self.config.asset {
+            AssetKind::Native => serde_json::json!({
+                "kind": "native",
+                "ticker": crate::ETH.ticker,
+                "decimals": self.config.decimals,
+            }),
+            AssetKind::Erc20(token) => serde_json::json!({
+                "kind": "erc20",
+                "token": token.to_string(),
+                "decimals": self.config.decimals,
+            }),
+        };
         Ok(TransactionSnapshot::new(
             SNAPSHOT_KIND,
             serde_json::json!({
@@ -352,7 +362,7 @@ impl BaseBuilder for Builder {
                 "source": self.from.to_string(),
                 "destination": destination.to_string(),
                 "amount": amount.to_string(),
-                "asset": asset_snapshot(&self.config.asset, self.config.decimals),
+                "asset": asset,
             }),
         ))
     }
@@ -370,28 +380,13 @@ impl BaseBuilder for Builder {
                     self.signer.as_ref(),
                 ))
                 .await
-                .map_err(preparation_error)?;
+                .map_err(ChainError::into_preparation)?;
             Ok(base::SignedTransaction::new(
                 PREPARED_KIND,
                 TransactionId::new(signed.id.to_string()),
                 TransactionEnvelope::new(signed.envelope),
             ))
         })
-    }
-}
-
-fn asset_snapshot(asset: &AssetKind, decimals: u32) -> serde_json::Value {
-    match asset {
-        AssetKind::Native => serde_json::json!({
-            "kind": "native",
-            "ticker": crate::ETH.ticker,
-            "decimals": decimals,
-        }),
-        AssetKind::Erc20(token) => serde_json::json!({
-            "kind": "erc20",
-            "token": token.to_string(),
-            "decimals": decimals,
-        }),
     }
 }
 
@@ -404,18 +399,28 @@ impl Broadcaster for Wallet {
             if prepared.version() != base::SignedTransaction::VERSION
                 || prepared.kind() != PREPARED_KIND
             {
-                return Err(transaction_error(
+                return Err(TransactionError::new(
                     TransactionErrorKind::InvalidTransaction,
                     "prepared transaction is not an Ethereum signed envelope",
                 ));
             }
-            let id = prepared.id().as_str().parse().map_err(|error| {
-                transaction_error(TransactionErrorKind::InvalidTransaction, error)
-            })?;
+            let id = prepared
+                .id()
+                .as_str()
+                .parse::<crate::TransactionId>()
+                .map_err(|error| {
+                    TransactionError::new(
+                        TransactionErrorKind::InvalidTransaction,
+                        error.to_string(),
+                    )
+                })?;
             let signed =
                 SignedTransaction::from_envelope(id, prepared.envelope().as_bytes().to_vec())
                     .map_err(|error| {
-                        transaction_error(TransactionErrorKind::InvalidTransaction, error)
+                        TransactionError::new(
+                            TransactionErrorKind::InvalidTransaction,
+                            error.to_string(),
+                        )
                     })?;
             let id = self.coordinator.broadcast(signed).await?;
             Ok(BroadcastReceipt {
@@ -425,31 +430,22 @@ impl Broadcaster for Wallet {
     }
 }
 
-fn transaction_error(
-    kind: TransactionErrorKind,
-    error: impl std::fmt::Display,
-) -> TransactionError {
-    TransactionError::new(kind, error.to_string())
-}
-
-pub(crate) fn preparation_error(error: ChainError) -> TransactionError {
-    let kind = match error.kind {
-        ChainErrorKind::InvalidAddress => TransactionErrorKind::InvalidAddress,
-        ChainErrorKind::InvalidTransaction => TransactionErrorKind::InvalidTransaction,
-        ChainErrorKind::InsufficientFunds => TransactionErrorKind::InsufficientFunds,
-        ChainErrorKind::FeeUnavailable => TransactionErrorKind::Fee,
-        ChainErrorKind::RpcUnavailable => TransactionErrorKind::Unavailable,
-        ChainErrorKind::Divergent => TransactionErrorKind::Divergent,
-        ChainErrorKind::Signer => TransactionErrorKind::Signing,
-        ChainErrorKind::Rejected => TransactionErrorKind::Rejected,
-        ChainErrorKind::NotFound => TransactionErrorKind::InvalidTransaction,
-        ChainErrorKind::Other => TransactionErrorKind::Unknown,
-    };
-    transaction_error(kind, error)
-}
-
-fn wallet_error(kind: WalletErrorKind, error: impl std::fmt::Display) -> WalletError {
-    WalletError::new(kind, error.to_string())
+impl ChainError {
+    pub(crate) fn into_preparation(self) -> TransactionError {
+        let kind = match self.kind {
+            ChainErrorKind::InvalidAddress => TransactionErrorKind::InvalidAddress,
+            ChainErrorKind::InvalidTransaction => TransactionErrorKind::InvalidTransaction,
+            ChainErrorKind::InsufficientFunds => TransactionErrorKind::InsufficientFunds,
+            ChainErrorKind::FeeUnavailable => TransactionErrorKind::Fee,
+            ChainErrorKind::RpcUnavailable => TransactionErrorKind::Unavailable,
+            ChainErrorKind::Divergent => TransactionErrorKind::Divergent,
+            ChainErrorKind::Signer => TransactionErrorKind::Signing,
+            ChainErrorKind::Rejected => TransactionErrorKind::Rejected,
+            ChainErrorKind::NotFound => TransactionErrorKind::InvalidTransaction,
+            ChainErrorKind::Other => TransactionErrorKind::Unknown,
+        };
+        TransactionError::new(kind, self.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -538,6 +534,82 @@ mod tests {
             coordinator,
             history,
         )
+    }
+
+    #[test]
+    fn address_format_preserves_invalid_width_error_classification() {
+        let wallet = block_on(provider().create(SecretBytes::new([1_u8; 32])))
+            .expect("fixed valid secret must create a wallet");
+        for length in [0, 19, 21, 32] {
+            let error = wallet
+                .address_text(&BaseAddress::new(vec![0; length]))
+                .expect_err("malformed address width must fail at the wallet boundary");
+            assert_eq!(error.kind, WalletErrorKind::InvalidAddress);
+            assert_eq!(
+                error.message,
+                "Ethereum address must contain exactly 20 bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn address_parsing_preserves_encoding_and_native_error_precedence() {
+        let wallet = block_on(provider().create(SecretBytes::new([1_u8; 32]))).unwrap();
+        for (encoding, text, message) in [
+            (
+                AddressEncoding::Base58,
+                "bad",
+                "Ethereum addresses use hexadecimal encoding",
+            ),
+            (
+                AddressEncoding::Hex,
+                "bad",
+                "Ethereum address is missing its 0x prefix",
+            ),
+            (
+                AddressEncoding::Hex,
+                "0xzz",
+                "Ethereum address must contain exactly 20 bytes",
+            ),
+        ] {
+            let error = wallet
+                .parse_address(&AddressText::new(encoding, text))
+                .unwrap_err();
+            assert_eq!(
+                error,
+                WalletError::new(WalletErrorKind::InvalidAddress, message)
+            );
+        }
+    }
+
+    #[test]
+    fn creation_validates_configuration_before_secret_and_preserves_secret_errors() {
+        let mut provider = provider();
+        provider.config.chain_id = 0;
+        let error = block_on(provider.create(SecretBytes::new(Vec::new())))
+            .err()
+            .expect("invalid configuration");
+        assert_eq!(
+            error,
+            WalletError::new(
+                WalletErrorKind::Unsupported,
+                "Ethereum wallet network, asset, and decimals must agree",
+            )
+        );
+
+        provider.config.chain_id = 1;
+        for secret in [Vec::new(), vec![0; 32], vec![255; 32]] {
+            let error = block_on(provider.create(SecretBytes::new(secret)))
+                .err()
+                .expect("invalid scalar");
+            assert_eq!(
+                error,
+                WalletError::new(
+                    WalletErrorKind::InvalidSecret,
+                    "secret key must be a valid 32-byte secp256k1 scalar",
+                )
+            );
+        }
     }
 
     #[test]
@@ -643,8 +715,26 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_preparation_kinds_remain_terminal_wallet_errors() {
+    fn preparation_conversion_preserves_every_kind_message_and_absence_of_ambiguity() {
         for (chain, expected) in [
+            (
+                ChainErrorKind::InvalidAddress,
+                TransactionErrorKind::InvalidAddress,
+            ),
+            (
+                ChainErrorKind::InvalidTransaction,
+                TransactionErrorKind::InvalidTransaction,
+            ),
+            (
+                ChainErrorKind::RpcUnavailable,
+                TransactionErrorKind::Unavailable,
+            ),
+            (ChainErrorKind::Signer, TransactionErrorKind::Signing),
+            (
+                ChainErrorKind::NotFound,
+                TransactionErrorKind::InvalidTransaction,
+            ),
+            (ChainErrorKind::Other, TransactionErrorKind::Unknown),
             (
                 ChainErrorKind::InsufficientFunds,
                 TransactionErrorKind::InsufficientFunds,
@@ -653,17 +743,19 @@ mod tests {
             (ChainErrorKind::Rejected, TransactionErrorKind::Rejected),
             (ChainErrorKind::Divergent, TransactionErrorKind::Divergent),
         ] {
-            let mapped = preparation_error(ChainError {
+            let mapped = ChainError::into_preparation(ChainError {
                 kind: chain,
                 message: "terminal preparation failure".to_owned(),
             });
             assert_eq!(mapped.kind, expected);
+            assert_eq!(mapped.message, "terminal preparation failure");
+            assert_eq!(mapped.ambiguous_transaction_id, None);
         }
     }
 
     #[test]
     fn rpc_preparation_failures_remain_unavailable() {
-        let mapped = preparation_error(ChainError {
+        let mapped = ChainError::into_preparation(ChainError {
             kind: ChainErrorKind::RpcUnavailable,
             message: "RPC failed".to_owned(),
         });
@@ -717,5 +809,62 @@ mod tests {
             .expect_err("zero-value transfers must fail before RPC");
 
         assert_eq!(error.kind, TransactionErrorKind::InvalidAmount);
+    }
+
+    #[test]
+    fn builder_snapshots_preserve_native_and_token_asset_identity() {
+        for (asset, decimals, expected) in [
+            (
+                AssetKind::Native,
+                18,
+                serde_json::json!({"kind": "native", "ticker": "ETH", "decimals": 18}),
+            ),
+            (
+                AssetKind::Erc20(Address([0xab; 20])),
+                6,
+                serde_json::json!({
+                    "kind": "erc20",
+                    "token": "0xabababababababababababababababababababab",
+                    "decimals": 6,
+                }),
+            ),
+        ] {
+            let provider = provider();
+            let wallet = Wallet {
+                config: config(asset, decimals),
+                address: Address([0x11; 20]),
+                signer: Arc::new(
+                    KeyPair::new(Address([0x11; 20]), vec![1_u8; 32])
+                        .expect("fixed valid secret must create a signer"),
+                ),
+                accounts: provider.accounts,
+                coordinator: provider.coordinator,
+                history: provider.history,
+            };
+            let mut builder = wallet.transaction();
+            builder
+                .transfer(
+                    Address([0x22; 20]).address(),
+                    "1.25".parse().expect("amount must parse"),
+                )
+                .expect("transfer must be valid");
+
+            let snapshot = builder.snapshot().expect("transfer must have a snapshot");
+            assert_eq!(snapshot.value()["asset"], expected);
+            let restored_builder =
+                Builder::restore(&wallet, &snapshot).expect("snapshot must restore");
+            assert!(Arc::ptr_eq(&restored_builder.signer, &wallet.signer));
+            assert!(Arc::ptr_eq(
+                &restored_builder.coordinator,
+                &wallet.coordinator
+            ));
+            assert_eq!(restored_builder.from, wallet.address);
+            assert_eq!(
+                restored_builder.transfer,
+                Some((Address([0x22; 20]), "1.25".parse().unwrap()))
+            );
+            let restored = wallet.restore(&snapshot).expect("snapshot must restore");
+            assert_eq!(restored.snapshot().unwrap(), snapshot);
+        }
     }
 }

@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use super::{Builder, SNAPSHOT_KIND, Wallet, WalletConfig, transaction_error};
+use super::{Builder, SNAPSHOT_KIND, Wallet, WalletConfig};
 use crate::{Address, AssetKind};
 use base::{Decimal, TransactionError, TransactionErrorKind, TransactionSnapshot};
 
@@ -28,20 +28,44 @@ enum Asset {
     Erc20 { token: String, decimals: u32 },
 }
 
-pub(super) fn restore(
-    wallet: &Wallet,
-    snapshot: &TransactionSnapshot,
-) -> Result<Builder, TransactionError> {
-    let (destination, amount) = decode(&wallet.config, &wallet.address, snapshot)?;
-    let mut builder = Builder::new(
-        wallet.config.clone(),
-        wallet.address.clone(),
-        wallet.signer.clone(),
-        wallet.coordinator.clone(),
-    );
-    builder.transfer = Some((destination, amount));
-    builder.validate()?;
-    Ok(builder)
+impl Asset {
+    fn matches(&self, configured: &AssetKind, decimals: u32) -> bool {
+        match (self, configured) {
+            (
+                Self::Native {
+                    ticker,
+                    decimals: actual,
+                },
+                AssetKind::Native,
+            ) => ticker == crate::ETH.ticker && *actual == decimals,
+            (
+                Self::Erc20 {
+                    token,
+                    decimals: actual,
+                },
+                AssetKind::Erc20(configured),
+            ) => token == &configured.to_string() && *actual == decimals,
+            _ => false,
+        }
+    }
+}
+
+impl Builder {
+    pub(super) fn restore(
+        wallet: &Wallet,
+        snapshot: &TransactionSnapshot,
+    ) -> Result<Self, TransactionError> {
+        let (destination, amount) = decode(&wallet.config, &wallet.address, snapshot)?;
+        let mut builder = Self::new(
+            wallet.config.clone(),
+            wallet.address.clone(),
+            wallet.signer.clone(),
+            wallet.coordinator.clone(),
+        );
+        builder.transfer = Some((destination, amount));
+        builder.validate()?;
+        Ok(builder)
+    }
 }
 
 fn decode(
@@ -59,7 +83,7 @@ fn decode(
         || data.scope.chain != "ethereum"
         || config.chain_id == 0
         || data.source != wallet_address.to_string()
-        || !asset_matches(&data.asset, &config.asset, config.decimals)
+        || !data.asset.matches(&config.asset, config.decimals)
     {
         return Err(invalid(
             "Ethereum snapshot does not belong to this wallet, network, or asset",
@@ -73,28 +97,9 @@ fn decode(
     Ok((destination, amount))
 }
 
-fn asset_matches(snapshot: &Asset, configured: &AssetKind, decimals: u32) -> bool {
-    match (snapshot, configured) {
-        (
-            Asset::Native {
-                ticker,
-                decimals: actual,
-            },
-            AssetKind::Native,
-        ) => ticker == crate::ETH.ticker && *actual == decimals,
-        (
-            Asset::Erc20 {
-                token,
-                decimals: actual,
-            },
-            AssetKind::Erc20(configured),
-        ) => token == &configured.to_string() && *actual == decimals,
-        _ => false,
-    }
-}
-
+// design-lint: allow unclassified-free-function -- shared Ethereum snapshot adapter maps heterogeneous validation failures to InvalidSnapshot without changing their messages or inventing transaction ambiguity
 fn invalid(error: impl std::fmt::Display) -> TransactionError {
-    transaction_error(TransactionErrorKind::InvalidSnapshot, error)
+    TransactionError::new(TransactionErrorKind::InvalidSnapshot, error.to_string())
 }
 
 #[cfg(test)]
@@ -129,6 +134,51 @@ mod tests {
     }
 
     #[test]
+    fn invalid_snapshot_adapter_preserves_validation_order_and_exact_errors() {
+        let wallet = Address([0x11; 20]);
+        let unsupported = TransactionSnapshot::new("unsupported", serde_json::json!({}));
+        let error = decode(&config(), &wallet, &unsupported)
+            .expect_err("kind must be checked before malformed content");
+        assert_eq!(error.kind, TransactionErrorKind::InvalidSnapshot);
+        assert_eq!(
+            error.message,
+            "snapshot is not a supported Ethereum transfer"
+        );
+        assert_eq!(error.ambiguous_transaction_id, None);
+
+        for (destination, amount, message) in [
+            (
+                "invalid".to_owned(),
+                "invalid",
+                "Ethereum address is missing its 0x prefix",
+            ),
+            (
+                Address([0x22; 20]).to_string(),
+                "invalid",
+                "decimal must use canonical base-10 notation",
+            ),
+            (
+                Address([0x22; 20]).to_string(),
+                "-1",
+                "currency amount must not be negative",
+            ),
+        ] {
+            let mut value = snapshot(&wallet).value().clone();
+            value["destination"] = serde_json::json!(destination);
+            value["amount"] = serde_json::json!(amount);
+            let error = decode(
+                &config(),
+                &wallet,
+                &TransactionSnapshot::new(SNAPSHOT_KIND, value),
+            )
+            .expect_err("invalid snapshot contents must be classified before restoration");
+            assert_eq!(error.kind, TransactionErrorKind::InvalidSnapshot);
+            assert_eq!(error.message, message);
+            assert_eq!(error.ambiguous_transaction_id, None);
+        }
+    }
+
+    #[test]
     fn json_round_trip_restores_transfer_intent() {
         let wallet = Address([0x11; 20]);
         let encoded = serde_json::to_string(&snapshot(&wallet)).expect("snapshot must serialize");
@@ -139,6 +189,110 @@ mod tests {
         assert_eq!(destination, Address([0x22; 20]));
         assert_eq!(amount.to_string(), "1.25");
         assert!(!encoded.contains("private"));
+    }
+
+    #[test]
+    fn erc20_json_round_trip_restores_transfer_intent() {
+        let wallet = Address([0x11; 20]);
+        let token = Address([0xab; 20]);
+        let mut config = config();
+        config.asset = AssetKind::Erc20(token.clone());
+        config.decimals = 6;
+        let mut value = snapshot(&wallet).value().clone();
+        value["asset"] = serde_json::json!({
+            "kind": "erc20", "token": token.to_string(), "decimals": 6,
+        });
+        let encoded = serde_json::to_string(&TransactionSnapshot::new(SNAPSHOT_KIND, value))
+            .expect("snapshot must serialize");
+        let restored = serde_json::from_str(&encoded).expect("snapshot must deserialize");
+
+        let (destination, amount) = decode(&config, &wallet, &restored)
+            .expect("matching token wallet must restore its transaction");
+
+        assert_eq!(destination, Address([0x22; 20]));
+        assert_eq!(amount.to_string(), "1.25");
+    }
+
+    #[test]
+    fn native_snapshots_reject_asset_mismatches() {
+        let wallet = Address([0x11; 20]);
+        for (case, asset) in [
+            (
+                "ticker",
+                serde_json::json!({ "kind": "native", "ticker": "BTC", "decimals": 18 }),
+            ),
+            (
+                "ticker casing",
+                serde_json::json!({ "kind": "native", "ticker": "eth", "decimals": 18 }),
+            ),
+            (
+                "decimals",
+                serde_json::json!({ "kind": "native", "ticker": "ETH", "decimals": 17 }),
+            ),
+            (
+                "token variant",
+                serde_json::json!({ "kind": "erc20", "token": Address([0xab; 20]).to_string(), "decimals": 18 }),
+            ),
+        ] {
+            let mut value = snapshot(&wallet).value().clone();
+            value["asset"] = asset;
+            let error = decode(
+                &config(),
+                &wallet,
+                &TransactionSnapshot::new(SNAPSHOT_KIND, value),
+            )
+            .expect_err(case);
+
+            assert_eq!(error.kind, TransactionErrorKind::InvalidSnapshot, "{case}");
+            assert_eq!(
+                error.message,
+                "Ethereum snapshot does not belong to this wallet, network, or asset",
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn erc20_snapshots_reject_asset_mismatches() {
+        let wallet = Address([0x11; 20]);
+        let token = Address([0xab; 20]);
+        let mut config = config();
+        config.asset = AssetKind::Erc20(token.clone());
+        config.decimals = 6;
+        for (case, asset) in [
+            (
+                "token contract",
+                serde_json::json!({ "kind": "erc20", "token": Address([0xcd; 20]).to_string(), "decimals": 6 }),
+            ),
+            (
+                "token casing",
+                serde_json::json!({ "kind": "erc20", "token": format!("0x{}", "AB".repeat(20)), "decimals": 6 }),
+            ),
+            (
+                "decimals",
+                serde_json::json!({ "kind": "erc20", "token": token.to_string(), "decimals": 18 }),
+            ),
+            (
+                "native variant",
+                serde_json::json!({ "kind": "native", "ticker": "ETH", "decimals": 6 }),
+            ),
+        ] {
+            let mut value = snapshot(&wallet).value().clone();
+            value["asset"] = asset;
+            let error = decode(
+                &config,
+                &wallet,
+                &TransactionSnapshot::new(SNAPSHOT_KIND, value),
+            )
+            .expect_err(case);
+
+            assert_eq!(error.kind, TransactionErrorKind::InvalidSnapshot, "{case}");
+            assert_eq!(
+                error.message,
+                "Ethereum snapshot does not belong to this wallet, network, or asset",
+                "{case}"
+            );
+        }
     }
 
     #[test]

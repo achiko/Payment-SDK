@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 axum = "0.8"
+constant_time_eq = "=0.4.2"
 tokio = { workspace = true, features = ["net", "time"] }
 
 [dev-dependencies]

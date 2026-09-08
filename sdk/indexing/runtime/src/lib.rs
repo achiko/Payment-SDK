@@ -7,7 +7,7 @@
 
 use std::{error::Error, io, sync::Arc, time::Duration};
 
-use indexing::{FilterSource, Indexer, SyncPhase};
+use indexing::{FilterSource, Indexer, SyncPhase, SyncStatus};
 use tokio::sync::watch;
 
 pub type TaskError = Box<dyn Error + Send + Sync>;
@@ -25,6 +25,35 @@ pub enum SyncState {
     Ready,
     /// The last pass failed with a retryable error and will be attempted again.
     Retrying { error: String },
+}
+
+impl SyncState {
+    fn from_statuses(indexer: &dyn Indexer, statuses: &[SyncStatus]) -> Option<Self> {
+        let complete = !indexer.scopes().is_empty()
+            && statuses.len() == indexer.scopes().len()
+            && indexer.scopes().iter().all(|scope| {
+                statuses
+                    .iter()
+                    .filter(|status| status.scope == *scope)
+                    .count()
+                    == 1
+            });
+        if !complete
+            || statuses
+                .iter()
+                .any(|status| status.phase == SyncPhase::Ready && status.checkpoint.is_none())
+        {
+            return None;
+        }
+        if statuses
+            .iter()
+            .all(|status| status.phase == SyncPhase::Ready)
+        {
+            Some(Self::Ready)
+        } else {
+            Some(Self::CatchingUp)
+        }
+    }
 }
 
 /// Keeps the composed index current until shutdown or a terminal failure.
@@ -50,57 +79,24 @@ pub async fn run(
             }
         };
 
-        let wait = match result {
-            Ok(statuses) => {
-                let complete = !indexer.scopes().is_empty()
-                    && statuses.len() == indexer.scopes().len()
-                    && indexer.scopes().iter().all(|scope| {
-                        statuses
-                            .iter()
-                            .filter(|status| status.scope == *scope)
-                            .count()
-                            == 1
-                    });
-                if !complete
-                    || statuses.iter().any(|status| {
-                        status.phase == SyncPhase::Ready && status.checkpoint.is_none()
-                    })
-                {
-                    state.send_replace(SyncState::Retrying {
-                        error: "incomplete synchronization status".to_owned(),
-                    });
-                    return Err(io::Error::other(
-                        "indexer returned incomplete or inconsistent synchronization status",
-                    )
-                    .into());
-                }
-                let caught_up = statuses
-                    .iter()
-                    .all(|status| status.phase == SyncPhase::Ready);
-                let next = if caught_up {
-                    SyncState::Ready
-                } else {
-                    SyncState::CatchingUp
-                };
-                state.send_if_modified(|current| {
-                    let changed = *current != next;
-                    *current = next;
-                    changed
+        let result = result.map(|statuses| SyncState::from_statuses(indexer.as_ref(), &statuses));
+        let next = match result {
+            Ok(Some(next)) => next,
+            Ok(None) => {
+                state.send_replace(SyncState::Retrying {
+                    error: "incomplete synchronization status".to_owned(),
                 });
-                caught_up
+                return Err(io::Error::other(
+                    "indexer returned incomplete or inconsistent synchronization status",
+                )
+                .into());
             }
             Err(error) if error.retryable => {
                 // The reason must reach the caller: this loop will keep going
                 // forever, and silence here is indistinguishable from health.
-                let next = SyncState::Retrying {
+                SyncState::Retrying {
                     error: error.message.clone(),
-                };
-                state.send_if_modified(|current| {
-                    let changed = *current != next;
-                    *current = next;
-                    changed
-                });
-                true
+                }
             }
             Err(error) => {
                 state.send_replace(SyncState::Retrying {
@@ -109,6 +105,12 @@ pub async fn run(
                 return Err(error.into());
             }
         };
+        let wait = next != SyncState::CatchingUp;
+        state.send_if_modified(|current| {
+            let changed = *current != next;
+            *current = next;
+            changed
+        });
 
         if wait {
             tokio::select! {
@@ -184,20 +186,19 @@ mod tests {
         ) -> BoxFuture<'a, Result<Vec<SyncStatus>, IndexError>> {
             Box::pin(async move {
                 if self.pending {
-                    future::pending().await
-                } else {
-                    let call = self.calls.fetch_add(1, Ordering::Relaxed);
-                    if call == 1
-                        && let Some(gate) = &self.continue_after_first
-                    {
-                        gate.notified().await;
-                    }
-                    self.results
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .pop_front()
-                        .unwrap_or_else(|| Ok(vec![status(&self.scope, SyncPhase::Ready)]))
+                    return future::pending().await;
                 }
+                let call = self.calls.fetch_add(1, Ordering::Relaxed);
+                if call == 1
+                    && let Some(gate) = &self.continue_after_first
+                {
+                    gate.notified().await;
+                }
+                self.results
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pop_front()
+                    .unwrap_or_else(|| Ok(vec![status(&self.scope, SyncPhase::Ready)]))
             })
         }
     }
@@ -375,5 +376,86 @@ mod tests {
         .await
         .expect_err("missing persisted checkpoint");
         assert!(error.to_string().contains("incomplete or inconsistent"));
+    }
+
+    #[tokio::test]
+    async fn invalid_status_sets_always_publish_before_returning_the_contract_error() {
+        let scope = scope();
+        let ready = status(&scope, SyncPhase::Ready);
+        let foreign = IndexScope {
+            network: "unconfigured".to_owned(),
+            ..scope.clone()
+        };
+        for statuses in [
+            Vec::new(),
+            vec![status(&foreign, SyncPhase::Ready)],
+            vec![ready.clone(), ready.clone()],
+            vec![SyncStatus {
+                checkpoint: None,
+                ..ready
+            }],
+        ] {
+            let index = index([Ok(statuses)]);
+            let (_shutdown, shutdown_rx) = watch::channel(false);
+            let expected = SyncState::Retrying {
+                error: "incomplete synchronization status".to_owned(),
+            };
+            let (state, state_rx) = watch::channel(expected.clone());
+            let error = run(
+                index,
+                Arc::new(Vec::new()),
+                Duration::from_secs(60),
+                shutdown_rx,
+                state.clone(),
+            )
+            .await
+            .expect_err("invalid status must terminate the runtime");
+
+            assert_eq!(
+                error.to_string(),
+                "indexer returned incomplete or inconsistent synchronization status"
+            );
+            assert_eq!(*state_rx.borrow(), expected);
+            assert!(state_rx.has_changed().expect("sender remains open"));
+        }
+    }
+
+    #[tokio::test]
+    async fn unchanged_states_do_not_notify_and_shutdown_interrupts_the_retry_interval() {
+        for (result, expected) in [
+            (
+                Ok(vec![status(&scope(), SyncPhase::Ready)]),
+                SyncState::Ready,
+            ),
+            (
+                Err(IndexError::new(IndexErrorKind::Source, "offline", true)),
+                SyncState::Retrying {
+                    error: "offline".to_owned(),
+                },
+            ),
+        ] {
+            let index = index([result]);
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let (state, state_rx) = watch::channel(expected.clone());
+            let mut task = std::pin::pin!(run(
+                index.clone(),
+                Arc::new(Vec::new()),
+                Duration::from_secs(60),
+                shutdown_rx,
+                state,
+            ));
+            future::poll_fn(|context| {
+                assert!(std::future::Future::poll(task.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+
+            assert_eq!(index.calls.load(Ordering::Relaxed), 1);
+            assert_eq!(*state_rx.borrow(), expected);
+            assert!(!state_rx.has_changed().expect("runtime still owns sender"));
+            shutdown.send_replace(true);
+            task.await.expect("shutdown interrupts the interval");
+            assert_eq!(index.calls.load(Ordering::Relaxed), 1);
+        }
     }
 }

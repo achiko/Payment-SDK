@@ -61,17 +61,7 @@ impl Config {
             if !ids.insert(&wallet.id) {
                 return Err("configured wallet IDs must be unique".into());
             }
-            let configured = match wallet.asset {
-                WalletAsset::Btc => self.indexes.bitcoin.is_some(),
-                WalletAsset::Eth => self.indexes.ethereum.is_some(),
-                WalletAsset::Usdc => self
-                    .indexes
-                    .ethereum
-                    .as_ref()
-                    .is_some_and(|ethereum| ethereum.usdc.is_some()),
-                WalletAsset::Sol => self.indexes.solana.is_some(),
-            };
-            if !configured {
+            if !self.indexes.supports(wallet.asset) {
                 return Err("configured wallet references a disabled asset".into());
             }
         }
@@ -109,26 +99,26 @@ impl ConfiguredWallet {
     pub(crate) fn secret(&self) -> Result<wallets::SecretBytes, AnyError> {
         let encoded = env::var(&self.secret_env)
             .map_err(|_| "configured wallet secret environment variable is unavailable")?;
-        decode_secret(self.asset, &encoded)
+        self.decode_secret(&encoded)
     }
-}
 
-fn decode_secret(asset: WalletAsset, encoded: &str) -> Result<wallets::SecretBytes, AnyError> {
-    if asset == WalletAsset::Sol
-        && (encoded.len() != 64
-            || !encoded
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
-    {
-        return Err(
-            "Solana wallet seed must be exactly 64 lowercase hexadecimal characters".into(),
-        );
+    fn decode_secret(&self, encoded: &str) -> Result<wallets::SecretBytes, AnyError> {
+        if self.asset == WalletAsset::Sol
+            && (encoded.len() != 64
+                || !encoded
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        {
+            return Err(
+                "Solana wallet seed must be exactly 64 lowercase hexadecimal characters".into(),
+            );
+        }
+        let secret = hex::decode(encoded).map_err(|_| "wallet secret must be hexadecimal")?;
+        if secret.len() != 32 {
+            return Err("wallet secret must contain exactly 32 bytes".into());
+        }
+        Ok(wallets::SecretBytes::new(secret))
     }
-    let secret = hex::decode(encoded).map_err(|_| "wallet secret must be hexadecimal")?;
-    if secret.len() != 32 {
-        return Err("wallet secret must contain exactly 32 bytes".into());
-    }
-    Ok(wallets::SecretBytes::new(secret))
 }
 
 #[derive(Deserialize)]
@@ -143,6 +133,18 @@ pub(crate) struct IndexConfig {
 }
 
 impl IndexConfig {
+    fn supports(&self, asset: WalletAsset) -> bool {
+        match asset {
+            WalletAsset::Btc => self.bitcoin.is_some(),
+            WalletAsset::Eth => self.ethereum.is_some(),
+            WalletAsset::Usdc => self
+                .ethereum
+                .as_ref()
+                .is_some_and(|ethereum| ethereum.usdc.is_some()),
+            WalletAsset::Sol => self.solana.is_some(),
+        }
+    }
+
     pub(crate) fn interval(&self) -> Duration {
         let millis = self
             .bitcoin
@@ -271,12 +273,25 @@ impl EthereumConfig {
     pub(crate) fn limits(&self) -> Result<chain_ethereum::Limits, AnyError> {
         self.limits.build()
     }
+
+    pub(crate) async fn validate_usdc(
+        &self,
+        accounts: &chain_ethereum::HttpAccounts,
+        expected_decimals: u8,
+    ) -> Result<(), indexing::SourceError> {
+        if let Some(usdc) = &self.usdc {
+            accounts
+                .validate_token(&usdc.contract, expected_decimals)
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UsdcConfig {
-    #[serde(deserialize_with = "deserialize_contract")]
+    #[serde(deserialize_with = "UsdcConfig::deserialize_contract")]
     contract: chain_ethereum::Address,
 }
 
@@ -284,27 +299,27 @@ impl UsdcConfig {
     pub(crate) fn contract(&self) -> chain_ethereum::Address {
         self.contract.clone()
     }
-}
 
-fn deserialize_contract<'de, D>(deserializer: D) -> Result<chain_ethereum::Address, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let encoded = String::deserialize(deserializer)?;
-    let contract = encoded
-        .parse::<chain_ethereum::Address>()
-        .map_err(de::Error::custom)?;
-    if contract.to_string() != encoded {
-        return Err(de::Error::custom(
-            "USDC contract must use canonical lowercase encoding",
-        ));
+    fn deserialize_contract<'de, D>(deserializer: D) -> Result<chain_ethereum::Address, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        let contract = encoded
+            .parse::<chain_ethereum::Address>()
+            .map_err(de::Error::custom)?;
+        if contract.to_string() != encoded {
+            return Err(de::Error::custom(
+                "USDC contract must use canonical lowercase encoding",
+            ));
+        }
+        if contract.is_zero() {
+            return Err(de::Error::custom(
+                "USDC contract must not be the zero address",
+            ));
+        }
+        Ok(contract)
     }
-    if contract.is_zero() {
-        return Err(de::Error::custom(
-            "USDC contract must not be the zero address",
-        ));
-    }
-    Ok(contract)
 }
 
 #[derive(Deserialize)]
@@ -434,6 +449,135 @@ mod tests {
     const CONTRACT: &str = "0x1111111111111111111111111111111111111111";
 
     #[test]
+    fn defaulted_rpc_and_sync_fields_reach_ethereum_runtime_settings() {
+        let config = parse(ethereum(None), json!([])).expect("configuration JSON");
+        config.validate().expect("defaulted bounds");
+        let settings = config
+            .indexes
+            .ethereum
+            .as_ref()
+            .unwrap()
+            .settings()
+            .unwrap();
+        assert_eq!(settings.endpoints, ["http://127.0.0.1:8545"]);
+        assert!(settings.headers.is_empty());
+        assert_eq!(settings.request_timeout, Duration::from_secs(15));
+        assert_eq!(settings.max_response_bytes, 64 * 1024 * 1024);
+        assert_eq!(settings.batch_size, 100);
+        assert_eq!(config.indexes.interval(), Duration::from_millis(1_000));
+
+        let mut indexes = ethereum(None);
+        indexes["ethereum"]["rpc"] = json!({
+            "endpoints": ["http://127.0.0.1:9545", "http://127.0.0.1:8545"],
+            "headers": [["x-fixture", "first"], ["x-fixture", "second"]],
+            "timeout_seconds": 3,
+            "max_response_bytes": 8_192
+        });
+        indexes["ethereum"]["poll_millis"] = json!(17);
+        indexes["ethereum"]["batch_size"] = json!(7);
+        let config = parse(indexes, json!([])).expect("explicit configuration");
+        config.validate().expect("explicit bounds");
+        let settings = config
+            .indexes
+            .ethereum
+            .as_ref()
+            .unwrap()
+            .settings()
+            .unwrap();
+        assert_eq!(
+            settings.endpoints,
+            ["http://127.0.0.1:9545", "http://127.0.0.1:8545"]
+        );
+        assert_eq!(
+            settings.headers,
+            [
+                ("x-fixture".to_owned(), "first".to_owned()),
+                ("x-fixture".to_owned(), "second".to_owned())
+            ]
+        );
+        assert_eq!(settings.request_timeout, Duration::from_secs(3));
+        assert_eq!(settings.max_response_bytes, 8_192);
+        assert_eq!(settings.batch_size, 7);
+        assert_eq!(config.indexes.interval(), Duration::from_millis(17));
+    }
+
+    #[test]
+    fn plural_rpc_wire_contract_rejects_duplicate_unknown_and_null_fields() {
+        for (raw, expected) in [
+            (
+                r#"{"endpoints":["a"],"endpoints":["b"]}"#,
+                "duplicate field `endpoints`",
+            ),
+            (
+                r#"{"endpoints":["a"],"timeout_seconds":1,"timeout_seconds":2}"#,
+                "duplicate field `timeout_seconds`",
+            ),
+            (
+                r#"{"endpoints":["a"],"endpoint":"b"}"#,
+                "unknown field `endpoint`",
+            ),
+            (
+                r#"{"endpoints":["a"],"headers":null}"#,
+                "invalid type: null",
+            ),
+            (
+                r#"{"endpoints":["a"],"max_response_bytes":"8192"}"#,
+                "invalid type: string",
+            ),
+            (
+                r#"{"endpoints":["a"],"timeout_seconds":null}"#,
+                "invalid type: null",
+            ),
+        ] {
+            serde_json::from_str::<Value>(raw).expect("syntactically valid raw JSON");
+            let error = serde_json::from_str::<RpcConfig>(raw)
+                .err()
+                .expect("strict RPC schema");
+            assert!(error.to_string().starts_with(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn flattened_sync_rejects_raw_duplicate_keys_and_keeps_rpc_error_precedence() {
+        let indexes = ethereum(None);
+        let raw = serde_json::to_string(&indexes["ethereum"]).unwrap();
+        let prefix = raw.strip_suffix('}').unwrap();
+        for (field, first, second) in [("poll_millis", 1, 2), ("batch_size", 3, 4)] {
+            let raw = format!(r#"{prefix},"{field}":{first},"{field}":{second}}}"#);
+            serde_json::from_str::<Value>(&raw).expect("a Value alone would collapse duplicates");
+            let error = serde_json::from_str::<EthereumConfig>(&raw)
+                .err()
+                .expect("duplicate flattened field");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(&format!("duplicate field `{field}`")),
+                "{error}"
+            );
+        }
+
+        let mut config = parse(indexes, json!([])).expect("configuration JSON");
+        let ethereum = config.indexes.ethereum.as_mut().unwrap();
+        ethereum.rpc.timeout_seconds = 0;
+        ethereum.sync.batch_size = 0;
+        assert_eq!(
+            config.validate().unwrap_err().to_string(),
+            "invalid database or RPC configuration"
+        );
+        config
+            .indexes
+            .ethereum
+            .as_mut()
+            .unwrap()
+            .rpc
+            .timeout_seconds = 1;
+        assert_eq!(
+            config.validate().unwrap_err().to_string(),
+            "index confirmation, retention, polling, and batch values must be positive"
+        );
+    }
+
+    #[test]
     fn accepts_canonical_nonzero_usdc_contract() {
         let config = parse(ethereum(Some(CONTRACT)), json!([])).expect("configuration JSON");
         config.validate().expect("valid USDC configuration");
@@ -452,15 +596,22 @@ mod tests {
 
     #[test]
     fn rejects_malformed_noncanonical_and_zero_usdc_contracts() {
-        for contract in [
-            "0x1234",
-            "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "0x0000000000000000000000000000000000000000",
+        for (contract, expected) in [
+            ("0x1234", "Ethereum address must contain exactly 20 bytes"),
+            (
+                "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "USDC contract must use canonical lowercase encoding",
+            ),
+            (
+                "0x0000000000000000000000000000000000000000",
+                "USDC contract must not be the zero address",
+            ),
         ] {
-            assert!(
-                parse(ethereum(Some(contract)), json!([])).is_err(),
-                "contract {contract} must be rejected"
-            );
+            let error = match parse(ethereum(Some(contract)), json!([])) {
+                Ok(_) => panic!("invalid contract must be rejected"),
+                Err(error) => error,
+            };
+            assert_eq!(error.to_string(), expected);
         }
     }
 
@@ -480,6 +631,48 @@ mod tests {
             error.to_string(),
             "configured wallet references a disabled asset"
         );
+    }
+
+    #[test]
+    fn wallet_validation_preserves_field_duplicate_and_asset_error_precedence() {
+        let valid = json!({
+            "id": "treasury",
+            "asset": "eth",
+            "secret_env": "UNREAD_SECRET_ENVIRONMENT",
+            "start_position": 1
+        });
+        let disabled = json!({
+            "id": "treasury",
+            "asset": "usdc",
+            "secret_env": "UNREAD_SECRET_ENVIRONMENT",
+            "start_position": 1
+        });
+        let missing_secret = json!({
+            "id": "treasury",
+            "asset": "usdc",
+            "secret_env": " ",
+            "start_position": 1
+        });
+        for (wallets, expected) in [
+            (
+                json!([valid.clone(), missing_secret.clone()]),
+                "wallet ID and secret environment name must not be empty",
+            ),
+            (
+                json!([valid, disabled.clone()]),
+                "configured wallet IDs must be unique",
+            ),
+            (
+                json!([disabled, missing_secret]),
+                "configured wallet references a disabled asset",
+            ),
+        ] {
+            let error = parse(ethereum(None), wallets)
+                .expect("configuration JSON")
+                .validate()
+                .expect_err("first wallet violation must win");
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     #[test]
@@ -637,15 +830,56 @@ mod tests {
             "pg_catalog".to_owned(),
             "pg_private".to_owned(),
             "éclair".to_owned(),
+            "a,b".to_owned(),
+            "a b".to_owned(),
+            "a;".to_owned(),
+            "a\0".to_owned(),
             format!("a{}", "0".repeat(63)),
         ] {
             let mut value = base_solana_value();
             value["postgres"]["schema"] = json!(schema);
-            assert!(
-                parse_value(value).is_err(),
-                "schema {schema} must be rejected"
+            let error = parse_value(value).err().expect("schema must be rejected");
+            assert_eq!(
+                error.to_string(),
+                "PostgreSQL schema must be a canonical application identifier"
             );
         }
+    }
+
+    #[test]
+    fn postgres_validation_keeps_field_precedence_without_environment_reads() {
+        for (url_env, schema, max_connections, message) in [
+            (
+                " ",
+                "pg_catalog",
+                0,
+                "PostgreSQL URL environment name must not be empty",
+            ),
+            (
+                "NOT_AN_ENVIRONMENT=NAME",
+                "pg_catalog",
+                0,
+                "PostgreSQL schema must be a canonical application identifier",
+            ),
+            (
+                "NOT_AN_ENVIRONMENT=NAME",
+                "payment",
+                0,
+                "PostgreSQL maximum connections must be positive",
+            ),
+        ] {
+            let mut value = base_solana_value();
+            value["postgres"] =
+                json!({"url_env": url_env, "schema": schema, "max_connections": max_connections});
+            let error = parse_value(value).err().expect("invalid configuration");
+            assert_eq!(error.to_string(), message);
+        }
+        let mut value = base_solana_value();
+        value["postgres"]["url_env"] = json!("NOT_AN_ENVIRONMENT=NAME");
+        assert!(
+            parse_value(value).is_ok(),
+            "validation must not look up the environment"
+        );
     }
 
     #[test]
@@ -716,9 +950,16 @@ mod tests {
 
     #[test]
     fn solana_seed_decoder_accepts_only_exact_lowercase_hex_without_disclosure() {
+        let wallet = ConfiguredWallet {
+            id: "fixture".to_owned(),
+            asset: WalletAsset::Sol,
+            secret_env: "UNREAD_TEST_ENVIRONMENT".to_owned(),
+            start_position: 7,
+        };
         let accepted = "ab".repeat(32);
         assert_eq!(
-            decode_secret(WalletAsset::Sol, &accepted)
+            wallet
+                .decode_secret(&accepted)
                 .expect("canonical Solana seed")
                 .as_bytes(),
             &[0xab; 32]
@@ -732,11 +973,49 @@ mod tests {
             format!("{accepted}00"),
             "z1".repeat(32),
         ] {
-            let error = match decode_secret(WalletAsset::Sol, &rejected) {
+            let error = match wallet.decode_secret(&rejected) {
                 Ok(_) => panic!("alternate Solana seed encoding must fail"),
                 Err(error) => error,
             };
+            assert_eq!(
+                error.to_string(),
+                "Solana wallet seed must be exactly 64 lowercase hexadecimal characters"
+            );
             assert!(!error.to_string().contains(&rejected));
+        }
+    }
+
+    #[test]
+    fn other_assets_keep_hex_acceptance_and_error_precedence() {
+        for asset in [WalletAsset::Btc, WalletAsset::Eth, WalletAsset::Usdc] {
+            let wallet = ConfiguredWallet {
+                id: "fixture".to_owned(),
+                asset,
+                secret_env: "UNREAD_TEST_ENVIRONMENT".to_owned(),
+                start_position: 1,
+            };
+            let decoded = wallet
+                .decode_secret(&"AB".repeat(32))
+                .expect("uppercase hex remains accepted");
+            assert_eq!(decoded.as_bytes().len(), 32);
+            assert!(decoded.as_bytes().iter().all(|byte| *byte == 0xab));
+        }
+
+        let wallet = ConfiguredWallet {
+            id: "fixture".to_owned(),
+            asset: WalletAsset::Eth,
+            secret_env: "UNREAD_TEST_ENVIRONMENT".to_owned(),
+            start_position: 1,
+        };
+        for (encoded, expected) in [
+            ("not-hex", "wallet secret must be hexadecimal"),
+            ("ab", "wallet secret must contain exactly 32 bytes"),
+        ] {
+            let error = match wallet.decode_secret(encoded) {
+                Ok(_) => panic!("invalid secret encoding must be rejected"),
+                Err(error) => error,
+            };
+            assert_eq!(error.to_string(), expected);
         }
     }
 

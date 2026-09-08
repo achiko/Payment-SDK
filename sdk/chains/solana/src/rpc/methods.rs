@@ -60,14 +60,14 @@ pub struct Context<T> {
 }
 
 #[derive(Deserialize)]
-struct ContextWire<T> {
-    context: SlotWire,
-    value: T,
+pub(super) struct ContextWire<T> {
+    pub(super) context: SlotWire,
+    pub(super) value: T,
 }
 
 #[derive(Deserialize)]
-struct SlotWire {
-    slot: u64,
+pub(super) struct SlotWire {
+    pub(super) slot: u64,
 }
 
 #[derive(Deserialize)]
@@ -97,7 +97,8 @@ where
 
     pub async fn genesis_hash(&self) -> Result<GenesisHash, Error> {
         let text = self.request::<String>("getGenesisHash", json!([])).await?;
-        text.parse().map_err(|_| malformed("getGenesisHash"))
+        text.parse()
+            .map_err(|_| Error::malformed_rpc("getGenesisHash"))
     }
 
     pub async fn slot(&self, commitment: Commitment, minimum: Option<u64>) -> Result<u64, Error> {
@@ -106,7 +107,12 @@ where
             None => json!([{ "commitment": commitment.text() }]),
         };
         let slot = self.request::<u64>("getSlot", params).await?;
-        require_floor(slot, minimum)?;
+        if minimum.is_some_and(|floor| slot < floor) {
+            return Err(Error::new(
+                ErrorKind::BelowFloor,
+                "Solana RPC response is below its requested context floor",
+            ));
+        }
         Ok(slot)
     }
 
@@ -123,7 +129,7 @@ where
                 json!([address.to_string(), config]),
             )
             .await?;
-        require_floor(wire.context.slot, minimum)?;
+        wire.require_floor(minimum)?;
         Ok(Context {
             slot: wire.context.slot,
             value: wire.value.map(AccountSnapshot::try_from).transpose()?,
@@ -153,9 +159,9 @@ where
                 json!([texts, config]),
             )
             .await?;
-        require_floor(wire.context.slot, minimum)?;
+        wire.require_floor(minimum)?;
         if wire.value.len() != addresses.len() {
-            return Err(malformed("getMultipleAccounts"));
+            return Err(Error::malformed_rpc("getMultipleAccounts"));
         }
         let values = wire
             .value
@@ -182,7 +188,7 @@ where
         let wire = self
             .request::<ContextWire<u64>>("getBalance", params)
             .await?;
-        require_floor(wire.context.slot, minimum)?;
+        wire.require_floor(minimum)?;
         Ok(Context {
             slot: wire.context.slot,
             value: Lamport::from_atomic(wire.value),
@@ -197,15 +203,22 @@ impl TryFrom<AccountWire> for AccountSnapshot {
         let owner = wire
             .owner
             .parse::<Address>()
-            .map_err(|_| malformed("account"))?;
-        let tuple = wire.data.as_array().ok_or_else(|| malformed("account"))?;
+            .map_err(|_| Error::malformed_rpc("account"))?;
+        let tuple = wire
+            .data
+            .as_array()
+            .ok_or_else(|| Error::malformed_rpc("account"))?;
         if tuple.len() != 2 || tuple[1].as_str() != Some("base64") {
-            return Err(malformed("account"));
+            return Err(Error::malformed_rpc("account"));
         }
-        let encoded = tuple[0].as_str().ok_or_else(|| malformed("account"))?;
-        let data = STANDARD.decode(encoded).map_err(|_| malformed("account"))?;
+        let encoded = tuple[0]
+            .as_str()
+            .ok_or_else(|| Error::malformed_rpc("account"))?;
+        let data = STANDARD
+            .decode(encoded)
+            .map_err(|_| Error::malformed_rpc("account"))?;
         if STANDARD.encode(&data) != encoded || u64::try_from(data.len()) != Ok(wire.space) {
-            return Err(malformed("account"));
+            return Err(Error::malformed_rpc("account"));
         }
         Ok(AccountSnapshot::new(
             owner,
@@ -216,6 +229,7 @@ impl TryFrom<AccountWire> for AccountSnapshot {
     }
 }
 
+// design-lint: allow unclassified-free-function -- shared private account-read RPC encoding; independent of client state and commitment semantics
 fn account_config(commitment: Commitment, minimum: Option<u64>) -> serde_json::Value {
     match minimum {
         Some(floor) => {
@@ -225,21 +239,16 @@ fn account_config(commitment: Commitment, minimum: Option<u64>) -> serde_json::V
     }
 }
 
-fn require_floor(value: u64, floor: Option<u64>) -> Result<(), Error> {
-    if floor.is_some_and(|floor| value < floor) {
-        return Err(Error::new(
-            ErrorKind::BelowFloor,
-            "Solana RPC response is below its requested context floor",
-        ));
+impl<T> ContextWire<T> {
+    pub(super) fn require_floor(&self, floor: Option<u64>) -> Result<(), Error> {
+        if floor.is_some_and(|floor| self.context.slot < floor) {
+            return Err(Error::new(
+                ErrorKind::BelowFloor,
+                "Solana RPC response is below its requested context floor",
+            ));
+        }
+        Ok(())
     }
-    Ok(())
-}
-
-fn malformed(method: &str) -> Error {
-    Error::new(
-        ErrorKind::MalformedRpc,
-        format!("Solana RPC {method} returned malformed data"),
-    )
 }
 
 #[cfg(test)]
@@ -255,6 +264,41 @@ mod tests {
             "data":[data,"base64"],
             "space":space
         })
+    }
+
+    #[tokio::test]
+    async fn balance_context_floor_accepts_equal_maximum_and_optional_absence() {
+        let address = Address::from_bytes([7; 32]);
+        for (slot, minimum, accepted) in [
+            (0, None, true),
+            (0, Some(0), true),
+            (u64::MAX, Some(u64::MAX), true),
+            (u64::MAX - 1, Some(u64::MAX), false),
+        ] {
+            let mut config = json!({"commitment":"finalized"});
+            if let Some(floor) = minimum {
+                config["minContextSlot"] = json!(floor);
+            }
+            let rpc = Scripted::one(
+                "getBalance",
+                json!([address.to_string(), config]),
+                json!({"context":{"slot":slot},"value":u64::MAX}),
+            );
+            let result = Client::new(rpc.clone()).balance(&address, minimum).await;
+            if accepted {
+                let context = result.unwrap();
+                assert_eq!(context.slot, slot);
+                assert_eq!(context.value.atomic(), u64::MAX);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::BelowFloor);
+                assert_eq!(
+                    error.to_string(),
+                    "Solana RPC response is below its requested context floor"
+                );
+            }
+            rpc.assert_finished();
+        }
     }
 
     #[tokio::test]
@@ -411,6 +455,48 @@ mod tests {
                     .kind(),
                 ErrorKind::MalformedRpc
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn account_shape_and_cardinality_errors_follow_context_floor() {
+        let address = Address::from_bytes([7; 32]);
+        for (slot, value, kind, message) in [
+            (
+                3,
+                json!([]),
+                ErrorKind::BelowFloor,
+                "Solana RPC response is below its requested context floor",
+            ),
+            (
+                4,
+                json!([]),
+                ErrorKind::MalformedRpc,
+                "Solana RPC getMultipleAccounts returned malformed data",
+            ),
+            (
+                4,
+                json!([{"lamports":1,"owner":"bad","executable":false,"data":["","base64"],"space":0}]),
+                ErrorKind::MalformedRpc,
+                "Solana RPC account returned malformed data",
+            ),
+        ] {
+            let rpc = Scripted::one(
+                "getMultipleAccounts",
+                json!([[address.to_string()], {"encoding":"base64", "commitment":"confirmed", "minContextSlot":4}]),
+                json!({"context":{"slot":slot},"value":value}),
+            );
+            let error = Client::new(rpc.clone())
+                .accounts(
+                    std::slice::from_ref(&address),
+                    Commitment::Confirmed,
+                    Some(4),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), message);
+            rpc.assert_finished();
         }
     }
 }

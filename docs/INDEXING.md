@@ -260,6 +260,9 @@ For a fresh scope:
 The anchor gives the first interpreted block a verified parent without reading
 irrelevant history or manufacturing `B - 1`, which may be a skipped native
 position. At position `P`, only filters with `start_position <= P` are active.
+`SyncPlan` selects those addresses from its captured filters in their original
+order. Advancing its checkpoint preserves those filters; selecting addresses
+for a block does not reread `FilterSource`.
 A generated wallet starts at the checked successor of the current checkpoint
 position; if that position is skipped, it activates at the first later produced
 block. Existing history therefore remains complete without backfill.

@@ -3,6 +3,7 @@
 use indexing_runtime::SyncState;
 use tokio::sync::watch;
 
+// design-lint: allow unclassified-free-function -- application-owned async bridge projects synchronization watch updates into HTTP readiness and retry diagnostics under tracked task supervision
 /// Publishes readiness and reports why synchronization is retrying.
 ///
 /// A retryable failure repeats indefinitely, so without this the only signal
@@ -23,6 +24,36 @@ pub(crate) async fn publish(mut state: watch::Receiver<SyncState>, ready: watch:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn publishes_current_state_even_when_upstream_already_closed() {
+        let (state, state_rx) = watch::channel(SyncState::Ready);
+        let (ready, ready_rx) = watch::channel(false);
+        drop(state);
+
+        publish(state_rx, ready).await;
+
+        assert!(*ready_rx.borrow());
+        assert!(ready_rx.has_changed().is_err());
+    }
+
+    #[tokio::test]
+    async fn loss_of_readiness_consumers_does_not_end_the_upstream_bridge() {
+        let (state, state_rx) = watch::channel(SyncState::CatchingUp);
+        let (ready, ready_rx) = watch::channel(false);
+        drop(ready_rx);
+        let mut publisher = std::pin::pin!(publish(state_rx, ready));
+
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(publisher.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(state.receiver_count(), 1);
+
+        drop(state);
+        publisher.await;
+    }
 
     #[tokio::test]
     async fn publishes_catching_up_ready_retrying_and_closure() {

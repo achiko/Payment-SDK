@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     sync::{
         Arc,
@@ -50,6 +50,40 @@ impl ResolvedTransfer {
     pub const fn amount(&self) -> Lamport {
         self.amount
     }
+
+    fn destination(&self) -> Result<Address, SendError> {
+        let parsed = self.destination.parse::<Address>().map_err(|_| {
+            SendError::item(
+                self.index,
+                Vec::new(),
+                WalletError::new(
+                    WalletErrorKind::InvalidAddress,
+                    "invalid Solana destination",
+                ),
+            )
+        })?;
+        let destination = NativeDestination::try_from(parsed).map_err(|_| {
+            SendError::item(
+                self.index,
+                Vec::new(),
+                WalletError::new(
+                    WalletErrorKind::Unsupported,
+                    "unsupported Solana native destination",
+                ),
+            )
+        })?;
+        if destination.address() == &self.source {
+            return Err(SendError::item(
+                self.index,
+                Vec::new(),
+                WalletError::new(
+                    WalletErrorKind::AddressMismatch,
+                    "Solana source and destination must differ",
+                ),
+            ));
+        }
+        Ok(destination.address().clone())
+    }
 }
 
 #[derive(Clone, Default)]
@@ -78,9 +112,22 @@ impl Cancellation {
 
     pub(super) fn ensure(&self) -> Result<(), SendError> {
         if self.state.cancelled.load(Ordering::Acquire) {
-            return Err(operation("Solana account acquisition was cancelled"));
+            return Err(SendError::operation(
+                WalletErrorKind::Unavailable,
+                "Solana account acquisition was cancelled",
+            ));
         }
         Ok(())
+    }
+
+    async fn race_acquisition<T>(
+        &self,
+        future: impl Future<Output = Result<T, crate::Error>>,
+    ) -> Result<T, SendError> {
+        tokio::select! {
+            result = future => result.map_err(|_| SendError::operation(WalletErrorKind::Unavailable, "Solana account acquisition failed")),
+            () = self.cancelled() => Err(SendError::operation(WalletErrorKind::Unavailable, "Solana account acquisition was cancelled")),
+        }
     }
 }
 
@@ -164,26 +211,36 @@ where
         }
         let leases = self.sources.lease(items, items.len() > 1)?;
         cancellation.ensure()?;
-        let destinations = validate_destinations(items)?;
+        let destinations = items
+            .iter()
+            .map(ResolvedTransfer::destination)
+            .collect::<Result<Vec<_>, _>>()?;
         cancellation.ensure()?;
-        let query = stable_query(items, &destinations);
+        let mut seen = BTreeSet::new();
+        let query = items
+            .iter()
+            .zip(&destinations)
+            .flat_map(|(item, destination)| [&item.source, destination])
+            .filter(|address| seen.insert(*address))
+            .cloned()
+            .collect::<Vec<_>>();
 
-        raced(cancellation, self.rpc.health()).await?;
+        cancellation.race_acquisition(self.rpc.health()).await?;
         cancellation.ensure()?;
-        let opening = raced(cancellation, self.rpc.slot(RpcCommitment::Confirmed, None)).await?;
+        let opening = cancellation
+            .race_acquisition(self.rpc.slot(RpcCommitment::Confirmed, None))
+            .await?;
         cancellation.ensure()?;
-        let context = raced(
-            cancellation,
-            self.rpc
-                .accounts(&query, RpcCommitment::Confirmed, Some(opening)),
-        )
-        .await?;
+        let context = cancellation
+            .race_acquisition(
+                self.rpc
+                    .accounts(&query, RpcCommitment::Confirmed, Some(opening)),
+            )
+            .await?;
         cancellation.ensure()?;
-        let closing = raced(
-            cancellation,
-            self.rpc.slot(RpcCommitment::Confirmed, Some(context.slot)),
-        )
-        .await?;
+        let closing = cancellation
+            .race_acquisition(self.rpc.slot(RpcCommitment::Confirmed, Some(context.slot)))
+            .await?;
         cancellation.ensure()?;
 
         let observed = query
@@ -202,86 +259,49 @@ where
     }
 }
 
-fn validate_destinations(items: &[ResolvedTransfer]) -> Result<Vec<Address>, SendError> {
-    items
-        .iter()
-        .map(|item| {
-            let parsed = item.destination.parse::<Address>().map_err(|_| {
-                SendError::item(
-                    item.index,
-                    Vec::new(),
-                    WalletError::new(
-                        WalletErrorKind::InvalidAddress,
-                        "invalid Solana destination",
-                    ),
-                )
-            })?;
-            let destination = NativeDestination::try_from(parsed).map_err(|_| {
-                SendError::item(
-                    item.index,
-                    Vec::new(),
-                    WalletError::new(
-                        WalletErrorKind::Unsupported,
-                        "unsupported Solana native destination",
-                    ),
-                )
-            })?;
-            if destination.address() == &item.source {
-                return Err(SendError::item(
-                    item.index,
-                    Vec::new(),
-                    WalletError::new(
-                        WalletErrorKind::AddressMismatch,
-                        "Solana source and destination must differ",
-                    ),
-                ));
-            }
-            Ok(destination.address().clone())
-        })
-        .collect()
-}
-
-fn stable_query(items: &[ResolvedTransfer], destinations: &[Address]) -> Vec<Address> {
-    let mut seen = BTreeMap::<Address, usize>::new();
-    let mut query = Vec::new();
-    for (item, destination) in items.iter().zip(destinations) {
-        for address in [&item.source, destination] {
-            if !seen.contains_key(address) {
-                seen.insert(address.clone(), query.len());
-                query.push(address.clone());
-            }
-        }
-    }
-    query
-}
-
 fn classify(
     items: &[ResolvedTransfer],
     destinations: &[Address],
     observed: &BTreeMap<Address, Option<AccountSnapshot>>,
 ) -> Result<Vec<Lamport>, SendError> {
-    let system = Address::from_bytes([0; 32]);
     let mut balances = Vec::with_capacity(items.len());
     for (item, destination) in items.iter().zip(destinations) {
-        let source = observed
-            .get(&item.source)
-            .ok_or_else(|| operation("Solana source observation is missing"))?;
-        if source
+        let source = observed.get(&item.source).ok_or_else(|| {
+            SendError::operation(
+                WalletErrorKind::Unavailable,
+                "Solana source observation is missing",
+            )
+        })?;
+        if !source
             .as_ref()
-            .is_some_and(|account| !supported(account, &system))
+            .is_none_or(AccountSnapshot::supports_native_transfer)
         {
-            return Err(unsupported(item.index, "unsupported Solana source account"));
-        }
-        let destination = observed
-            .get(destination)
-            .ok_or_else(|| operation("Solana destination observation is missing"))?;
-        if destination
-            .as_ref()
-            .is_some_and(|account| !supported(account, &system))
-        {
-            return Err(unsupported(
+            return Err(SendError::item(
                 item.index,
-                "unsupported Solana destination account",
+                Vec::new(),
+                WalletError::new(
+                    WalletErrorKind::Unsupported,
+                    "unsupported Solana source account",
+                ),
+            ));
+        }
+        let destination = observed.get(destination).ok_or_else(|| {
+            SendError::operation(
+                WalletErrorKind::Unavailable,
+                "Solana destination observation is missing",
+            )
+        })?;
+        if !destination
+            .as_ref()
+            .is_none_or(AccountSnapshot::supports_native_transfer)
+        {
+            return Err(SendError::item(
+                item.index,
+                Vec::new(),
+                WalletError::new(
+                    WalletErrorKind::Unsupported,
+                    "unsupported Solana destination account",
+                ),
             ));
         }
         balances.push(
@@ -293,30 +313,12 @@ fn classify(
     Ok(balances)
 }
 
-fn supported(account: &AccountSnapshot, system: &Address) -> bool {
-    !account.executable() && account.owner() == system && account.data().is_empty()
-}
-
-pub(super) async fn raced<T>(
-    cancellation: &Cancellation,
-    future: impl Future<Output = Result<T, crate::Error>>,
-) -> Result<T, SendError> {
-    tokio::select! {
-        result = future => result.map_err(|_| operation("Solana account acquisition failed")),
-        () = cancellation.cancelled() => Err(operation("Solana account acquisition was cancelled")),
+impl AccountSnapshot {
+    fn supports_native_transfer(&self) -> bool {
+        !self.executable()
+            && self.owner() == &Address::from_bytes([0; 32])
+            && self.data().is_empty()
     }
-}
-
-fn unsupported(index: usize, message: &'static str) -> SendError {
-    SendError::item(
-        index,
-        Vec::new(),
-        WalletError::new(WalletErrorKind::Unsupported, message),
-    )
-}
-
-fn operation(message: &'static str) -> SendError {
-    SendError::operation(WalletErrorKind::Unavailable, message)
 }
 
 #[cfg(test)]
@@ -330,6 +332,45 @@ mod tests {
     use crate::rpc::test_support::Scripted;
 
     use super::*;
+
+    #[tokio::test]
+    async fn acquisition_failures_preserve_operation_scope_and_redacted_messages() {
+        let source = Address::from_bytes([1; 32]);
+        let destination = Address::from_bytes([2; 32]);
+        let items = [ResolvedTransfer::new(
+            0,
+            source.clone(),
+            destination.to_string(),
+            Lamport::from_atomic(1),
+        )];
+        let missing_source =
+            classify(&items, std::slice::from_ref(&destination), &BTreeMap::new()).unwrap_err();
+        let missing_destination =
+            classify(&items, &[destination], &BTreeMap::from([(source, None)])).unwrap_err();
+        let transport = Cancellation::default()
+            .race_acquisition::<()>(async {
+                Err(crate::Error::new(
+                    crate::ErrorKind::RpcTimeout,
+                    "provider secret",
+                ))
+            })
+            .await
+            .unwrap_err();
+        for (failure, message) in [
+            (missing_source, "Solana source observation is missing"),
+            (
+                missing_destination,
+                "Solana destination observation is missing",
+            ),
+            (transport, "Solana account acquisition failed"),
+        ] {
+            assert_eq!(failure.source.kind, WalletErrorKind::Unavailable);
+            assert_eq!(failure.to_string(), message);
+            assert_eq!(failure.failed_index, None);
+            assert!(failure.accepted.is_empty());
+            assert_eq!(failure.ambiguous_transaction_id, None);
+        }
+    }
 
     #[derive(Clone)]
     struct Blocking {
@@ -440,6 +481,7 @@ mod tests {
             transfer(0, &source, &destination),
             transfer(1, &other, &destination),
             transfer(2, &source, &other),
+            transfer(3, &destination, &source),
         ])
         .unwrap();
         let acquired = acquirer
@@ -449,7 +491,7 @@ mod tests {
         assert_eq!(acquired.floor(), 12);
         assert_eq!(
             acquired.destinations(),
-            &[destination.clone(), destination, other]
+            &[destination.clone(), destination, other, source.clone()]
         );
         assert_eq!(
             acquired
@@ -457,7 +499,7 @@ mod tests {
                 .iter()
                 .map(|value| value.atomic())
                 .collect::<Vec<_>>(),
-            [20, 30, 20]
+            [20, 30, 20, 0]
         );
         rpc.assert_finished();
         assert!(
@@ -479,9 +521,22 @@ mod tests {
         let rpc = Scripted::new([]);
         let sources = SourceCoordinator::default();
         let acquirer = Acquirer::new(RpcClient::new(rpc.clone()), sources.clone());
-        for (destination, kind) in [
-            ("bad".to_owned(), WalletErrorKind::InvalidAddress),
-            (source.to_string(), WalletErrorKind::AddressMismatch),
+        for (destination, kind, message) in [
+            (
+                "bad".to_owned(),
+                WalletErrorKind::InvalidAddress,
+                "invalid Solana destination",
+            ),
+            (
+                "2fnQrngrQT4SeLcdToJAD96phoEjNL2man2kfRLCASVk".to_owned(),
+                WalletErrorKind::Unsupported,
+                "unsupported Solana native destination",
+            ),
+            (
+                source.to_string(),
+                WalletErrorKind::AddressMismatch,
+                "Solana source and destination must differ",
+            ),
         ] {
             let failure = acquirer
                 .acquire(
@@ -499,6 +554,9 @@ mod tests {
                 .expect("destination rejection");
             assert_eq!(failure.failed_index, Some(0));
             assert_eq!(failure.source.kind, kind);
+            assert_eq!(failure.source.message, message);
+            assert!(failure.accepted.is_empty());
+            assert_eq!(failure.ambiguous_transaction_id, None);
             assert!(
                 sources
                     .lease(&[transfer(0, &source, &address(8))], false)
@@ -595,6 +653,12 @@ mod tests {
             .expect("cancelled acquisition");
         assert_eq!(failure.failed_index, None);
         assert_eq!(failure.source.kind, WalletErrorKind::Unavailable);
+        assert_eq!(
+            failure.to_string(),
+            "Solana account acquisition was cancelled"
+        );
+        assert!(failure.accepted.is_empty());
+        assert_eq!(failure.ambiguous_transaction_id, None);
         assert!(
             sources
                 .lease(&[transfer(0, &source, &destination)], false)
@@ -602,34 +666,74 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stable_query_preserves_first_appearance_through_public_maximum() {
+    #[tokio::test]
+    async fn acquisition_preserves_first_appearance_through_public_maximum() {
         let mut items = Vec::new();
-        let mut destinations = Vec::new();
+        let mut expected = Vec::new();
         for index in 0..wallets::MAX_TRANSFERS {
             let source = address(u8::try_from(index + 1).unwrap());
             let destination = address(u8::try_from(index + 101).unwrap());
             items.push(transfer(index, &source, &destination));
-            destinations.push(destination);
+            expected.push(source.to_string());
+            expected.push(destination.to_string());
         }
-        let query = stable_query(&items, &destinations);
-        assert_eq!(query.len(), 100);
-        for (index, item) in items.iter().enumerate() {
-            assert_eq!(&query[index * 2], item.source());
-            assert_eq!(&query[index * 2 + 1], &destinations[index]);
-        }
-
-        let duplicate = stable_query(
-            &[
-                transfer(0, items[0].source(), &destinations[0]),
-                transfer(1, items[0].source(), &destinations[0]),
-            ],
-            &[destinations[0].clone(), destinations[0].clone()],
-        );
+        assert_eq!(expected.len(), 100);
+        let rpc = Scripted::new([
+            ("getHealth", json!([]), json!("ok")),
+            ("getSlot", json!([{"commitment":"confirmed"}]), json!(10)),
+            (
+                "getMultipleAccounts",
+                json!([expected, {"encoding":"base64","commitment":"confirmed","minContextSlot":10}]),
+                json!({"context":{"slot":11},"value":vec![serde_json::Value::Null;100]}),
+            ),
+            (
+                "getSlot",
+                json!([{"commitment":"confirmed","minContextSlot":11}]),
+                json!(12),
+            ),
+        ]);
+        let acquired = Acquirer::new(RpcClient::new(rpc.clone()), SourceCoordinator::default())
+            .acquire(Batch::new(items).unwrap(), &Cancellation::default())
+            .await
+            .expect("one complete maximum-size query");
+        assert_eq!(acquired.floor(), 12);
         assert_eq!(
-            duplicate,
-            [items[0].source().clone(), destinations[0].clone()]
+            acquired.balances(),
+            vec![Lamport::ZERO; wallets::MAX_TRANSFERS]
         );
+        rpc.assert_finished();
+    }
+
+    #[test]
+    fn classification_preserves_earliest_occurrence_and_source_before_destination_errors() {
+        let source = address(7);
+        let destination = address(8);
+        let other = address(9);
+        let items = [
+            transfer(0, &source, &destination),
+            transfer(1, &destination, &other),
+        ];
+        let unsupported = AccountSnapshot::new(other.clone(), Lamport::ZERO, false, Vec::new());
+        for (first_source, message) in [
+            (None, "unsupported Solana destination account"),
+            (
+                Some(unsupported.clone()),
+                "unsupported Solana source account",
+            ),
+        ] {
+            let observed = BTreeMap::from([
+                (source.clone(), first_source),
+                (destination.clone(), Some(unsupported.clone())),
+                (other.clone(), Some(unsupported.clone())),
+            ]);
+            let failure =
+                classify(&items, &[destination.clone(), other.clone()], &observed).unwrap_err();
+            assert_eq!(failure.failed_index, Some(0));
+            assert_eq!(failure.source.kind, WalletErrorKind::Unsupported);
+            assert_eq!(failure.source.message, message);
+            assert!(failure.accepted.is_empty());
+            assert_eq!(failure.ambiguous_transaction_id, None);
+        }
     }
 
     #[test]
@@ -656,11 +760,11 @@ mod tests {
                     &observed,
                 );
                 assert_eq!(result.is_err(), failed);
-                if !failed {
-                    let balances = result.unwrap();
-                    let expected = if failing_address == &source { 1 } else { 0 };
-                    assert_eq!(balances[0].atomic(), expected);
-                }
+                let Ok(balances) = result else {
+                    continue;
+                };
+                let expected = u64::from(failing_address == &source);
+                assert_eq!(balances[0].atomic(), expected);
             }
         }
     }
@@ -695,6 +799,12 @@ mod tests {
             cancellation.cancel();
             let failure = task.await.unwrap().err().expect("cancelled RPC await");
             assert_eq!(failure.failed_index, None);
+            assert_eq!(
+                failure.to_string(),
+                "Solana account acquisition was cancelled"
+            );
+            assert!(failure.accepted.is_empty());
+            assert_eq!(failure.ambiguous_transaction_id, None);
             assert_eq!(calls.load(Ordering::SeqCst), block_at + 1);
             assert!(
                 sources

@@ -34,6 +34,14 @@ impl IndexError {
             retryable,
         }
     }
+
+    pub(crate) fn cannot_connect(message: impl Into<String>) -> Self {
+        Self::new(IndexErrorKind::CannotConnect, message, true)
+    }
+
+    pub(crate) fn retryable_conflict(message: impl Into<String>) -> Self {
+        Self::new(IndexErrorKind::Conflict, message, true)
+    }
 }
 
 impl From<SourceError> for IndexError {

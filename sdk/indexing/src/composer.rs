@@ -48,6 +48,21 @@ impl Composer {
                 )
             })
     }
+
+    fn validate_selection(&self, selection: &dyn crate::FilterSource) -> Result<(), IndexError> {
+        let mut addresses = BTreeSet::new();
+        for filter in &selection.filters()? {
+            self.indexer(&filter.address.scope)?;
+            if filter.address.value.is_empty() || !addresses.insert(filter.address.clone()) {
+                return Err(IndexError::new(
+                    IndexErrorKind::InvalidRequest,
+                    "address filters must be non-empty and unique",
+                    false,
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Checkpoint for Composer {
@@ -84,17 +99,7 @@ impl Indexer for Composer {
         selection: &'a dyn crate::FilterSource,
     ) -> BoxFuture<'a, Result<Vec<SyncStatus>, IndexError>> {
         Box::pin(async move {
-            let mut addresses = BTreeSet::new();
-            for filter in &selection.filters()? {
-                self.indexer(&filter.address.scope)?;
-                if filter.address.value.is_empty() || !addresses.insert(filter.address.clone()) {
-                    return Err(IndexError::new(
-                        IndexErrorKind::InvalidRequest,
-                        "address filters must be non-empty and unique",
-                        false,
-                    ));
-                }
-            }
+            self.validate_selection(selection)?;
             let mut statuses = Vec::with_capacity(self.indexers.len());
             for indexer in &self.indexers {
                 // Narrowing happens per read rather than once over a snapshot,

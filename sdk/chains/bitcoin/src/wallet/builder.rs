@@ -4,7 +4,7 @@ use base::{
     TransactionSnapshot,
 };
 
-use super::provider::{PREPARED_KIND, SNAPSHOT_KIND, Wallet, network_name, transaction_error};
+use super::provider::{PREPARED_KIND, SNAPSHOT_KIND, Wallet};
 use crate::{Address, BuildRequest, Output, SpendSource, TransactionBuilder, TransactionId};
 
 pub(super) struct Builder {
@@ -47,14 +47,15 @@ impl Builder {
     }
 
     fn validate(&self) -> Result<(), TransactionError> {
-        if self.scope.chain.0 != "bitcoin" || self.scope.network != network_name(self.network) {
-            return Err(transaction_error(
+        if self.scope.chain.0 != "bitcoin" || self.scope.network != self.network.canonical_name() {
+            return Err(TransactionError::new(
                 TransactionErrorKind::InvalidSnapshot,
                 "Bitcoin transaction identity, chain, and network do not agree",
             ));
         }
-        Address::parse_for_network(self.source.encoded(), self.network)
-            .map_err(|error| transaction_error(TransactionErrorKind::InvalidSnapshot, error))?;
+        Address::parse_for_network(self.source.encoded(), self.network).map_err(|error| {
+            TransactionError::new(TransactionErrorKind::InvalidSnapshot, error.to_string())
+        })?;
         Ok(())
     }
 }
@@ -66,15 +67,17 @@ impl BaseBuilder for Builder {
         amount: Decimal,
     ) -> Result<(), TransactionError> {
         let value = std::str::from_utf8(destination.as_bytes()).map_err(|_| {
-            transaction_error(
+            TransactionError::new(
                 TransactionErrorKind::InvalidAddress,
                 "Bitcoin address is not UTF-8",
             )
         })?;
-        let address = Address::parse_for_network(value, self.network)
-            .map_err(|error| transaction_error(TransactionErrorKind::InvalidAddress, error))?;
-        crate::Satoshi::from_decimal(&amount)
-            .map_err(|error| transaction_error(TransactionErrorKind::InvalidAmount, error))?;
+        let address = Address::parse_for_network(value, self.network).map_err(|error| {
+            TransactionError::new(TransactionErrorKind::InvalidAddress, error.to_string())
+        })?;
+        crate::Satoshi::from_decimal(&amount).map_err(|error| {
+            TransactionError::new(TransactionErrorKind::InvalidAmount, error.to_string())
+        })?;
         self.recipients.push((address, amount));
         Ok(())
     }
@@ -82,7 +85,7 @@ impl BaseBuilder for Builder {
     fn snapshot(&self) -> Result<TransactionSnapshot, TransactionError> {
         self.validate()?;
         if self.recipients.is_empty() {
-            return Err(transaction_error(
+            return Err(TransactionError::new(
                 TransactionErrorKind::InvalidTransaction,
                 "transaction has no recipients",
             ));
@@ -122,7 +125,7 @@ impl BaseBuilder for Builder {
         Box::pin(async move {
             self.validate()?;
             if self.recipients.is_empty() {
-                return Err(transaction_error(
+                return Err(TransactionError::new(
                     TransactionErrorKind::InvalidTransaction,
                     "transaction has no recipients",
                 ));
@@ -131,7 +134,9 @@ impl BaseBuilder for Builder {
                 .utxos
                 .utxos(vec![self.source.clone()])
                 .await
-                .map_err(|error| transaction_error(TransactionErrorKind::Unavailable, error))?;
+                .map_err(|error| {
+                    TransactionError::new(TransactionErrorKind::Unavailable, error.to_string())
+                })?;
             let available = set
                 .outputs
                 .into_iter()
@@ -144,28 +149,32 @@ impl BaseBuilder for Builder {
                         output.value,
                         output.script_pubkey,
                     )
-                    .map_err(|error| {
-                        transaction_error(TransactionErrorKind::InvalidTransaction, error)
-                    })
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    TransactionError::new(
+                        TransactionErrorKind::InvalidTransaction,
+                        error.to_string(),
+                    )
+                })?;
             let recipients = self
                 .recipients
                 .iter()
                 .cloned()
-                .map(|(address, amount)| {
-                    Output::new(address, amount).map_err(|error| {
-                        transaction_error(TransactionErrorKind::InvalidAmount, error)
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+                .map(|(address, amount)| Output::new(address, amount))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    TransactionError::new(TransactionErrorKind::InvalidAmount, error.to_string())
+                })?;
             let fee_rate = self
                 .fees
                 .estimate(self.fee_target_blocks)
                 .await
-                .map_err(|error| transaction_error(TransactionErrorKind::Unavailable, error))?;
+                .map_err(|error| {
+                    TransactionError::new(TransactionErrorKind::Unavailable, error.to_string())
+                })?;
             if fee_rate > self.max_fee_rate {
-                return Err(transaction_error(
+                return Err(TransactionError::new(
                     TransactionErrorKind::Fee,
                     "estimated Bitcoin fee rate exceeds the configured maximum",
                 ));
@@ -180,7 +189,9 @@ impl BaseBuilder for Builder {
             let signed = TransactionBuilder::new(self.network, request)
                 .sign(self.signer.as_ref())
                 .await
-                .map_err(|error| transaction_error(TransactionErrorKind::Signing, error))?;
+                .map_err(|error| {
+                    TransactionError::new(TransactionErrorKind::Signing, error.to_string())
+                })?;
             Ok(base::SignedTransaction::new(
                 PREPARED_KIND,
                 BaseTransactionId::new(signed.id().to_string()),

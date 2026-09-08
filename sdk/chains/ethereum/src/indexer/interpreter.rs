@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, sync::LazyLock};
 
-use alloy_primitives::U256;
+use alloy_primitives::{U256, hex};
 use base::Decimal;
 use indexing::{
     AssetId, BlockInterpreter as IndexBlockInterpreter, CanonicalAddress, ChainId, IndexError,
@@ -11,7 +11,7 @@ use num_bigint::BigUint;
 
 use super::{
     Block,
-    model::{ParsedBlock, ParsedLog, ParsedReceipt, ParsedTransaction, encode_hex},
+    model::{ParseError, ParsedBlock, ParsedLog, ParsedReceipt, ParsedTransaction},
 };
 
 const TRANSFER_TOPIC: [u8; 32] = [
@@ -37,7 +37,7 @@ impl Movements {
         receipt: &ParsedReceipt,
         scope: &IndexScope,
     ) -> Result<Self, IndexError> {
-        let transaction_id = encode_hex(&transaction.hash);
+        let transaction_id = hex::encode_prefixed(transaction.hash);
         let mut movements = Self::new();
         if !transaction.value.is_zero() {
             let to = transaction.to.or(receipt.contract_address).ok_or_else(|| {
@@ -88,7 +88,7 @@ impl ParsedLog {
         let id = MovementId(format!("{transaction_id}:{}", self.log_index));
         let asset = AssetId {
             chain: (*CHAIN_ID).clone(),
-            asset: encode_hex(&self.address),
+            asset: hex::encode_prefixed(self.address),
         };
         if from == ZERO_ADDRESS {
             (to != ZERO_ADDRESS).then(|| ValueMovement::Mint {
@@ -191,7 +191,7 @@ impl IndexBlockInterpreter for BlockInterpreter {
         addresses: &[CanonicalAddress],
     ) -> Result<InterpretedBlock, IndexError> {
         let parsed = ParsedBlock::parse(&block.raw_block, Some(block.reference.height), true)
-            .map_err(invalid_block)?;
+            .map_err(ParseError::into_invalid_block)?;
         if parsed.reference != block.reference {
             return Err(IndexError::new(
                 IndexErrorKind::InvalidBlock,
@@ -199,8 +199,8 @@ impl IndexBlockInterpreter for BlockInterpreter {
                 false,
             ));
         }
-        let receipts =
-            ParsedReceipt::parse_all(&block.raw_receipts, &parsed).map_err(invalid_block)?;
+        let receipts = ParsedReceipt::parse_all(&block.raw_receipts, &parsed)
+            .map_err(ParseError::into_invalid_block)?;
         let mut transactions = Vec::new();
         for (transaction, receipt) in parsed.transactions.iter().zip(&receipts) {
             let fee_amount = receipt
@@ -251,6 +251,7 @@ impl IndexBlockInterpreter for BlockInterpreter {
     }
 }
 
+// design-lint: allow unclassified-free-function -- Ethereum indexing adapter validates foreign canonical-address chain identity and preserves Alloy address syntax with contextual IndexError
 fn parse_canonical_address(address: &CanonicalAddress) -> Result<[u8; 20], IndexError> {
     if address.scope.chain != *CHAIN_ID {
         return Err(IndexError::new(
@@ -272,6 +273,7 @@ fn parse_canonical_address(address: &CanonicalAddress) -> Result<[u8; 20], Index
         })
 }
 
+// design-lint: allow unclassified-free-function -- lossless Ethereum indexer boundary conversion from Alloy U256 to shared scale-zero Decimal for native amounts, token units, and fees
 fn atomic_decimal(value: U256) -> Decimal {
     Decimal::from_atomic(BigUint::from_bytes_be(&value.to_be_bytes::<32>()), 0)
 }
@@ -288,7 +290,7 @@ impl Canonicalize for [u8; 20] {
     fn canonical(self, scope: &IndexScope) -> Self::Output {
         CanonicalAddress {
             scope: scope.clone(),
-            value: encode_hex(&self),
+            value: hex::encode_prefixed(self),
         }
     }
 }
@@ -299,13 +301,15 @@ impl Canonicalize for [u8; 32] {
     fn canonical(self, scope: &IndexScope) -> Self::Output {
         TransactionRef {
             scope: scope.clone(),
-            value: encode_hex(&self),
+            value: hex::encode_prefixed(self),
         }
     }
 }
 
-fn invalid_block(error: impl ToString) -> IndexError {
-    IndexError::new(IndexErrorKind::InvalidBlock, error.to_string(), false)
+impl ParseError {
+    fn into_invalid_block(self) -> IndexError {
+        IndexError::new(IndexErrorKind::InvalidBlock, self.to_string(), false)
+    }
 }
 
 #[cfg(test)]

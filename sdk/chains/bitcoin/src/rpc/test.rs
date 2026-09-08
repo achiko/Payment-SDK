@@ -1,5 +1,5 @@
+use super::transport::Client as Transport;
 use super::*;
-use super::{transport::Client as Transport, wire::fee_rate_json};
 use crate::{FeeRate, Network, Satoshi, SignedTransaction, TransactionId};
 use bitcoin::{
     Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, absolute,
@@ -255,8 +255,13 @@ fn preflight_preserves_rejection_reason_and_exact_fee() {
 
 #[test]
 fn core_max_fee_rate_boundary_is_enforced_before_rpc() {
-    assert!(fee_rate_json(FeeRate::new(BITCOIN_CORE_MAX_FEE_RATE_SATOSHIS_PER_KVB,)).is_ok());
-    let error = fee_rate_json(FeeRate::new(BITCOIN_CORE_MAX_FEE_RATE_SATOSHIS_PER_KVB + 1))
+    assert!(
+        FeeRate::new(BITCOIN_CORE_MAX_FEE_RATE_SATOSHIS_PER_KVB)
+            .core_maximum_json()
+            .is_ok()
+    );
+    let error = FeeRate::new(BITCOIN_CORE_MAX_FEE_RATE_SATOSHIS_PER_KVB + 1)
+        .core_maximum_json()
         .expect_err("fee rates above Core's limit must fail locally");
     assert!(!error.retryable);
 }
@@ -296,6 +301,10 @@ fn broadcast_remote_rejection_is_definite_and_has_no_ambiguity() {
         .expect_err("a remote Bitcoin rejection must fail definitively");
 
     assert_eq!(error.kind, base::TransactionErrorKind::Rejected);
+    assert_eq!(
+        error.message,
+        "Bitcoin JSON-RPC request failed with code -26"
+    );
     assert_eq!(error.ambiguous_transaction_id, None);
 }
 
@@ -357,4 +366,141 @@ fn broadcast_fee_rejection_happens_before_wire_and_has_no_ambiguity() {
 
     assert_eq!(error.kind, base::TransactionErrorKind::Fee);
     assert_eq!(error.ambiguous_transaction_id, None);
+}
+
+#[test]
+fn core_maximum_fee_json_preserves_exact_satoshis_and_validation() {
+    for (satoshis, expected) in [
+        (1, "0.00000001"),
+        (1_000, "0.00001"),
+        (1_001, "0.00001001"),
+        (99_999_999, "0.99999999"),
+        (100_000_000, "1"),
+    ] {
+        let encoded = FeeRate::new(satoshis).core_maximum_json().unwrap();
+        assert_eq!(encoded.to_string(), expected);
+        assert_eq!(
+            Satoshi::from_rpc_json(&Value::Number(encoded), "maximum fee")
+                .unwrap()
+                .0,
+            satoshis
+        );
+    }
+    for (satoshis, message) in [
+        (0, "Bitcoin maximum fee rate must be greater than zero"),
+        (
+            100_000_001,
+            "Bitcoin maximum fee rate exceeds Bitcoin Core's 1 BTC/kvB limit",
+        ),
+        (
+            u64::MAX,
+            "Bitcoin maximum fee rate exceeds Bitcoin Core's 1 BTC/kvB limit",
+        ),
+    ] {
+        let error = FeeRate::new(satoshis).core_maximum_json().unwrap_err();
+        assert_eq!(error.message, message);
+        assert!(!error.retryable);
+    }
+}
+
+#[test]
+fn block_hash_format_uses_bitcoin_display_byte_order() {
+    let internal = indexing::BlockHash((0_u8..32).collect());
+    let displayed = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100";
+    assert_eq!(format_bitcoin_block_hash(&internal).unwrap(), displayed);
+    assert_eq!(parse_bitcoin_block_hash(displayed).unwrap(), internal);
+    assert_eq!(
+        parse_bitcoin_block_hash(&displayed.to_uppercase()).unwrap(),
+        internal
+    );
+}
+
+#[test]
+fn block_hash_format_rejects_non_native_lengths() {
+    for length in [0, 1, 31, 33, 64] {
+        let error = format_bitcoin_block_hash(&indexing::BlockHash(vec![0; length])).unwrap_err();
+        assert_eq!(error.message, "Bitcoin block hash must be 32 bytes");
+        assert!(!error.retryable);
+    }
+}
+
+#[test]
+fn rpc_amount_json_keeps_exact_precision_and_range() {
+    for (json, expected) in [
+        ("0", 0),
+        ("0.00000001", 1),
+        ("1.23000000", 123_000_000),
+        ("184467440737.09551615", u64::MAX),
+    ] {
+        let value = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            Satoshi::from_rpc_json(&value, "amount").unwrap(),
+            Satoshi(expected)
+        );
+    }
+}
+
+#[test]
+fn rpc_amount_json_keeps_rejection_context_and_retryability() {
+    for (json, suffix) in [
+        ("null", "must be a JSON number"),
+        ("\"1\"", "must be a JSON number"),
+        ("true", "must be a JSON number"),
+        ("{}", "must be a JSON number"),
+        ("[]", "must be a JSON number"),
+        ("-1", "must be a non-negative fixed-point decimal"),
+        ("1e0", "must be a non-negative fixed-point decimal"),
+        ("1E2", "must be a non-negative fixed-point decimal"),
+        ("0.000000001", "is not an exact Bitcoin amount"),
+        ("1.000000000", "is not an exact Bitcoin amount"),
+        ("184467440737.09551616", "exceeds u64 satoshis"),
+        ("184467440738", "exceeds u64 satoshis"),
+        ("18446744073709551616", "exceeds u64 satoshis"),
+    ] {
+        let value = serde_json::from_str(json).unwrap();
+        let error = Satoshi::from_rpc_json(&value, "amount").unwrap_err();
+        assert_eq!(error.to_string(), format!("amount {suffix}"), "{json}");
+        assert!(error.retryable);
+    }
+}
+
+#[test]
+fn block_hash_parse_rejects_invalid_text_as_retryable_rpc_data() {
+    for value in [
+        String::new(),
+        "00".repeat(31),
+        "00".repeat(33),
+        "gg".repeat(32),
+        format!("0x{}", "00".repeat(32)),
+        format!(" {}", "00".repeat(32)),
+    ] {
+        let error = parse_bitcoin_block_hash(&value).unwrap_err();
+        assert_eq!(error.message, "Bitcoin RPC returned an invalid block hash");
+        assert!(error.retryable);
+    }
+}
+
+#[test]
+fn object_parser_keeps_json_values_and_contextual_shape_errors() {
+    let value: Value = serde_json::from_str(
+        r#"{"exact":18446744073709551616,"nested":{"values":[null,true,"text"]}}"#,
+    )
+    .unwrap();
+    let raw = RawJson::from_serializable(&value).unwrap();
+    assert_eq!(
+        wire::parse_object(&raw, "result").unwrap(),
+        *value.as_object().unwrap()
+    );
+    for value in [
+        Value::Null,
+        serde_json::json!(false),
+        serde_json::json!(1),
+        serde_json::json!("text"),
+        serde_json::json!([]),
+    ] {
+        let raw = RawJson::from_serializable(&value).unwrap();
+        let error = wire::parse_object(&raw, "Bitcoin boundary result").unwrap_err();
+        assert_eq!(error.message, "Bitcoin boundary result must be an object");
+        assert!(error.retryable);
+    }
 }

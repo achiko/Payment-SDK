@@ -1,10 +1,11 @@
 use std::{fmt, time::Duration};
 
+use indexing::SourceError;
 use json_rpc::Retry;
 
 use crate::Wei;
 
-use super::error::BuildError;
+use super::{error::BuildError, wire::invalid_rpc_response};
 
 const BASIS_POINTS_DENOMINATOR: u64 = 10_000;
 
@@ -65,6 +66,20 @@ impl Limits {
             max_fee_per_gas,
             max_priority_fee_per_gas,
             max_total_fee,
+        })
+    }
+
+    pub(super) fn gas_limit_with_margin(&self, estimated: u64) -> Result<u64, SourceError> {
+        let numerator = u128::from(estimated)
+            .checked_mul(u128::from(self.gas_limit_margin_basis_points))
+            .ok_or_else(|| invalid_rpc_response("eth_estimateGas", "gas margin overflowed"))?;
+        let margin = numerator
+            .checked_add(u128::from(BASIS_POINTS_DENOMINATOR - 1))
+            .map(|value| value / u128::from(BASIS_POINTS_DENOMINATOR))
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or_else(|| invalid_rpc_response("eth_estimateGas", "gas margin exceeds u64"))?;
+        estimated.checked_add(margin).ok_or_else(|| {
+            invalid_rpc_response("eth_estimateGas", "gas limit with margin exceeds u64")
         })
     }
 
@@ -224,6 +239,33 @@ mod tests {
             Wei::from_u128(1_000_000_000_000_000_000),
         )
         .expect("test limits must be valid")
+    }
+
+    #[test]
+    fn configured_gas_margin_rounds_up_without_losing_large_values() {
+        for (basis_points, estimated, expected) in [
+            (0, u64::MAX, u64::MAX),
+            (1, 1, 2),
+            (2_000, 21_000, 25_200),
+            (2_000, 21_001, 25_202),
+            (10_000, u64::MAX / 2, u64::MAX - 1),
+        ] {
+            let mut limits = limits();
+            limits.gas_limit_margin_basis_points = basis_points;
+            assert_eq!(limits.gas_limit_with_margin(estimated).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn gas_margin_overflow_remains_a_terminal_rpc_response_error() {
+        let error = limits()
+            .gas_limit_with_margin(u64::MAX)
+            .expect_err("adding the configured margin must not wrap");
+        assert!(!error.retryable);
+        assert_eq!(
+            error.message,
+            "Ethereum RPC eth_estimateGas returned an invalid response: gas limit with margin exceeds u64"
+        );
     }
 
     #[test]

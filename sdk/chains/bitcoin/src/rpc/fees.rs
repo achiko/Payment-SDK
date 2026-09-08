@@ -1,13 +1,8 @@
 use indexing::SourceError;
 
-use crate::FeeRate;
+use crate::{FeeRate, Satoshi};
 
-use super::{
-    Client,
-    error::source_error,
-    transport::Client as Transport,
-    wire::{parse_btc_amount, parse_object},
-};
+use super::{Client, error::source_error, transport::Client as Transport, wire::parse_object};
 
 impl<C> Client<C>
 where
@@ -30,7 +25,7 @@ where
         let fee_rate = result.get("feerate").ok_or_else(|| {
             source_error("Bitcoin Core cannot currently estimate a fee rate", true)
         })?;
-        let satoshis = parse_btc_amount(fee_rate, "Bitcoin estimated BTC/kvB fee rate")?;
+        let satoshis = Satoshi::from_rpc_json(fee_rate, "Bitcoin estimated BTC/kvB fee rate")?.0;
         if satoshis == 0 {
             return Err(source_error("Bitcoin Core estimated a zero fee rate", true));
         }

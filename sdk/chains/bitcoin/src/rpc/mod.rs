@@ -15,7 +15,6 @@ pub use client::Client;
 pub use config::CoreConfig;
 pub(crate) use error::source_error;
 pub use types::{NodeStatus, Preflight, UnspentOutput, UtxoSet};
-pub(crate) use wire::parse_header;
 pub use wire::{format_bitcoin_block_hash, parse_bitcoin_block_hash};
 
 const SATOSHIS_PER_BITCOIN: u64 = 100_000_000;

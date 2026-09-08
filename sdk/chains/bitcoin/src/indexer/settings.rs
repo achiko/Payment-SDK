@@ -187,11 +187,33 @@ impl IndexerSettings {
             self.retry_initial_backoff,
             self.retry_max_backoff,
         )
-        .map_err(transport_error)?;
-        Http::new(config).map_err(transport_error)
+        .map_err(|error| IndexError::new(IndexErrorKind::Source, error.to_string(), false))?;
+        Http::new(config)
+            .map_err(|error| IndexError::new(IndexErrorKind::Source, error.to_string(), false))
     }
 }
 
-fn transport_error(error: json_rpc::Error) -> IndexError {
-    IndexError::new(IndexErrorKind::Source, error.to_string(), false)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_configuration_errors_keep_source_kind_nonretryability_and_order() {
+        let mut settings =
+            IndexerSettings::new("http://127.0.0.1:18443", Network::Regtest, "unused");
+        settings.headers = vec![("invalid header".to_owned(), "value".to_owned())];
+        settings.retry_initial_backoff = Duration::from_secs(3);
+        let error = settings.transport().unwrap_err();
+        assert_eq!(error.kind, IndexErrorKind::Source);
+        assert!(!error.retryable);
+        assert_eq!(
+            error.message,
+            "initial retry backoff must not exceed its maximum"
+        );
+        settings.retry_initial_backoff = Duration::ZERO;
+        let error = settings.transport().unwrap_err();
+        assert_eq!(error.kind, IndexErrorKind::Source);
+        assert!(!error.retryable);
+        assert_eq!(error.message, "JSON-RPC header name is invalid");
+    }
 }

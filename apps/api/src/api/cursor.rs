@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::error::ApiError;
+use super::{error::ApiError, transaction::Block};
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -15,18 +15,8 @@ pub(super) struct HistoryCursor {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CursorBlock {
-    position: u64,
-    height: u64,
-    hash: String,
-    parent: Option<CursorParent>,
+    block: Block,
     timestamp: Option<u64>,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct CursorParent {
-    position: u64,
-    hash: String,
 }
 
 impl HistoryCursor {
@@ -39,13 +29,7 @@ impl HistoryCursor {
             transaction: cursor.position.transaction.value.clone(),
             height: cursor.position.height.0,
             checkpoint: cursor.checkpoint.as_ref().map(|block| CursorBlock {
-                position: block.position.0,
-                height: block.height.0,
-                hash: hex::encode(&block.hash.0),
-                parent: block.parent.as_ref().map(|parent| CursorParent {
-                    position: parent.position.0,
-                    hash: hex::encode(&parent.hash.0),
-                }),
+                block: block.into(),
                 timestamp: block.timestamp,
             }),
         })
@@ -70,21 +54,23 @@ impl HistoryCursor {
         };
         let checkpoint = cursor
             .checkpoint
-            .map(|block| {
+            .map(|checkpoint| {
+                let block = checkpoint.block;
                 Ok::<_, ApiError>(base::BlockRef {
                     position: base::BlockPosition(block.position),
                     height: base::BlockHeight(block.height),
-                    hash: base::BlockHash(block.decoded_hash()?),
+                    hash: base::BlockHash(CursorBlock::decode_hash(&block.hash)?),
                     parent: block
                         .parent
                         .map(|parent| {
-                            CursorBlock::decode_hash(&parent.hash).map(|hash| base::BlockParent {
+                            let hash = CursorBlock::decode_hash(&parent.hash)?;
+                            Ok::<_, ApiError>(base::BlockParent {
                                 position: base::BlockPosition(parent.position),
                                 hash: base::BlockHash(hash),
                             })
                         })
                         .transpose()?,
-                    timestamp: block.timestamp,
+                    timestamp: checkpoint.timestamp,
                 })
             })
             .transpose()?;
@@ -110,10 +96,6 @@ impl HistoryCursor {
 }
 
 impl CursorBlock {
-    fn decoded_hash(&self) -> Result<Vec<u8>, ApiError> {
-        Self::decode_hash(&self.hash)
-    }
-
     fn decode_hash(value: &str) -> Result<Vec<u8>, ApiError> {
         let bytes = hex::decode(value)
             .map_err(|_| HistoryCursor::invalid_request("history cursor is invalid"))?;

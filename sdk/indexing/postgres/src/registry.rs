@@ -4,9 +4,8 @@ use indexing::{
     AddressFilter, BlockPosition, BoxFuture, CanonicalAddress, IndexError, IndexErrorKind,
     IndexScope, RegisteredAddress, Registry,
 };
-use tokio_postgres::Row;
 
-use crate::{Repository, prepare, row};
+use crate::{Repository, row};
 
 const REGISTER: &str = "\
 INSERT INTO payment_wallets (id, chain, network, address, start_height, secret)
@@ -21,7 +20,10 @@ impl Repository {
         self.check_scope(&entry.filter.address.scope)?;
         let position = row::as_i64(entry.filter.start_position.0, "start position")?;
         let client = self.client().await?;
-        let statement = prepare(&client, REGISTER).await?;
+        let statement = client
+            .prepare_cached(REGISTER)
+            .await
+            .map_err(crate::store)?;
         let written = client
             .execute(
                 &statement,
@@ -55,12 +57,33 @@ impl Repository {
     ) -> Result<Vec<RegisteredAddress>, IndexError> {
         self.check_scope(scope)?;
         let client = self.client().await?;
-        let statement = prepare(&client, REGISTERED).await?;
+        let statement = client
+            .prepare_cached(REGISTERED)
+            .await
+            .map_err(crate::store)?;
         let rows = client
             .query(&statement, &[&scope.chain.0, &scope.network])
             .await
             .map_err(crate::store)?;
-        rows.iter().map(|entry| registered(scope, entry)).collect()
+        rows.iter()
+            .map(|entry| {
+                let start: i64 = entry.try_get("start_height").map_err(crate::store)?;
+                Ok(RegisteredAddress {
+                    id: entry.try_get("id").map_err(crate::store)?,
+                    filter: AddressFilter {
+                        address: CanonicalAddress {
+                            scope: scope.clone(),
+                            value: entry.try_get("address").map_err(crate::store)?,
+                        },
+                        start_position: BlockPosition(
+                            u64::try_from(start)
+                                .map_err(|_| row::store("stored start position is negative"))?,
+                        ),
+                    },
+                    material: entry.try_get("secret").map_err(crate::store)?,
+                })
+            })
+            .collect()
     }
 }
 
@@ -75,22 +98,4 @@ impl Registry for Repository {
     ) -> BoxFuture<'a, Result<Vec<RegisteredAddress>, IndexError>> {
         Box::pin(async move { self.read_registrations(scope).await })
     }
-}
-
-fn registered(scope: &IndexScope, entry: &Row) -> Result<RegisteredAddress, IndexError> {
-    let start: i64 = entry.try_get("start_height").map_err(crate::store)?;
-    Ok(RegisteredAddress {
-        id: entry.try_get("id").map_err(crate::store)?,
-        filter: AddressFilter {
-            address: CanonicalAddress {
-                scope: scope.clone(),
-                value: entry.try_get("address").map_err(crate::store)?,
-            },
-            start_position: BlockPosition(
-                u64::try_from(start)
-                    .map_err(|_| row::store("stored start position is negative"))?,
-            ),
-        },
-        material: entry.try_get("secret").map_err(crate::store)?,
-    })
 }

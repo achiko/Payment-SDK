@@ -1,3 +1,4 @@
+use alloy_primitives::hex;
 use indexing::{BlockRef, BoxFuture, SourceError};
 use serde_json::json;
 
@@ -6,10 +7,7 @@ use super::{
     blocks::Methods,
     error::BuildError,
     transport::Client as Transport,
-    wire::{
-        address_hex, block_parameter, data_hex, invalid_rpc_response, map_json_rpc_error,
-        parse_data, parse_fixed_data, source_error,
-    },
+    wire::{invalid_rpc_response, map_json_rpc_error, parse_data, parse_fixed_data, source_error},
 };
 use crate::{Address, AssetKind, Wei, erc20};
 
@@ -69,35 +67,47 @@ where
         at: Option<BlockRef>,
     ) -> BoxFuture<'a, Result<Wei, SourceError>> {
         Box::pin(async move {
-            let block = block_parameter(at)?;
-            match asset {
+            let block = match at {
+                None => json!("pending"),
+                Some(block) if block.hash.0.len() != 32 => {
+                    return Err(source_error(
+                        "Ethereum balance block hash must contain exactly 32 bytes",
+                        false,
+                    ));
+                }
+                Some(block) => json!({
+                    "blockHash": hex::encode_prefixed(&block.hash.0),
+                    "requireCanonical": true,
+                }),
+            };
+            let token = match asset {
                 AssetKind::Native => {
-                    self.rpc_wei("eth_getBalance", json!([address_hex(&address), block]))
-                        .await
+                    return self
+                        .rpc_wei("eth_getBalance", json!([address.to_string(), block]))
+                        .await;
                 }
-                AssetKind::Erc20(token) => {
-                    if token.is_zero() {
-                        return Err(source_error(
-                            "Ethereum ERC-20 token address must not be zero",
-                            false,
-                        ));
-                    }
-                    let raw = self
-                        .request_result(
-                            "eth_call",
-                            json!([{
-                                "to": address_hex(token),
-                                "data": data_hex(&erc20::balance_of(&address)),
-                            }, block]),
-                        )
-                        .await?;
-                    let value: String = raw.deserialize().map_err(map_json_rpc_error)?;
-                    let word = parse_fixed_data::<32>(&value, "ERC-20 balance result")
-                        .map_err(|message| invalid_rpc_response("eth_call", message))?;
-                    erc20::decode_balance(&word)
-                        .map_err(|_| invalid_rpc_response("eth_call", "invalid balanceOf result"))
-                }
+                AssetKind::Erc20(token) => token,
+            };
+            if token.is_zero() {
+                return Err(source_error(
+                    "Ethereum ERC-20 token address must not be zero",
+                    false,
+                ));
             }
+            let raw = self
+                .request_result(
+                    "eth_call",
+                    json!([{
+                        "to": token.to_string(),
+                        "data": hex::encode_prefixed(erc20::balance_of(&address)),
+                    }, block]),
+                )
+                .await?;
+            let value: String = raw.deserialize().map_err(map_json_rpc_error)?;
+            let word = parse_fixed_data::<32>(&value, "ERC-20 balance result")
+                .map_err(|message| invalid_rpc_response("eth_call", message))?;
+            erc20::decode_balance(&word)
+                .map_err(|_| invalid_rpc_response("eth_call", "invalid balanceOf result"))
         })
     }
 
@@ -105,7 +115,7 @@ where
         Box::pin(async move {
             self.rpc_u64(
                 "eth_getTransactionCount",
-                json!([address_hex(&address), "pending"]),
+                json!([address.to_string(), "pending"]),
             )
             .await
         })
@@ -131,7 +141,7 @@ where
         let block = self.latest_canonical_parameter().await?;
 
         let raw = self
-            .request_result("eth_getCode", json!([address_hex(token), block.clone()]))
+            .request_result("eth_getCode", json!([token.to_string(), block.clone()]))
             .await?;
         let code: String = raw.deserialize().map_err(map_json_rpc_error)?;
         if parse_data(&code)
@@ -180,8 +190,8 @@ where
             .request_result(
                 "eth_call",
                 json!([{
-                    "to": address_hex(token),
-                    "data": data_hex(&input),
+                    "to": token.to_string(),
+                    "data": hex::encode_prefixed(&input),
                 }, block]),
             )
             .await?;

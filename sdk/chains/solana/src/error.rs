@@ -27,6 +27,13 @@ pub struct Error {
 }
 
 impl Error {
+    pub(crate) fn malformed_rpc(method: &str) -> Self {
+        Self::new(
+            ErrorKind::MalformedRpc,
+            format!("Solana RPC {method} returned malformed data"),
+        )
+    }
+
     pub(crate) fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,

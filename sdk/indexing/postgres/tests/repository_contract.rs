@@ -799,9 +799,20 @@ async fn reorg_preserves_atomic_canonical_state() {
             .expect("stored journal rollback"),
         Some(first.clone())
     );
-    assert_eq!(tip(&repository, &scope).await, Some(first));
+    assert_eq!(tip(&repository, &scope).await, Some(first.clone()));
     assert_eq!(history(&repository, &scope, "receiver").await, ["funding"]);
     assert_eq!(outputs(&repository, &scope).await, vec![funding]);
+
+    assert_eq!(
+        repository
+            .remove(scope.clone(), first)
+            .await
+            .expect("rollback to absent checkpoint"),
+        None
+    );
+    assert_eq!(tip(&repository, &scope).await, None);
+    assert!(history(&repository, &scope, "receiver").await.is_empty());
+    assert!(outputs(&repository, &scope).await.is_empty());
 }
 
 #[tokio::test]
@@ -991,7 +1002,11 @@ async fn batched_writes_keep_per_address_rows_and_movement_order() {
                 reason: Some("reverted".into()),
             },
             movements: Vec::new(),
-            fee: None,
+            fee: Some(indexing::NetworkFee {
+                asset: asset(&scope),
+                amount: Decimal::from(7),
+                payer: Some(address(&scope, "sender")),
+            }),
         },
     ];
 
@@ -1006,10 +1021,13 @@ async fn batched_writes_keep_per_address_rows_and_movement_order() {
         .await
         .expect("block with several transactions");
 
-    // Both endpoints of the transfer are watched, so both list both
-    // transactions — "beta" through neither endpoint, so only "alpha".
+    // Transfer endpoints own alpha; the failed transaction remains visible
+    // through its fee payer even though it has no movements.
     assert_eq!(history(&repository, &scope, "receiver").await, ["alpha"]);
-    assert_eq!(history(&repository, &scope, "sender").await, ["alpha"]);
+    assert_eq!(
+        history(&repository, &scope, "sender").await,
+        ["alpha", "beta"]
+    );
 
     let page = Transactions::list(
         &repository,
@@ -1024,6 +1042,32 @@ async fn batched_writes_keep_per_address_rows_and_movement_order() {
     .expect("history page");
     let alpha = &page.transactions[0];
     assert_eq!(alpha.movements, ordered, "movement order must survive");
+
+    let sender = Transactions::list(
+        &repository,
+        HistoryQuery {
+            scope: scope.clone(),
+            address: address(&scope, "sender"),
+            after: None,
+            limit: 10,
+        },
+    )
+    .await
+    .expect("fee payer history");
+    let beta = &sender.transactions[1];
+    assert!(matches!(
+        &beta.status,
+        indexing::CanonicalStatus::Failed { reason: Some(reason), .. } if reason == "reverted"
+    ));
+    assert!(beta.movements.is_empty());
+    assert_eq!(
+        beta.fee,
+        Some(indexing::NetworkFee {
+            asset: asset(&scope),
+            amount: Decimal::from(7),
+            payer: Some(address(&scope, "sender")),
+        })
+    );
 }
 
 /// A required spend that matches nothing is an invalid block; a tracked spend
@@ -1217,6 +1261,81 @@ async fn output_pagination_covers_every_output_once() {
     // textually and put "…:10" before "…:2".
     let expected: Vec<u32> = (0..12).collect();
     assert_eq!(seen, expected, "pages must be ordered and complete");
+}
+
+#[tokio::test]
+async fn stale_history_and_output_cursors_remain_retryable_conflicts() {
+    let scope = unique_scope();
+    let (database, repository) = repository(&scope).await;
+    let first = block(1, 1, 0);
+    repository
+        .add(addition(
+            &scope,
+            first.clone(),
+            None,
+            vec![draft(&scope, "alpha"), draft(&scope, "beta")],
+            OutputChanges {
+                created: vec![output(&scope, "alpha", 0, 1), output(&scope, "beta", 0, 1)],
+                ..OutputChanges::default()
+            },
+        ))
+        .await
+        .expect("first block");
+
+    let mut history = HistoryQuery {
+        scope: scope.clone(),
+        address: address(&scope, "receiver"),
+        after: None,
+        limit: 1,
+    };
+    history.after = Transactions::list(&repository, history.clone())
+        .await
+        .expect("first history page")
+        .next;
+    assert!(history.after.is_some());
+    let mut outputs = OutputRequest {
+        scope: scope.clone(),
+        address: address(&scope, "receiver"),
+        after: None,
+        limit: 1,
+    };
+    outputs.after = Outputs::list(&repository, outputs.clone())
+        .await
+        .expect("first output page")
+        .next;
+    assert!(outputs.after.is_some());
+
+    repository
+        .add(addition(
+            &scope,
+            block(2, 2, 1),
+            Some(first),
+            Vec::new(),
+            OutputChanges::default(),
+        ))
+        .await
+        .expect("advance checkpoint");
+    let before = scope_signature(&database, &scope).await;
+    for (error, message) in [
+        (
+            Transactions::list(&repository, history)
+                .await
+                .expect_err("stale history cursor"),
+            "history changed during pagination",
+        ),
+        (
+            Outputs::list(&repository, outputs)
+                .await
+                .expect_err("stale output cursor"),
+            "outputs changed during pagination",
+        ),
+    ] {
+        assert_eq!(error.kind, IndexErrorKind::Conflict);
+        assert_eq!(error.message, message);
+        assert!(error.retryable);
+    }
+    assert_eq!(scope_signature(&database, &scope).await, before);
+    assert!(database.registry_sentinel_unchanged().await);
 }
 
 #[tokio::test]
@@ -1830,6 +1949,167 @@ async fn replaying_the_tip_is_not_a_second_commit() {
         BlockOutcome::AlreadyApplied
     );
     assert_eq!(history(&repository, &scope, "receiver").await, ["funding"]);
+}
+
+#[tokio::test]
+async fn replaying_the_tip_requires_its_matching_journal() {
+    let scope = unique_scope();
+    let (database, repository) = repository(&scope).await;
+    let candidate = addition(
+        &scope,
+        block(1, 1, 0),
+        None,
+        one(&scope, "funding"),
+        OutputChanges::default(),
+    );
+    repository
+        .add(candidate.clone())
+        .await
+        .expect("first block");
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("journal fixture connection");
+
+    for (case, statement) in [
+        (
+            "mismatched journal hash",
+            "UPDATE journal SET block_hash = decode('ff', 'hex') \
+             WHERE chain = $1 AND network = $2 AND height = $3",
+        ),
+        (
+            "missing journal",
+            "DELETE FROM journal WHERE chain = $1 AND network = $2 AND height = $3",
+        ),
+    ] {
+        assert_eq!(
+            client
+                .execute(statement, &[&scope.chain.0, &scope.network, &1_i64])
+                .await
+                .expect("alter owned journal fixture"),
+            1,
+            "{case}"
+        );
+        let before = scope_signature(&database, &scope).await;
+        let error = repository.add(candidate.clone()).await.expect_err(case);
+
+        assert_eq!(error.kind, IndexErrorKind::Store, "{case}");
+        assert!(!error.retryable, "{case}");
+        assert_eq!(
+            error.message, "canonical checkpoint is missing its rollback journal",
+            "{case}"
+        );
+        assert_eq!(scope_signature(&database, &scope).await, before, "{case}");
+    }
+    assert!(database.registry_sentinel_unchanged().await);
+}
+
+#[tokio::test]
+async fn retained_height_conflict_does_not_change_committed_state() {
+    let scope = unique_scope();
+    let (database, repository) = repository(&scope).await;
+    repository
+        .add(addition(
+            &scope,
+            block(1, 1, 0),
+            None,
+            one(&scope, "funding"),
+            OutputChanges::default(),
+        ))
+        .await
+        .expect("first block");
+    let before = scope_signature(&database, &scope).await;
+    let error = repository
+        .add(addition(
+            &scope,
+            block(1, 99, 0),
+            None,
+            one(&scope, "replacement"),
+            OutputChanges::default(),
+        ))
+        .await
+        .expect_err("retained height must be rejected before the stale checkpoint");
+
+    assert_eq!(error.kind, IndexErrorKind::CannotConnect);
+    assert!(error.retryable);
+    assert_eq!(
+        error.message,
+        "another retained block exists at this height"
+    );
+    assert_eq!(scope_signature(&database, &scope).await, before);
+    assert!(database.registry_sentinel_unchanged().await);
+}
+
+#[tokio::test]
+async fn registry_preserves_birthday_bounds_and_rejects_negative_stored_positions() {
+    let scope = unique_scope();
+    let (database, repository) = repository(&scope).await;
+    let baseline_scope = IndexScope {
+        chain: ChainId("baseline-chain".into()),
+        network: "baseline-network".into(),
+    };
+    let baseline = Repository::new(database.pool(), baseline_scope.clone()).expect("baseline");
+    let before = baseline
+        .registered(&baseline_scope)
+        .await
+        .expect("baseline records");
+    assert_eq!(before.len(), 1);
+    let mut expected = Vec::new();
+    for (index, position) in [0, i64::MAX as u64].into_iter().enumerate() {
+        let entry = RegisteredAddress {
+            id: format!("{}-{index}", scope.chain.0),
+            filter: indexing::AddressFilter {
+                address: address(&scope, &format!("receiver-{index}")),
+                start_position: BlockPosition(position),
+            },
+            material: (0..=255).collect(),
+        };
+        repository
+            .register(entry.clone())
+            .await
+            .expect("registration");
+        expected.push(entry);
+    }
+    let restored = repository.registered(&scope).await.expect("registrations");
+    assert_eq!(restored.len(), expected.len());
+    for entry in &expected {
+        assert_eq!(
+            restored.iter().find(|stored| stored.id == entry.id),
+            Some(entry)
+        );
+    }
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("owned fixture connection");
+    for negative in [-1_i64, i64::MIN] {
+        assert_eq!(
+            client
+                .execute(
+                    "UPDATE payment_wallets SET start_height = $2 WHERE id = $1",
+                    &[&expected[0].id, &negative],
+                )
+                .await
+                .expect("set owned invalid birthday"),
+            1
+        );
+        let error = repository
+            .registered(&scope)
+            .await
+            .expect_err("negative birthday");
+        assert_eq!(error.kind, IndexErrorKind::Store);
+        assert!(!error.retryable);
+        assert_eq!(error.message, "stored start position is negative");
+    }
+    assert_eq!(
+        baseline
+            .registered(&baseline_scope)
+            .await
+            .expect("baseline records"),
+        before
+    );
 }
 
 /// The registry stores an address once and refuses a second registration of

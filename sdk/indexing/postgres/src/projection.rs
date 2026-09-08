@@ -5,8 +5,8 @@ use indexing::{BlockAddition, IndexError, IndexErrorKind, IndexScope};
 use tokio_postgres::types::ToSql;
 
 use crate::{
-    columns::{self, SpendKeys},
-    prepare_in, row,
+    columns::{HistoryRows, OutputRows, SpendKeys},
+    row,
 };
 
 const WRITE_HISTORY: &str = "\
@@ -66,7 +66,7 @@ pub(crate) async fn write_history(
     height: i64,
     addition: &BlockAddition,
 ) -> Result<(), IndexError> {
-    let (history, movements) = columns::canonical(addition)?;
+    let history = HistoryRows::try_from(addition)?;
 
     if history.is_empty() {
         return Ok(());
@@ -84,7 +84,10 @@ pub(crate) async fn write_history(
         .timestamp
         .map(|value| row::as_i64(value, "block timestamp"))
         .transpose()?;
-    let statement = prepare_in(transaction, WRITE_HISTORY).await?;
+    let statement = transaction
+        .prepare_cached(WRITE_HISTORY)
+        .await
+        .map_err(crate::store)?;
     transaction
         .execute(
             &statement,
@@ -109,10 +112,14 @@ pub(crate) async fn write_history(
         .await
         .map_err(conflict_aware)?;
 
+    let movements = &history.movements;
     if movements.is_empty() {
         return Ok(());
     }
-    let statement = prepare_in(transaction, WRITE_MOVEMENT).await?;
+    let statement = transaction
+        .prepare_cached(WRITE_MOVEMENT)
+        .await
+        .map_err(crate::store)?;
     transaction
         .execute(
             &statement,
@@ -143,12 +150,15 @@ pub(crate) async fn write_created(
     height: i64,
     addition: &BlockAddition,
 ) -> Result<(), IndexError> {
-    let rows = columns::created(&addition.outputs().created)?;
+    let rows = OutputRows::try_from(addition.outputs().created.as_slice())?;
     if rows.is_empty() {
         return Ok(());
     }
 
-    let statement = prepare_in(transaction, WRITE_CREATED).await?;
+    let statement = transaction
+        .prepare_cached(WRITE_CREATED)
+        .await
+        .map_err(crate::store)?;
     transaction
         .execute(
             &statement,
@@ -178,8 +188,8 @@ pub(crate) async fn write_spent(
     height: i64,
     addition: &BlockAddition,
 ) -> Result<(), IndexError> {
-    let required = columns::spends(&addition.outputs().spent)?;
-    let tracked = columns::spends(&addition.outputs().tracked_spends)?;
+    let required = SpendKeys::try_from(addition.outputs().spent.as_slice())?;
+    let tracked = SpendKeys::try_from(addition.outputs().tracked_spends.as_slice())?;
 
     if !required.is_empty() {
         let moved = spend(transaction, scope, height, &required).await?;
@@ -203,7 +213,10 @@ async fn spend(
     height: i64,
     keys: &SpendKeys,
 ) -> Result<u64, IndexError> {
-    let statement = prepare_in(transaction, SPEND_OUTPUTS).await?;
+    let statement = transaction
+        .prepare_cached(SPEND_OUTPUTS)
+        .await
+        .map_err(crate::store)?;
     let parameters: [&(dyn ToSql + Sync); 6] = [
         &scope.chain.0,
         &scope.network,
@@ -218,6 +231,7 @@ async fn spend(
         .map_err(crate::store)
 }
 
+// design-lint: allow unclassified-free-function -- shared PostgreSQL write-error translation between foreign error types; SQLSTATE policy belongs to this adapter
 fn conflict_aware(error: tokio_postgres::Error) -> IndexError {
     let unique = error
         .code()

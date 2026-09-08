@@ -5,8 +5,9 @@ use futures_executor::block_on;
 use indexing::{
     AssetId, BlockAddition, BlockHash, BlockHeight, BlockOutcome, BlockParent, BlockPosition,
     BlockRef, BlockSelector, Blocks, CanonicalAddress, ChainId, HistoryQuery, IndexScope,
-    IndexedOutput, InterpretedBlock, MovementId, ObservationDraft, ObservationDraftStatus,
-    OutputChanges, OutputId, OutputRequest, Outputs, TransactionRef, Transactions, ValueMovement,
+    IndexedOutput, InterpretedBlock, MovementId, NetworkFee, ObservationDraft,
+    ObservationDraftStatus, OutputChanges, OutputId, OutputRequest, Outputs, TransactionRef,
+    Transactions, ValueMovement,
 };
 use tempfile::TempDir;
 
@@ -217,6 +218,72 @@ fn revert_removes_canonical_history_and_restores_outputs() {
         .transactions
         .is_empty()
     );
+}
+
+#[test]
+fn block_history_preserves_every_address_projection_through_rollback() {
+    let repository = repository();
+    let first = block(1, 1, 0);
+    let mut second = draft("second");
+    second.fee = Some(NetworkFee {
+        asset: AssetId {
+            chain: scope().chain,
+            asset: "native".to_owned(),
+        },
+        amount: Decimal::from(2_u64),
+        payer: Some(address("fee-payer")),
+    });
+    let addition = BlockAddition::new(
+        scope(),
+        None,
+        4,
+        InterpretedBlock {
+            block: first.clone(),
+            transactions: vec![draft("first"), second],
+            outputs: OutputChanges::default(),
+        },
+    )
+    .expect("valid multi-address block");
+    let expected = addition.transactions().to_vec();
+    block_on(repository.add(addition)).expect("block commit");
+
+    for (value, transactions) in [
+        ("receiver", expected.clone()),
+        ("sender", expected.clone()),
+        ("fee-payer", vec![expected[1].clone()]),
+    ] {
+        let page = block_on(Transactions::list(
+            &*repository,
+            HistoryQuery {
+                scope: scope(),
+                address: address(value),
+                after: None,
+                limit: 10,
+            },
+        ))
+        .expect("canonical address history");
+        assert_eq!(page.checkpoint, Some(first.clone()));
+        assert_eq!(page.transactions, transactions);
+    }
+
+    assert_eq!(
+        block_on(repository.remove(scope(), first)).expect("journal rollback"),
+        None
+    );
+    for value in ["receiver", "sender", "fee-payer"] {
+        let page = block_on(Transactions::list(
+            &*repository,
+            HistoryQuery {
+                scope: scope(),
+                address: address(value),
+                after: None,
+                limit: 10,
+            },
+        ))
+        .expect("address history after rollback");
+        assert_eq!(page.checkpoint, None);
+        assert!(page.transactions.is_empty());
+    }
 }
 
 #[test]

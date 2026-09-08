@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use super::provider::{Config, SNAPSHOT_KIND, network_name, transaction_error};
+use super::provider::{Config, SNAPSHOT_KIND};
 use crate::{Address, Satoshi};
 use base::{Decimal, TransactionError, TransactionErrorKind, TransactionSnapshot};
 
@@ -46,7 +46,7 @@ pub(super) fn decode(
     }
     let data: Data = serde_json::from_value(snapshot.value().clone())
         .map_err(|error| invalid(format!("invalid Bitcoin snapshot: {error}")))?;
-    let network = network_name(config.network);
+    let network = config.network.canonical_name();
     if data.scope.chain != config.scope.chain.0
         || data.scope.network != config.scope.network
         || data.scope.chain != "bitcoin"
@@ -76,8 +76,9 @@ pub(super) fn decode(
         .collect()
 }
 
+// design-lint: allow unclassified-free-function -- shared Bitcoin snapshot boundary maps heterogeneous decode and validation errors to foreign TransactionError::InvalidSnapshot without submission ambiguity
 fn invalid(error: impl std::fmt::Display) -> TransactionError {
-    transaction_error(TransactionErrorKind::InvalidSnapshot, error)
+    TransactionError::new(TransactionErrorKind::InvalidSnapshot, error.to_string())
 }
 
 #[cfg(test)]
@@ -163,5 +164,32 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn invalid_transfers_remain_snapshot_errors_without_ambiguity() {
+        for (transfers, message) in [
+            (serde_json::json!([]), "Bitcoin snapshot has no transfers"),
+            (
+                serde_json::json!([{ "destination": ADDRESS, "amount": "-1" }]),
+                "currency amount must not be negative",
+            ),
+            (
+                serde_json::json!([{ "destination": ADDRESS, "amount": "0.000000001" }]),
+                "amount has more than 8 fractional digits",
+            ),
+        ] {
+            let mut value = snapshot(ADDRESS).value().clone();
+            value["transfers"] = transfers;
+            let error = decode(
+                &config(),
+                &Address::from_encoded(ADDRESS),
+                &TransactionSnapshot::new(SNAPSHOT_KIND, value),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind, TransactionErrorKind::InvalidSnapshot);
+            assert_eq!(error.message, message);
+            assert_eq!(error.ambiguous_transaction_id, None);
+        }
     }
 }

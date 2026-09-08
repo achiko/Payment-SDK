@@ -372,3 +372,82 @@ fn batched_receipt_fallback_restores_transaction_order() {
 
     assert_eq!(block.raw_receipts, vec![first_receipt, second_receipt]);
 }
+
+#[test]
+fn canonical_lookup_distinguishes_json_null_from_non_null_values() {
+    let client = ScriptedClient::new(vec![
+        success("eth_chainId", json!("0x7a69")),
+        success(
+            "eth_getBlockByNumber",
+            block(0, GENESIS_HASH, PARENT_HASH, Vec::new()),
+        ),
+        raw_success("eth_getBlockByNumber", b" \nnull\t ".to_vec()),
+        success("eth_getBlockByNumber", json!("null")),
+        success("eth_getBlockByNumber", json!({"value": null})),
+        success("eth_getBlockByNumber", json!(false)),
+    ]);
+    let source = block_on(BlockClient::connect(client, config())).expect("identity must match");
+    assert_eq!(
+        block_on(source.canonical_at(BlockPosition(10))).unwrap(),
+        None
+    );
+    for _ in 0..3 {
+        let error = block_on(source.canonical_at(BlockPosition(10)))
+            .expect_err("non-null results must pass through strict block parsing");
+        assert_eq!(
+            error.message,
+            "Ethereum block result does not match the RPC block shape"
+        );
+        assert!(error.retryable);
+    }
+}
+
+#[test]
+fn remote_failure_retains_code_with_indexer_retry_policy_and_redaction() {
+    for (code, retryable) in [
+        (-32100, false),
+        (-32099, true),
+        (-32000, true),
+        (-31999, false),
+        (-32601, false),
+        (429, false),
+        (3, false),
+    ] {
+        let failure = CallFailure::remote(Failure {
+            code,
+            message: "rate limit execution reverted secret provider details".to_owned(),
+            data: Some(RawJson::from_serializable(&json!({"secret": "private response"})).unwrap()),
+        });
+        assert_eq!(failure.remote_code, Some(code));
+        assert_eq!(failure.error.retryable, retryable);
+        assert_eq!(
+            failure.error.message,
+            format!("Ethereum JSON-RPC request failed with code {code}")
+        );
+    }
+}
+
+#[test]
+fn json_rpc_adapter_preserves_transport_retryability_and_message() {
+    use json_rpc::ErrorKind;
+    for (kind, retryable) in [
+        (ErrorKind::InvalidConfiguration, false),
+        (ErrorKind::InvalidRequest, false),
+        (ErrorKind::Timeout, true),
+        (ErrorKind::Unavailable, true),
+        (ErrorKind::HttpStatus(429), true),
+        (ErrorKind::HttpStatus(502), true),
+        (ErrorKind::HttpStatus(503), true),
+        (ErrorKind::HttpStatus(504), true),
+        (ErrorKind::HttpStatus(500), false),
+        (ErrorKind::ResponseTooLarge, false),
+        (ErrorKind::InvalidResponse, false),
+    ] {
+        let error = map_json_rpc_error(Error {
+            kind,
+            message: "bounded transport context".into(),
+        });
+        assert_eq!(error.retryable, retryable, "{kind:?}");
+        assert_eq!(error.message, "bounded transport context");
+    }
+}

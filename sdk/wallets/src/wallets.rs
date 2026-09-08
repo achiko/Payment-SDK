@@ -13,7 +13,7 @@ use indexing::{
 
 use crate::{
     AddressText, Balance, Error, ErrorKind, FutureResult, History, HistoryRequest, Provider,
-    SecretBytes, SendError, SendFuture, Sender, Transfer, Wallet,
+    SecretBytes, SendError, SendFuture, Sender, Transfer, Wallet, selection::publication_error,
 };
 
 /// Non-secret facts retained for one registered wallet.
@@ -59,8 +59,19 @@ struct Entry<I, F> {
 pub struct Wallets<I: Ord, F: Ord> {
     checkpoint: Arc<dyn Checkpoint>,
     families: BTreeMap<F, Family>,
-    pub(crate) admissions: BTreeMap<IndexScope, Arc<ScopeAdmission>>,
+    admissions: BTreeMap<IndexScope, Arc<ScopeAdmission>>,
     values: RwLock<BTreeMap<I, Entry<I, F>>>,
+}
+
+impl<I: Ord, F: Ord> Wallets<I, F> {
+    pub(crate) fn admission(&self, scope: &IndexScope) -> Result<Arc<ScopeAdmission>, Error> {
+        self.admissions.get(scope).cloned().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unsupported,
+                "wallet family scope has no address admission",
+            )
+        })
+    }
 }
 
 impl<I, F> Wallets<I, F>
@@ -93,9 +104,7 @@ where
                 "a wallet family is already registered for this key",
             ));
         }
-        self.admissions
-            .entry(scope.clone())
-            .or_insert_with(|| Arc::new(ScopeAdmission::new()));
+        self.admissions.entry(scope.clone()).or_default();
         self.families.insert(
             family,
             Family {
@@ -118,7 +127,7 @@ where
             let wallet = configured.provider.generate().await?;
             let (info, _, publication) =
                 self.store(id, family_key, configured, wallet, None).await?;
-            crate::selection::publication(publication)?.complete()?;
+            publication.ok_or_else(publication_error)?.complete()?;
             Ok(info)
         })
     }
@@ -168,7 +177,7 @@ where
                 self.forget(&id);
                 return Err(error.into());
             }
-            crate::selection::publication(publication)?.complete()?;
+            publication.ok_or_else(publication_error)?.complete()?;
             Ok(info)
         })
     }
@@ -332,26 +341,22 @@ where
     ) -> Result<(WalletInfo<I, F>, AddressFilter, Option<PublicationPermit>), Error> {
         let publication = if start_position.is_none() {
             let persisted = self.checkpoint.checkpoint(&family.scope).await?;
-            Some(
-                crate::selection::admission(self, &family.scope)?
-                    .publication(persisted)
-                    .await?,
-            )
+            let admission = self.admission(&family.scope)?;
+            Some(admission.publication(persisted).await?)
         } else {
             None
         };
-        let start_position = match (start_position, publication.as_ref()) {
+        let checkpoint = publication.as_ref().map(PublicationPermit::checkpoint);
+        let start_position = match (start_position, checkpoint) {
             (Some(position), _) => position,
-            (None, Some(permit)) => match permit.checkpoint() {
-                Some(block) => block.position.checked_successor().ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::Unavailable,
-                        "checkpoint position has no successor for wallet publication",
-                    )
-                })?,
-                None => BlockPosition(0),
-            },
-            (None, None) => return Err(crate::selection::publication_error()),
+            (None, Some(Some(block))) => block.position.checked_successor().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unavailable,
+                    "checkpoint position has no successor for wallet publication",
+                )
+            })?,
+            (None, Some(None)) => BlockPosition(0),
+            (None, None) => return Err(publication_error()),
         };
         let entry = self
             .activate(id.clone(), family_key, family, wallet, start_position)
@@ -446,10 +451,10 @@ where
             let entry = self
                 .entry(&request.wallet)
                 .map_err(|error| SendError::item(index, Vec::new(), error))?;
-            if family
+            let family_mismatch = family
                 .as_ref()
-                .is_some_and(|expected| expected != &entry.info.family)
-            {
+                .is_some_and(|expected| expected != &entry.info.family);
+            if family_mismatch {
                 return Err(SendError::item(
                     index,
                     Vec::new(),
@@ -828,6 +833,108 @@ mod tests {
         assert_eq!(failure.source.message, message);
         assert_eq!(failure.source.ambiguous_transaction_id, None);
         assert_eq!(failure.to_string(), message);
+    }
+
+    #[test]
+    fn families_share_admission_only_within_the_exact_scope() {
+        let (sender, _) = sender();
+        let mainnet = scope("mainnet");
+        let testnet = scope("testnet");
+        let other_chain = IndexScope {
+            chain: ChainId("other".to_owned()),
+            network: mainnet.network.clone(),
+        };
+        let mut wallets = Wallets::<String, &str>::new(Arc::new(FixtureIndex(Some(block(7)))));
+        wallets
+            .register(
+                "first",
+                mainnet.clone(),
+                FixtureProvider::Value,
+                sender.clone(),
+                None,
+            )
+            .expect("first family");
+        let admission = wallets.admission(&mainnet).expect("first admission");
+
+        for (family, scope) in [
+            ("second", mainnet.clone()),
+            ("testnet", testnet.clone()),
+            ("other-chain", other_chain.clone()),
+        ] {
+            wallets
+                .register(family, scope, FixtureProvider::Value, sender.clone(), None)
+                .expect("additional family");
+        }
+        assert!(Arc::ptr_eq(
+            &admission,
+            &wallets.admission(&mainnet).expect("shared admission"),
+        ));
+        for scope in [&testnet, &other_chain] {
+            assert!(!Arc::ptr_eq(
+                &admission,
+                &wallets.admission(scope).expect("distinct admission"),
+            ));
+        }
+
+        let stale = wallets
+            .plan(&mainnet, Some(block(7)))
+            .expect("mainnet plan");
+        let testnet_plan = wallets
+            .plan(&testnet, Some(block(7)))
+            .expect("testnet plan");
+        let other_plan = wallets
+            .plan(&other_chain, Some(block(7)))
+            .expect("other chain plan");
+        futures_executor::block_on(wallets.generate("alice".to_owned(), &"second"))
+            .expect("second-family publication");
+
+        let error = stale.begin().err().expect("same-scope plan is stale");
+        assert_eq!(error.kind, IndexErrorKind::Conflict);
+        assert!(testnet_plan.filters().is_empty());
+        assert!(other_plan.filters().is_empty());
+        assert!(testnet_plan.begin().is_ok());
+        assert!(other_plan.begin().is_ok());
+        let current = wallets
+            .plan(&mainnet, Some(block(7)))
+            .expect("current plan");
+        assert_eq!(current.filters().len(), 1);
+        assert_eq!(current.filters()[0].start_position, BlockPosition(8));
+    }
+
+    #[test]
+    fn unsupported_admission_preserves_wallet_and_filter_errors() {
+        let (sender, _) = sender();
+        let mut wallets = Wallets::<String, &str>::new(Arc::new(FixtureIndex(None)));
+        wallets
+            .register(
+                "family",
+                scope("mainnet"),
+                FixtureProvider::Value,
+                sender,
+                None,
+            )
+            .expect("family registration");
+        let unsupported = scope("testnet");
+        let error = wallets
+            .admission(&unsupported)
+            .err()
+            .expect("unknown scope");
+        assert_eq!(error.kind, ErrorKind::Unsupported);
+        assert_eq!(
+            error.message,
+            "wallet family scope has no address admission"
+        );
+
+        let error = wallets
+            .plan(&unsupported, None)
+            .err()
+            .expect("unknown scope plan");
+        assert_eq!(error.kind, IndexErrorKind::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "wallet family scope has no address admission"
+        );
+        assert!(!error.retryable);
     }
 
     #[test]

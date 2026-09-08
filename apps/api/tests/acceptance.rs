@@ -129,13 +129,16 @@ async fn wait_removed(root: &str, wallet: &str, transaction: &str) {
     let url = format!("{root}/v1/wallets/{wallet}/transactions?limit=20");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if get(&url).await.is_some_and(|value| {
-            value["transactions"].as_array().is_some_and(|items| {
-                items
-                    .iter()
-                    .all(|item| item["transaction_id"] != transaction)
-            })
-        }) {
+        let response = get(&url).await;
+        let transactions = response
+            .as_ref()
+            .and_then(|value| value["transactions"].as_array());
+        let removed = transactions.is_some()
+            && transactions
+                .into_iter()
+                .flatten()
+                .all(|item| item["transaction_id"] != transaction);
+        if removed {
             return;
         }
         assert!(

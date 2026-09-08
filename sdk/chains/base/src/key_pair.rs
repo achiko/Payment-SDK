@@ -15,13 +15,13 @@ pub struct KeyPair<A> {
 
 impl<A> KeyPair<A> {
     pub fn new(address: A, key: impl Into<Vec<u8>>) -> Result<Self, SignerError> {
-        let key = SecretKey::new(key).map_err(signer_error)?;
+        let key = SecretKey::new(key).map_err(SignerError::from_crypto)?;
         Ok(Self { address, key })
     }
 
     fn sign_now(&self, request: SignRequest) -> Result<SignedPayload, SignerError> {
         let SignablePayload::Digest(digest) = request.payload else {
-            return Err(error(
+            return Err(SignerError::new(
                 SignerErrorKind::UnsupportedOperation,
                 "signer accepts precomputed digests only",
             ));
@@ -29,25 +29,25 @@ impl<A> KeyPair<A> {
         let public_key = self
             .key
             .public_key(request.public_key_format)
-            .map_err(signer_error)?;
+            .map_err(SignerError::from_crypto)?;
         let bytes = match request.scheme {
             SignatureScheme::EcdsaSecp256k1 => {
                 if request.key_tweak.is_some() {
-                    return Err(error(
+                    return Err(SignerError::new(
                         SignerErrorKind::UnsupportedOperation,
                         "ECDSA does not accept a key tweak",
                     ));
                 }
                 self.key
                     .sign_ecdsa(&digest.bytes, request.encoding)
-                    .map_err(signer_error)?
+                    .map_err(SignerError::from_crypto)?
             }
             SignatureScheme::SchnorrSecp256k1 => self
                 .key
                 .sign_schnorr(&digest.bytes, request.encoding, request.key_tweak.as_ref())
-                .map_err(signer_error)?,
+                .map_err(SignerError::from_crypto)?,
             _ => {
-                return Err(error(
+                return Err(SignerError::new(
                     SignerErrorKind::UnsupportedScheme,
                     "key pair supports secp256k1 only",
                 ));
@@ -76,17 +76,9 @@ impl<A: Send + Sync> Signer for KeyPair<A> {
     }
 }
 
-fn signer_error(error: CryptoError) -> SignerError {
-    SignerError {
-        kind: SignerErrorKind::InvalidRequest,
-        message: error.to_string(),
-    }
-}
-
-fn error(kind: SignerErrorKind, message: impl Into<String>) -> SignerError {
-    SignerError {
-        kind,
-        message: message.into(),
+impl SignerError {
+    fn from_crypto(error: CryptoError) -> Self {
+        Self::new(SignerErrorKind::InvalidRequest, error.to_string())
     }
 }
 
@@ -96,6 +88,105 @@ mod tests {
 
     use super::*;
     use crate::{Digest, PublicKeyFormat, SignablePayload, SignatureEncoding, SignatureScheme};
+
+    #[test]
+    fn unsupported_signing_requests_preserve_error_kind_and_validation_order() {
+        let pair = KeyPair::new([7_u8; 20], [1_u8; 32]).expect("test key must be valid");
+        for (payload, scheme, key_tweak, kind, message) in [
+            (
+                SignablePayload::Message(vec![9; 32]),
+                SignatureScheme::Ed25519,
+                None,
+                SignerErrorKind::UnsupportedOperation,
+                "signer accepts precomputed digests only",
+            ),
+            (
+                SignablePayload::Digest(Digest { bytes: vec![9; 31] }),
+                SignatureScheme::EcdsaSecp256k1,
+                Some(crate::KeyTweak::Add([0; 32])),
+                SignerErrorKind::UnsupportedOperation,
+                "ECDSA does not accept a key tweak",
+            ),
+            (
+                SignablePayload::Digest(Digest { bytes: vec![9; 31] }),
+                SignatureScheme::Ed25519,
+                None,
+                SignerErrorKind::UnsupportedScheme,
+                "key pair supports secp256k1 only",
+            ),
+        ] {
+            let error = block_on(pair.sign(SignRequest {
+                payload,
+                scheme,
+                encoding: SignatureEncoding::Recoverable,
+                public_key_format: PublicKeyFormat::Raw,
+                key_tweak,
+            }))
+            .expect_err("unsupported requests must fail before digest signing");
+            assert_eq!(error.kind, kind);
+            assert_eq!(error.message, message);
+        }
+    }
+
+    #[test]
+    fn crypto_failures_keep_invalid_request_mapping_and_validation_precedence() {
+        let error = KeyPair::new((), [0_u8; 32]).err().unwrap();
+        assert_eq!(error.kind, SignerErrorKind::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "secret key must be a valid 32-byte secp256k1 scalar"
+        );
+        let pair = KeyPair::new((), [1_u8; 32]).unwrap();
+        for (scheme, encoding, size, key_tweak, message) in [
+            (
+                SignatureScheme::EcdsaSecp256k1,
+                SignatureEncoding::Der,
+                31,
+                None,
+                "digest must contain exactly 32 bytes",
+            ),
+            (
+                SignatureScheme::SchnorrSecp256k1,
+                SignatureEncoding::Der,
+                31,
+                None,
+                "Schnorr signatures require raw encoding",
+            ),
+            (
+                SignatureScheme::SchnorrSecp256k1,
+                SignatureEncoding::Raw,
+                31,
+                Some(crate::KeyTweak::TaggedHashAdd {
+                    tag: Vec::new(),
+                    suffix: Vec::new(),
+                }),
+                "digest must contain exactly 32 bytes",
+            ),
+            (
+                SignatureScheme::SchnorrSecp256k1,
+                SignatureEncoding::Raw,
+                32,
+                Some(crate::KeyTweak::TaggedHashAdd {
+                    tag: Vec::new(),
+                    suffix: Vec::new(),
+                }),
+                "tag must not be empty",
+            ),
+        ] {
+            let error = block_on(pair.sign(SignRequest {
+                payload: SignablePayload::Digest(Digest {
+                    bytes: vec![9; size],
+                }),
+                scheme,
+                encoding,
+                public_key_format: PublicKeyFormat::Raw,
+                key_tweak,
+            }))
+            .unwrap_err();
+            assert_eq!(error.kind, SignerErrorKind::InvalidRequest);
+            assert_eq!(error.message, message);
+        }
+    }
 
     #[test]
     fn key_pair_is_the_local_signer() {

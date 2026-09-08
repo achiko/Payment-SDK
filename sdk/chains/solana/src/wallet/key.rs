@@ -41,7 +41,7 @@ impl Key {
     }
 
     pub fn sign_message(&self, message: &[u8]) -> Result<SignedMessage, Error> {
-        let signature = self.native_key()?.sign_message(message);
+        let signature = self.native()?.sign_message(message);
         SignedMessage::verified(&self.address, message, signature)
     }
 
@@ -76,7 +76,7 @@ impl Key {
         Ok(SecretBytes::new(*bytes))
     }
 
-    fn native_key(&self) -> Result<Keypair, Error> {
+    fn native(&self) -> Result<Keypair, Error> {
         let bytes: [u8; 32] = self
             .secret
             .as_bytes()
@@ -163,6 +163,7 @@ impl Signer for Key {
     }
 }
 
+// design-lint: allow unclassified-free-function -- Solana Signer adapter constructs foreign base errors from caller-selected kinds and redacted messages without moving signing policy into base
 fn signer_error(kind: SignerErrorKind, message: impl Into<String>) -> SignerError {
     SignerError {
         kind,
@@ -237,6 +238,30 @@ mod tests {
         .expect("injected failure");
         assert_eq!(calls.get(), 1);
         assert_eq!(error.kind(), ErrorKind::Generation);
+    }
+
+    #[test]
+    fn signing_failure_is_redacted_and_request_validation_precedes_key_access() {
+        let key = Key {
+            secret: SecretBytes::new([7; 31]),
+            address: fixture().address().clone(),
+        };
+        let mut request = SignRequest {
+            payload: SignablePayload::Message(b"private message fixture".to_vec()),
+            scheme: SignatureScheme::Ed25519,
+            encoding: SignatureEncoding::Raw,
+            public_key_format: PublicKeyFormat::Raw,
+            key_tweak: None,
+        };
+        let error = block_on(key.sign(request.clone())).unwrap_err();
+        assert_eq!(error.kind, SignerErrorKind::Other);
+        assert_eq!(error.message, "Solana signing failed");
+
+        request.scheme = SignatureScheme::EcdsaSecp256k1;
+        request.encoding = SignatureEncoding::Der;
+        let error = block_on(key.sign(request)).unwrap_err();
+        assert_eq!(error.kind, SignerErrorKind::UnsupportedScheme);
+        assert_eq!(error.message, "Solana requires Ed25519 signatures");
     }
 
     #[test]

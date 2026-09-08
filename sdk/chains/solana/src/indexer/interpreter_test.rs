@@ -292,6 +292,10 @@ fn failed_transaction_is_fee_only_and_visible_only_to_payer() {
         draft.fee.as_ref().expect("failed fee").amount.to_string(),
         "5"
     );
+    assert_eq!(
+        draft.fee.as_ref().and_then(|fee| fee.payer.as_ref()),
+        Some(&selected(1))
+    );
 
     let endpoint = inspect(vec![value], &[selected(2)]).expect("attempted endpoint ignored");
     assert!(endpoint.transactions.is_empty());
@@ -310,6 +314,13 @@ fn retains_successful_fee_only_transaction_for_selected_payer() {
     let interpreted = inspect(vec![value], &[selected(1)]).expect("fee-only success");
     assert_eq!(interpreted.transactions.len(), 1);
     assert!(interpreted.transactions[0].movements.is_empty());
+    assert_eq!(
+        interpreted.transactions[0]
+            .fee
+            .as_ref()
+            .and_then(|fee| fee.payer.as_ref()),
+        Some(&selected(1))
+    );
 }
 
 #[test]
@@ -395,4 +406,117 @@ fn rejects_duplicate_first_signature_identity() {
         .expect_err("duplicate first signature");
     assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
     assert!(error.message.contains("duplicate first signatures"));
+}
+
+#[test]
+fn shared_interpretation_errors_preserve_exact_context_and_nonretryability() {
+    for (path, invalid, message) in [
+        (
+            "/meta",
+            Value::Null,
+            "Solana transaction metadata is missing",
+        ),
+        (
+            "/meta/innerInstructions",
+            Value::Null,
+            "successful selected Solana transaction has incomplete inner instructions",
+        ),
+        (
+            "/transaction/message/instructions/0/data",
+            json!("0"),
+            "Solana System instruction data is not canonical Base58",
+        ),
+    ] {
+        let mut transaction = baseline(41);
+        *transaction.pointer_mut(path).unwrap() = invalid;
+        let error = inspect(vec![baseline(40), transaction], &[selected(2)]).unwrap_err();
+        assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+        assert_eq!(error.message, message);
+        assert!(!error.retryable);
+    }
+}
+
+#[test]
+fn malformed_static_and_loaded_addresses_keep_context_before_balance_validation() {
+    for target in ["static", "writable", "readonly"] {
+        let mut value = baseline(31);
+        match target {
+            "static" => value["transaction"]["message"]["accountKeys"][1] = json!("invalid"),
+            "writable" => {
+                value["version"] = json!(0);
+                value["meta"]["loadedAddresses"] = json!({"writable":["invalid"],"readonly":[]});
+            }
+            "readonly" => {
+                value["version"] = json!(0);
+                value["meta"]["loadedAddresses"] = json!({"writable":[],"readonly":["invalid"]});
+            }
+            _ => unreachable!(),
+        }
+        value["meta"]["preBalances"] = json!([]);
+        let error = inspect(vec![value], &[selected(2)]).unwrap_err();
+        assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+        assert!(!error.retryable);
+        assert_eq!(
+            error.message,
+            "Solana transaction contains a malformed canonical address"
+        );
+    }
+}
+
+#[test]
+fn instruction_bounds_and_inner_group_validation_keep_error_precedence() {
+    let index_error = "Solana compiled instruction contains an invalid account index";
+    let group_error = "Solana transaction contains an invalid or duplicate inner-instruction group";
+    for (program, accounts) in [(3, vec![0]), (2, vec![3])] {
+        let invalid = json!({"programIdIndex":program,"accounts":accounts,"data":"opaque"});
+        let mut outer = baseline(35);
+        outer["transaction"]["message"]["instructions"] = json!([invalid.clone()]);
+        let mut inner = baseline(35);
+        inner["meta"]["innerInstructions"] = json!([{"index":0,"instructions":[invalid.clone()]}]);
+        let mut invalid_group = baseline(35);
+        invalid_group["meta"]["innerInstructions"] =
+            json!([{"index":1,"instructions":[invalid.clone()]}]);
+        let mut duplicate_group = baseline(35);
+        duplicate_group["meta"]["innerInstructions"] = json!([
+            {"index":0,"instructions":[]}, {"index":0,"instructions":[invalid]},
+        ]);
+        for (value, expected) in [
+            (outer, index_error),
+            (inner, index_error),
+            (invalid_group, group_error),
+            (duplicate_group, index_error),
+        ] {
+            let error = inspect(vec![value], &[selected(2)]).unwrap_err();
+            assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+            assert!(!error.retryable);
+            assert_eq!(error.message, expected);
+        }
+    }
+}
+
+#[test]
+fn instruction_conversion_preserves_account_order_duplicates_and_opaque_data() {
+    let mut value = baseline(36);
+    value["transaction"]["message"]["instructions"] = json!([
+        {"programIdIndex":2,"accounts":[2,0,2,1],"data":"opaque_1"},
+        {"programIdIndex":0,"accounts":[],"data":""},
+    ]);
+    value["meta"]["innerInstructions"] = json!([
+        {"index":1,"instructions":[{"programIdIndex":1,"accounts":[1,0],"data":"opaque_2"}]},
+    ]);
+    let block = block(vec![value]);
+    let parsed = Transactions::parse(block.raw()).unwrap();
+    let transaction = &parsed.values()[0];
+    let instructions = transaction.instructions();
+    assert_eq!(instructions.len(), 2);
+    assert_eq!(instructions[0].program, 2);
+    assert_eq!(instructions[0].accounts, [2, 0, 2, 1]);
+    assert_eq!(instructions[0].data, "opaque_1");
+    assert_eq!(instructions[1].program, 0);
+    assert!(instructions[1].accounts.is_empty());
+    assert!(instructions[1].data.is_empty());
+    let inner = &transaction.inner().unwrap()[&1][0];
+    assert_eq!(inner.program, 1);
+    assert_eq!(inner.accounts, [1, 0]);
+    assert_eq!(inner.data, "opaque_2");
 }

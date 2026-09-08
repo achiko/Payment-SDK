@@ -75,10 +75,10 @@ pub struct Decimal {
 impl Ord for Decimal {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self.coefficient.sign(), other.coefficient.sign()) {
-            (Sign::Minus, Sign::Minus) => compare_magnitude(other, self),
+            (Sign::Minus, Sign::Minus) => other.compare_magnitude(self),
             (Sign::Minus, _) => Ordering::Less,
             (_, Sign::Minus) => Ordering::Greater,
-            _ => compare_magnitude(self, other),
+            _ => self.compare_magnitude(other),
         }
     }
 }
@@ -169,8 +169,8 @@ impl Decimal {
     /// todo would this be better add?
     pub fn checked_add(&self, other: &Self) -> Result<Self, DecimalError> {
         let scale = self.scale.max(other.scale);
-        let left = scaled_coefficient(self, scale)?;
-        let right = scaled_coefficient(other, scale)?;
+        let left = self.scaled_coefficient(scale)?;
+        let right = other.scaled_coefficient(scale)?;
         Ok(Self::new(left + right, scale))
     }
 
@@ -178,8 +178,8 @@ impl Decimal {
     /// todo just sub?
     pub fn checked_sub(&self, other: &Self) -> Result<Self, DecimalError> {
         let scale = self.scale.max(other.scale);
-        let left = scaled_coefficient(self, scale)?;
-        let right = scaled_coefficient(other, scale)?;
+        let left = self.scaled_coefficient(scale)?;
+        let right = other.scaled_coefficient(scale)?;
         Ok(Self::new(left - right, scale))
     }
 
@@ -200,9 +200,9 @@ impl Decimal {
 
         let coefficient = self.coefficient.magnitude();
         let units = if self.scale <= decimals {
-            coefficient * power_of_ten(decimals - self.scale)
+            coefficient * BigUint::from(10_u8).pow(decimals - self.scale)
         } else {
-            let divisor = power_of_ten(self.scale - decimals);
+            let divisor = BigUint::from(10_u8).pow(self.scale - decimals);
             if coefficient % &divisor != BigUint::ZERO {
                 return Err(DecimalError::new(
                     DecimalErrorKind::ExcessPrecision,
@@ -243,6 +243,48 @@ impl Decimal {
         Ok(value)
     }
 
+    fn scaled_coefficient(&self, scale: u32) -> Result<BigInt, DecimalError> {
+        let exponent = scale.checked_sub(self.scale).ok_or_else(|| {
+            DecimalError::new(
+                DecimalErrorKind::Invalid,
+                "target scale must not be smaller than the decimal scale",
+            )
+        })?;
+        Ok(&self.coefficient * BigInt::from(BigUint::from(10_u8).pow(exponent)))
+    }
+
+    fn compare_magnitude(&self, other: &Self) -> Ordering {
+        if self.coefficient.is_zero() || other.coefficient.is_zero() {
+            return self
+                .coefficient
+                .magnitude()
+                .cmp(other.coefficient.magnitude());
+        }
+
+        let left_digits = self.coefficient.magnitude().to_str_radix(10).len();
+        let right_digits = other.coefficient.magnitude().to_str_radix(10).len();
+        let left_exponent = left_digits as i128 - i128::from(self.scale);
+        let right_exponent = right_digits as i128 - i128::from(other.scale);
+        match left_exponent.cmp(&right_exponent) {
+            Ordering::Equal => {}
+            ordering => return ordering,
+        }
+
+        match self.scale.cmp(&other.scale) {
+            Ordering::Equal => self
+                .coefficient
+                .magnitude()
+                .cmp(other.coefficient.magnitude()),
+            Ordering::Less => (self.coefficient.magnitude()
+                * BigUint::from(10_u8).pow(other.scale - self.scale))
+            .cmp(other.coefficient.magnitude()),
+            Ordering::Greater => self.coefficient.magnitude().cmp(
+                &(other.coefficient.magnitude()
+                    * BigUint::from(10_u8).pow(self.scale - other.scale)),
+            ),
+        }
+    }
+
     fn normalize(mut coefficient: BigInt, mut scale: u32) -> Self {
         if coefficient.is_zero() {
             return Self {
@@ -280,13 +322,13 @@ impl FromStr for Decimal {
         let mut parts = unsigned.split('.');
         let whole = parts.next().unwrap_or_default();
         let fraction = parts.next();
-        if parts.next().is_some()
+        let invalid_notation = parts.next().is_some()
             || whole.is_empty()
             || !whole.bytes().all(|byte| byte.is_ascii_digit())
             || fraction.is_some_and(|digits| {
                 digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit())
-            })
-        {
+            });
+        if invalid_notation {
             return Err(DecimalError::invalid());
         }
         let fraction = fraction.unwrap_or_default();
@@ -319,51 +361,6 @@ impl fmt::Display for Decimal {
         }
         formatter.write_str(&digits)
     }
-}
-
-fn power_of_ten(exponent: u32) -> BigUint {
-    BigUint::from(10_u8).pow(exponent)
-}
-
-fn compare_magnitude(left: &Decimal, right: &Decimal) -> Ordering {
-    if left.coefficient.is_zero() || right.coefficient.is_zero() {
-        return left
-            .coefficient
-            .magnitude()
-            .cmp(right.coefficient.magnitude());
-    }
-
-    let left_digits = left.coefficient.magnitude().to_str_radix(10).len();
-    let right_digits = right.coefficient.magnitude().to_str_radix(10).len();
-    let left_exponent = left_digits as i128 - i128::from(left.scale);
-    let right_exponent = right_digits as i128 - i128::from(right.scale);
-    match left_exponent.cmp(&right_exponent) {
-        Ordering::Equal => {}
-        ordering => return ordering,
-    }
-
-    match left.scale.cmp(&right.scale) {
-        Ordering::Equal => left
-            .coefficient
-            .magnitude()
-            .cmp(right.coefficient.magnitude()),
-        Ordering::Less => (left.coefficient.magnitude() * power_of_ten(right.scale - left.scale))
-            .cmp(right.coefficient.magnitude()),
-        Ordering::Greater => left
-            .coefficient
-            .magnitude()
-            .cmp(&(right.coefficient.magnitude() * power_of_ten(left.scale - right.scale))),
-    }
-}
-
-fn scaled_coefficient(value: &Decimal, scale: u32) -> Result<BigInt, DecimalError> {
-    let exponent = scale.checked_sub(value.scale).ok_or_else(|| {
-        DecimalError::new(
-            DecimalErrorKind::Invalid,
-            "target scale must not be smaller than the decimal scale",
-        )
-    })?;
-    Ok(&value.coefficient * BigInt::from(power_of_ten(exponent)))
 }
 
 #[cfg(test)]

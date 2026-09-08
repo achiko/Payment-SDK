@@ -58,13 +58,12 @@ fn artifacts() -> Result<Vec<Artifact<'static>>, io::Error> {
                 name: fields.next().ok_or_else(invalid_manifest)?,
                 sha256: fields.next().ok_or_else(invalid_manifest)?,
             };
-            if fields.next().is_some()
-                || artifact.sha256.len() != 64
-                || !artifact
+            let checksum_is_canonical = artifact.sha256.len() == 64
+                && artifact
                     .sha256
                     .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+            if fields.next().is_some() || !checksum_is_canonical {
                 return Err(invalid_manifest());
             }
             Ok(artifact)
@@ -132,10 +131,13 @@ fn executable(directory: &Path, name: &str) -> Option<PathBuf> {
     for entry in fs::read_dir(directory).ok()? {
         let path = entry.ok()?.path();
         if path.is_dir() {
-            if let Some(found) = executable(&path, name) {
-                return Some(found);
-            }
-        } else if path.file_name().and_then(|value| value.to_str()) == Some(name) {
+            let Some(found) = executable(&path, name) else {
+                continue;
+            };
+            return Some(found);
+        }
+        let matches_name = path.file_name().and_then(|value| value.to_str()) == Some(name);
+        if matches_name {
             return Some(path);
         }
     }
@@ -152,6 +154,28 @@ fn host_target() -> &'static str {
     } else {
         "unsupported"
     }
+}
+
+#[test]
+fn executable_search_finds_nested_files_and_rejects_missing_or_file_roots() {
+    let directory = tempfile::tempdir().expect("temporary search directory");
+    let named_directory = directory.path().join("fixture-tool");
+    fs::create_dir(&named_directory).expect("same-named directory");
+    assert_eq!(executable(directory.path(), "fixture-tool"), None);
+
+    let nested = directory.path().join("release/bin");
+    fs::create_dir_all(&nested).expect("nested artifact layout");
+    let expected = nested.join("fixture-tool");
+    fs::write(&expected, b"fixture only").expect("fixture file");
+    assert_eq!(
+        executable(directory.path(), "fixture-tool"),
+        Some(expected.clone())
+    );
+    assert_eq!(executable(&expected, "fixture-tool"), None);
+    assert_eq!(
+        executable(&directory.path().join("missing"), "fixture-tool"),
+        None
+    );
 }
 
 #[test]
@@ -495,11 +519,11 @@ async fn native_sol_submission_indexing_and_central_storage() {
             .history(&"source".to_owned(), HistoryRequest::first(100))
             .await
             .expect("history during retained rollback");
-        if history
+        let transaction_absent = history
             .transactions
             .iter()
-            .all(|entry| entry.transaction_id.value != transaction.as_str())
-        {
+            .all(|entry| entry.transaction_id.value != transaction.as_str());
+        if transaction_absent {
             break;
         }
         let tip = repository

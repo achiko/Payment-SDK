@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
-use super::{Draft, Preparation, PreparationError, chain_error};
-use crate::{Address, ChainErrorKind, Wei};
+use super::{Draft, PreparationError};
+use crate::{Address, ChainError, ChainErrorKind, Wei};
 
 type Contributions = (Wei, Vec<(usize, Wei)>);
 type RequirementsByAsset = BTreeMap<(Address, RequiredAsset), Contributions>;
@@ -55,25 +55,26 @@ impl Requirements {
                 .ok_or_else(|| {
                     PreparationError::new(
                         index,
-                        chain_error(
+                        ChainError::new(
                             ChainErrorKind::FeeUnavailable,
                             "Ethereum aggregate maximum fee overflows U256",
                         ),
                     )
                 })?;
             let native = if request.erc20_transfer().is_none() {
-                fee.checked_add(&request.value()).ok_or_else(|| {
-                    PreparationError::new(
-                        index,
-                        chain_error(
-                            ChainErrorKind::InsufficientFunds,
-                            "Ethereum aggregate native requirement overflows U256",
-                        ),
-                    )
-                })?
+                fee.checked_add(&request.value())
             } else {
-                fee
-            };
+                Some(fee)
+            }
+            .ok_or_else(|| {
+                PreparationError::new(
+                    index,
+                    ChainError::new(
+                        ChainErrorKind::InsufficientFunds,
+                        "Ethereum aggregate native requirement overflows U256",
+                    ),
+                )
+            })?;
             add(
                 &mut values,
                 request.from().clone(),
@@ -118,7 +119,7 @@ fn add(
     entry.0 = entry.0.checked_add(&amount).ok_or_else(|| {
         PreparationError::new(
             index,
-            chain_error(
+            ChainError::new(
                 ChainErrorKind::InsufficientFunds,
                 "Ethereum aggregate asset requirement overflows U256",
             ),
@@ -126,16 +127,4 @@ fn add(
     })?;
     entry.1.push((index, amount));
     Ok(())
-}
-
-pub(super) fn senders(preparations: &[Preparation<'_>]) -> Vec<(Address, usize)> {
-    let mut values = BTreeMap::new();
-    for (index, preparation) in preparations.iter().enumerate() {
-        values
-            .entry(preparation.request.from().clone())
-            .or_insert(index);
-    }
-    let mut values = values.into_iter().collect::<Vec<_>>();
-    values.sort_by_key(|(_, index)| *index);
-    values
 }

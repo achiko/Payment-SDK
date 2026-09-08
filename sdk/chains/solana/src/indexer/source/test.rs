@@ -195,13 +195,14 @@ async fn refuses_same_slot_omission_and_late_pruning() {
         enumeration(7, 7, 10, json!([])),
         ("getFirstAvailableBlock", json!([]), json!(8)),
     ]);
-    assert!(
-        Source::new(RpcClient::new(pruned.clone()))
-            .canonical_at(BlockPosition(7))
-            .await
-            .unwrap_err()
-            .message
-            .contains("pruned")
+    let error = Source::new(RpcClient::new(pruned.clone()))
+        .canonical_at(BlockPosition(7))
+        .await
+        .unwrap_err();
+    assert!(!error.retryable);
+    assert_eq!(
+        error.message,
+        "Solana required position was pruned during source acquisition"
     );
     pruned.assert_finished();
 }
@@ -252,4 +253,239 @@ async fn rejects_broken_produced_height_or_parent_sequence() {
         assert!(error.message.contains("strict canonical sequence"));
         rpc.assert_finished();
     }
+}
+
+#[tokio::test]
+async fn validates_parent_connections_across_sparse_enumeration_windows() {
+    for parent in [100, 99] {
+        let second = block(10_103, 3, parent, 3, 2);
+        let rpc = Scripted::new([
+            (
+                "getSlot",
+                json!([{"commitment":"finalized"}]),
+                json!(10_103),
+            ),
+            ("getFirstAvailableBlock", json!([]), json!(1)),
+            enumeration(104, 10_103, 10_103, json!([10_103])),
+            full(10_103, second.clone()),
+            ("getFirstAvailableBlock", json!([]), json!(1)),
+            enumeration(100, 10_099, 10_103, json!([100])),
+            full(100, block(100, 2, 1, 2, 1)),
+            enumeration(10_100, 10_103, 10_103, json!([10_103])),
+            full(10_103, second),
+            ("getFirstAvailableBlock", json!([]), json!(1)),
+        ]);
+        let client = RpcClient::new(rpc.clone());
+        let result = Source::new(client.clone())
+            .blocks(BlockPosition(100), BlockPosition(10_103), 2)
+            .await;
+        if parent == 100 {
+            let blocks = result.expect("connected blocks across windows");
+            assert_eq!(blocks.len(), 2);
+            assert_eq!(blocks[0].reference().position, BlockPosition(100));
+            assert_eq!(blocks[1].reference().position, BlockPosition(10_103));
+            assert_eq!(blocks[1].reference().height, BlockHeight(3));
+        } else {
+            let error = result.expect_err("cross-window parent mismatch");
+            assert!(error.retryable);
+            assert_eq!(
+                error.message,
+                "Solana produced blocks are not a strict canonical sequence"
+            );
+            assert_eq!(client.first_available_block().await.unwrap(), 1);
+        }
+        rpc.assert_finished();
+    }
+}
+
+#[tokio::test]
+async fn within_preserves_rpc_error_messages_and_retryability() {
+    let rpc = RpcClient::new(Scripted::new([]));
+    let attempt = Attempt::new(&rpc);
+    for (kind, retryable) in [
+        (ErrorKind::InvalidBatch, false),
+        (ErrorKind::InvalidBudget, false),
+        (ErrorKind::InvalidIdentity, false),
+        (ErrorKind::InvalidSecret, false),
+        (ErrorKind::Generation, false),
+        (ErrorKind::Signing, false),
+        (ErrorKind::InvalidRpcConfiguration, false),
+        (ErrorKind::RpcTimeout, true),
+        (ErrorKind::RpcUnavailable, true),
+        (ErrorKind::RpcHttpStatus(400), true),
+        (ErrorKind::RpcHttpStatus(503), true),
+        (ErrorKind::RpcRemote(-32000), true),
+        (ErrorKind::MalformedRpc, true),
+        (ErrorKind::ResponseTooLarge, true),
+        (ErrorKind::BelowFloor, true),
+        (ErrorKind::UnsupportedDestination, false),
+        (ErrorKind::Simulation, true),
+    ] {
+        let message = format!("source RPC fixture {kind:?}");
+        let error = attempt
+            .within::<()>(std::future::ready(Err(Error::new(kind, message.clone()))))
+            .await
+            .expect_err("RPC error must remain an error");
+
+        assert_eq!(error.message, message, "{kind:?}");
+        assert_eq!(error.retryable, retryable, "{kind:?}");
+    }
+}
+
+#[tokio::test]
+async fn within_preserves_successful_values() {
+    let rpc = RpcClient::new(Scripted::new([]));
+    let attempt = Attempt::new(&rpc);
+    let value = attempt
+        .within(std::future::ready(Ok(vec![3, 100, 107])))
+        .await
+        .expect("successful RPC must retain its value");
+
+    assert_eq!(value, vec![3, 100, 107]);
+}
+
+#[tokio::test]
+async fn within_times_out_a_pending_future_at_the_existing_deadline() {
+    let rpc = RpcClient::new(Scripted::new([]));
+    let deadline = Instant::now() - Duration::from_millis(1);
+    let attempt = Attempt {
+        rpc: &rpc,
+        deadline,
+        enumerations: 17,
+    };
+    let value = attempt.within(std::future::ready(Ok(42))).await.unwrap();
+    assert_eq!(
+        value, 42,
+        "a ready future retains timeout_at polling precedence"
+    );
+    let error = attempt
+        .within(std::future::pending::<Result<(), Error>>())
+        .await
+        .expect_err("pending RPC must respect the elapsed attempt deadline");
+
+    assert_eq!(
+        error.message,
+        "Solana source exceeded its 30-second deadline"
+    );
+    assert!(error.retryable);
+    assert_eq!(attempt.deadline, deadline);
+    assert_eq!(attempt.enumerations, 17);
+}
+
+#[test]
+fn deadline_guard_is_strict_and_does_not_reset_attempt_state() {
+    let rpc = RpcClient::new(Scripted::new([]));
+    let deadline = Instant::now();
+    let attempt = Attempt {
+        rpc: &rpc,
+        deadline,
+        enumerations: 17,
+    };
+
+    assert!(
+        attempt
+            .ensure_before_deadline(deadline - Duration::from_nanos(1))
+            .is_ok()
+    );
+    for observed in [deadline, deadline + Duration::from_nanos(1)] {
+        let error = attempt.ensure_before_deadline(observed).unwrap_err();
+        assert_eq!(
+            error.message,
+            "Solana source exceeded its 30-second deadline"
+        );
+        assert!(error.retryable);
+    }
+    assert_eq!(attempt.deadline, deadline);
+    assert_eq!(attempt.enumerations, 17);
+}
+
+#[tokio::test]
+async fn expired_attempt_rejects_before_spending_enumeration_budget_or_rpc() {
+    let scripted = Scripted::new([]);
+    let rpc = RpcClient::new(scripted.clone());
+    let deadline = Instant::now() - Duration::from_nanos(1);
+    for enumerations in [0, MAX_ENUMERATIONS] {
+        let mut attempt = Attempt {
+            rpc: &rpc,
+            deadline,
+            enumerations,
+        };
+        let error = attempt.enumerate(1, 1, 1).await.unwrap_err();
+        assert_eq!(
+            error.message,
+            "Solana source exceeded its 30-second deadline"
+        );
+        assert!(error.retryable);
+        assert_eq!(attempt.enumerations, enumerations);
+        assert_eq!(attempt.deadline, deadline);
+    }
+    scripted.assert_finished();
+}
+
+#[tokio::test]
+async fn selected_anchor_accepts_retention_equality_but_retries_later_pruning() {
+    for closing in [7, 8] {
+        let rpc = Scripted::new([
+            ("getSlot", json!([{"commitment":"finalized"}]), json!(10)),
+            ("getFirstAvailableBlock", json!([]), json!(1)),
+            enumeration(1, 10, 10, json!([7])),
+            full(7, block(7, 5, 6, 9, 8)),
+            ("getFirstAvailableBlock", json!([]), json!(closing)),
+        ]);
+        let result = Source::new(RpcClient::new(rpc.clone())).tip().await;
+        if closing == 7 {
+            assert_eq!(result.unwrap().position, BlockPosition(7));
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.retryable);
+            assert_eq!(
+                error.message,
+                "Solana selected anchor was pruned during source acquisition"
+            );
+        }
+        rpc.assert_finished();
+    }
+}
+
+#[tokio::test]
+async fn canonical_retention_equality_succeeds_and_opening_pruning_precedes_tip_check() {
+    let rpc = Scripted::new([
+        ("getSlot", json!([{"commitment":"finalized"}]), json!(10)),
+        ("getFirstAvailableBlock", json!([]), json!(7)),
+        enumeration(7, 7, 10, json!([7])),
+        full(7, block(7, 5, 6, 9, 8)),
+        ("getFirstAvailableBlock", json!([]), json!(7)),
+    ]);
+    let result = Source::new(RpcClient::new(rpc.clone()))
+        .canonical_at(BlockPosition(7))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.position, BlockPosition(7));
+    rpc.assert_finished();
+
+    let pruned = Scripted::new([
+        ("getSlot", json!([{"commitment":"finalized"}]), json!(6)),
+        ("getFirstAvailableBlock", json!([]), json!(8)),
+    ]);
+    let error = Source::new(RpcClient::new(pruned.clone()))
+        .canonical_at(BlockPosition(7))
+        .await
+        .unwrap_err();
+    assert!(!error.retryable);
+    assert_eq!(
+        error.message,
+        "Solana required position was pruned during source acquisition"
+    );
+    pruned.assert_finished();
+}
+
+#[test]
+fn produced_height_overflow_precedes_other_connection_errors() {
+    let previous =
+        Block::parse(7, serde_json::to_vec(&block(7, u64::MAX, 6, 7, 6)).unwrap()).unwrap();
+    let current = Block::parse(7, serde_json::to_vec(&block(7, 0, 6, 9, 8)).unwrap()).unwrap();
+    let error = current.require_connection(&previous).unwrap_err();
+    assert!(error.retryable);
+    assert_eq!(error.message, "Solana produced height is exhausted");
 }

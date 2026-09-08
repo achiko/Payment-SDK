@@ -24,9 +24,15 @@ where
         let span = end
             .checked_sub(start)
             .and_then(|difference| difference.checked_add(1))
-            .ok_or_else(|| invalid_range("Solana finalized block range must be ordered"))?;
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidRpcConfiguration,
+                    "Solana finalized block range must be ordered",
+                )
+            })?;
         if span > MAX_ENUMERATION_SPAN {
-            return Err(invalid_range(
+            return Err(Error::new(
+                ErrorKind::InvalidRpcConfiguration,
                 "Solana finalized block range exceeds 500000 slots",
             ));
         }
@@ -40,7 +46,14 @@ where
                 }]),
             )
             .await?;
-        validate_slots(&slots, start, end)?;
+        if slots.iter().any(|slot| *slot < start || *slot > end)
+            || slots.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(Error::new(
+                ErrorKind::MalformedRpc,
+                "Solana getBlocks returned unordered, duplicate, or out-of-range slots",
+            ));
+        }
         Ok(slots)
     }
 
@@ -57,22 +70,6 @@ where
         )
         .await
     }
-}
-
-fn validate_slots(slots: &[u64], start: u64, end: u64) -> Result<(), Error> {
-    if slots.iter().any(|slot| *slot < start || *slot > end)
-        || slots.windows(2).any(|pair| pair[0] >= pair[1])
-    {
-        return Err(Error::new(
-            ErrorKind::MalformedRpc,
-            "Solana getBlocks returned unordered, duplicate, or out-of-range slots",
-        ));
-    }
-    Ok(())
-}
-
-fn invalid_range(message: &'static str) -> Error {
-    Error::new(ErrorKind::InvalidRpcConfiguration, message)
 }
 
 #[cfg(test)]
@@ -128,34 +125,79 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_invalid_request_bounds_before_rpc() {
-        let client = Client::new(Scripted::new([]));
-        for (start, end) in [(2, 1), (0, MAX_ENUMERATION_SPAN)] {
-            assert_eq!(
-                client
-                    .finalized_blocks(start, end, 9)
-                    .await
-                    .unwrap_err()
-                    .kind(),
-                ErrorKind::InvalidRpcConfiguration
+        let rpc = Scripted::new([]);
+        let client = Client::new(rpc.clone());
+        for (start, end, message) in [
+            (2, 1, "Solana finalized block range must be ordered"),
+            (u64::MAX, 0, "Solana finalized block range must be ordered"),
+            (0, u64::MAX, "Solana finalized block range must be ordered"),
+            (
+                0,
+                MAX_ENUMERATION_SPAN,
+                "Solana finalized block range exceeds 500000 slots",
+            ),
+        ] {
+            let error = client.finalized_blocks(start, end, 9).await.unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidRpcConfiguration);
+            assert_eq!(error.to_string(), message);
+        }
+        rpc.assert_finished();
+    }
+
+    #[tokio::test]
+    async fn accepts_maximum_span_and_final_u64_slot_without_changing_rpc_bounds() {
+        for (start, end) in [
+            (0, MAX_ENUMERATION_SPAN - 1),
+            (u64::MAX, u64::MAX),
+            (u64::MAX - MAX_ENUMERATION_SPAN + 1, u64::MAX),
+        ] {
+            let rpc = Scripted::one(
+                "getBlocks",
+                json!([start, end, { "commitment": "finalized", "minContextSlot": end }]),
+                json!([end]),
             );
+            let client = Client::new(rpc.clone());
+            assert_eq!(
+                client.finalized_blocks(start, end, end).await.unwrap(),
+                [end]
+            );
+            rpc.assert_finished();
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_empty_and_sparse_slots_without_reordering() {
+        for slots in [vec![], vec![2], vec![7], vec![2, 4, 7]] {
+            let rpc = Scripted::one(
+                "getBlocks",
+                json!([2, 7, {"commitment":"finalized","minContextSlot":9}]),
+                json!(slots),
+            );
+            let client = Client::new(rpc.clone());
+            assert_eq!(client.finalized_blocks(2, 7, 9).await.unwrap(), slots);
+            rpc.assert_finished();
         }
     }
 
     #[tokio::test]
     async fn rejects_unordered_duplicate_and_out_of_range_slots() {
         for slots in [json!([3, 2]), json!([2, 2]), json!([1]), json!([4])] {
-            let client = Client::new(Scripted::one(
+            let rpc = Scripted::one(
                 "getBlocks",
                 json!([2, 3, {
                     "commitment": "finalized",
                     "minContextSlot": 9,
                 }]),
                 slots,
-            ));
-            assert_eq!(
-                client.finalized_blocks(2, 3, 9).await.unwrap_err().kind(),
-                ErrorKind::MalformedRpc
             );
+            let client = Client::new(rpc.clone());
+            let error = client.finalized_blocks(2, 3, 9).await.unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::MalformedRpc);
+            assert_eq!(
+                error.to_string(),
+                "Solana getBlocks returned unordered, duplicate, or out-of-range slots",
+            );
+            rpc.assert_finished();
         }
     }
 }

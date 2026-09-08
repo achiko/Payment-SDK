@@ -35,7 +35,7 @@ impl MovementRecord {
             kind,
             id: value.id().0.clone(),
             asset: AssetRecord::from_domain(value.asset()),
-            amount: crate::amount_record::encode(value.amount()),
+            amount: value.amount().to_string(),
             from,
             to,
         }

@@ -36,7 +36,7 @@ use indexing::{
     BlockAddition, BlockOutcome, BlockRef, BlockSelector, Blocks, BoxFuture, CanonicalAddress,
     IndexError, IndexErrorKind, IndexScope,
 };
-use tokio_postgres::{NoTls, Statement};
+use tokio_postgres::NoTls;
 
 /// The scope's tip. Column aliases match [`row::block`] so every block-shaped
 /// row decodes through one function.
@@ -50,6 +50,7 @@ const RETAINED_BLOCK: &str = "SELECT block_position AS position, height, block_h
                               block_timestamp AS timestamp FROM journal \
                               WHERE chain = $1 AND network = $2 AND height = $3";
 
+// design-lint: allow unclassified-free-function -- public PostgreSQL factory validates connection configuration and constructs a foreign pool for process-wide injection without making scope-bound repositories own connection creation
 /// Builds a connection pool from a libpq-style URL.
 ///
 /// TLS is not configured: this is intended for a database reached over a
@@ -77,7 +78,15 @@ pub fn pool_for_schema(url: &str, max_size: usize, schema: &str) -> Result<Pool,
     if max_size == 0 {
         return Err(invalid("PostgreSQL pool size must be greater than zero"));
     }
-    if !valid_schema(schema) {
+    let bytes = schema.as_bytes();
+    let valid = (1..=63).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .skip(1)
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+        && !schema.starts_with("pg_");
+    if !valid {
         return Err(invalid(
             "PostgreSQL schema must be a canonical application identifier",
         ));
@@ -89,6 +98,7 @@ pub fn pool_for_schema(url: &str, max_size: usize, schema: &str) -> Result<Pool,
     build_pool(config, max_size)
 }
 
+// design-lint: allow unclassified-free-function -- constructs foreign pool types for both public factories; repositories receive the completed pool by injection
 fn build_pool(config: tokio_postgres::Config, max_size: usize) -> Result<Pool, IndexError> {
     let manager = Manager::from_config(
         config,
@@ -101,17 +111,6 @@ fn build_pool(config: tokio_postgres::Config, max_size: usize) -> Result<Pool, I
         .max_size(max_size)
         .build()
         .map_err(|error| invalid(format!("could not build a connection pool: {error}")))
-}
-
-fn valid_schema(schema: &str) -> bool {
-    let bytes = schema.as_bytes();
-    (1..=63).contains(&bytes.len())
-        && bytes[0].is_ascii_lowercase()
-        && bytes
-            .iter()
-            .skip(1)
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
-        && !schema.starts_with("pg_")
 }
 
 /// One chain's indexing store.
@@ -156,7 +155,10 @@ impl Repository {
         &self,
         client: &Client,
     ) -> Result<Option<BlockRef>, IndexError> {
-        let statement = prepare(client, CHECKPOINT).await?;
+        let statement = client
+            .prepare_cached(CHECKPOINT)
+            .await
+            .map_err(crate::store)?;
         let row = client
             .query_opt(&statement, &[&self.scope.chain.0, &self.scope.network])
             .await
@@ -169,7 +171,10 @@ impl Repository {
         &self,
         transaction: &Transaction<'_>,
     ) -> Result<Option<BlockRef>, IndexError> {
-        let statement = prepare_in(transaction, CHECKPOINT).await?;
+        let statement = transaction
+            .prepare_cached(CHECKPOINT)
+            .await
+            .map_err(crate::store)?;
         let row = transaction
             .query_opt(&statement, &[&self.scope.chain.0, &self.scope.network])
             .await
@@ -203,28 +208,16 @@ impl Repository {
             return self.checkpoint_on(&client).await;
         };
         let height = row::as_i64(height.0, "block height")?;
-        let statement = prepare(&client, RETAINED_BLOCK).await?;
+        let statement = client
+            .prepare_cached(RETAINED_BLOCK)
+            .await
+            .map_err(crate::store)?;
         let row = client
             .query_opt(&statement, &[&scope.chain.0, &scope.network, &height])
             .await
             .map_err(store)?;
         row.as_ref().map(|row| row::block(row, "")).transpose()
     }
-}
-
-/// Prepares through the connection's cache, so a repeated statement costs one
-/// round trip instead of a parse and a bind.
-pub(crate) async fn prepare(client: &Client, sql: &str) -> Result<Statement, IndexError> {
-    client.prepare_cached(sql).await.map_err(store)
-}
-
-/// The same cache, reached from inside a transaction. The cache belongs to the
-/// connection, so statements survive the transaction that first prepared them.
-pub(crate) async fn prepare_in(
-    transaction: &Transaction<'_>,
-    sql: &str,
-) -> Result<Statement, IndexError> {
-    transaction.prepare_cached(sql).await.map_err(store)
 }
 
 impl Clone for Repository {
@@ -260,14 +253,17 @@ impl Blocks for Repository {
     }
 }
 
+// design-lint: allow unclassified-free-function -- shared PostgreSQL pool, schema and repository input validation maps caller context to nonretryable InvalidRequest before storage access
 fn invalid(message: impl Into<String>) -> IndexError {
     IndexError::new(IndexErrorKind::InvalidRequest, message, false)
 }
 
+// design-lint: allow unclassified-free-function -- PostgreSQL driver-to-IndexError translation between foreign types preserves display text and retryable Store classification across query and transaction boundaries
 fn store(error: tokio_postgres::Error) -> IndexError {
     IndexError::new(IndexErrorKind::Store, error.to_string(), true)
 }
 
+// design-lint: allow unclassified-free-function -- PostgreSQL pool acquisition translates foreign errors to retryable Store errors for repository access and startup validation while preserving native display context
 fn unavailable(error: deadpool_postgres::PoolError) -> IndexError {
     IndexError::new(IndexErrorKind::Store, error.to_string(), true)
 }
@@ -290,14 +286,70 @@ mod tests {
 
     #[test]
     fn schema_pool_rejects_invalid_identifiers_before_url_parsing() {
-        for schema in ["", "Pg", "0payment", "payment-data", "pg_catalog"] {
-            let error = pool_for_schema("not a PostgreSQL URL", 1, schema)
+        for schema in [
+            "".to_owned(),
+            "Pg".to_owned(),
+            "0payment".to_owned(),
+            "payment-data".to_owned(),
+            "pg_catalog".to_owned(),
+            "a".repeat(64),
+            "é".to_owned(),
+            "a,b".to_owned(),
+            "a b".to_owned(),
+            "a;".to_owned(),
+            "a\0".to_owned(),
+            "_payment".to_owned(),
+        ] {
+            let error = pool_for_schema("not a PostgreSQL URL", 1, &schema)
                 .expect_err("invalid schema must fail first");
             assert_eq!(error.kind, IndexErrorKind::InvalidRequest);
             assert_eq!(
                 error.message,
                 "PostgreSQL schema must be a canonical application identifier"
             );
+            assert!(!error.retryable);
         }
+    }
+
+    #[test]
+    fn schema_pool_accepts_grammar_boundaries_without_opening_storage() {
+        for schema in [
+            "a".to_owned(),
+            "a0_".to_owned(),
+            "pg".to_owned(),
+            "a".repeat(63),
+        ] {
+            let pool = pool_for_schema("postgres://localhost/unused", 1, &schema)
+                .expect("canonical schema");
+            assert_eq!(pool.status().size, 0);
+        }
+    }
+
+    #[test]
+    fn repository_rejects_empty_scope_before_acquiring_a_connection() {
+        let pool = pool("postgres://localhost/unused", 1).expect("lazy pool configuration");
+        for (chain, network) in [
+            ("", "test"),
+            (" \t", "test"),
+            ("chain", ""),
+            ("chain", " \t"),
+        ] {
+            let error = Repository::new(
+                pool.clone(),
+                IndexScope {
+                    chain: indexing::ChainId(chain.into()),
+                    network: network.into(),
+                },
+            )
+            .err()
+            .expect("empty repository scope");
+            assert_eq!(error.kind, IndexErrorKind::InvalidRequest);
+            assert_eq!(
+                error.message,
+                "persistent index scope must contain a chain and network"
+            );
+            assert!(!error.retryable);
+        }
+        assert_eq!(pool.status().size, 0, "validation must not open storage");
     }
 }

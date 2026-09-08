@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use futures_channel::oneshot;
 
-use crate::{AddressFilter, BlockRef, IndexError, IndexErrorKind};
+use crate::{AddressFilter, BlockPosition, BlockRef, CanonicalAddress, IndexError, IndexErrorKind};
 
 #[derive(Default)]
 struct State {
@@ -13,6 +13,14 @@ struct State {
     publication: bool,
     recovery: bool,
     waiters: Vec<oneshot::Sender<()>>,
+}
+
+impl State {
+    fn notify(&mut self) {
+        for waiter in std::mem::take(&mut self.waiters) {
+            let _ = waiter.send(());
+        }
+    }
 }
 
 /// Serializes checkpoint commits with forward-only address publication.
@@ -39,7 +47,9 @@ impl ScopeAdmission {
         let revision = {
             let mut state = self.lock()?;
             if state.commit || state.publication {
-                return Err(conflict("address admission is changing"));
+                return Err(IndexError::retryable_conflict(
+                    "address admission is changing",
+                ));
             }
             if !state.initialized || state.recovery || state.persisted != persisted {
                 state.persisted = persisted.clone();
@@ -56,7 +66,7 @@ impl ScopeAdmission {
             || state.persisted != persisted
             || state.revision != revision
         {
-            return Err(conflict(
+            return Err(IndexError::retryable_conflict(
                 "checkpoint or address revision changed during filter capture",
             ));
         }
@@ -77,19 +87,18 @@ impl ScopeAdmission {
         loop {
             let wait = {
                 let mut state = self.lock()?;
-                if state.commit || state.publication {
+                let busy = state.commit || state.publication;
+                if busy {
                     reload = None;
-                    let (send, receive) = oneshot::channel();
-                    state.waiters.push(send);
-                    Some(receive)
-                } else {
-                    if let Some(persisted) = reload.take()
-                        && (!state.initialized || state.recovery || state.persisted != persisted)
-                    {
-                        state.persisted = persisted;
-                        state.initialized = true;
-                        state.recovery = false;
-                    }
+                }
+                if let Some(persisted) = reload.take()
+                    && (!state.initialized || state.recovery || state.persisted != persisted)
+                {
+                    state.persisted = persisted;
+                    state.initialized = true;
+                    state.recovery = false;
+                }
+                if !busy {
                     state.publication = true;
                     return Ok(PublicationPermit {
                         admission: self.clone(),
@@ -97,23 +106,34 @@ impl ScopeAdmission {
                         finished: false,
                     });
                 }
+                let (send, receive) = oneshot::channel();
+                state.waiters.push(send);
+                receive
             };
-            let wait = wait.ok_or_else(|| unavailable("busy admission did not create a waiter"))?;
-            wait.await
-                .map_err(|_| unavailable("address admission waiter was abandoned"))?;
+            wait.await.map_err(|_| {
+                IndexError::new(
+                    IndexErrorKind::Store,
+                    "address admission waiter was abandoned",
+                    false,
+                )
+            })?;
         }
     }
 
     fn begin(self: &Arc<Self>, plan: &SyncPlan) -> Result<CommitPermit, IndexError> {
         let mut state = self.lock()?;
         if state.recovery {
-            return Err(conflict("checkpoint admission requires repository reload"));
+            return Err(IndexError::retryable_conflict(
+                "checkpoint admission requires repository reload",
+            ));
         }
         if state.commit || state.publication {
-            return Err(conflict("checkpoint admission is busy"));
+            return Err(IndexError::retryable_conflict(
+                "checkpoint admission is busy",
+            ));
         }
         if state.persisted != plan.checkpoint || state.revision != plan.revision {
-            return Err(conflict(
+            return Err(IndexError::retryable_conflict(
                 "checkpoint or address revision changed before commit",
             ));
         }
@@ -126,9 +146,13 @@ impl ScopeAdmission {
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, State>, IndexError> {
-        self.state
-            .lock()
-            .map_err(|_| unavailable("address admission lock is poisoned"))
+        self.state.lock().map_err(|_| {
+            IndexError::new(
+                IndexErrorKind::Store,
+                "address admission lock is poisoned",
+                false,
+            )
+        })
     }
 }
 
@@ -154,6 +178,21 @@ impl SyncPlan {
     #[must_use]
     pub fn filters(&self) -> &[AddressFilter] {
         &self.filters
+    }
+
+    pub(crate) fn earliest_position(&self) -> Option<BlockPosition> {
+        self.filters
+            .iter()
+            .map(|filter| filter.start_position)
+            .min()
+    }
+
+    pub(crate) fn active_addresses(&self, position: BlockPosition) -> Vec<CanonicalAddress> {
+        self.filters
+            .iter()
+            .filter(|filter| filter.start_position <= position)
+            .map(|filter| filter.address.clone())
+            .collect()
     }
 
     #[must_use]
@@ -211,7 +250,7 @@ impl CommitPermit {
             let mut state = admission.lock()?;
             state.persisted = checkpoint;
             state.commit = false;
-            notify(&mut state);
+            state.notify();
         }
         self.finished = true;
         Ok(())
@@ -229,7 +268,7 @@ impl Drop for CommitPermit {
         if let Ok(mut state) = admission.state.lock() {
             state.commit = false;
             state.recovery |= self.started;
-            notify(&mut state);
+            state.notify();
         }
     }
 }
@@ -249,12 +288,15 @@ impl PublicationPermit {
 
     pub fn complete(mut self) -> Result<(), IndexError> {
         let mut state = self.admission.lock()?;
-        state.revision = state
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| unavailable("address filter revision is exhausted"))?;
+        state.revision = state.revision.checked_add(1).ok_or_else(|| {
+            IndexError::new(
+                IndexErrorKind::Store,
+                "address filter revision is exhausted",
+                false,
+            )
+        })?;
         state.publication = false;
-        notify(&mut state);
+        state.notify();
         drop(state);
         self.finished = true;
         Ok(())
@@ -268,23 +310,9 @@ impl Drop for PublicationPermit {
         }
         if let Ok(mut state) = self.admission.state.lock() {
             state.publication = false;
-            notify(&mut state);
+            state.notify();
         }
     }
-}
-
-fn notify(state: &mut State) {
-    for waiter in std::mem::take(&mut state.waiters) {
-        let _ = waiter.send(());
-    }
-}
-
-fn conflict(message: impl Into<String>) -> IndexError {
-    IndexError::new(IndexErrorKind::Conflict, message, true)
-}
-
-fn unavailable(message: impl Into<String>) -> IndexError {
-    IndexError::new(IndexErrorKind::Store, message, false)
 }
 
 #[cfg(test)]
@@ -297,7 +325,7 @@ mod tests {
     use futures_executor::block_on;
 
     use super::*;
-    use crate::{BlockHash, BlockHeight, BlockParent, BlockPosition};
+    use crate::{BlockHash, BlockHeight, BlockParent, ChainId, IndexScope};
 
     fn block(position: u64) -> BlockRef {
         BlockRef {
@@ -316,6 +344,130 @@ mod tests {
         match result {
             Ok(_) => panic!("{message}"),
             Err(error) => error,
+        }
+    }
+
+    fn filter(value: &str, position: u64) -> AddressFilter {
+        AddressFilter {
+            address: CanonicalAddress {
+                scope: IndexScope {
+                    chain: ChainId("test".into()),
+                    network: "testing".into(),
+                },
+                value: value.into(),
+            },
+            start_position: BlockPosition(position),
+        }
+    }
+
+    #[test]
+    fn notifying_drains_all_waiters_even_when_one_receiver_was_dropped() {
+        let (first_send, first_receive) = oneshot::channel();
+        let (cancelled_send, cancelled_receive) = oneshot::channel();
+        let (last_send, last_receive) = oneshot::channel();
+        drop(cancelled_receive);
+        let mut state = State {
+            waiters: vec![first_send, cancelled_send, last_send],
+            revision: 42,
+            ..State::default()
+        };
+        state.notify();
+        assert!(state.waiters.is_empty());
+        assert_eq!(block_on(first_receive), Ok(()));
+        assert_eq!(block_on(last_receive), Ok(()));
+        state.notify();
+        assert_eq!(state.revision, 42);
+    }
+
+    #[test]
+    fn empty_plan_has_no_active_addresses() {
+        let plan = SyncPlan::detached(Vec::new(), None);
+
+        assert_eq!(plan.earliest_position(), None);
+        assert!(plan.active_addresses(BlockPosition(0)).is_empty());
+        assert!(plan.active_addresses(BlockPosition(u64::MAX)).is_empty());
+    }
+
+    #[test]
+    fn earliest_position_uses_native_birthdays_without_inventing_a_parent() {
+        for (starts, expected) in [
+            (vec![950, 900], Some(BlockPosition(900))),
+            (vec![0], Some(BlockPosition(0))),
+            (vec![u64::MAX], Some(BlockPosition(u64::MAX))),
+            (vec![900, 900, 950], Some(BlockPosition(900))),
+        ] {
+            let filters = starts
+                .into_iter()
+                .enumerate()
+                .map(|(index, position)| filter(&format!("address-{index}"), position))
+                .collect();
+            let plan = SyncPlan::detached(filters, Some(block(1)));
+            assert_eq!(plan.earliest_position(), expected);
+        }
+    }
+
+    #[test]
+    fn earliest_position_tracks_replaced_filters_without_changing_checkpoint() {
+        let plan = SyncPlan::detached(vec![filter("old", 50)], Some(block(10)))
+            .with_filters(vec![filter("future", 100), filter("earlier", 20)]);
+        assert_eq!(plan.earliest_position(), Some(BlockPosition(20)));
+        assert_eq!(plan.checkpoint(), Some(&block(10)));
+        assert_eq!(plan.with_filters(Vec::new()).earliest_position(), None);
+    }
+
+    #[test]
+    fn active_addresses_use_inclusive_native_birthdays_and_preserve_input_order() {
+        let filters = vec![
+            filter("future", 107),
+            filter("birthday", 103),
+            filter("earlier", 100),
+            filter("skipped", 102),
+        ];
+        let checkpoint = BlockRef {
+            height: BlockHeight(2),
+            ..block(103)
+        };
+        let plan = SyncPlan::detached(filters.clone(), Some(checkpoint));
+
+        assert!(plan.active_addresses(BlockPosition(99)).is_empty());
+        assert_eq!(
+            plan.active_addresses(BlockPosition(103)),
+            vec![
+                filters[1].address.clone(),
+                filters[2].address.clone(),
+                filters[3].address.clone(),
+            ]
+        );
+        assert_eq!(
+            plan.active_addresses(BlockPosition(107)),
+            filters
+                .iter()
+                .map(|filter| filter.address.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(plan.filters(), filters);
+    }
+
+    #[test]
+    fn checkpoint_movement_keeps_the_captured_address_selection() {
+        let admission = Arc::new(ScopeAdmission::new());
+        let mut filters = vec![filter("selected", 103), filter("future", 107)];
+        let selected = filters[0].address.clone();
+        let mut plan = admission
+            .plan(Some(block(100)), || Ok(filters.clone()))
+            .expect("captured plan");
+        filters[0].start_position = BlockPosition(0);
+        filters.push(filter("registered-later", 101));
+
+        for position in [107, 100] {
+            plan.advance(block(position));
+            assert_eq!(plan.earliest_position(), Some(BlockPosition(103)));
+            assert_eq!(plan.checkpoint(), Some(&block(position)));
+            assert!(plan.active_addresses(BlockPosition(102)).is_empty());
+            assert_eq!(
+                plan.active_addresses(BlockPosition(103)),
+                vec![selected.clone()]
+            );
         }
     }
 
@@ -352,13 +504,21 @@ mod tests {
             block_on(admission.publication(Some(block(7)))).expect("publication permit");
 
         assert_eq!(
-            commit_error(plan.begin(), "publication must block commit").kind,
-            IndexErrorKind::Conflict
+            commit_error(plan.begin(), "publication must block commit"),
+            IndexError::new(
+                IndexErrorKind::Conflict,
+                "checkpoint admission is busy",
+                true
+            )
         );
         publication.complete().expect("publish filter revision");
         assert_eq!(
-            commit_error(plan.begin(), "old revision must not commit").kind,
-            IndexErrorKind::Conflict
+            commit_error(plan.begin(), "old revision must not commit"),
+            IndexError::new(
+                IndexErrorKind::Conflict,
+                "checkpoint or address revision changed before commit",
+                true,
+            )
         );
     }
 
@@ -373,8 +533,12 @@ mod tests {
         drop(commit);
 
         assert_eq!(
-            commit_error(stale.begin(), "recovery must block stale plan").kind,
-            IndexErrorKind::Conflict
+            commit_error(stale.begin(), "recovery must block stale plan"),
+            IndexError::new(
+                IndexErrorKind::Conflict,
+                "checkpoint admission requires repository reload",
+                true,
+            )
         );
         let reloaded = admission
             .plan(Some(block(8)), || Ok(Vec::new()))
@@ -384,6 +548,28 @@ mod tests {
             .expect("reloaded plan can commit")
             .complete(Some(block(8)))
             .expect("complete reloaded plan");
+    }
+
+    #[test]
+    fn idle_publication_reloads_after_a_cancelled_commit_even_for_an_empty_checkpoint() {
+        for persisted in [Some(block(8)), None] {
+            let admission = Arc::new(ScopeAdmission::new());
+            let plan = admission
+                .plan(Some(block(7)), || Ok(Vec::new()))
+                .expect("initial plan");
+            let mut commit = plan.begin().expect("commit permit");
+            commit.start();
+            drop(commit);
+
+            let publication = block_on(admission.publication(persisted.clone()))
+                .expect("publication reloads the repository checkpoint");
+            assert_eq!(publication.checkpoint(), persisted.as_ref());
+            let state = admission.lock().expect("admission state");
+            assert!(state.initialized);
+            assert!(!state.recovery);
+            assert!(state.publication);
+            assert_eq!(state.persisted, persisted);
+        }
     }
 
     #[test]
@@ -400,6 +586,82 @@ mod tests {
         admission
             .plan(None, || Ok(Vec::new()))
             .expect("admission remains usable");
+    }
+
+    #[test]
+    fn exhausted_revision_releases_publication_and_wakes_waiters() {
+        let admission = Arc::new(ScopeAdmission::new());
+        admission.lock().unwrap().revision = u64::MAX;
+        let first = block_on(admission.publication(Some(block(7)))).unwrap();
+        let mut second = Box::pin(admission.publication(None));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(second.as_mut().poll(&mut context), Poll::Pending));
+
+        assert_eq!(
+            first.complete(),
+            Err(IndexError::new(
+                IndexErrorKind::Store,
+                "address filter revision is exhausted",
+                false,
+            ))
+        );
+        assert_eq!(admission.lock().unwrap().revision, u64::MAX);
+        let second = block_on(second).expect("failed completion releases the waiter");
+        assert_eq!(second.checkpoint(), Some(&block(7)));
+        drop(second);
+        assert!(!admission.lock().unwrap().publication);
+    }
+
+    #[test]
+    fn abandoned_publication_waiter_is_a_terminal_store_error() {
+        let admission = Arc::new(ScopeAdmission::new());
+        let first = block_on(admission.publication(None)).unwrap();
+        let mut second = Box::pin(admission.publication(None));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(second.as_mut().poll(&mut context), Poll::Pending));
+        admission.lock().unwrap().waiters.clear();
+
+        let error = block_on(second).err().expect("abandoned waiter error");
+        assert_eq!(
+            error,
+            IndexError::new(
+                IndexErrorKind::Store,
+                "address admission waiter was abandoned",
+                false,
+            )
+        );
+        assert!(admission.lock().unwrap().publication);
+        drop(first);
+        assert!(!admission.lock().unwrap().publication);
+    }
+
+    #[test]
+    fn poisoned_admission_rejects_plan_before_capturing_filters() {
+        let admission = Arc::new(ScopeAdmission::new());
+        let poisoned = admission.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _state = poisoned.state.lock().unwrap();
+                panic!("poison the owned admission fixture");
+            })
+            .join()
+            .is_err()
+        );
+
+        let error = admission
+            .plan(None, || {
+                panic!("poisoned state must precede filter capture")
+            })
+            .err()
+            .expect("poisoned admission error");
+        assert_eq!(
+            error,
+            IndexError::new(
+                IndexErrorKind::Store,
+                "address admission lock is poisoned",
+                false,
+            )
+        );
     }
 
     #[test]

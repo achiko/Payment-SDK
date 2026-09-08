@@ -34,15 +34,14 @@ struct Profile {
     spent: usize,
 }
 
-fn number(key: &str, fallback: usize) -> usize {
-    env::var(key)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(fallback)
-}
-
 impl Profile {
     fn from_env() -> Self {
+        let number = |key: &str, fallback: usize| {
+            env::var(key)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(fallback)
+        };
         Self {
             blocks: number("BENCH_BLOCKS", 200) as u64,
             txs: number("BENCH_TXS", 40),
@@ -59,26 +58,20 @@ impl Profile {
         let movements = history * self.movements;
         history + movements + self.created + self.spent * 2
     }
+
+    fn address(&self, index: usize) -> CanonicalAddress {
+        let index = index % self.addresses;
+        CanonicalAddress {
+            scope: scope(),
+            value: format!("addr-{index:04}"),
+        }
+    }
 }
 
 fn scope() -> IndexScope {
     IndexScope {
         chain: ChainId(CHAIN.into()),
         network: NETWORK.into(),
-    }
-}
-
-fn address(index: usize) -> CanonicalAddress {
-    CanonicalAddress {
-        scope: scope(),
-        value: format!("addr-{index:04}"),
-    }
-}
-
-fn transaction(height: u64, index: usize) -> TransactionRef {
-    TransactionRef {
-        scope: scope(),
-        value: format!("{height:010}-{index:05}"),
     }
 }
 
@@ -89,12 +82,17 @@ fn asset() -> AssetId {
     }
 }
 
-fn amount(units: u64) -> Decimal {
-    units.to_string().parse().expect("amount parses")
-}
-
-fn block_ref(height: u64, parent: Option<&BlockRef>) -> BlockRef {
-    BlockRef {
+fn interpret(
+    profile: &Profile,
+    height: u64,
+    parent: Option<&BlockRef>,
+    spend: Vec<OutputKey>,
+) -> (InterpretedBlock, Vec<OutputKey>) {
+    let transaction = |index: usize| TransactionRef {
+        scope: scope(),
+        value: format!("{height:010}-{index:05}"),
+    };
+    let block = BlockRef {
         position: BlockPosition(height),
         height: BlockHeight(height),
         hash: BlockHash(format!("hash-{height:010}").into_bytes()),
@@ -103,32 +101,23 @@ fn block_ref(height: u64, parent: Option<&BlockRef>) -> BlockRef {
             hash: block.hash.clone(),
         }),
         timestamp: Some(1_700_000_000 + height),
-    }
-}
-
-fn interpret(
-    profile: &Profile,
-    height: u64,
-    parent: Option<&BlockRef>,
-    spend: Vec<OutputKey>,
-) -> (InterpretedBlock, Vec<OutputKey>) {
-    let block = block_ref(height, parent);
+    };
     let mut transactions = Vec::with_capacity(profile.txs);
     for index in 0..profile.txs {
-        let from = address(index % profile.addresses);
-        let to = address((index + 1) % profile.addresses);
+        let from = profile.address(index);
+        let to = profile.address(index + 1);
         let movements = (0..profile.movements)
             .map(|ordinal| ValueMovement::Transfer {
                 id: MovementId(format!("{height}-{index}-{ordinal}")),
                 asset: asset(),
-                amount: amount(1_000 + ordinal as u64),
+                amount: Decimal::from(1_000 + ordinal as u64),
                 from: from.clone(),
                 to: to.clone(),
             })
             .collect();
         transactions.push(ObservationDraft {
             scope: scope(),
-            transaction_id: transaction(height, index),
+            transaction_id: transaction(index),
             status: ObservationDraftStatus::Included,
             movements,
             fee: None,
@@ -139,12 +128,12 @@ fn interpret(
     for index in 0..profile.created {
         created.push(IndexedOutput {
             id: OutputId {
-                transaction: transaction(height, index),
+                transaction: transaction(index),
                 index: index as u32,
             },
-            address: address(index % profile.addresses),
+            address: profile.address(index),
             asset: asset(),
-            amount: amount(50_000 + index as u64),
+            amount: Decimal::from(50_000 + index as u64),
             evidence: vec![0x51; 22],
             created_at: BlockHeight(height),
             coinbase: index == 0,
@@ -170,11 +159,10 @@ fn interpret(
     )
 }
 
-fn rate(count: f64, seconds: f64) -> f64 {
-    if seconds <= 0.0 { 0.0 } else { count / seconds }
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let rate = |count: f64, seconds: f64| {
+        if seconds <= 0.0 { 0.0 } else { count / seconds }
+    };
     let profile = Profile::from_env();
     let directory = tempfile::TempDir::new()?;
     let storage = storage_redb::Redb::open(directory.path().join("index.redb"))?;
@@ -220,7 +208,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &repository,
             HistoryQuery {
                 scope: scope(),
-                address: address(index % profile.addresses),
+                address: profile.address(index),
                 after: None,
                 limit: 100,
             },
@@ -241,7 +229,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &repository,
             OutputRequest {
                 scope: scope(),
-                address: address(index % profile.addresses),
+                address: profile.address(index),
                 after: None,
                 limit: 100,
             },

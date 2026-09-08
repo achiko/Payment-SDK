@@ -91,15 +91,7 @@ impl IndexBlockInterpreter for Interpreter {
             };
 
             if transaction.succeeded() {
-                let affected = transaction.selected_effects(&selected, &movements);
-                if !affected.is_empty() && transaction.inner().is_none() {
-                    return Err(invalid_block(
-                        "successful selected Solana transaction has incomplete inner instructions",
-                    ));
-                }
-                for address in affected {
-                    transaction.reconcile(address, &movements)?;
-                }
+                transaction.reconcile_selected(&selected, &movements)?;
             }
 
             let relevant = if transaction.succeeded() {
@@ -128,7 +120,10 @@ impl IndexBlockInterpreter for Interpreter {
                 fee: Some(NetworkFee {
                     asset: self.asset.clone(),
                     amount: base::Decimal::from_atomic(transaction.fee().into(), 0),
-                    payer: Some(canonical(transaction.fee_payer(), &self.scope)),
+                    payer: Some(CanonicalAddress {
+                        scope: self.scope.clone(),
+                        value: transaction.fee_payer().to_string(),
+                    }),
                 }),
             });
         }
@@ -141,13 +136,7 @@ impl IndexBlockInterpreter for Interpreter {
     }
 }
 
-fn canonical(address: &Address, scope: &IndexScope) -> CanonicalAddress {
-    CanonicalAddress {
-        scope: scope.clone(),
-        value: address.to_string(),
-    }
-}
-
+// design-lint: allow unclassified-free-function -- shared Solana block, transaction and movement validation maps native invariant failures to nonretryable foreign IndexError::InvalidBlock
 fn invalid_block(message: impl Into<String>) -> IndexError {
     IndexError::new(IndexErrorKind::InvalidBlock, message, false)
 }

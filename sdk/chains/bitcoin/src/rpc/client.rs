@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use super::{
     CoreConfig,
-    error::{CallFailure, map_json_rpc_error, map_remote_failure},
+    error::{CallFailure, map_json_rpc_error},
     transport::{Client as Transport, RawJson},
 };
 
@@ -92,10 +92,7 @@ where
             .map_err(CallFailure::local)?;
         match result {
             Ok(result) => Ok(result),
-            Err(failure) => Err(CallFailure {
-                remote_code: Some(failure.code),
-                error: map_remote_failure(failure),
-            }),
+            Err(failure) => Err(CallFailure::remote(failure)),
         }
     }
 
@@ -113,10 +110,7 @@ where
             .map_err(CallFailure::local)?;
         match result {
             Ok(result) => Ok(result),
-            Err(failure) => Err(CallFailure {
-                remote_code: Some(failure.code),
-                error: map_remote_failure(failure),
-            }),
+            Err(failure) => Err(CallFailure::remote(failure)),
         }
     }
 }

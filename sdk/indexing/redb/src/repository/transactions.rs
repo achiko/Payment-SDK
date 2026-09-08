@@ -11,11 +11,11 @@ impl Transactions for Repository {
             self.check_address(&request.address)?;
             Self::validate_limit(request.limit)?;
             let checkpoint = self.current_checkpoint().await?;
-            if request
+            let checkpoint_changed = request
                 .after
                 .as_ref()
-                .is_some_and(|cursor| cursor.checkpoint != checkpoint)
-            {
+                .is_some_and(|cursor| cursor.checkpoint != checkpoint);
+            if checkpoint_changed {
                 return Err(IndexError::new(
                     IndexErrorKind::Conflict,
                     "history changed during pagination",
@@ -49,19 +49,20 @@ impl Transactions for Repository {
                 })
                 .collect::<Result<Vec<_>, IndexError>>()?;
             self.ensure_checkpoint(&checkpoint).await?;
-            let next = has_more.then(|| {
-                transactions.last().map(|transaction| HistoryCursor {
+            let next = transactions
+                .last()
+                .filter(|_| has_more)
+                .map(|transaction| HistoryCursor {
                     checkpoint: checkpoint.clone(),
                     position: indexing::HistoryPosition {
                         height: transaction.block().height,
                         transaction: transaction.transaction_id.clone(),
                     },
-                })
-            });
+                });
             Ok(CanonicalPage {
                 checkpoint,
                 transactions,
-                next: next.flatten(),
+                next,
             })
         })
     }

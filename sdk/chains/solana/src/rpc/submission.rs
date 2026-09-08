@@ -9,7 +9,7 @@ use solana_signature::Signature;
 
 use crate::{BlockhashLifetime, Error, ErrorKind, Lamport};
 
-use super::{Client, Context};
+use super::{Client, Context, methods::ContextWire};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignatureStatus {
@@ -27,17 +27,6 @@ impl SignatureStatus {
     pub const fn failed(&self) -> bool {
         self.failed
     }
-}
-
-#[derive(Deserialize)]
-struct ContextWire<T> {
-    context: SlotWire,
-    value: T,
-}
-
-#[derive(Deserialize)]
-struct SlotWire {
-    slot: u64,
 }
 
 #[derive(Deserialize)]
@@ -72,11 +61,11 @@ where
                 json!([{"commitment":"confirmed", "minContextSlot":floor}]),
             )
             .await?;
-        require_floor(wire.context.slot, floor)?;
-        let blockhash =
-            Hash::from_str(&wire.value.blockhash).map_err(|_| malformed("getLatestBlockhash"))?;
+        wire.require_floor(Some(floor))?;
+        let blockhash = Hash::from_str(&wire.value.blockhash)
+            .map_err(|_| Error::malformed_rpc("getLatestBlockhash"))?;
         if blockhash.to_string() != wire.value.blockhash {
-            return Err(malformed("getLatestBlockhash"));
+            return Err(Error::malformed_rpc("getLatestBlockhash"));
         }
         Ok(Context {
             slot: wire.context.slot,
@@ -95,7 +84,7 @@ where
                 json!([STANDARD.encode(message), {"commitment":"confirmed", "minContextSlot":floor}]),
             )
             .await?;
-        require_floor(wire.context.slot, floor)?;
+        wire.require_floor(Some(floor))?;
         let fee = wire
             .value
             .ok_or_else(|| Error::new(ErrorKind::MalformedRpc, "Solana fee is unavailable"))?;
@@ -118,7 +107,7 @@ where
                 }]),
             )
             .await?;
-        require_floor(wire.context.slot, floor)?;
+        wire.require_floor(Some(floor))?;
         if wire.value.err.is_some() {
             return Err(Error::new(
                 ErrorKind::Simulation,
@@ -155,9 +144,19 @@ where
                 local_id.clone(),
             )
             .await?;
-        let signature = Signature::from_str(&returned).map_err(|_| unknown(local_id.clone()))?;
+        let signature = Signature::from_str(&returned).map_err(|_| {
+            TransactionError::new(
+                TransactionErrorKind::Unknown,
+                "Solana submission outcome is unknown",
+            )
+            .with_ambiguous_transaction_id(local_id.clone())
+        })?;
         if signature.to_string() != returned || returned != local_id.as_str() {
-            return Err(unknown(local_id));
+            return Err(TransactionError::new(
+                TransactionErrorKind::Unknown,
+                "Solana submission outcome is unknown",
+            )
+            .with_ambiguous_transaction_id(local_id));
         }
         Ok(())
     }
@@ -173,9 +172,9 @@ where
                 json!([[local_id.as_str()], {"searchTransactionHistory":true}]),
             )
             .await?;
-        require_floor(wire.context.slot, floor)?;
+        wire.require_floor(Some(floor))?;
         let [status] = <[Option<StatusWire>; 1]>::try_from(wire.value)
-            .map_err(|_| malformed("getSignatureStatuses"))?;
+            .map_err(|_| Error::malformed_rpc("getSignatureStatuses"))?;
         let status = status.map(|status| {
             if status.slot < floor
                 || status.slot > wire.context.slot
@@ -185,7 +184,7 @@ where
                 )
                 || (status.confirmation_status == "finalized" && status.confirmations.is_some())
             {
-                return Err(malformed("getSignatureStatuses"));
+                return Err(Error::malformed_rpc("getSignatureStatuses"));
             }
             Ok(SignatureStatus {
                 slot: status.slot,
@@ -199,31 +198,6 @@ where
     }
 }
 
-fn require_floor(slot: u64, floor: u64) -> Result<(), Error> {
-    if slot < floor {
-        return Err(Error::new(
-            ErrorKind::BelowFloor,
-            "Solana RPC response is below its requested context floor",
-        ));
-    }
-    Ok(())
-}
-
-fn malformed(method: &str) -> Error {
-    Error::new(
-        ErrorKind::MalformedRpc,
-        format!("Solana RPC {method} returned malformed data"),
-    )
-}
-
-fn unknown(local_id: TransactionId) -> TransactionError {
-    TransactionError::new(
-        TransactionErrorKind::Unknown,
-        "Solana submission outcome is unknown",
-    )
-    .with_ambiguous_transaction_id(local_id)
-}
-
 #[cfg(test)]
 mod tests {
     use solana_hash::Hash;
@@ -232,6 +206,59 @@ mod tests {
     use crate::rpc::test_support::Scripted;
 
     use super::*;
+
+    #[tokio::test]
+    async fn context_floor_precedes_fee_simulation_and_status_semantics() {
+        let id = TransactionId::new(Signature::from([7; 64]).to_string());
+        for slot in [3, 4] {
+            let rpc = Scripted::new([
+                (
+                    "getFeeForMessage",
+                    json!([STANDARD.encode([]), {"commitment":"confirmed", "minContextSlot":4}]),
+                    json!({"context":{"slot":slot},"value":null}),
+                ),
+                (
+                    "simulateTransaction",
+                    json!([STANDARD.encode([]), {"encoding":"base64","commitment":"confirmed","sigVerify":true,"replaceRecentBlockhash":false,"minContextSlot":4}]),
+                    json!({"context":{"slot":slot},"value":{"err":{"x":1}}}),
+                ),
+                (
+                    "getSignatureStatuses",
+                    json!([[id.as_str()], {"searchTransactionHistory":true}]),
+                    json!({"context":{"slot":slot},"value":[]}),
+                ),
+            ]);
+            let client = Client::new(rpc.clone());
+            let expected = if slot < 4 {
+                [(
+                    ErrorKind::BelowFloor,
+                    "Solana RPC response is below its requested context floor",
+                ); 3]
+            } else {
+                [
+                    (ErrorKind::MalformedRpc, "Solana fee is unavailable"),
+                    (
+                        ErrorKind::Simulation,
+                        "Solana transaction simulation failed",
+                    ),
+                    (
+                        ErrorKind::MalformedRpc,
+                        "Solana RPC getSignatureStatuses returned malformed data",
+                    ),
+                ]
+            };
+            let errors = [
+                client.fee_for_message(&[], 4).await.unwrap_err(),
+                client.simulate(&[], 4).await.unwrap_err(),
+                client.signature_status(&id, 4).await.unwrap_err(),
+            ];
+            for (error, (kind, message)) in errors.into_iter().zip(expected) {
+                assert_eq!(error.kind(), kind);
+                assert_eq!(error.to_string(), message);
+            }
+            rpc.assert_finished();
+        }
+    }
 
     #[tokio::test]
     async fn reads_lifetime_fee_simulation_and_height_with_exact_floors() {
@@ -326,15 +353,25 @@ mod tests {
         rpc.assert_finished();
 
         let local = TransactionId::new(Signature::from([7; 64]).to_string());
-        let mismatch = Client::new(Scripted::one(
-            "sendTransaction",
-            json!([STANDARD.encode(bytes), {"encoding":"base64","skipPreflight":false,"preflightCommitment":"confirmed","minContextSlot":11,"maxRetries":0}]),
-            json!(Signature::from([8; 64]).to_string()),
-        ))
-        .send_transaction(&bytes, 11, local.clone())
-        .await
-        .expect_err("provider mismatch is ambiguous");
-        assert_eq!(mismatch.ambiguous_transaction_id, Some(local));
+        for returned in [
+            Signature::from([8; 64]).to_string(),
+            "malformed".to_owned(),
+            String::new(),
+        ] {
+            let rpc = Scripted::one(
+                "sendTransaction",
+                json!([STANDARD.encode(bytes), {"encoding":"base64","skipPreflight":false,"preflightCommitment":"confirmed","minContextSlot":11,"maxRetries":0}]),
+                json!(returned),
+            );
+            let error = Client::new(rpc.clone())
+                .send_transaction(&bytes, 11, local.clone())
+                .await
+                .expect_err("a mismatched or malformed response stays ambiguous");
+            assert_eq!(error.kind, TransactionErrorKind::Unknown);
+            assert_eq!(error.message, "Solana submission outcome is unknown");
+            assert_eq!(error.ambiguous_transaction_id, Some(local.clone()));
+            rpc.assert_finished();
+        }
     }
 
     #[tokio::test]
@@ -371,5 +408,63 @@ mod tests {
         assert_eq!(status.slot(), 12);
         assert!(status.failed());
         rpc.assert_finished();
+    }
+
+    #[tokio::test]
+    async fn lifetime_content_errors_keep_method_context_after_floor_validation() {
+        for (slot, kind, message) in [
+            (
+                3,
+                ErrorKind::BelowFloor,
+                "Solana RPC response is below its requested context floor",
+            ),
+            (
+                4,
+                ErrorKind::MalformedRpc,
+                "Solana RPC getLatestBlockhash returned malformed data",
+            ),
+        ] {
+            let rpc = Scripted::one(
+                "getLatestBlockhash",
+                json!([{"commitment":"confirmed", "minContextSlot":4}]),
+                json!({"context":{"slot":slot},"value":{"blockhash":"bad","lastValidBlockHeight":9}}),
+            );
+            let error = Client::new(rpc.clone())
+                .latest_blockhash(4)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), message);
+            rpc.assert_finished();
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_historical_status_preserves_its_method_context() {
+        let id = TransactionId::new(Signature::from([7; 64]).to_string());
+        for value in [
+            json!([]),
+            json!([null, null]),
+            json!([{"slot":9,"confirmations":null,"err":null,"confirmationStatus":"finalized"}]),
+            json!([{"slot":16,"confirmations":null,"err":null,"confirmationStatus":"finalized"}]),
+            json!([{"slot":12,"confirmations":1,"err":null,"confirmationStatus":"finalized"}]),
+            json!([{"slot":12,"confirmations":null,"err":null,"confirmationStatus":"unknown"}]),
+        ] {
+            let rpc = Scripted::one(
+                "getSignatureStatuses",
+                json!([[id.as_str()], {"searchTransactionHistory":true}]),
+                json!({"context":{"slot":15},"value":value}),
+            );
+            let error = Client::new(rpc.clone())
+                .signature_status(&id, 10)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::MalformedRpc);
+            assert_eq!(
+                error.to_string(),
+                "Solana RPC getSignatureStatuses returned malformed data"
+            );
+            rpc.assert_finished();
+        }
     }
 }

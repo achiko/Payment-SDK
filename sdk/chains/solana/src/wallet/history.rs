@@ -28,25 +28,29 @@ where
                 })
                 .await
                 .map_err(WalletError::from)?;
-            History::from_index(page, scope, |asset| sol_asset(self.config.asset(), asset))
+            History::from_index(page, scope, |asset| {
+                self.config.asset().history_asset(asset)
+            })
         })
     }
 }
 
-fn sol_asset(configured: AssetKind, asset: &AssetId) -> Result<HistoryAsset, WalletError> {
-    if asset != &configured.id() {
-        return Err(WalletError::new(
-            WalletErrorKind::History,
-            "Solana history contains an unsupported asset",
-        ));
+impl AssetKind {
+    fn history_asset(self, asset: &AssetId) -> Result<HistoryAsset, WalletError> {
+        if asset != &self.id() {
+            return Err(WalletError::new(
+                WalletErrorKind::History,
+                "Solana history contains an unsupported asset",
+            ));
+        }
+        let metadata = self.metadata();
+        Ok(HistoryAsset {
+            id: asset.clone(),
+            name: Some(metadata.name.to_owned()),
+            ticker: Some(metadata.ticker.to_owned()),
+            decimals: metadata.decimals,
+        })
     }
-    let metadata = configured.metadata();
-    Ok(HistoryAsset {
-        id: asset.clone(),
-        name: Some(metadata.name.to_owned()),
-        ticker: Some(metadata.ticker.to_owned()),
-        decimals: metadata.decimals,
-    })
 }
 
 #[cfg(test)]
@@ -57,14 +61,12 @@ mod tests {
 
     #[test]
     fn native_history_uses_exact_sol_metadata() {
-        let asset = sol_asset(
-            AssetKind::Native,
-            &AssetId {
+        let asset = AssetKind::Native
+            .history_asset(&AssetId {
                 chain: ChainId(crate::CHAIN.to_owned()),
                 asset: "native".to_owned(),
-            },
-        )
-        .expect("native SOL asset");
+            })
+            .expect("native SOL asset");
 
         assert_eq!(asset.name.as_deref(), Some("Solana"));
         assert_eq!(asset.ticker.as_deref(), Some("SOL"));
@@ -84,7 +86,8 @@ mod tests {
             },
         ] {
             assert_eq!(
-                sol_asset(AssetKind::Native, &asset)
+                AssetKind::Native
+                    .history_asset(&asset)
                     .expect_err("unsupported asset")
                     .kind,
                 WalletErrorKind::History

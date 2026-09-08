@@ -29,6 +29,50 @@ fn put(namespace: &Namespace, key: &Key, value: &str) -> Operation {
 }
 
 #[tokio::test]
+async fn invalid_scan_bounds_preserve_errors_and_leave_the_store_usable() -> Result<(), Error> {
+    let directory = TempDir::new().map_err(|error| other(error.to_string()))?;
+    let storage = Redb::open(database_path(&directory))?;
+    let records = namespace("records");
+    for (limit, after, message) in [
+        (0, None, "scan limit must be greater than zero"),
+        (usize::MAX, None, "scan limit is too large"),
+        (
+            1,
+            Some(key("other")),
+            "scan continuation key does not match the requested prefix",
+        ),
+    ] {
+        let error = storage
+            .scan(ScanRequest {
+                namespace: records.clone(),
+                prefix: b"entry/".to_vec(),
+                after,
+                limit,
+            })
+            .await
+            .expect_err("invalid scan bounds");
+        assert_eq!(error.kind, ErrorKind::InvalidRequest);
+        assert_eq!(error.message, message);
+    }
+    let committed = storage
+        .commit(WriteBatch {
+            conditions: Vec::new(),
+            operations: vec![put(&records, &key("entry/1"), "stored")],
+        })
+        .await?;
+    assert_eq!(committed.version, Version(1));
+    assert_eq!(
+        storage
+            .get(&records, &key("entry/1"))
+            .await?
+            .map(|stored| stored.value),
+        Some(value("stored"))
+    );
+    assert_eq!(storage.reopen_count_for_test().await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancellation_after_enqueue_does_not_cancel_the_accepted_commit() -> Result<(), Error> {
     let directory = TempDir::new().map_err(|error| other(error.to_string()))?;
     let storage = Redb::open(database_path(&directory))?;
@@ -264,6 +308,80 @@ async fn stale_condition_rejects_the_complete_batch() -> Result<(), Error> {
 }
 
 #[tokio::test]
+async fn absent_or_present_condition_conflicts_preserve_batch_and_version() -> Result<(), Error> {
+    let directory = TempDir::new().map_err(|error| other(error.to_string()))?;
+    let storage = Redb::open(database_path(&directory))?;
+    let records = namespace("records");
+    let other_namespace = namespace("other");
+    let primary = key("primary");
+    let missing = key("missing");
+    let side_effect = key("side-effect");
+    storage
+        .commit(WriteBatch {
+            conditions: vec![],
+            operations: vec![put(&records, &primary, "original")],
+        })
+        .await?;
+
+    for (condition, message) in [
+        (
+            Condition::Missing {
+                namespace: records.clone(),
+                key: primary.clone(),
+            },
+            "missing condition failed in namespace `records` because the key exists",
+        ),
+        (
+            Condition::Version {
+                namespace: records.clone(),
+                key: missing.clone(),
+                expected: Version(2),
+            },
+            "version condition failed in namespace `records` because the key is missing",
+        ),
+    ] {
+        let error = storage
+            .commit(WriteBatch {
+                conditions: vec![condition],
+                operations: vec![
+                    Operation::Delete {
+                        namespace: records.clone(),
+                        key: primary.clone(),
+                    },
+                    put(&records, &missing, "must-not-commit"),
+                    put(&other_namespace, &side_effect, "must-not-commit"),
+                ],
+            })
+            .await
+            .expect_err("conditions must inspect the state before any batch operation");
+
+        assert_eq!(error.kind, ErrorKind::Conflict);
+        assert_eq!(error.message, message);
+        assert_eq!(storage.get(&records, &missing).await?, None);
+        assert_eq!(storage.get(&other_namespace, &side_effect).await?, None);
+        assert_eq!(
+            storage.get(&records, &primary).await?,
+            Some(StoredValue {
+                value: value("original"),
+                version: Version(1),
+            })
+        );
+    }
+
+    let next = storage
+        .commit(WriteBatch {
+            conditions: vec![Condition::Missing {
+                namespace: records.clone(),
+                key: missing.clone(),
+            }],
+            operations: vec![put(&records, &missing, "committed")],
+        })
+        .await?;
+    assert_eq!(next.version, Version(2));
+    Ok(())
+}
+
+#[tokio::test]
 async fn concurrent_compare_and_swap_has_one_winner() -> Result<(), Error> {
     let directory = TempDir::new().map_err(|error| other(error.to_string()))?;
     let storage = Redb::open(database_path(&directory))?;
@@ -313,6 +431,48 @@ async fn concurrent_compare_and_swap_has_one_winner() -> Result<(), Error> {
     ));
     assert_eq!(successes, 1);
     assert_eq!(conflicts, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn mixed_operations_preserve_input_order_and_one_commit_version() -> Result<(), Error> {
+    let directory = TempDir::new().map_err(|error| other(error.to_string()))?;
+    let storage = Redb::open(database_path(&directory))?;
+    let records = namespace("records");
+    let primary = key("primary");
+    let removed = key("removed");
+    let result = storage
+        .commit(WriteBatch {
+            conditions: vec![Condition::Missing {
+                namespace: records.clone(),
+                key: primary.clone(),
+            }],
+            operations: vec![
+                put(&records, &primary, "first"),
+                put(&records, &primary, "replaced"),
+                Operation::Delete {
+                    namespace: records.clone(),
+                    key: primary.clone(),
+                },
+                put(&records, &primary, "last"),
+                put(&records, &removed, "temporary"),
+                Operation::Delete {
+                    namespace: records.clone(),
+                    key: removed.clone(),
+                },
+            ],
+        })
+        .await?;
+
+    assert_eq!(result.version, Version(1));
+    assert_eq!(
+        storage.get(&records, &primary).await?,
+        Some(StoredValue {
+            value: value("last"),
+            version: Version(1),
+        })
+    );
+    assert_eq!(storage.get(&records, &removed).await?, None);
     Ok(())
 }
 

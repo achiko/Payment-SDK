@@ -145,11 +145,11 @@ mod tests {
                     .0
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some((index, _)) = transfers
+                let busy = transfers
                     .iter()
                     .enumerate()
-                    .find(|(_, transfer)| guarded.contains(transfer.source()))
-                {
+                    .find(|(_, transfer)| guarded.contains(transfer.source()));
+                if let Some((index, _)) = busy {
                     return Err(item(
                         index,
                         ErrorKind::SourceBusy,

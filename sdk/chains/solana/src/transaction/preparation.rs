@@ -65,7 +65,9 @@ where
     ) -> Result<PreparedBatch, SendError> {
         let (mut floor, transfers, balances, destinations, leases) = acquired.into_parts();
         cancellation.ensure()?;
-        let lifetime = race(cancellation, self.rpc.latest_blockhash(floor)).await?;
+        let lifetime = cancellation
+            .race_preparation(self.rpc.latest_blockhash(floor))
+            .await?;
         floor = lifetime.slot;
 
         let mut messages = Vec::with_capacity(transfers.len());
@@ -121,7 +123,9 @@ where
         let mut fees = Vec::with_capacity(messages.len());
         for (_, bytes) in &messages {
             cancellation.ensure()?;
-            let fee = race(cancellation, self.rpc.fee_for_message(bytes, floor)).await?;
+            let fee = cancellation
+                .race_preparation(self.rpc.fee_for_message(bytes, floor))
+                .await?;
             floor = fee.slot;
             fees.push(fee.value);
         }
@@ -168,7 +172,7 @@ where
 
         for envelope in &envelopes {
             cancellation.ensure()?;
-            floor = simulate(cancellation, &self.rpc, envelope, floor).await?;
+            floor = self.simulate(cancellation, envelope, floor).await?;
         }
         cancellation.ensure()?;
         Ok(PreparedBatch {
@@ -176,6 +180,26 @@ where
             envelopes,
             leases,
         })
+    }
+
+    async fn simulate(
+        &self,
+        cancellation: &Cancellation,
+        envelope: &Envelope,
+        floor: u64,
+    ) -> Result<u64, SendError> {
+        tokio::select! {
+            result = self.rpc.simulate(envelope.signed_bytes(), floor) => match result {
+                Ok(slot) => Ok(slot),
+                Err(error) if error.kind() == ErrorKind::Simulation => Err(item(
+                    envelope.index(),
+                    WalletErrorKind::Transaction,
+                    "Solana transaction simulation failed",
+                )),
+                Err(_) => Err(SendError::operation(WalletErrorKind::Unavailable, "Solana transaction simulation is unavailable")),
+            },
+            () = cancellation.cancelled() => Err(SendError::operation(WalletErrorKind::Unavailable, "Solana transaction preparation was cancelled")),
+        }
     }
 
     #[cfg(test)]
@@ -204,11 +228,14 @@ fn check_sufficiency(
     let mut available = BTreeMap::<Address, Lamport>::new();
     let mut required = BTreeMap::<Address, Lamport>::new();
     for ((transfer, balance), fee) in transfers.iter().zip(balances).zip(fees) {
-        if available
+        let inconsistent = available
             .insert(transfer.source().clone(), *balance)
-            .is_some_and(|previous| previous != *balance)
-        {
-            return Err(operation("Solana source balance witness is inconsistent"));
+            .is_some_and(|previous| previous != *balance);
+        if inconsistent {
+            return Err(SendError::operation(
+                WalletErrorKind::Unavailable,
+                "Solana source balance witness is inconsistent",
+            ));
         }
         let needed = transfer.amount().checked_add(*fee).ok_or_else(|| {
             item(
@@ -241,45 +268,20 @@ fn check_sufficiency(
     Ok(())
 }
 
-async fn race<T>(
-    cancellation: &Cancellation,
-    future: impl std::future::Future<Output = Result<T, Error>>,
-) -> Result<T, SendError> {
-    tokio::select! {
-        result = future => result.map_err(|_| operation("Solana transaction preparation failed")),
-        () = cancellation.cancelled() => Err(operation("Solana transaction preparation was cancelled")),
-    }
-}
-
-async fn simulate<C>(
-    cancellation: &Cancellation,
-    rpc: &RpcClient<C>,
-    envelope: &Envelope,
-    floor: u64,
-) -> Result<u64, SendError>
-where
-    C: json_rpc::Client,
-{
-    tokio::select! {
-        result = rpc.simulate(envelope.signed_bytes(), floor) => match result {
-            Ok(slot) => Ok(slot),
-            Err(error) if error.kind() == ErrorKind::Simulation => Err(item(
-                envelope.index(),
-                WalletErrorKind::Transaction,
-                "Solana transaction simulation failed",
-            )),
-            Err(_) => Err(operation("Solana transaction simulation is unavailable")),
-        },
-        () = cancellation.cancelled() => Err(operation("Solana transaction preparation was cancelled")),
+impl Cancellation {
+    async fn race_preparation<T>(
+        &self,
+        future: impl std::future::Future<Output = Result<T, Error>>,
+    ) -> Result<T, SendError> {
+        tokio::select! {
+            result = future => result.map_err(|_| SendError::operation(WalletErrorKind::Unavailable, "Solana transaction preparation failed")),
+            () = self.cancelled() => Err(SendError::operation(WalletErrorKind::Unavailable, "Solana transaction preparation was cancelled")),
+        }
     }
 }
 
 fn item(index: usize, kind: WalletErrorKind, message: &'static str) -> SendError {
     SendError::item(index, Vec::new(), WalletError::new(kind, message))
-}
-
-fn operation(message: &'static str) -> SendError {
-    SendError::operation(WalletErrorKind::Unavailable, message)
 }
 
 #[cfg(test)]
@@ -298,6 +300,161 @@ mod tests {
         Arc::new(
             Key::from_seed(hex::encode([value; 32]).parse::<Seed>().expect("seed")).expect("key"),
         )
+    }
+
+    #[tokio::test]
+    async fn simulation_preserves_context_precedence_and_original_occurrence() {
+        let signer = key(7);
+        let lifetime = crate::BlockhashLifetime::new(Hash::new_from_array([9; 32]), 44);
+        let message = Message::native_transfer(
+            signer.address(),
+            key(8).address(),
+            Lamport::from_atomic(10),
+            Memo::from_bytes([3; Memo::LENGTH]),
+            &lifetime,
+        )
+        .unwrap();
+        let envelope =
+            Envelope::sign(signer.address().clone(), 7, message, 8, lifetime, &signer).unwrap();
+        let original = envelope.clone();
+        for (response, index, kind, message) in [
+            (
+                json!({"context":{"slot":10},"value":{"err":"provider detail"}}),
+                Some(7),
+                WalletErrorKind::Transaction,
+                "Solana transaction simulation failed",
+            ),
+            (
+                json!({"context":{"slot":9},"value":{"err":"provider detail"}}),
+                None,
+                WalletErrorKind::Unavailable,
+                "Solana transaction simulation is unavailable",
+            ),
+            (
+                json!({"context":{"slot":10},"value":"malformed"}),
+                None,
+                WalletErrorKind::Unavailable,
+                "Solana transaction simulation is unavailable",
+            ),
+        ] {
+            let rpc = Scripted::one(
+                "simulateTransaction",
+                json!([STANDARD.encode(envelope.signed_bytes()), {"encoding":"base64","commitment":"confirmed","sigVerify":true,"replaceRecentBlockhash":false,"minContextSlot":10}]),
+                response,
+            );
+            let error = Preparer::new(RpcClient::new(rpc.clone()))
+                .simulate(&Cancellation::default(), &envelope, 10)
+                .await
+                .unwrap_err();
+            assert_eq!(error.failed_index, index);
+            assert_eq!(error.source.kind, kind);
+            assert_eq!(error.source.message, message);
+            assert!(error.accepted.is_empty());
+            assert_eq!(error.ambiguous_transaction_id, None);
+            assert_eq!(error.source.ambiguous_transaction_id, None);
+            assert_eq!(envelope, original);
+            rpc.assert_finished();
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_rpc_failure_and_cancellation_have_no_submission_metadata() {
+        let failure = Cancellation::default()
+            .race_preparation::<()>(async {
+                Err(Error::new(ErrorKind::RpcTimeout, "provider secret"))
+            })
+            .await
+            .unwrap_err();
+        let cancellation = Cancellation::default();
+        cancellation.cancel();
+        let cancelled = cancellation
+            .race_preparation::<()>(std::future::pending())
+            .await
+            .unwrap_err();
+        for (error, message) in [
+            (failure, "Solana transaction preparation failed"),
+            (cancelled, "Solana transaction preparation was cancelled"),
+        ] {
+            assert_eq!(error.source.kind, WalletErrorKind::Unavailable);
+            assert_eq!(error.to_string(), message);
+            assert!(error.accepted.is_empty());
+            assert_eq!(error.failed_index, None);
+            assert_eq!(error.ambiguous_transaction_id, None);
+            assert_eq!(error.source.ambiguous_transaction_id, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_pending_preparation_without_background_work() {
+        use std::{
+            sync::atomic::{AtomicBool, Ordering},
+            task::{Context, Poll, Waker},
+        };
+
+        struct PendingGuard(Arc<AtomicBool>);
+        impl Drop for PendingGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = PendingGuard(dropped.clone());
+        let cancellation = Cancellation::default();
+        let work = async move {
+            let _guard = guard;
+            std::future::pending::<Result<(), Error>>().await
+        };
+        let mut raced = Box::pin(cancellation.race_preparation(work));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            std::future::Future::poll(raced.as_mut(), &mut context),
+            Poll::Pending
+        ));
+        assert!(!dropped.load(Ordering::SeqCst));
+        cancellation.cancel();
+        let error = raced.await.unwrap_err();
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(
+            error.to_string(),
+            "Solana transaction preparation was cancelled"
+        );
+        assert!(error.accepted.is_empty());
+        assert_eq!(error.failed_index, None);
+        assert_eq!(error.ambiguous_transaction_id, None);
+    }
+
+    #[test]
+    fn inconsistent_balance_witness_is_operation_wide_before_amount_validation() {
+        let source = Address::from_bytes([1; 32]);
+        let transfers = [
+            ResolvedTransfer::new(
+                0,
+                source.clone(),
+                Address::from_bytes([2; 32]).to_string(),
+                Lamport::from_atomic(1),
+            ),
+            ResolvedTransfer::new(
+                1,
+                source,
+                Address::from_bytes([3; 32]).to_string(),
+                Lamport::from_atomic(u64::MAX),
+            ),
+        ];
+        let error = check_sufficiency(
+            &transfers,
+            &[Lamport::from_atomic(10), Lamport::from_atomic(11)],
+            &[Lamport::from_atomic(1), Lamport::from_atomic(1)],
+        )
+        .unwrap_err();
+        assert_eq!(error.source.kind, WalletErrorKind::Unavailable);
+        assert_eq!(
+            error.to_string(),
+            "Solana source balance witness is inconsistent"
+        );
+        assert!(error.accepted.is_empty());
+        assert_eq!(error.failed_index, None);
+        assert_eq!(error.ambiguous_transaction_id, None);
     }
 
     #[test]

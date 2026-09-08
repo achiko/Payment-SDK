@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
-use base::Address as BaseAddress;
 use wallets::{Error, ErrorKind, MAX_TRANSFERS, SendError, SendFuture, Sender, Transfer};
 
 use crate::transaction::{Preparation, PreparationError};
-use crate::wallet::{WalletConfig, preparation_error};
+use crate::wallet::WalletConfig;
 use crate::{Address, TransactionCoordinator};
 
 pub(crate) struct Batch {
@@ -21,9 +20,11 @@ impl Batch {
     }
 
     fn preparation<'a>(&self, transfer: &'a Transfer) -> Result<Preparation<'a>, Error> {
-        let from = ethereum_address(&transfer.wallet.address())?;
+        let from = Address::try_from(&transfer.wallet.address())
+            .map_err(|error| Error::new(ErrorKind::InvalidAddress, error.to_string()))?;
         let destination = transfer.wallet.parse_address(&transfer.to)?;
-        let destination = ethereum_address(&destination)?;
+        let destination = Address::try_from(&destination)
+            .map_err(|error| Error::new(ErrorKind::InvalidAddress, error.to_string()))?;
         let request = self
             .config
             .transfer_request(from, destination, &transfer.amount)
@@ -34,70 +35,64 @@ impl Batch {
             transfer.wallet.as_ref(),
         ))
     }
+
+    async fn execute(
+        &self,
+        transfers: Vec<Transfer>,
+    ) -> Result<Vec<base::TransactionId>, SendError> {
+        if transfers.is_empty() {
+            return Err(SendError::collection(
+                ErrorKind::InvalidBatch,
+                "at least one transfer is required",
+            ));
+        }
+        if transfers.len() > MAX_TRANSFERS {
+            return Err(SendError::collection(
+                ErrorKind::InvalidBatch,
+                "at most 50 transfers are allowed",
+            ));
+        }
+        let preparations = transfers
+            .iter()
+            .enumerate()
+            .map(|(index, transfer)| {
+                self.preparation(transfer)
+                    .map_err(|error| SendError::item(index, Vec::new(), error))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut prepared = self
+            .coordinator
+            .prepare_batch(preparations)
+            .await
+            .map_err(PreparationError::into_send)?;
+        let mut accepted = Vec::with_capacity(prepared.len());
+        loop {
+            let id = prepared
+                .next()
+                .await
+                .map_err(|error| SendError::item(accepted.len(), accepted.clone(), error.into()))?;
+            let Some(id) = id else {
+                return Ok(accepted);
+            };
+            accepted.push(base::Id::new(id.to_string()));
+        }
+    }
 }
 
 impl Sender for Batch {
     fn send<'a>(&'a self, transfers: Vec<Transfer>) -> SendFuture<'a> {
-        Box::pin(async move {
-            if transfers.is_empty() {
-                return Err(SendError::collection(
-                    ErrorKind::InvalidBatch,
-                    "at least one transfer is required",
-                ));
-            }
-            if transfers.len() > MAX_TRANSFERS {
-                return Err(SendError::collection(
-                    ErrorKind::InvalidBatch,
-                    "at most 50 transfers are allowed",
-                ));
-            }
-            let preparations = transfers
-                .iter()
-                .enumerate()
-                .map(|(index, transfer)| {
-                    self.preparation(transfer)
-                        .map_err(|error| SendError::item(index, Vec::new(), error))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut prepared = self
-                .coordinator
-                .prepare_batch(preparations)
-                .await
-                .map_err(preparation_failure)?;
-            let mut accepted = Vec::with_capacity(prepared.len());
-            loop {
-                let id = prepared.next().await.map_err(|error| {
-                    SendError::item(accepted.len(), accepted.clone(), broadcast_error(error))
-                })?;
-                let Some(id) = id else {
-                    return Ok(accepted);
-                };
-                accepted.push(base::Id::new(id.to_string()));
-            }
-        })
+        Box::pin(self.execute(transfers))
     }
 }
 
-fn ethereum_address(address: &BaseAddress) -> Result<Address, Error> {
-    let bytes: [u8; 20] = address.as_bytes().try_into().map_err(|_| {
-        Error::new(
-            ErrorKind::InvalidAddress,
-            "Ethereum address must contain exactly 20 bytes",
+impl PreparationError {
+    fn into_send(self) -> SendError {
+        SendError::item(
+            self.index,
+            Vec::new(),
+            self.source.into_preparation().into(),
         )
-    })?;
-    Ok(Address(bytes))
-}
-
-fn preparation_failure(error: PreparationError) -> SendError {
-    SendError::item(
-        error.index,
-        Vec::new(),
-        preparation_error(error.source).into(),
-    )
-}
-
-fn broadcast_error(error: base::TransactionError) -> Error {
-    error.into()
+    }
 }
 
 #[cfg(test)]
@@ -308,6 +303,27 @@ mod tests {
     }
 
     #[test]
+    fn item_preflight_reports_the_first_authored_error_before_chain_io() {
+        let (sender, wallet, dependencies) = direct_sender();
+        let first = transfer(wallet.clone());
+        let mut second = transfer(wallet.clone());
+        second.amount = base::Decimal::zero();
+        let mut third = transfer(wallet);
+        third.to.text = "not-an-address".to_owned();
+
+        let failure = block_on(sender.send(vec![first, second, third]))
+            .expect_err("the earlier invalid amount must win before any chain I/O");
+
+        assert_eq!(failure.failed_index, Some(1));
+        assert!(failure.accepted.is_empty());
+        assert_eq!(failure.source.kind, ErrorKind::InvalidAmount);
+        assert_eq!(failure.source.message, "amount must be positive");
+        assert_eq!(failure.ambiguous_transaction_id, None);
+        assert_eq!(failure.source.ambiguous_transaction_id, None);
+        assert_no_chain_io(&dependencies);
+    }
+
+    #[test]
     fn duplicates_keep_authored_indices_and_stop_after_the_ambiguous_item() {
         let (sender, wallet, dependencies) = direct_sender();
         let transfers = (0..3).map(|_| transfer(wallet.clone())).collect();
@@ -345,19 +361,16 @@ mod tests {
             Some("provider-candidate")
         );
         assert_eq!(failure.source.ambiguous_transaction_id, None);
-    }
-
-    #[test]
-    fn rejects_non_ethereum_source_addresses_before_preparation() {
-        let error = ethereum_address(&BaseAddress::new(vec![0_u8; 19]))
-            .expect_err("a non-Ethereum address must fail before RPC");
-
-        assert_eq!(error.kind, ErrorKind::InvalidAddress);
+        assert_eq!(failure.source.kind, ErrorKind::Unavailable);
+        assert_eq!(
+            failure.source.message,
+            "provider claimed transaction provider-candidate"
+        );
     }
 
     #[test]
     fn preparation_failure_preserves_index_with_zero_accepted() {
-        let failure = preparation_failure(PreparationError {
+        let failure = PreparationError::into_send(PreparationError {
             index: 2,
             source: ChainError {
                 kind: ChainErrorKind::InsufficientFunds,
@@ -368,15 +381,18 @@ mod tests {
         assert_eq!(failure.failed_index, Some(2));
         assert!(failure.accepted.is_empty());
         assert_eq!(failure.source.kind, ErrorKind::Transaction);
+        assert_eq!(failure.source.message, "aggregate balance is insufficient");
+        assert_eq!(failure.ambiguous_transaction_id, None);
+        assert_eq!(failure.source.ambiguous_transaction_id, None);
     }
 
     #[test]
     fn broadcast_failure_preserves_transaction_classification_for_http_mapping() {
-        let unavailable = broadcast_error(base::TransactionError::new(
+        let unavailable = Error::from(base::TransactionError::new(
             base::TransactionErrorKind::Unavailable,
             "submission outcome is ambiguous",
         ));
-        let rejected = broadcast_error(base::TransactionError::new(
+        let rejected = Error::from(base::TransactionError::new(
             base::TransactionErrorKind::Rejected,
             "node rejected the transaction",
         ));

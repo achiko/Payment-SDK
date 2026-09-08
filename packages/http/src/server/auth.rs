@@ -78,8 +78,9 @@ impl BearerToken {
         Ok(Self(Arc::from(bytes)))
     }
 
-    /// Compares an HTTP `Authorization` value without timing-dependent early
-    /// exits over the credential bytes.
+    /// Compares equal-length credentials using `constant_time_eq`.
+    /// Missing headers, invalid prefixes, and unequal lengths may return early;
+    /// credential length is not hidden.
     #[must_use]
     pub fn matches_authorization_header(&self, value: Option<&HeaderValue>) -> bool {
         const PREFIX: &[u8] = b"Bearer ";
@@ -90,7 +91,7 @@ impl BearerToken {
         if bytes.len() < PREFIX.len() || !bytes.starts_with(PREFIX) {
             return false;
         }
-        constant_time_eq(&bytes[PREFIX.len()..], &self.0)
+        constant_time_eq::constant_time_eq(&bytes[PREFIX.len()..], &self.0)
     }
 }
 
@@ -100,13 +101,54 @@ impl fmt::Debug for BearerToken {
     }
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let maximum = left.len().max(right.len());
-    let mut difference = left.len() ^ right.len();
-    for index in 0..maximum {
-        difference |= usize::from(
-            left.get(index).copied().unwrap_or(0) ^ right.get(index).copied().unwrap_or(0),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authorization_requires_every_credential_byte_to_match() {
+        let token = BearerToken::new("correct-secret").expect("fixture token is valid");
+        assert!(
+            token.matches_authorization_header(Some(&HeaderValue::from_static(
+                "Bearer correct-secret",
+            )))
         );
+
+        for value in [
+            "Bearer xorrect-secret",
+            "Bearer correctxsecret",
+            "Bearer correct-secrex",
+        ] {
+            assert!(!token.matches_authorization_header(Some(&HeaderValue::from_static(value))));
+        }
     }
-    difference == 0
+
+    #[test]
+    fn authorization_rejects_shorter_longer_and_empty_credentials() {
+        let token = BearerToken::new("correct-secret").expect("fixture token is valid");
+        for value in [
+            "Bearer correct-secre",
+            "Bearer correct-secret-extra",
+            "Bearer ",
+        ] {
+            assert!(!token.matches_authorization_header(Some(&HeaderValue::from_static(value))));
+        }
+    }
+
+    #[test]
+    fn authorization_requires_the_exact_bearer_prefix_without_trimming() {
+        let token = BearerToken::new("correct-secret").expect("fixture token is valid");
+        assert!(!token.matches_authorization_header(None));
+        for value in [
+            "",
+            "Bearer",
+            "correct-secret",
+            "Basic correct-secret",
+            "bearer correct-secret",
+            "Bearer  correct-secret",
+            "Bearer correct-secret ",
+        ] {
+            assert!(!token.matches_authorization_header(Some(&HeaderValue::from_static(value))));
+        }
+    }
 }

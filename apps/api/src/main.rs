@@ -60,9 +60,7 @@ async fn main() -> Result<(), AnyError> {
                 client.clone(),
                 config.chain_id,
             )?);
-            if let Some(contract) = &usdc {
-                accounts.validate_token(contract, USDC_DECIMALS).await?;
-            }
+            config.validate_usdc(&accounts, USDC_DECIMALS).await?;
             let accounts: Arc<dyn chain_ethereum::Accounts> = accounts;
             let transactions: Arc<dyn chain_ethereum::Transactions> = Arc::new(
                 chain_ethereum::TransactionClient::new(client, config.chain_id, config.limits()?)?,
@@ -314,10 +312,9 @@ async fn main() -> Result<(), AnyError> {
     if let Some(result) = startup_result {
         readiness_control.send_replace(false);
         if let Some(task) = submission_tasks.take() {
-            submission_control
-                .close()
-                .await
-                .map_err(|_| "could not close submission registration")?;
+            let Ok(()) = submission_control.close().await else {
+                return Err("could not close submission registration".into());
+            };
             task.await??;
         }
         if let Some(task) = synchronization.take() {

@@ -97,7 +97,7 @@ fn log(index: u64, from: &str, to: &str, data: &str) -> Value {
     json!({
         "address": TOKEN,
         "topics": [
-            encode_hex(&TRANSFER_TOPIC),
+            hex::encode_prefixed(TRANSFER_TOPIC),
             topic_address(from),
             topic_address(to)
         ],
@@ -147,16 +147,69 @@ fn interprets_successful_native_transfer_and_actual_fee() {
         draft.movements[0].id(),
         &MovementId(format!("{TX_HASH}:value"))
     );
-    assert_eq!(
-        draft.movements[0].amount(),
-        &atomic_decimal(U256::from(42_u8))
-    );
+    assert_eq!(draft.movements[0].amount(), &Decimal::from(42_u64));
     assert_eq!(
         draft.fee.as_ref().expect("fee must exist").amount,
-        atomic_decimal(U256::from(21_000_u64 * 3))
+        Decimal::from(63_000_u64)
     );
     assert_eq!(draft.movements[0].amount().scale(), 0);
+    assert_eq!(
+        draft.fee.as_ref().expect("fee must exist").amount.scale(),
+        0
+    );
     assert_eq!(draft.status, ObservationDraftStatus::Included);
+}
+
+#[test]
+fn preserves_full_width_atomic_native_token_and_fee_amounts() {
+    let maximum = format!("0x{}", "ff".repeat(32));
+    let zero = "0x0000000000000000000000000000000000000000";
+    let block = ethereum_block(
+        transaction(Some(TO), &maximum),
+        receipt(
+            true,
+            Some(TO),
+            None,
+            &format!("0x1{}", "0".repeat(60)),
+            vec![
+                log(0, FROM, TO, &maximum),
+                log(1, zero, TO, &maximum),
+                log(2, FROM, zero, &maximum),
+            ],
+        ),
+    );
+    let interpreted = inspect(&block, &[canonical_address(FROM)])
+        .expect("full-width amounts with a non-overflowing fee must interpret");
+    let draft = &interpreted.transactions[0];
+    let expected = "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+        .parse::<Decimal>()
+        .expect("maximum U256 decimal literal must parse");
+    assert_eq!(
+        draft
+            .movements
+            .iter()
+            .map(ValueMovement::kind)
+            .collect::<Vec<_>>(),
+        [
+            MovementKind::Transfer,
+            MovementKind::Transfer,
+            MovementKind::Mint,
+            MovementKind::Burn
+        ]
+    );
+    for movement in &draft.movements {
+        assert_eq!(movement.amount(), &expected);
+        assert_eq!(movement.amount().scale(), 0);
+    }
+
+    // The fixture charges 21,000 gas at 2^240 atomic units per gas.
+    let expected_fee =
+        "37103788360346070921249247515601288832377161834387998120553730227145015296000"
+            .parse::<Decimal>()
+            .expect("full-width fee decimal literal must parse");
+    let fee = draft.fee.as_ref().expect("fee must exist");
+    assert_eq!(fee.amount, expected_fee);
+    assert_eq!(fee.amount.scale(), 0);
 }
 
 #[test]
@@ -255,12 +308,16 @@ fn interprets_transfer_mint_and_burn_logs() {
     assert_eq!(movements[2].kind(), MovementKind::Burn);
     assert_eq!(movements[2].to(), None);
     assert_eq!(movements[2].id(), &MovementId(format!("{TX_HASH}:2")));
+    for (movement, amount) in movements.iter().zip([1_u64, 2, 3]) {
+        assert_eq!(movement.amount(), &Decimal::from(amount));
+        assert_eq!(movement.amount().scale(), 0);
+    }
 }
 
 #[test]
 fn ignores_structurally_malformed_transfer_log() {
     let mut malformed = log(0, FROM, TO, &format!("0x{:064x}", 1));
-    malformed["topics"] = json!([encode_hex(&TRANSFER_TOPIC)]);
+    malformed["topics"] = json!([hex::encode_prefixed(TRANSFER_TOPIC)]);
     let block = ethereum_block(
         transaction(Some(TO), "0x0"),
         receipt(true, Some(TO), None, "0x1", vec![malformed]),
@@ -301,5 +358,75 @@ fn raw_block_reference_is_stable() {
             }),
             timestamp: Some(100),
         }
+    );
+}
+
+#[test]
+fn canonical_identities_preserve_scope_leading_zeroes_and_lowercase_hex() {
+    let scope = scope();
+    let mut address = [0; 20];
+    address[18..].copy_from_slice(&[0xab, 0xff]);
+    let canonical = address.canonical(&scope);
+    assert_eq!(canonical.scope, scope);
+    assert_eq!(canonical.value, format!("0x{}abff", "00".repeat(18)));
+
+    let hash: [u8; 32] = std::array::from_fn(|index| index as u8);
+    let transaction = hash.canonical(&scope);
+    assert_eq!(transaction.scope, scope);
+    assert_eq!(
+        transaction.value,
+        "0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    );
+}
+
+#[test]
+fn malformed_block_and_receipt_errors_remain_terminal_before_projection() {
+    let mut block = ethereum_block(
+        transaction(Some(TO), "0x2a"),
+        receipt(true, Some(TO), None, "0x3", Vec::new()),
+    );
+    block.raw_receipts[0] = b"not-json".to_vec();
+    let error = inspect(&block, &[]).expect_err("invalid receipt must fail even without filters");
+    assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+    assert_eq!(error.message, "Ethereum receipt result is not valid JSON");
+    assert!(!error.retryable);
+
+    block.raw_block = b"not-json".to_vec();
+    let error = inspect(&block, &[]).expect_err("invalid block must fail before receipt parsing");
+    assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+    assert_eq!(
+        error.message,
+        "Ethereum block result does not match the RPC block shape"
+    );
+    assert!(!error.retryable);
+}
+
+#[test]
+fn canonical_address_adapter_preserves_chain_precedence_and_alloy_syntax() {
+    for prefix in ["", "0x", "0X"] {
+        let address = CanonicalAddress {
+            scope: scope(),
+            value: format!("{prefix}{}", "aB".repeat(20)),
+        };
+        assert_eq!(parse_canonical_address(&address).unwrap(), [0xab; 20]);
+    }
+    let mut address = CanonicalAddress {
+        scope: scope(),
+        value: "invalid".into(),
+    };
+    let error = parse_canonical_address(&address).unwrap_err();
+    assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+    assert!(!error.retryable);
+    assert_eq!(
+        error.message,
+        "Ethereum movement contains a malformed canonical address"
+    );
+    address.scope.chain = ChainId("foreign".into());
+    let error = parse_canonical_address(&address).unwrap_err();
+    assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+    assert!(!error.retryable);
+    assert_eq!(
+        error.message,
+        "Ethereum movement contains a foreign-chain address"
     );
 }

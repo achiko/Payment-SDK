@@ -7,6 +7,5 @@
 
 mod backend;
 mod codec;
-mod format;
 
 pub use backend::{DEFAULT_COMMAND_QUEUE_CAPACITY, Redb};

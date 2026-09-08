@@ -30,11 +30,41 @@ struct AccountKey {
     writable: bool,
 }
 
+impl AccountKey {
+    fn parse(text: &str, writable: bool) -> Result<Self, IndexError> {
+        let address = text.parse::<Address>().map_err(|_| {
+            invalid_block("Solana transaction contains a malformed canonical address")
+        })?;
+        Ok(Self { address, writable })
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct Instruction {
     pub program: usize,
     pub accounts: Vec<usize>,
     pub data: String,
+}
+
+impl Instruction {
+    fn parse(wire: InstructionWire, key_count: usize) -> Result<Self, IndexError> {
+        let program = usize::from(wire.program_id_index);
+        let accounts = wire
+            .accounts
+            .into_iter()
+            .map(usize::from)
+            .collect::<Vec<_>>();
+        if program >= key_count || accounts.iter().any(|index| *index >= key_count) {
+            return Err(invalid_block(
+                "Solana compiled instruction contains an invalid account index",
+            ));
+        }
+        Ok(Self {
+            program,
+            accounts,
+            data: wire.data,
+        })
+    }
 }
 
 impl Transactions {
@@ -98,10 +128,7 @@ impl Transaction {
             } else {
                 index < static_count - readonly_unsigned
             };
-            keys.push(AccountKey {
-                address: parse_address(&text)?,
-                writable,
-            });
+            keys.push(AccountKey::parse(&text, writable)?);
         }
 
         let meta = wire
@@ -118,16 +145,10 @@ impl Transaction {
             (Version::Legacy, _) => {}
             (Version::Zero, Some(loaded)) => {
                 for text in loaded.writable {
-                    keys.push(AccountKey {
-                        address: parse_address(&text)?,
-                        writable: true,
-                    });
+                    keys.push(AccountKey::parse(&text, true)?);
                 }
                 for text in loaded.readonly {
-                    keys.push(AccountKey {
-                        address: parse_address(&text)?,
-                        writable: false,
-                    });
+                    keys.push(AccountKey::parse(&text, false)?);
                 }
             }
             (Version::Zero, None) => {
@@ -153,7 +174,11 @@ impl Transaction {
             ));
         }
 
-        let instructions = parse_instructions(message.instructions, keys.len())?;
+        let instructions = message
+            .instructions
+            .into_iter()
+            .map(|wire| Instruction::parse(wire, keys.len()))
+            .collect::<Result<Vec<_>, _>>()?;
         let inner = meta
             .inner_instructions
             .map(|groups| parse_inner(groups, instructions.len(), keys.len()))
@@ -202,7 +227,24 @@ impl Transaction {
         &self.keys[index].address
     }
 
-    pub fn selected_effects<'a>(
+    pub fn reconcile_selected(
+        &self,
+        selected: &std::collections::BTreeSet<Address>,
+        movements: &Movements,
+    ) -> Result<(), IndexError> {
+        let affected = self.selected_effects(selected, movements);
+        if !affected.is_empty() && self.inner().is_none() {
+            return Err(invalid_block(
+                "successful selected Solana transaction has incomplete inner instructions",
+            ));
+        }
+        for address in affected {
+            self.reconcile(address, movements)?;
+        }
+        Ok(())
+    }
+
+    fn selected_effects<'a>(
         &'a self,
         selected: &'a std::collections::BTreeSet<Address>,
         movements: &Movements,
@@ -219,7 +261,7 @@ impl Transaction {
             .collect()
     }
 
-    pub fn reconcile(&self, address: &Address, movements: &Movements) -> Result<(), IndexError> {
+    fn reconcile(&self, address: &Address, movements: &Movements) -> Result<(), IndexError> {
         let index = self
             .keys
             .iter()
@@ -241,33 +283,7 @@ impl Transaction {
     }
 }
 
-fn parse_instructions(
-    wires: Vec<InstructionWire>,
-    key_count: usize,
-) -> Result<Vec<Instruction>, IndexError> {
-    wires
-        .into_iter()
-        .map(|wire| {
-            let program = usize::from(wire.program_id_index);
-            let accounts = wire
-                .accounts
-                .into_iter()
-                .map(usize::from)
-                .collect::<Vec<_>>();
-            if program >= key_count || accounts.iter().any(|index| *index >= key_count) {
-                return Err(invalid_block(
-                    "Solana compiled instruction contains an invalid account index",
-                ));
-            }
-            Ok(Instruction {
-                program,
-                accounts,
-                data: wire.data,
-            })
-        })
-        .collect()
-}
-
+// design-lint: allow single-use-free-function -- decodes and validates a complete set of inner-instruction groups against outer-instruction and account-key bounds as a distinct section of transaction decoding
 fn parse_inner(
     groups: Vec<InnerWire>,
     outer_count: usize,
@@ -276,22 +292,23 @@ fn parse_inner(
     let mut inner = BTreeMap::new();
     for group in groups {
         let index = usize::from(group.index);
-        if index >= outer_count
-            || inner
-                .insert(index, parse_instructions(group.instructions, key_count)?)
-                .is_some()
-        {
+        if index >= outer_count {
+            return Err(invalid_block(
+                "Solana transaction contains an invalid or duplicate inner-instruction group",
+            ));
+        }
+        let instructions = group
+            .instructions
+            .into_iter()
+            .map(|wire| Instruction::parse(wire, key_count))
+            .collect::<Result<Vec<_>, _>>()?;
+        if inner.insert(index, instructions).is_some() {
             return Err(invalid_block(
                 "Solana transaction contains an invalid or duplicate inner-instruction group",
             ));
         }
     }
     Ok(inner)
-}
-
-fn parse_address(text: &str) -> Result<Address, IndexError> {
-    text.parse::<Address>()
-        .map_err(|_| invalid_block("Solana transaction contains a malformed canonical address"))
 }
 
 #[derive(Clone, Copy)]

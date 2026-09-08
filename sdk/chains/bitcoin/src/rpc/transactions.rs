@@ -9,7 +9,7 @@ use super::{
     Client, Preflight,
     error::{map_json_rpc_error, source_error},
     transport::Client as Transport,
-    wire::{fee_rate_json, parse_btc_amount, required_bool, required_string},
+    wire::{required_bool, required_string},
 };
 
 impl<C> Client<C>
@@ -21,7 +21,7 @@ where
         transaction: &SignedTransaction,
         max_fee_rate: FeeRate,
     ) -> Result<Preflight, SourceError> {
-        let max_fee_rate = fee_rate_json(max_fee_rate)?;
+        let max_fee_rate = max_fee_rate.core_maximum_json()?;
         let raw = self
             .request_result(
                 "testmempoolaccept",
@@ -62,9 +62,8 @@ where
             .get("fees")
             .and_then(Value::as_object)
             .and_then(|fees| fees.get("base"))
-            .map(|value| parse_btc_amount(value, "Bitcoin preflight base fee"))
-            .transpose()?
-            .map(Satoshi);
+            .map(|value| Satoshi::from_rpc_json(value, "Bitcoin preflight base fee"))
+            .transpose()?;
         Ok(Preflight {
             allowed,
             reject_reason,
@@ -79,8 +78,9 @@ where
         max_fee_rate: FeeRate,
     ) -> Result<TransactionId, TransactionError> {
         let expected_id = transaction.id();
-        let max_fee_rate = fee_rate_json(max_fee_rate)
-            .map_err(|error| transaction_error(TransactionErrorKind::Fee, error))?;
+        let max_fee_rate = max_fee_rate
+            .core_maximum_json()
+            .map_err(|error| TransactionError::new(TransactionErrorKind::Fee, error.to_string()))?;
         let raw = match self
             .request_result_detailed_once(
                 "sendrawtransaction",
@@ -93,9 +93,9 @@ where
         {
             Ok(raw) => raw,
             Err(failure) if failure.remote_code.is_some() => {
-                return Err(transaction_error(
+                return Err(TransactionError::new(
                     TransactionErrorKind::Rejected,
-                    failure.error,
+                    failure.error.to_string(),
                 ));
             }
             Err(failure) => return Err(ambiguous_submission(expected_id, failure.error)),
@@ -120,14 +120,8 @@ where
     }
 }
 
-fn transaction_error(
-    kind: TransactionErrorKind,
-    error: impl std::fmt::Display,
-) -> TransactionError {
-    TransactionError::new(kind, error.to_string())
-}
-
+// design-lint: allow unclassified-free-function -- shared Bitcoin RPC uncertainty mapping attaches the verified local transaction ID independently of client state
 fn ambiguous_submission(id: TransactionId, error: impl std::fmt::Display) -> TransactionError {
-    transaction_error(TransactionErrorKind::Unavailable, error)
+    TransactionError::new(TransactionErrorKind::Unavailable, error.to_string())
         .with_ambiguous_transaction_id(BaseTransactionId::new(id.to_string()))
 }

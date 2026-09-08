@@ -15,7 +15,7 @@ use indexing::{
 };
 use tokio_postgres::{IsolationLevel, Row};
 
-use crate::{Repository, prepare_in, row};
+use crate::{Repository, row};
 
 const MAX_PAGE: usize = 1_000;
 
@@ -60,7 +60,13 @@ impl Repository {
     ) -> Result<CanonicalPage, IndexError> {
         self.check_scope(&request.scope)?;
         self.check_address(&request.address)?;
-        validate_limit(request.limit)?;
+        if request.limit == 0 || request.limit > MAX_PAGE {
+            return Err(IndexError::new(
+                IndexErrorKind::InvalidRequest,
+                "page limit must be between one and one thousand",
+                false,
+            ));
+        }
         let mut client = self.client().await?;
         let transaction = client
             .build_transaction()
@@ -75,7 +81,11 @@ impl Repository {
             .as_ref()
             .is_some_and(|cursor| cursor.checkpoint != checkpoint)
         {
-            return Err(conflict("history changed during pagination"));
+            return Err(IndexError::new(
+                IndexErrorKind::Conflict,
+                "history changed during pagination",
+                true,
+            ));
         }
 
         // One extra row reveals whether another page exists without a count.
@@ -88,7 +98,10 @@ impl Repository {
             ),
             None => (-1, String::new()),
         };
-        let statement = prepare_in(&transaction, HISTORY_PAGE).await?;
+        let statement = transaction
+            .prepare_cached(HISTORY_PAGE)
+            .await
+            .map_err(crate::store)?;
         let rows = transaction
             .query(
                 &statement,
@@ -121,7 +134,11 @@ impl Repository {
         // The checkpoint must not have moved while the page was assembled, or
         // the page would mix two views of canonical history.
         if self.checkpoint_in(&transaction).await? != checkpoint {
-            return Err(conflict("history changed during pagination"));
+            return Err(IndexError::new(
+                IndexErrorKind::Conflict,
+                "history changed during pagination",
+                true,
+            ));
         }
         let next = has_more
             .then(|| {
@@ -159,7 +176,10 @@ impl Repository {
         let last_height: i64 = last.try_get("height").map_err(crate::store)?;
         let last_transaction: String = last.try_get("transaction_id").map_err(crate::store)?;
 
-        let statement = prepare_in(transaction, PAGE_MOVEMENTS).await?;
+        let statement = transaction
+            .prepare_cached(PAGE_MOVEMENTS)
+            .await
+            .map_err(crate::store)?;
         let rows = transaction
             .query(
                 &statement,
@@ -295,7 +315,13 @@ impl Repository {
     ) -> Result<OutputPage, IndexError> {
         self.check_scope(&request.scope)?;
         self.check_address(&request.address)?;
-        validate_limit(request.limit)?;
+        if request.limit == 0 || request.limit > MAX_PAGE {
+            return Err(IndexError::new(
+                IndexErrorKind::InvalidRequest,
+                "page limit must be between one and one thousand",
+                false,
+            ));
+        }
         let mut client = self.client().await?;
         let transaction = client
             .build_transaction()
@@ -310,7 +336,11 @@ impl Repository {
             .as_ref()
             .is_some_and(|cursor| cursor.checkpoint != checkpoint)
         {
-            return Err(conflict("outputs changed during pagination"));
+            return Err(IndexError::new(
+                IndexErrorKind::Conflict,
+                "outputs changed during pagination",
+                true,
+            ));
         }
         let (after_transaction, after_index) = match &request.after {
             Some(cursor) => decode_position(&cursor.position)?,
@@ -318,7 +348,10 @@ impl Repository {
         };
         let limit = i64::try_from(request.limit.saturating_add(1))
             .map_err(|_| row::store("page limit exceeds the query range"))?;
-        let statement = prepare_in(&transaction, OUTPUT_PAGE).await?;
+        let statement = transaction
+            .prepare_cached(OUTPUT_PAGE)
+            .await
+            .map_err(crate::store)?;
         let rows = transaction
             .query(
                 &statement,
@@ -341,7 +374,11 @@ impl Repository {
             .map(|entry| row::output(&request.scope, entry))
             .collect::<Result<Vec<_>, _>>()?;
         if self.checkpoint_in(&transaction).await? != checkpoint {
-            return Err(conflict("outputs changed during pagination"));
+            return Err(IndexError::new(
+                IndexErrorKind::Conflict,
+                "outputs changed during pagination",
+                true,
+            ));
         }
         let next = has_more
             .then(|| {
@@ -379,12 +416,15 @@ impl indexing::Outputs for Repository {
     }
 }
 
+// design-lint: allow unclassified-free-function -- private PostgreSQL output cursor encoder pairs transaction and index bytes for decode_position without exposing backend framing on the opaque indexing cursor
 /// An output cursor is the output's identity, not a rendering of it: the page
 /// query compares it as a row value so the index can supply the order.
 fn encode_position(transaction: &str, index: u32) -> Vec<u8> {
     format!("{transaction}\u{0}{index}").into_bytes()
 }
 
+// design-lint: allow single-use-free-function -- decodes the private PostgreSQL output cursor format paired with encode_position, keeping parsing separate from page queries
+// design-lint: allow unclassified-free-function -- private PostgreSQL output cursor parser keeps backend row-key bytes and Store errors out of the opaque chain-neutral OutputCursor
 fn decode_position(position: &[u8]) -> Result<(String, i32), IndexError> {
     let text =
         std::str::from_utf8(position).map_err(|_| row::store("output cursor is not valid"))?;
@@ -397,21 +437,6 @@ fn decode_position(position: &[u8]) -> Result<(String, i32), IndexError> {
     Ok((transaction.to_owned(), index))
 }
 
-fn conflict(message: &'static str) -> IndexError {
-    IndexError::new(IndexErrorKind::Conflict, message, true)
-}
-
-fn validate_limit(limit: usize) -> Result<(), IndexError> {
-    if limit == 0 || limit > MAX_PAGE {
-        return Err(IndexError::new(
-            IndexErrorKind::InvalidRequest,
-            "page limit must be between one and one thousand",
-            false,
-        ));
-    }
-    Ok(())
-}
-
 /// Unused today but kept so the movement mapper can name every variant.
 #[allow(dead_code)]
 const fn kinds() -> [MovementKind; 5] {
@@ -422,4 +447,102 @@ const fn kinds() -> [MovementKind; 5] {
         MovementKind::Mint,
         MovementKind::Burn,
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn page_limit_boundaries_preserve_errors_before_pool_access() {
+        let pool = crate::pool("postgres://localhost/unused", 1).unwrap();
+        pool.close();
+        let scope = indexing::IndexScope {
+            chain: ChainId("chain".into()),
+            network: "network".into(),
+        };
+        let address = indexing::CanonicalAddress {
+            scope: scope.clone(),
+            value: "address".into(),
+        };
+        let repository = Repository::new(pool.clone(), scope.clone()).unwrap();
+        let unavailable = deadpool_postgres::PoolError::Closed.to_string();
+        let invalid = "page limit must be between one and one thousand";
+        for (limit, kind, message, retryable) in [
+            (0, IndexErrorKind::InvalidRequest, invalid, false),
+            (MAX_PAGE + 1, IndexErrorKind::InvalidRequest, invalid, false),
+            (usize::MAX, IndexErrorKind::InvalidRequest, invalid, false),
+            (1, IndexErrorKind::Store, unavailable.as_str(), true),
+            (MAX_PAGE, IndexErrorKind::Store, unavailable.as_str(), true),
+        ] {
+            let history = repository
+                .list_history(HistoryQuery {
+                    scope: scope.clone(),
+                    address: address.clone(),
+                    after: None,
+                    limit,
+                })
+                .await
+                .unwrap_err();
+            let outputs = repository
+                .list_outputs(OutputRequest {
+                    scope: scope.clone(),
+                    address: address.clone(),
+                    after: None,
+                    limit,
+                })
+                .await
+                .unwrap_err();
+            for error in [history, outputs] {
+                assert_eq!(error.kind, kind);
+                assert_eq!(error.message, message);
+                assert_eq!(error.retryable, retryable);
+            }
+        }
+        assert_eq!(pool.status().size, 0);
+    }
+
+    #[test]
+    fn output_position_keeps_its_existing_wire_format() {
+        assert_eq!(encode_position("tx:abc", 12), b"tx:abc\x0012");
+        assert_eq!(
+            decode_position(b"tx:abc\x0012").expect("valid output cursor"),
+            ("tx:abc".to_owned(), 12)
+        );
+    }
+
+    #[test]
+    fn output_position_round_trips_bounds_and_transaction_ids() {
+        for transaction in ["tx-1", "tx:with:delimiters", "交易"] {
+            for index in [0, i32::MAX] {
+                let encoded = encode_position(
+                    transaction,
+                    u32::try_from(index).expect("nonnegative output index"),
+                );
+
+                assert_eq!(
+                    decode_position(&encoded).expect("encodable SQL output position"),
+                    (transaction.to_owned(), index)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn output_position_rejects_malformed_encodings_without_retrying() {
+        for position in [
+            b"\xff\x001".as_slice(),
+            b"tx-without-separator",
+            b"tx\x00",
+            b"tx\x00not-an-integer",
+            b"tx\x002147483648",
+            b"tx\x00-2147483649",
+        ] {
+            let error = decode_position(position).expect_err("malformed output cursor");
+
+            assert_eq!(error.kind, IndexErrorKind::Store);
+            assert_eq!(error.message, "output cursor is not valid");
+            assert!(!error.retryable);
+        }
+    }
 }

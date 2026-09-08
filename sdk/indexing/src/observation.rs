@@ -234,15 +234,15 @@ impl ObservationDraft {
         }
         let mut ids = BTreeSet::new();
         for movement in &self.movements {
-            if movement.id().0.is_empty()
+            let invalid_movement = movement.id().0.is_empty()
                 || !ids.insert(movement.id())
                 || movement.asset().chain != scope.chain
                 || movement.amount().validate_amount().is_err()
                 || movement
                     .from()
                     .is_some_and(|value| !value.belongs_to(scope))
-                || movement.to().is_some_and(|value| !value.belongs_to(scope))
-            {
+                || movement.to().is_some_and(|value| !value.belongs_to(scope));
+            if invalid_movement {
                 return Err(IndexError::new(
                     IndexErrorKind::InvalidBlock,
                     "transaction contains an invalid movement",
@@ -250,14 +250,15 @@ impl ObservationDraft {
                 ));
             }
         }
-        if self.fee.as_ref().is_some_and(|fee| {
+        let invalid_fee = self.fee.as_ref().is_some_and(|fee| {
             fee.asset.chain != scope.chain
                 || fee.amount.validate_amount().is_err()
                 || fee
                     .payer
                     .as_ref()
                     .is_some_and(|payer| !payer.belongs_to(scope))
-        }) {
+        });
+        if invalid_fee {
             return Err(IndexError::new(
                 IndexErrorKind::InvalidBlock,
                 "transaction contains an invalid network fee",
