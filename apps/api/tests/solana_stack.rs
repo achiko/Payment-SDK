@@ -131,10 +131,13 @@ fn executable(directory: &Path, name: &str) -> Option<PathBuf> {
     for entry in fs::read_dir(directory).ok()? {
         let path = entry.ok()?.path();
         if path.is_dir() {
-            if let Some(found) = executable(&path, name) {
-                return Some(found);
-            }
-        } else if path.file_name().and_then(|value| value.to_str()) == Some(name) {
+            let Some(found) = executable(&path, name) else {
+                continue;
+            };
+            return Some(found);
+        }
+        let matches_name = path.file_name().and_then(|value| value.to_str()) == Some(name);
+        if matches_name {
             return Some(path);
         }
     }
@@ -151,6 +154,28 @@ fn host_target() -> &'static str {
     } else {
         "unsupported"
     }
+}
+
+#[test]
+fn executable_search_finds_nested_files_and_rejects_missing_or_file_roots() {
+    let directory = tempfile::tempdir().expect("temporary search directory");
+    let named_directory = directory.path().join("fixture-tool");
+    fs::create_dir(&named_directory).expect("same-named directory");
+    assert_eq!(executable(directory.path(), "fixture-tool"), None);
+
+    let nested = directory.path().join("release/bin");
+    fs::create_dir_all(&nested).expect("nested artifact layout");
+    let expected = nested.join("fixture-tool");
+    fs::write(&expected, b"fixture only").expect("fixture file");
+    assert_eq!(
+        executable(directory.path(), "fixture-tool"),
+        Some(expected.clone())
+    );
+    assert_eq!(executable(&expected, "fixture-tool"), None);
+    assert_eq!(
+        executable(&directory.path().join("missing"), "fixture-tool"),
+        None
+    );
 }
 
 #[test]

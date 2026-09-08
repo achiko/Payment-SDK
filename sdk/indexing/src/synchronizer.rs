@@ -265,10 +265,10 @@ where
         let mut previous = None;
         for block in &blocks {
             let position = block.block_ref().position;
-            if position < start
+            let invalid_position = position < start
                 || position > end
-                || previous.is_some_and(|previous| position <= previous)
-            {
+                || previous.is_some_and(|previous| position <= previous);
+            if invalid_position {
                 return Err(IndexError::cannot_connect(
                     "source blocks are outside the range or not strictly increasing",
                 ));

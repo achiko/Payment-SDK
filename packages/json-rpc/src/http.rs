@@ -372,26 +372,21 @@ impl Error {
                 format!("JSON-RPC call failed with code {}", error.code()),
             ),
             RpcError::RequestTimeout => Self::new(ErrorKind::Timeout, "JSON-RPC request timed out"),
-            RpcError::Transport(source) => {
-                if let Some(error) = source.downcast_ref::<transport::Error>() {
-                    return match error {
-                        transport::Error::Rejected { status_code } => Self::new(
-                            ErrorKind::HttpStatus(*status_code),
-                            "JSON-RPC endpoint rejected the request",
-                        ),
-                        transport::Error::Http(HttpError::TooLarge) => Self::new(
-                            ErrorKind::ResponseTooLarge,
-                            "JSON-RPC response exceeded its configured limit",
-                        ),
-                        transport::Error::Http(HttpError::Malformed) => Self::new(
-                            ErrorKind::InvalidResponse,
-                            "JSON-RPC endpoint returned an invalid response",
-                        ),
-                        _ => Self::new(ErrorKind::Unavailable, "JSON-RPC transport is unavailable"),
-                    };
-                }
-                Self::new(ErrorKind::Unavailable, "JSON-RPC transport is unavailable")
-            }
+            RpcError::Transport(source) => match source.downcast_ref::<transport::Error>() {
+                Some(transport::Error::Rejected { status_code }) => Self::new(
+                    ErrorKind::HttpStatus(*status_code),
+                    "JSON-RPC endpoint rejected the request",
+                ),
+                Some(transport::Error::Http(HttpError::TooLarge)) => Self::new(
+                    ErrorKind::ResponseTooLarge,
+                    "JSON-RPC response exceeded its configured limit",
+                ),
+                Some(transport::Error::Http(HttpError::Malformed)) => Self::new(
+                    ErrorKind::InvalidResponse,
+                    "JSON-RPC endpoint returned an invalid response",
+                ),
+                _ => Self::new(ErrorKind::Unavailable, "JSON-RPC transport is unavailable"),
+            },
             RpcError::ParseError(_) | RpcError::InvalidRequestId(_) => Self::new(
                 ErrorKind::InvalidResponse,
                 "JSON-RPC endpoint returned an invalid response",

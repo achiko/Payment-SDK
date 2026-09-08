@@ -358,6 +358,53 @@ fn indexed_address_spend_is_recorded_directly() {
 }
 
 #[test]
+fn duplicate_spends_keep_the_global_error_even_for_unselected_addresses() {
+    let source = p2wpkh_address(0x02);
+    let transactions = [1_000, 900]
+        .into_iter()
+        .map(|value| {
+            let transaction = Transaction {
+                version: Version::TWO,
+                lock_time: absolute::LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::new(Txid::from_byte_array([9; 32]), 1),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(value),
+                    script_pubkey: source.script_pubkey(),
+                }],
+            };
+            transaction_json(
+                &transaction,
+                &[Some(PreviousEvidence {
+                    value: 2_000,
+                    script: source.script_pubkey(),
+                    height: 4,
+                    coinbase: false,
+                })],
+            )
+        })
+        .collect();
+    let block = block(transactions);
+    let interpreter = BlockInterpreter::new(scope(), Network::Regtest).unwrap();
+    for addresses in [Vec::new(), vec![indexed_address(&source)]] {
+        let error = interpreter
+            .inspect(&block, &addresses)
+            .expect_err("duplicate inputs must fail before output aggregation");
+
+        assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+        assert_eq!(
+            error.message,
+            "Bitcoin block spends the same outpoint more than once"
+        );
+        assert!(!error.retryable);
+    }
+}
+
+#[test]
 fn missing_resolved_prevout_fails_before_commit() {
     let destination = p2wpkh_address(0x02);
     let transaction = Transaction {

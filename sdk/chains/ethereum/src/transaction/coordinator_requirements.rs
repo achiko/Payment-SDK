@@ -62,18 +62,19 @@ impl Requirements {
                     )
                 })?;
             let native = if request.erc20_transfer().is_none() {
-                fee.checked_add(&request.value()).ok_or_else(|| {
-                    PreparationError::new(
-                        index,
-                        ChainError::new(
-                            ChainErrorKind::InsufficientFunds,
-                            "Ethereum aggregate native requirement overflows U256",
-                        ),
-                    )
-                })?
+                fee.checked_add(&request.value())
             } else {
-                fee
-            };
+                Some(fee)
+            }
+            .ok_or_else(|| {
+                PreparationError::new(
+                    index,
+                    ChainError::new(
+                        ChainErrorKind::InsufficientFunds,
+                        "Ethereum aggregate native requirement overflows U256",
+                    ),
+                )
+            })?;
             add(
                 &mut values,
                 request.from().clone(),

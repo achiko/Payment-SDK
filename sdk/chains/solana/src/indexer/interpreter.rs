@@ -91,15 +91,7 @@ impl IndexBlockInterpreter for Interpreter {
             };
 
             if transaction.succeeded() {
-                let affected = transaction.selected_effects(&selected, &movements);
-                if !affected.is_empty() && transaction.inner().is_none() {
-                    return Err(invalid_block(
-                        "successful selected Solana transaction has incomplete inner instructions",
-                    ));
-                }
-                for address in affected {
-                    transaction.reconcile(address, &movements)?;
-                }
+                transaction.reconcile_selected(&selected, &movements)?;
             }
 
             let relevant = if transaction.succeeded() {

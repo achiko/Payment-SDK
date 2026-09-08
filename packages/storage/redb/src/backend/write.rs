@@ -153,11 +153,11 @@ fn evaluate_condition(
     match condition {
         Condition::Missing { namespace, key } => {
             let physical_key = encode_physical_key(namespace, key)?;
-            if data
+            let exists = data
                 .get(physical_key.as_slice())
                 .map_err(|error| storage_error(error, "failed to evaluate redb condition"))?
-                .is_some()
-            {
+                .is_some();
+            if exists {
                 return Err(Error::conflict(format!(
                     "missing condition failed in namespace `{}` because the key exists",
                     namespace.0

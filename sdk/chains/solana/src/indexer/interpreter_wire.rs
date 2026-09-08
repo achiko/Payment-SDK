@@ -227,7 +227,24 @@ impl Transaction {
         &self.keys[index].address
     }
 
-    pub fn selected_effects<'a>(
+    pub fn reconcile_selected(
+        &self,
+        selected: &std::collections::BTreeSet<Address>,
+        movements: &Movements,
+    ) -> Result<(), IndexError> {
+        let affected = self.selected_effects(selected, movements);
+        if !affected.is_empty() && self.inner().is_none() {
+            return Err(invalid_block(
+                "successful selected Solana transaction has incomplete inner instructions",
+            ));
+        }
+        for address in affected {
+            self.reconcile(address, movements)?;
+        }
+        Ok(())
+    }
+
+    fn selected_effects<'a>(
         &'a self,
         selected: &'a std::collections::BTreeSet<Address>,
         movements: &Movements,
@@ -244,7 +261,7 @@ impl Transaction {
             .collect()
     }
 
-    pub fn reconcile(&self, address: &Address, movements: &Movements) -> Result<(), IndexError> {
+    fn reconcile(&self, address: &Address, movements: &Movements) -> Result<(), IndexError> {
         let index = self
             .keys
             .iter()

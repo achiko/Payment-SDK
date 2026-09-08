@@ -178,11 +178,11 @@ impl HistoryEntry {
                         "indexed asset does not belong to the transaction chain",
                     ));
                 }
-                if fee
+                let payer_outside_scope = fee
                     .payer
                     .as_ref()
-                    .is_some_and(|payer| !payer.belongs_to(&scope))
-                {
+                    .is_some_and(|payer| !payer.belongs_to(&scope));
+                if payer_outside_scope {
                     return Err(Error::history(
                         "indexed fee payer does not belong to the transaction scope",
                     ));

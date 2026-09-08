@@ -47,7 +47,9 @@ impl<R: Transactions> History for Index<R> {
                 .as_ref()
                 .map(|cursor| cursor.checkpoint.clone());
             let page = self.repository.list(request).await?;
-            if expected_checkpoint.is_some_and(|checkpoint| checkpoint != page.checkpoint) {
+            let checkpoint_changed =
+                expected_checkpoint.is_some_and(|checkpoint| checkpoint != page.checkpoint);
+            if checkpoint_changed {
                 return Err(IndexError::new(
                     IndexErrorKind::Conflict,
                     "history changed between pages; restart from the first page",

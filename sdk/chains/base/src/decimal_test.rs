@@ -5,6 +5,65 @@ use num_bigint::BigInt;
 use super::{Decimal, DecimalErrorKind, DecimalParts, DecimalSign};
 
 #[test]
+fn parsing_normalizes_accepted_signs_leading_zeroes_and_fractional_scale() {
+    for (input, coefficient, scale, display) in [
+        ("+001.2300", 123, 2, "1.23"),
+        ("-001.2300", -123, 2, "-1.23"),
+        ("-0.000", 0, 0, "0"),
+        ("+0", 0, 0, "0"),
+        ("00012", 12, 0, "12"),
+        ("0.00100", 1, 3, "0.001"),
+    ] {
+        let decimal = input.parse::<Decimal>().expect("valid decimal notation");
+        assert_eq!(decimal.coefficient(), &BigInt::from(coefficient));
+        assert_eq!(decimal.scale(), scale);
+        assert_eq!(decimal.to_string(), display);
+    }
+}
+
+#[test]
+fn parsing_rejects_invalid_signs_separators_and_non_ascii_digits() {
+    for input in [
+        "",
+        " ",
+        " 1",
+        "1 ",
+        "\t1",
+        "1\n",
+        "+",
+        "-",
+        ".1",
+        "-.1",
+        "+.1",
+        "1.",
+        "1..0",
+        "1.2.3",
+        "++1",
+        "--1",
+        "+-1",
+        "-+1",
+        "1e2",
+        "1_000",
+        "1,0",
+        "1.-2",
+        "1.+2",
+        "1. 2",
+        "\u{0661}",
+        "1.\u{0661}",
+        "\u{ff11}",
+    ] {
+        let error = input
+            .parse::<Decimal>()
+            .expect_err("invalid decimal notation");
+        assert_eq!(error.kind, DecimalErrorKind::Invalid, "input: {input:?}");
+        assert_eq!(
+            error.message, "decimal must use canonical base-10 notation",
+            "input: {input:?}"
+        );
+    }
+}
+
+#[test]
 fn converts_human_units_to_exact_atomic_units() {
     assert_eq!(
         "1".parse::<Decimal>().unwrap().to_atomic_u64(8).unwrap(),

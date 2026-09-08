@@ -322,13 +322,13 @@ impl FromStr for Decimal {
         let mut parts = unsigned.split('.');
         let whole = parts.next().unwrap_or_default();
         let fraction = parts.next();
-        if parts.next().is_some()
+        let invalid_notation = parts.next().is_some()
             || whole.is_empty()
             || !whole.bytes().all(|byte| byte.is_ascii_digit())
             || fraction.is_some_and(|digits| {
                 digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit())
-            })
-        {
+            });
+        if invalid_notation {
             return Err(DecimalError::invalid());
         }
         let fraction = fraction.unwrap_or_default();
