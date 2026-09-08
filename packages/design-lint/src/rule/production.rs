@@ -7,6 +7,26 @@ use syn::{
 
 use crate::source::SourceFile;
 
+pub(super) fn text(source: &SourceFile) -> String {
+    let mut visitor = RangeVisitor::default();
+    visitor.visit_file(&source.syntax);
+    let offsets = LineOffsets::new(&source.text);
+    let mut bytes = source.text.as_bytes().to_vec();
+    for range in visitor
+        .ranges
+        .into_iter()
+        .filter_map(|range| offsets.byte_range(range))
+    {
+        for byte in &mut bytes[range] {
+            if *byte != b'\n' && *byte != b'\r' {
+                *byte = b' ';
+            }
+        }
+    }
+    // Replacing whole AST spans cannot split a UTF-8 character.
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 pub(super) fn line_count(source: &SourceFile) -> usize {
     let mut visitor = RangeVisitor::default();
     visitor.visit_file(&source.syntax);
@@ -23,7 +43,7 @@ pub(super) fn line_count(source: &SourceFile) -> usize {
         .count()
 }
 
-pub(super) fn test_only(attributes: &[Attribute]) -> bool {
+pub(crate) fn test_only(attributes: &[Attribute]) -> bool {
     if attributes
         .iter()
         .any(|attribute| attribute.path().is_ident("test"))
@@ -247,23 +267,20 @@ fn foreign_item_attributes(item: &ForeignItem) -> Option<&[Attribute]> {
     }
 }
 
-struct LineOffsets {
+struct LineOffsets<'a> {
+    text: &'a str,
     starts: Vec<usize>,
-    length: usize,
 }
 
-impl LineOffsets {
-    fn new(text: &str) -> Self {
+impl<'a> LineOffsets<'a> {
+    fn new(text: &'a str) -> Self {
         let mut starts = vec![0];
         starts.extend(
             text.match_indices('\n')
                 .map(|(index, _)| index + 1)
                 .filter(|start| *start < text.len()),
         );
-        Self {
-            starts,
-            length: text.len(),
-        }
+        Self { starts, text }
     }
 
     fn byte_range(&self, range: SpanRange) -> Option<Range<usize>> {
@@ -274,8 +291,12 @@ impl LineOffsets {
 
     fn byte_offset(&self, location: LineColumn) -> Option<usize> {
         let start = *self.starts.get(location.line.checked_sub(1)?)?;
-        let offset = start.checked_add(location.column)?;
-        (offset <= self.length).then_some(offset)
+        let line = self.text[start..].split('\n').next()?;
+        line.char_indices()
+            .map(|(offset, _)| offset)
+            .chain(std::iter::once(line.len()))
+            .nth(location.column)
+            .map(|offset| start + offset)
     }
 }
 

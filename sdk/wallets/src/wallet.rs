@@ -46,6 +46,19 @@ pub struct HistoryAsset {
 }
 
 impl HistoryAsset {
+    fn resolve<F>(asset_id: &AssetId, asset: &F) -> Result<Self, Error>
+    where
+        F: Fn(&AssetId) -> Result<HistoryAsset, Error>,
+    {
+        let metadata = asset(asset_id)?;
+        if metadata.id != *asset_id {
+            return Err(Error::history(
+                "wallet asset metadata does not match the indexed asset identity",
+            ));
+        }
+        Ok(metadata)
+    }
+
     pub fn display_amount(&self, atomic: &Decimal) -> Result<Decimal, Error> {
         let units = atomic.to_atomic(0).map_err(|error| {
             Error::new(
@@ -115,7 +128,7 @@ impl History {
             .as_ref()
             .is_some_and(|next| !next.position.transaction.belongs_to(expected_scope))
         {
-            return Err(history_error(
+            return Err(Error::history(
                 "indexed history cursor does not belong to the requested scope",
             ));
         }
@@ -142,12 +155,12 @@ impl HistoryEntry {
         F: Fn(&AssetId) -> Result<HistoryAsset, Error>,
     {
         if &transaction.scope != expected_scope {
-            return Err(history_error(
+            return Err(Error::history(
                 "indexed transaction does not belong to the requested scope",
             ));
         }
         if !transaction.transaction_id.belongs_to(expected_scope) {
-            return Err(history_error(
+            return Err(Error::history(
                 "indexed transaction identity does not belong to its observation scope",
             ));
         }
@@ -155,22 +168,26 @@ impl HistoryEntry {
         let movements = transaction
             .movements
             .into_iter()
-            .map(|movement| map_movement(movement, &scope, asset))
+            .map(|movement| HistoryMovement::from_index(movement, &scope, asset))
             .collect::<Result<Vec<_>, _>>()?;
         let fee = transaction
             .fee
             .map(|fee| {
-                validate_asset_scope(&fee.asset, &scope)?;
-                if fee
+                if fee.asset.chain != scope.chain {
+                    return Err(Error::history(
+                        "indexed asset does not belong to the transaction chain",
+                    ));
+                }
+                let payer_outside_scope = fee
                     .payer
                     .as_ref()
-                    .is_some_and(|payer| !payer.belongs_to(&scope))
-                {
-                    return Err(history_error(
+                    .is_some_and(|payer| !payer.belongs_to(&scope));
+                if payer_outside_scope {
+                    return Err(Error::history(
                         "indexed fee payer does not belong to the transaction scope",
                     ));
                 }
-                let metadata = resolve_asset(&fee.asset, asset)?;
+                let metadata = HistoryAsset::resolve(&fee.asset, asset)?;
                 Ok(HistoryFee {
                     amount: metadata.display_amount(&fee.amount)?,
                     asset: metadata,
@@ -210,93 +227,75 @@ impl From<TransactionStatus> for HistoryStatus {
     }
 }
 
-fn map_movement<F>(
-    movement: ValueMovement,
-    scope: &IndexScope,
-    asset: &F,
-) -> Result<HistoryMovement, Error>
-where
-    F: Fn(&AssetId) -> Result<HistoryAsset, Error>,
-{
-    let kind = movement.kind();
-    let (id, asset_id, atomic, from, to) = match movement {
-        ValueMovement::Transfer {
-            id,
-            asset,
-            amount,
-            from,
-            to,
-        } => (id, asset, amount, Some(from), Some(to)),
-        ValueMovement::Input {
-            id,
-            asset,
-            amount,
-            owner,
-        } => (id, asset, amount, owner, None),
-        ValueMovement::Output {
-            id,
-            asset,
-            amount,
-            owner,
-        } => (id, asset, amount, None, owner),
-        ValueMovement::Mint {
-            id,
-            asset,
-            amount,
-            to,
-        } => (id, asset, amount, None, Some(to)),
-        ValueMovement::Burn {
-            id,
-            asset,
-            amount,
-            from,
-        } => (id, asset, amount, Some(from), None),
-    };
-    validate_asset_scope(&asset_id, scope)?;
-    if from
-        .iter()
-        .chain(to.iter())
-        .any(|address| !address.belongs_to(scope))
+impl HistoryMovement {
+    fn from_index<F>(movement: ValueMovement, scope: &IndexScope, asset: &F) -> Result<Self, Error>
+    where
+        F: Fn(&AssetId) -> Result<HistoryAsset, Error>,
     {
-        return Err(history_error(
-            "indexed movement address does not belong to the transaction scope",
-        ));
+        let kind = movement.kind();
+        let (id, asset_id, atomic, from, to) = match movement {
+            ValueMovement::Transfer {
+                id,
+                asset,
+                amount,
+                from,
+                to,
+            } => (id, asset, amount, Some(from), Some(to)),
+            ValueMovement::Input {
+                id,
+                asset,
+                amount,
+                owner,
+            } => (id, asset, amount, owner, None),
+            ValueMovement::Output {
+                id,
+                asset,
+                amount,
+                owner,
+            } => (id, asset, amount, None, owner),
+            ValueMovement::Mint {
+                id,
+                asset,
+                amount,
+                to,
+            } => (id, asset, amount, None, Some(to)),
+            ValueMovement::Burn {
+                id,
+                asset,
+                amount,
+                from,
+            } => (id, asset, amount, Some(from), None),
+        };
+        if asset_id.chain != scope.chain {
+            return Err(Error::history(
+                "indexed asset does not belong to the transaction chain",
+            ));
+        }
+        if from
+            .iter()
+            .chain(to.iter())
+            .any(|address| !address.belongs_to(scope))
+        {
+            return Err(Error::history(
+                "indexed movement address does not belong to the transaction scope",
+            ));
+        }
+        let metadata = HistoryAsset::resolve(&asset_id, asset)?;
+        Ok(Self {
+            id,
+            kind,
+            amount: metadata.display_amount(&atomic)?,
+            asset: metadata,
+            from,
+            to,
+        })
     }
-    let metadata = resolve_asset(&asset_id, asset)?;
-    Ok(HistoryMovement {
-        id,
-        kind,
-        amount: metadata.display_amount(&atomic)?,
-        asset: metadata,
-        from,
-        to,
-    })
 }
 
-fn resolve_asset<F>(asset_id: &AssetId, asset: &F) -> Result<HistoryAsset, Error>
-where
-    F: Fn(&AssetId) -> Result<HistoryAsset, Error>,
-{
-    let metadata = asset(asset_id)?;
-    if metadata.id != *asset_id {
-        return Err(history_error(
-            "wallet asset metadata does not match the indexed asset identity",
-        ));
+impl Error {
+    fn history(message: impl Into<String>) -> Self {
+        Self::new(crate::ErrorKind::History, message)
     }
-    Ok(metadata)
-}
-
-fn validate_asset_scope(asset: &AssetId, scope: &IndexScope) -> Result<(), Error> {
-    if asset.chain != scope.chain {
-        return Err(history_error(
-            "indexed asset does not belong to the transaction chain",
-        ));
-    }
-    Ok(())
-}
-
-fn history_error(message: impl Into<String>) -> Error {
-    Error::new(crate::ErrorKind::History, message)
 }
 
 pub trait BalanceReader: Send + Sync {
@@ -319,54 +318,62 @@ pub trait HistoryReader: Send + Sync {
     fn history<'a>(&'a self, request: HistoryRequest) -> FutureResult<'a, History>;
 }
 
-/// Chain-independent capabilities available after application composition.
-pub trait Wallet:
-    Addresser
-    + AddressFormat
-    + BalanceReader
-    + TransactionFactory
-    + HistoryReader
-    + Signer
-    + Send
-    + Sync
-{
-    /// Builds, signs, and submits one transfer through this wallet's native
-    /// transaction implementation. Inclusion and confirmation remain indexing
-    /// facts rather than RPC results.
+/// Submits one native transfer through the concrete wallet's coordinator.
+///
+/// Concrete wallets may use the transaction-builder default below or keep
+/// preparation and submission inside one guarded operation that cannot be
+/// split across a generic signed-transaction value.
+pub trait SingleSender: Send + Sync {
     fn send<'a>(
         &'a self,
         destination: crate::AddressText,
         amount: Decimal,
-    ) -> FutureResult<'a, TransactionId> {
-        Box::pin(async move {
-            if amount <= Decimal::zero() {
-                return Err(Error::new(
-                    crate::ErrorKind::InvalidAmount,
-                    "amount must be positive",
-                ));
-            }
-            let destination = self.parse_address(&destination)?;
-            let mut transaction = self.transaction();
-            transaction.transfer(destination, amount)?;
-            let signed = transaction.prepare().await?;
-            let submitted = self.broadcaster().broadcast(&signed).await?;
-            if submitted.id != *signed.id() {
-                return Err(Error::new(
-                    crate::ErrorKind::Transaction,
-                    "broadcaster returned a different transaction ID",
-                ));
-            }
-            Ok(submitted.id)
-        })
-    }
+    ) -> FutureResult<'a, TransactionId>;
+}
+
+#[doc(hidden)]
+pub fn send_with_transaction<W>(
+    wallet: &W,
+    destination: crate::AddressText,
+    amount: Decimal,
+) -> FutureResult<'_, TransactionId>
+where
+    W: AddressFormat + TransactionFactory + Sync + ?Sized,
+{
+    Box::pin(async move {
+        if amount <= Decimal::zero() {
+            return Err(Error::new(
+                crate::ErrorKind::InvalidAmount,
+                "amount must be positive",
+            ));
+        }
+        let destination = wallet.parse_address(&destination)?;
+        let mut transaction = wallet.transaction();
+        transaction.transfer(destination, amount)?;
+        let signed = transaction.prepare().await?;
+        let submitted = wallet.broadcaster().broadcast(&signed).await?;
+        if submitted.id != *signed.id() {
+            return Err(Error::new(
+                crate::ErrorKind::Transaction,
+                "broadcaster returned a different transaction ID",
+            ));
+        }
+        Ok(submitted.id)
+    })
+}
+
+/// Chain-independent capabilities available after application composition.
+pub trait Wallet:
+    Addresser + AddressFormat + BalanceReader + HistoryReader + SingleSender + Signer + Send + Sync
+{
 }
 
 impl<T> Wallet for T where
     T: Addresser
         + AddressFormat
         + BalanceReader
-        + TransactionFactory
         + HistoryReader
+        + SingleSender
         + Signer
         + Send
         + Sync
@@ -410,10 +417,298 @@ mod tests {
 
     fn block(height: u64) -> BlockRef {
         BlockRef {
+            position: base::BlockPosition(height),
             height: BlockHeight(height),
             hash: BlockHash(vec![height as u8; 32]),
-            parent_hash: None,
+            parent: None,
             timestamp: None,
+        }
+    }
+
+    fn transaction(movements: Vec<ValueMovement>) -> ObservedTransaction {
+        ObservedTransaction {
+            scope: scope(),
+            transaction_id: TransactionRef {
+                scope: scope(),
+                value: "tx".to_owned(),
+            },
+            status: TransactionStatus::Included {
+                block: block(7),
+                confirmations: 1,
+            },
+            movements,
+            fee: None,
+        }
+    }
+
+    #[test]
+    fn history_scope_failures_preserve_error_order_before_metadata_resolution() {
+        let mut foreign_scope = scope();
+        foreign_scope.network = "other".to_owned();
+        let mut foreign_transaction = transaction(Vec::new());
+        foreign_transaction.scope = foreign_scope.clone();
+        foreign_transaction.transaction_id.scope = foreign_scope.clone();
+        let first = TransactionPage {
+            checkpoint: Some(block(7)),
+            transactions: vec![foreign_transaction],
+            next: Some(HistoryCursor {
+                checkpoint: Some(block(7)),
+                position: HistoryPosition {
+                    height: BlockHeight(7),
+                    transaction: TransactionRef {
+                        scope: foreign_scope.clone(),
+                        value: "cursor".to_owned(),
+                    },
+                },
+            }),
+        };
+        let mut second = first.clone();
+        second.next = None;
+        let mut third = second.clone();
+        third.transactions[0].scope = scope();
+        let mut fourth = third.clone();
+        fourth.transactions[0].transaction_id.scope = scope();
+        fourth.transactions[0].fee = Some(NetworkFee {
+            asset: asset("native", 18).id,
+            amount: Decimal::from(1),
+            payer: Some(CanonicalAddress {
+                scope: foreign_scope,
+                value: "payer".to_owned(),
+            }),
+        });
+        let mut fifth = fourth.clone();
+        let foreign_fee = fifth.transactions[0].fee.as_mut().expect("fee fixture");
+        foreign_fee.asset.chain = ChainId("another".to_owned());
+        foreign_fee.amount = "0.1".parse().expect("fractional amount");
+        for (page, message) in [
+            (
+                first,
+                "indexed history cursor does not belong to the requested scope",
+            ),
+            (
+                second,
+                "indexed transaction does not belong to the requested scope",
+            ),
+            (
+                third,
+                "indexed transaction identity does not belong to its observation scope",
+            ),
+            (
+                fourth,
+                "indexed fee payer does not belong to the transaction scope",
+            ),
+            (
+                fifth,
+                "indexed asset does not belong to the transaction chain",
+            ),
+        ] {
+            let error = History::from_index(page, &scope(), |_| {
+                panic!("scope validation must precede metadata resolution")
+            })
+            .expect_err("scope mismatch must reject the entire page");
+            assert_eq!(error.kind, crate::ErrorKind::History);
+            assert_eq!(error.message, message);
+            assert_eq!(error.ambiguous_transaction_id, None);
+        }
+    }
+
+    #[test]
+    fn keeps_movement_order_and_optional_owners_with_trusted_metadata() {
+        let metadata = HistoryAsset {
+            name: Some("Example token".to_owned()),
+            ticker: Some("TOK".to_owned()),
+            ..asset("token", 3)
+        };
+        let owner = address("owner");
+        let movements = vec![
+            ValueMovement::Input {
+                id: MovementId("unknown-input".to_owned()),
+                asset: metadata.id.clone(),
+                amount: Decimal::from(1_250_u64),
+                owner: None,
+            },
+            ValueMovement::Output {
+                id: MovementId("known-output".to_owned()),
+                asset: metadata.id.clone(),
+                amount: Decimal::from(1_250_u64),
+                owner: Some(owner.clone()),
+            },
+            ValueMovement::Mint {
+                id: MovementId("mint".to_owned()),
+                asset: metadata.id.clone(),
+                amount: Decimal::from(1_250_u64),
+                to: owner.clone(),
+            },
+            ValueMovement::Burn {
+                id: MovementId("burn".to_owned()),
+                asset: metadata.id.clone(),
+                amount: Decimal::from(1_250_u64),
+                from: owner.clone(),
+            },
+            ValueMovement::Input {
+                id: MovementId("known-input".to_owned()),
+                asset: metadata.id.clone(),
+                amount: Decimal::from(1_250_u64),
+                owner: Some(owner.clone()),
+            },
+            ValueMovement::Output {
+                id: MovementId("unknown-output".to_owned()),
+                asset: metadata.id.clone(),
+                amount: Decimal::from(1_250_u64),
+                owner: None,
+            },
+        ];
+        let entry = HistoryEntry::from_index(transaction(movements), &scope(), &|id| {
+            assert_eq!(id, &metadata.id);
+            Ok(metadata.clone())
+        })
+        .expect("valid indexed movements");
+
+        let observed = entry
+            .movements
+            .iter()
+            .map(|movement| {
+                assert_eq!(movement.asset, metadata);
+                assert_eq!(movement.amount.to_string(), "1.25");
+                (
+                    movement.id.0.as_str(),
+                    movement.kind,
+                    movement.from.as_ref(),
+                    movement.to.as_ref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observed,
+            [
+                ("unknown-input", MovementKind::Input, None, None),
+                ("known-output", MovementKind::Output, None, Some(&owner)),
+                ("mint", MovementKind::Mint, None, Some(&owner)),
+                ("burn", MovementKind::Burn, Some(&owner), None),
+                ("known-input", MovementKind::Input, Some(&owner), None),
+                ("unknown-output", MovementKind::Output, None, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn movement_scope_checks_precede_asset_resolution() {
+        let mut foreign_asset = asset("token", 3).id;
+        foreign_asset.chain = ChainId("another".to_owned());
+        let mut foreign_owner = address("owner");
+        foreign_owner.scope.network = "another".to_owned();
+        let cases = [
+            (
+                ValueMovement::Input {
+                    id: MovementId("foreign-asset".to_owned()),
+                    asset: foreign_asset,
+                    amount: Decimal::from(1_u64),
+                    owner: Some(foreign_owner.clone()),
+                },
+                "indexed asset does not belong to the transaction chain",
+            ),
+            (
+                ValueMovement::Input {
+                    id: MovementId("foreign-input".to_owned()),
+                    asset: asset("token", 3).id,
+                    amount: Decimal::from(1_u64),
+                    owner: Some(foreign_owner.clone()),
+                },
+                "indexed movement address does not belong to the transaction scope",
+            ),
+            (
+                ValueMovement::Output {
+                    id: MovementId("foreign-output".to_owned()),
+                    asset: asset("token", 3).id,
+                    amount: Decimal::from(1_u64),
+                    owner: Some(foreign_owner),
+                },
+                "indexed movement address does not belong to the transaction scope",
+            ),
+        ];
+
+        for (movement, message) in cases {
+            let error = HistoryMovement::from_index(movement, &scope(), &|_| {
+                panic!("invalid scope must fail before metadata resolution")
+            })
+            .expect_err("invalid movement scope");
+            assert_eq!(error, Error::new(crate::ErrorKind::History, message));
+        }
+    }
+
+    #[test]
+    fn movement_metadata_errors_precede_amount_conversion() {
+        let movement = ValueMovement::Output {
+            id: MovementId("fractional-output".to_owned()),
+            asset: asset("token", 3).id,
+            amount: "0.1".parse().expect("decimal"),
+            owner: None,
+        };
+        let unavailable = Error::new(crate::ErrorKind::Unavailable, "metadata unavailable");
+        let error =
+            HistoryMovement::from_index(movement.clone(), &scope(), &|_| Err(unavailable.clone()))
+                .expect_err("resolver failure");
+        assert_eq!(error, unavailable);
+
+        let error = HistoryMovement::from_index(movement.clone(), &scope(), &|_| {
+            Ok(asset("other-token", 3))
+        })
+        .expect_err("mismatched resolver identity");
+        assert_eq!(
+            error,
+            Error::new(
+                crate::ErrorKind::History,
+                "wallet asset metadata does not match the indexed asset identity"
+            )
+        );
+
+        let error = HistoryMovement::from_index(movement, &scope(), &|_| Ok(asset("token", 3)))
+            .expect_err("fractional indexed amount");
+        assert_eq!(
+            error,
+            Error::new(
+                crate::ErrorKind::History,
+                "indexed amount is not a non-negative integer: amount has more than 0 fractional digits"
+            )
+        );
+    }
+
+    #[test]
+    fn fee_resolution_runs_once_and_precedes_amount_validation() {
+        let mut observed = transaction(Vec::new());
+        observed.fee = Some(NetworkFee {
+            asset: asset("native", 8).id,
+            amount: "0.1".parse().unwrap(),
+            payer: None,
+        });
+        for (resolved, expected) in [
+            (
+                Err(Error::new(
+                    crate::ErrorKind::Unavailable,
+                    "metadata unavailable",
+                )),
+                Error::new(crate::ErrorKind::Unavailable, "metadata unavailable"),
+            ),
+            (
+                Ok(asset("other", 8)),
+                Error::history("wallet asset metadata does not match the indexed asset identity"),
+            ),
+            (
+                Ok(asset("native", 8)),
+                Error::history(
+                    "indexed amount is not a non-negative integer: amount has more than 0 fractional digits",
+                ),
+            ),
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let error = HistoryEntry::from_index(observed.clone(), &scope(), &|id| {
+                assert_eq!(id, &asset("native", 8).id);
+                calls.set(calls.get() + 1);
+                resolved.clone()
+            })
+            .unwrap_err();
+            assert_eq!(calls.get(), 1);
+            assert_eq!(error, expected);
         }
     }
 

@@ -2,17 +2,18 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use futures_util::{StreamExt, stream};
 use indexing::{
-    BlockHash, BlockHeight, BlockRef, BlockSource, BoxFuture, ChainId, IndexScope, SourceError,
+    BlockHash, BlockHeight, BlockPosition, BlockRef, BlockSource, BoxFuture, ChainId, IndexScope,
+    SourceError,
 };
 use json_rpc::Client;
 use serde_json::Value;
 
 use crate::{Network, TransactionId};
 
-use super::{Block, Outpoint, model::address_for_script};
+use super::{Block, Outpoint};
 use crate::rpc::{
     Client as RpcClient, CoreConfig, format_bitcoin_block_hash, parse_bitcoin_block_hash,
-    parse_header, source_error,
+    source_error,
 };
 
 // Every non-coinbase input consumes at least a 36-byte outpoint, one-byte
@@ -145,24 +146,6 @@ where
         })
     }
 
-    async fn header(&self, hash: &BlockHash, height: BlockHeight) -> Result<BlockRef, SourceError> {
-        let raw = self
-            .client
-            .request_result(
-                "getblockheader",
-                serde_json::json!([format_bitcoin_block_hash(hash)?, true]),
-            )
-            .await?;
-        let header = parse_header(&raw, Some(height))?;
-        if header.hash != *hash {
-            return Err(source_error(
-                "Bitcoin header lookup returned a different block hash",
-                true,
-            ));
-        }
-        Ok(header)
-    }
-
     async fn raw_block(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, SourceError> {
         self.client
             .request_optional_result(
@@ -234,8 +217,12 @@ where
                     true,
                 )
             })?;
-            let address = address_for_script(&output.script_pubkey, self.config.network);
-            validate_compact_address(address.as_ref())?;
+            let address =
+                crate::Address::from_script_for_network(&output.script_pubkey, self.config.network);
+            address
+                .as_ref()
+                .map(crate::Address::validate_compact_prevout)
+                .transpose()?;
             outputs.insert(
                 *output_index,
                 ResolvedOutput {
@@ -278,44 +265,23 @@ where
         }
 
         let mut earlier_outputs = BTreeSet::new();
-        let mut external_outputs: BTreeMap<TransactionId, BTreeSet<u32>> = BTreeMap::new();
-        let mut external_prevout_count = 0_usize;
+        let mut external_outputs = RequiredPrevouts::default();
         for (transaction_id, transaction) in &transactions {
             for input in &transaction.input {
-                if input.previous_output.is_null() {
-                    continue;
-                }
-                let previous_id = TransactionId::from(input.previous_output.txid);
-                let outpoint = Outpoint {
-                    transaction_id: previous_id,
-                    output_index: input.previous_output.vout,
-                };
-                if earlier_outputs.contains(&outpoint) {
-                    continue;
-                }
-                if transaction_ids.contains(&previous_id) {
-                    return Err(source_error(
-                        "Bitcoin block transaction spends an output that was not created earlier in the block",
-                        true,
-                    ));
-                }
-                record_external_prevout(
-                    &mut external_outputs,
-                    &mut external_prevout_count,
-                    previous_id,
-                    input.previous_output.vout,
-                )?;
+                external_outputs.observe(input, &earlier_outputs, &transaction_ids)?;
             }
             for output_index in 0..transaction.output.len() {
-                let output_index = u32::try_from(output_index)
-                    .map_err(|_| source_error("Bitcoin block output index exceeds u32", true))?;
+                let Ok(output_index) = u32::try_from(output_index) else {
+                    return Err(source_error("Bitcoin block output index exceeds u32", true));
+                };
                 earlier_outputs.insert(Outpoint {
                     transaction_id: *transaction_id,
                     output_index,
                 });
             }
         }
-        let compact_data_budget = external_prevout_count
+        let compact_data_budget = external_outputs
+            .len()
             .checked_mul(MAX_COMPACT_PREVOUT_JSON_BYTES)
             .ok_or_else(|| source_error("Bitcoin compact prevout data budget overflowed", false))?;
         if compact_data_budget > MAX_COMPACT_PREVOUT_TOTAL_BYTES {
@@ -325,14 +291,15 @@ where
             ));
         }
 
-        let mut resolved = BTreeMap::new();
+        let mut resolved = ResolvedPrevouts::default();
         let requests =
             external_outputs
                 .into_iter()
                 .map(|(transaction_id, output_indexes)| async move {
-                    self.resolve_outputs(transaction_id, &output_indexes)
-                        .await
-                        .map(|data| (transaction_id, data))
+                    let data = self
+                        .resolve_outputs(transaction_id, &output_indexes)
+                        .await?;
+                    Ok::<_, SourceError>((transaction_id, data))
                 });
         let mut requests = stream::iter(requests).buffer_unordered(MAX_IN_FLIGHT_PREVOUT_REQUESTS);
         while let Some(result) = requests.next().await {
@@ -355,41 +322,12 @@ where
                 .and_then(Value::as_array_mut)
                 .ok_or_else(|| source_error("Bitcoin transaction inputs must be an array", true))?;
             for (input, native_input) in inputs.iter_mut().zip(&transaction.input) {
-                if native_input.previous_output.is_null() {
-                    continue;
-                }
-                let input = input.as_object_mut().ok_or_else(|| {
-                    source_error("Bitcoin transaction input must be an object", true)
-                })?;
-                // Verbosity 2 does not include this field. Removing any
-                // unexpected value ensures parsing sees only the compact,
-                // source-owned previous-output shape.
-                input.remove("prevout");
-                let previous_id = TransactionId::from(native_input.previous_output.txid);
-                let outpoint = Outpoint {
-                    transaction_id: previous_id,
-                    output_index: native_input.previous_output.vout,
-                };
-                if earlier_outputs.contains(&outpoint) {
-                    continue;
-                }
-                let previous_transaction = resolved.get(&previous_id).ok_or_else(|| {
-                    source_error(
-                        "Bitcoin external previous transaction was not resolved",
-                        true,
-                    )
-                })?;
-                let output = previous_transaction
-                    .get(&native_input.previous_output.vout)
-                    .ok_or_else(|| {
-                        source_error("Bitcoin external previous output was not resolved", true)
-                    })?;
-                let prevout = output.compact_json()?;
-                input.insert("prevout".to_owned(), prevout);
+                resolved.enrich_input(input, native_input, &earlier_outputs)?;
             }
             for output_index in 0..transaction.output.len() {
-                let output_index = u32::try_from(output_index)
-                    .map_err(|_| source_error("Bitcoin block output index exceeds u32", true))?;
+                let Ok(output_index) = u32::try_from(output_index) else {
+                    return Err(source_error("Bitcoin block output index exceeds u32", true));
+                };
                 earlier_outputs.insert(Outpoint {
                     transaction_id: *transaction_id,
                     output_index,
@@ -401,18 +339,31 @@ where
             .map_err(|_| source_error("Bitcoin enriched block JSON could not be encoded", true))
     }
 
-    async fn fetch_block(
-        &self,
-        hash: &BlockHash,
-        expected_height: Option<BlockHeight>,
-    ) -> Result<Option<Block>, SourceError> {
-        let Some(raw_block) = self.raw_block(hash).await? else {
-            return Ok(None);
+    async fn fetch_block(&self, height: BlockHeight) -> Result<Block, SourceError> {
+        let first_hash = self.hash_at(height).await?;
+        let Some(raw_block) = self.raw_block(&first_hash).await? else {
+            return Err(source_error(
+                "Bitcoin Core no longer exposes the requested block",
+                true,
+            ));
         };
         let raw_block = self.enrich_prevouts(raw_block).await?;
-        Block::parse(&raw_block, expected_height, Some(hash), self.config.network)
-            .map(Some)
-            .map_err(|error| source_error(error.to_string(), true))
+        let block = Block::parse(
+            &raw_block,
+            Some(height),
+            Some(&first_hash),
+            self.config.network,
+        )
+        .map_err(|error| source_error(error.to_string(), true))?;
+        drop(raw_block);
+        let second_hash = self.hash_at(height).await?;
+        if first_hash != second_hash {
+            return Err(source_error(
+                "Bitcoin canonical block changed while it was being fetched",
+                true,
+            ));
+        }
+        Ok(block)
     }
 }
 
@@ -429,42 +380,51 @@ where
         Box::pin(async move {
             let height = self.block_count().await?;
             let hash = self.hash_at(height).await?;
-            self.header(&hash, height).await
+            self.client.header(&hash, height).await
         })
     }
 
-    fn block_at<'a>(
+    fn blocks<'a>(
         &'a self,
-        height: BlockHeight,
-    ) -> BoxFuture<'a, Result<Self::Block, SourceError>> {
+        start: BlockPosition,
+        end: BlockPosition,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<Self::Block>, SourceError>> {
         Box::pin(async move {
-            let first_hash = self.hash_at(height).await?;
-            let block = self
-                .fetch_block(&first_hash, Some(height))
-                .await?
-                .ok_or_else(|| {
-                    source_error("Bitcoin Core no longer exposes the requested block", true)
-                })?;
-            let second_hash = self.hash_at(height).await?;
-            if first_hash != second_hash {
+            if limit == 0 || start > end {
                 return Err(source_error(
-                    "Bitcoin canonical block changed while it was being fetched",
-                    true,
+                    "Bitcoin block range requires ordered positions and a positive limit",
+                    false,
                 ));
             }
-            Ok(block)
+            let mut position = start.0;
+            let end = end.0;
+            let mut blocks = Vec::with_capacity(limit.min(64));
+            while position <= end && blocks.len() < limit {
+                let block = self.fetch_block(BlockHeight(position)).await?;
+                blocks.push(block);
+                let Some(next) = position.checked_add(1) else {
+                    break;
+                };
+                position = next;
+            }
+            Ok(blocks)
         })
     }
 
-    fn canonical_hash<'a>(
+    fn canonical_at<'a>(
         &'a self,
-        height: BlockHeight,
-    ) -> BoxFuture<'a, Result<Option<BlockHash>, SourceError>> {
+        position: BlockPosition,
+    ) -> BoxFuture<'a, Result<Option<BlockRef>, SourceError>> {
         Box::pin(async move {
+            let height = BlockHeight(position.0);
             if height > self.block_count().await? {
                 return Ok(None);
             }
-            self.optional_hash_at(height).await
+            let Some(hash) = self.optional_hash_at(height).await? else {
+                return Ok(None);
+            };
+            self.client.header(&hash, height).await.map(Some)
         })
     }
 }

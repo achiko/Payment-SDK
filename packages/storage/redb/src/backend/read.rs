@@ -1,13 +1,9 @@
 use redb::ReadableDatabase;
 use storage::{Error, ErrorKind, Key, Namespace, ScanPage, ScanRequest, StoredValue};
 
-use crate::codec::{
-    decode_physical_key, decode_stored_value, encode_physical_key, namespace_prefix,
-};
+use crate::codec::{StoredRecord, decode_physical_key, encode_physical_key, namespace_prefix};
 
-use super::{
-    Backend, DATA_TABLE, invalid_request, operation_error, table_error, transaction_error,
-};
+use super::{Backend, DATA_TABLE, storage_error, table_error, transaction_error};
 
 impl Backend {
     pub(super) fn get(
@@ -29,25 +25,27 @@ impl Backend {
             .map_err(|error| table_error(error, "failed to open redb data table"))?;
         let raw = table
             .get(physical_key)
-            .map_err(|error| operation_error(error, "redb point read failed"))?;
-        raw.map(|value| decode_stored_value(value.value()))
+            .map_err(|error| storage_error(error, "redb point read failed"))?;
+        raw.map(|value| StoredRecord::try_from(value.value()).map(StoredValue::from))
             .transpose()
     }
 
     pub(super) fn scan(&mut self, request: ScanRequest) -> Result<ScanPage, Error> {
         if request.limit == 0 {
-            return Err(invalid_request("scan limit must be greater than zero"));
+            return Err(Error::invalid_request(
+                "scan limit must be greater than zero",
+            ));
         }
         let read_limit = request
             .limit
             .checked_add(1)
-            .ok_or_else(|| invalid_request("scan limit is too large"))?;
+            .ok_or_else(|| Error::invalid_request("scan limit is too large"))?;
         if request
             .after
             .as_ref()
             .is_some_and(|after| !after.0.starts_with(&request.prefix))
         {
-            return Err(invalid_request(
+            return Err(Error::invalid_request(
                 "scan continuation key does not match the requested prefix",
             ));
         }
@@ -80,24 +78,27 @@ impl Backend {
             .map_err(|error| table_error(error, "failed to open redb data table"))?;
         let iterator = table
             .range(start..)
-            .map_err(|error| operation_error(error, "failed to start redb prefix scan"))?;
+            .map_err(|error| storage_error(error, "failed to start redb prefix scan"))?;
         let mut entries = Vec::with_capacity(request.limit.min(256));
         for item in iterator {
             let (physical_key, raw_value) =
-                item.map_err(|error| operation_error(error, "redb prefix scan failed"))?;
+                item.map_err(|error| storage_error(error, "redb prefix scan failed"))?;
             if !physical_key.value().starts_with(physical_prefix) {
                 break;
             }
 
             let logical_key = decode_physical_key(physical_key.value(), &request.namespace)?;
-            if request
+            let before_or_at_cursor = request
                 .after
                 .as_ref()
-                .is_some_and(|after| logical_key <= *after)
-            {
+                .is_some_and(|after| logical_key <= *after);
+            if before_or_at_cursor {
                 continue;
             }
-            entries.push((logical_key, decode_stored_value(raw_value.value())?));
+            entries.push((
+                logical_key,
+                StoredValue::from(StoredRecord::try_from(raw_value.value())?),
+            ));
             if entries.len() == read_limit {
                 break;
             }

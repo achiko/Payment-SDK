@@ -6,8 +6,8 @@ use axum::{
     http::{Request, StatusCode},
 };
 use base::{
-    Address, Addresser, BlockHash, BlockHeight, BlockRef, Broadcaster, Decimal, SignRequest,
-    SignedTransaction, Signer, Submission, TransactionBuilder, TransactionEnvelope,
+    Address, Addresser, BlockHash, BlockHeight, BlockPosition, BlockRef, Broadcaster, Decimal,
+    SignRequest, SignedTransaction, Signer, Submission, TransactionBuilder, TransactionEnvelope,
     TransactionError, TransactionId, TransactionSnapshot,
 };
 use http_body_util::BodyExt;
@@ -48,6 +48,7 @@ impl Checkpoint for FixtureCheckpoint {
 
 struct FixtureProvider {
     calls: Arc<Calls>,
+    generation_error: Option<wallets::ErrorKind>,
 }
 
 impl Provider for FixtureProvider {
@@ -56,6 +57,18 @@ impl Provider for FixtureProvider {
             calls: Arc::clone(&self.calls),
         };
         Box::pin(async move { Ok(Arc::new(wallet) as Arc<dyn wallets::Wallet>) })
+    }
+
+    fn generate(&self) -> FutureResult<'_, Arc<dyn wallets::Wallet>> {
+        if let Some(kind) = self.generation_error {
+            return Box::pin(async move {
+                Err(wallets::Error::new(
+                    kind,
+                    "fixture wallet generation failed",
+                ))
+            });
+        }
+        self.create(SecretBytes::new([7_u8; 32]))
     }
 }
 
@@ -192,6 +205,16 @@ impl TransactionFactory for FixtureWallet {
     }
 }
 
+impl wallets::SingleSender for FixtureWallet {
+    fn send<'a>(
+        &'a self,
+        destination: AddressText,
+        amount: Decimal,
+    ) -> wallets::FutureResult<'a, TransactionId> {
+        wallets::send_with_transaction(self, destination, amount)
+    }
+}
+
 impl Broadcaster for FixtureWallet {
     fn broadcast<'a>(
         &'a self,
@@ -252,6 +275,14 @@ fn fixture(initially_ready: bool) -> Fixture {
 }
 
 fn fixture_with_usdc(initially_ready: bool, usdc: bool) -> Fixture {
+    fixture_with_generation_error(initially_ready, usdc, None)
+}
+
+fn fixture_with_generation_error(
+    initially_ready: bool,
+    usdc: bool,
+    generation_error: Option<wallets::ErrorKind>,
+) -> Fixture {
     let calls = Arc::new(Calls::default());
     let checkpoint: Arc<dyn Checkpoint> = Arc::new(FixtureCheckpoint::Value);
     let mut wallets = Wallets::<String, WalletAsset>::new(checkpoint);
@@ -261,6 +292,7 @@ fn fixture_with_usdc(initially_ready: bool, usdc: bool) -> Fixture {
             scope(),
             FixtureProvider {
                 calls: Arc::clone(&calls),
+                generation_error,
             },
             Arc::new(FixtureSender {
                 calls: Arc::clone(&calls),
@@ -268,6 +300,20 @@ fn fixture_with_usdc(initially_ready: bool, usdc: bool) -> Fixture {
             None,
         )
         .expect("fixture family must register");
+    wallets
+        .register(
+            WalletAsset::Sol,
+            solana_scope(),
+            FixtureProvider {
+                calls: Arc::clone(&calls),
+                generation_error: None,
+            },
+            Arc::new(FixtureSender {
+                calls: Arc::clone(&calls),
+            }),
+            None,
+        )
+        .expect("native SOL fixture family must register");
     if usdc {
         wallets
             .register(
@@ -275,6 +321,7 @@ fn fixture_with_usdc(initially_ready: bool, usdc: bool) -> Fixture {
                 ethereum_scope(),
                 FixtureProvider {
                     calls: Arc::clone(&calls),
+                    generation_error: None,
                 },
                 Arc::new(FixtureSender {
                     calls: Arc::clone(&calls),
@@ -316,6 +363,55 @@ async fn unconfigured_wallet_asset_is_not_found() {
         json_body(&response)["message"],
         "wallet asset is not configured"
     );
+}
+
+#[tokio::test]
+async fn wallet_generation_errors_preserve_status_and_message() {
+    for (kind, status, message) in [
+        (
+            wallets::ErrorKind::Unsupported,
+            StatusCode::NOT_FOUND,
+            "wallet asset is not configured",
+        ),
+        (
+            wallets::ErrorKind::Generation,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "fixture wallet generation failed",
+        ),
+        (
+            wallets::ErrorKind::Conflict,
+            StatusCode::CONFLICT,
+            "fixture wallet generation failed",
+        ),
+        (
+            wallets::ErrorKind::InvalidAddress,
+            StatusCode::BAD_REQUEST,
+            "fixture wallet generation failed",
+        ),
+        (
+            wallets::ErrorKind::NotFound,
+            StatusCode::NOT_FOUND,
+            "fixture wallet generation failed",
+        ),
+    ] {
+        let fixture = fixture_with_generation_error(true, false, Some(kind));
+        let response = request(
+            &fixture.app,
+            "POST",
+            "/v1/wallets",
+            Some(json!({"asset": "btc"})),
+            true,
+        )
+        .await;
+
+        assert_eq!(response.status, status, "{kind:?}");
+        assert_eq!(
+            json_body(&response),
+            json!({"message": message}),
+            "{kind:?}"
+        );
+        assert_no_transaction_calls(&fixture.calls);
+    }
 }
 
 #[tokio::test]
@@ -365,6 +461,58 @@ async fn readiness_reflects_runtime_state_while_liveness_stays_available() {
 }
 
 #[tokio::test]
+async fn closed_readiness_is_unavailable_even_when_the_last_value_was_true() {
+    for last_value in [false, true] {
+        let fixture = fixture(last_value);
+        drop(fixture.ready);
+
+        let response = request(&fixture.app, "GET", "/health/ready", None, false).await;
+        assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.body.is_empty());
+        assert_eq!(
+            request(&fixture.app, "GET", "/health/live", None, false)
+                .await
+                .status,
+            StatusCode::NO_CONTENT
+        );
+    }
+}
+
+#[tokio::test]
+async fn openapi_serves_the_merged_contract_without_authentication() {
+    let fixture = fixture(false);
+    let response = request(&fixture.app, "GET", "/openapi.json", None, false).await;
+
+    assert_eq!(response.status, StatusCode::OK);
+    let document = json_body(&response);
+    for path in ["/openapi.json", "/health/ready", "/v1/wallets/{id}"] {
+        assert!(document["paths"][path]["get"].is_object(), "{path}");
+    }
+    assert!(document["components"]["schemas"]["Wallet"].is_object());
+    assert_no_transaction_calls(&fixture.calls);
+}
+
+#[tokio::test]
+async fn missing_wallet_read_preserves_the_not_found_error_contract() {
+    let fixture = fixture(true);
+    let response = request(
+        &fixture.app,
+        "GET",
+        "/v1/wallets/missing-wallet",
+        None,
+        true,
+    )
+    .await;
+
+    assert_eq!(response.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_body(&response),
+        json!({"message": "wallet does not exist"})
+    );
+    assert_no_transaction_calls(&fixture.calls);
+}
+
+#[tokio::test]
 async fn wallet_routes_delegate_to_the_wallet_collection() {
     let fixture = fixture(true);
     let unauthorized = request(
@@ -406,6 +554,20 @@ async fn wallet_routes_delegate_to_the_wallet_collection() {
     assert_eq!(usdc["asset"], "usdc");
     assert_eq!(usdc["chain"], "ethereum");
     assert_eq!(usdc["network"], "mainnet");
+
+    let sol = request(
+        &fixture.app,
+        "POST",
+        "/v1/wallets",
+        Some(json!({"asset": "sol"})),
+        true,
+    )
+    .await;
+    assert_eq!(sol.status, StatusCode::CREATED);
+    let sol = json_body(&sol);
+    assert_eq!(sol["asset"], "sol");
+    assert_eq!(sol["chain"], "solana");
+    assert_eq!(sol["network"], "localnet");
 
     let read = request(
         &fixture.app,
@@ -513,6 +675,361 @@ async fn wallet_routes_delegate_to_the_wallet_collection() {
     );
 }
 
+#[tokio::test]
+async fn transaction_query_rejection_follows_auth_and_precedes_body_semantics() {
+    let fixture = fixture(true);
+    let unauthorized = raw_request(
+        &fixture.app,
+        "POST",
+        "/v1/transactions?commitment=finalized",
+        Some("{"),
+        false,
+        &[],
+    )
+    .await;
+    assert_eq!(unauthorized.status, StatusCode::UNAUTHORIZED);
+
+    let wallet_id = generated_wallet_id(&fixture).await;
+    let malformed = raw_request(
+        &fixture.app,
+        "POST",
+        &format!("/v1/wallets/{wallet_id}/transactions?commitment=finalized"),
+        Some("{"),
+        true,
+        &[],
+    )
+    .await;
+    assert_transaction_query_rejected(&malformed);
+
+    let empty = request(
+        &fixture.app,
+        "POST",
+        "/v1/transactions?min_context_slot=9",
+        Some(json!({"transfers": []})),
+        true,
+    )
+    .await;
+    assert_transaction_query_rejected(&empty);
+
+    let transfers = (0..51)
+        .map(|_| {
+            json!({
+                "wallet_id": wallet_id,
+                "destination": {
+                    "encoding": "hex",
+                    "text": "fixture-destination"
+                },
+                "amount": "1"
+            })
+        })
+        .collect::<Vec<_>>();
+    let oversized = request(
+        &fixture.app,
+        "POST",
+        "/v1/transactions?priority_fee=1",
+        Some(json!({"transfers": transfers})),
+        true,
+    )
+    .await;
+    assert_transaction_query_rejected(&oversized);
+    assert_no_transaction_calls(&fixture.calls);
+}
+
+#[tokio::test]
+async fn empty_query_and_unrecognized_headers_do_not_change_transaction_semantics() {
+    let fixture = fixture(true);
+    let wallet_id = generated_wallet_id(&fixture).await;
+    let single_body = json!({
+        "destination": {"encoding": "hex", "text": "fixture-destination"},
+        "amount": "2.25"
+    })
+    .to_string();
+    let single = raw_request(
+        &fixture.app,
+        "POST",
+        &format!("/v1/wallets/{wallet_id}/transactions?"),
+        Some(&single_body),
+        true,
+        &[
+            ("x-min-context-slot", "9"),
+            ("traceparent", "fixture-trace"),
+        ],
+    )
+    .await;
+    assert_eq!(single.status, StatusCode::ACCEPTED);
+    assert_eq!(
+        json_body(&single),
+        json!({"transaction_id": "fixture-single"})
+    );
+
+    let batch_body = json!({"transfers": [{
+        "wallet_id": wallet_id,
+        "destination": {"encoding": "hex", "text": "fixture-destination"},
+        "amount": "3"
+    }]})
+    .to_string();
+    let batch = raw_request(
+        &fixture.app,
+        "POST",
+        "/v1/transactions?",
+        Some(&batch_body),
+        true,
+        &[("x-retry-transaction", "true")],
+    )
+    .await;
+    assert_eq!(batch.status, StatusCode::ACCEPTED);
+    assert_eq!(
+        json_body(&batch),
+        json!({"transaction_ids": ["fixture-batch"]})
+    );
+
+    assert_eq!(
+        fixture
+            .calls
+            .transfers
+            .lock()
+            .expect("transfer calls")
+            .as_slice(),
+        &["2.25".parse::<Decimal>().expect("fixed decimal")]
+    );
+    assert_eq!(
+        *fixture.calls.broadcasts.lock().expect("broadcast calls"),
+        1
+    );
+    assert_eq!(
+        fixture
+            .calls
+            .batches
+            .lock()
+            .expect("batch calls")
+            .as_slice(),
+        &[1]
+    );
+}
+
+#[tokio::test]
+async fn batch_wire_maximum_precedes_conversion_and_leaves_minimum_to_the_sdk() {
+    let fixture = fixture(true);
+
+    let empty = request(
+        &fixture.app,
+        "POST",
+        "/v1/transactions",
+        Some(json!({"transfers": []})),
+        true,
+    )
+    .await;
+    assert_eq!(empty.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(&empty),
+        json!({"message": "at least one transfer is required"})
+    );
+
+    let oversized = request(
+        &fixture.app,
+        "POST",
+        "/v1/transactions",
+        Some(json!({
+            "transfers": (0..=wallets::MAX_TRANSFERS)
+                .map(|_| json!({
+                    "wallet_id": "missing-wallet",
+                    "destination": {
+                        "encoding": "hex",
+                        "text": "fixture-destination"
+                    },
+                    "amount": "not-a-decimal"
+                }))
+                .collect::<Vec<_>>()
+        })),
+        true,
+    )
+    .await;
+    assert_eq!(oversized.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(&oversized),
+        json!({"message": "at most 50 transfers are allowed"})
+    );
+    assert_no_transaction_calls(&fixture.calls);
+
+    let wallet_id = generated_wallet_id(&fixture).await;
+    for admitted_count in [1, wallets::MAX_TRANSFERS] {
+        let transfers = (0..admitted_count)
+            .map(|_| {
+                json!({
+                    "wallet_id": wallet_id,
+                    "destination": {
+                        "encoding": "hex",
+                        "text": "fixture-destination"
+                    },
+                    "amount": "1"
+                })
+            })
+            .collect::<Vec<_>>();
+        let admitted = request(
+            &fixture.app,
+            "POST",
+            "/v1/transactions",
+            Some(json!({"transfers": transfers})),
+            true,
+        )
+        .await;
+        assert_eq!(admitted.status, StatusCode::ACCEPTED);
+        assert_eq!(
+            json_body(&admitted),
+            json!({"transaction_ids": ["fixture-batch"]})
+        );
+    }
+
+    assert_eq!(
+        fixture
+            .calls
+            .batches
+            .lock()
+            .expect("batch calls")
+            .as_slice(),
+        &[1, wallets::MAX_TRANSFERS]
+    );
+    assert!(
+        fixture
+            .calls
+            .transfers
+            .lock()
+            .expect("transfer calls")
+            .is_empty()
+    );
+    assert_eq!(
+        *fixture.calls.broadcasts.lock().expect("broadcast calls"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn transaction_bodies_reject_unknown_controls_before_sdk_delegation() {
+    let fixture = fixture(true);
+    let wallet_id = generated_wallet_id(&fixture).await;
+    let single_path = format!("/v1/wallets/{wallet_id}/transactions");
+    let cases = [
+        (
+            "single destination lag control",
+            single_path.as_str(),
+            json!({
+                "destination": {
+                    "encoding": "hex",
+                    "text": "fixture-destination",
+                    "max_lag": 4
+                },
+                "amount": "1"
+            }),
+        ),
+        (
+            "batch destination reference control",
+            "/v1/transactions",
+            json!({"transfers": [{
+                "wallet_id": wallet_id,
+                "destination": {
+                    "encoding": "hex",
+                    "text": "fixture-destination",
+                    "reference_slot": 9
+                },
+                "amount": "1"
+            }]}),
+        ),
+        (
+            "single commitment control",
+            single_path.as_str(),
+            json!({
+                "destination": {
+                    "encoding": "hex",
+                    "text": "fixture-destination"
+                },
+                "amount": "1",
+                "commitment": "finalized"
+            }),
+        ),
+        (
+            "single retry control",
+            single_path.as_str(),
+            json!({
+                "destination": {
+                    "encoding": "hex",
+                    "text": "fixture-destination"
+                },
+                "amount": "1",
+                "retry": true
+            }),
+        ),
+        (
+            "batch item Memo override",
+            "/v1/transactions",
+            json!({"transfers": [{
+                "wallet_id": wallet_id,
+                "destination": {
+                    "encoding": "hex",
+                    "text": "fixture-destination"
+                },
+                "amount": "1",
+                "memo": "caller-selected"
+            }]}),
+        ),
+        (
+            "batch priority control",
+            "/v1/transactions",
+            json!({
+                "transfers": [{
+                    "wallet_id": wallet_id,
+                    "destination": {
+                        "encoding": "hex",
+                        "text": "fixture-destination"
+                    },
+                    "amount": "1"
+                }],
+                "priority_fee": "1"
+            }),
+        ),
+    ];
+
+    for (case, path, body) in cases {
+        let response = request(&fixture.app, "POST", path, Some(body), true).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST, "{case}");
+        assert_eq!(
+            json_body(&response),
+            json!({"message": "request body must match the documented JSON schema"}),
+            "{case}"
+        );
+        assert_no_transaction_calls(&fixture.calls);
+    }
+}
+
+async fn generated_wallet_id(fixture: &Fixture) -> String {
+    let response = request(
+        &fixture.app,
+        "POST",
+        "/v1/wallets",
+        Some(json!({"asset": "btc"})),
+        true,
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::CREATED);
+    json_body(&response)["id"]
+        .as_str()
+        .expect("generated wallet ID")
+        .to_owned()
+}
+
+fn assert_transaction_query_rejected(response: &Response) {
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(response),
+        json!({"message": "transaction query parameters are not supported"})
+    );
+}
+
+fn assert_no_transaction_calls(calls: &Calls) {
+    assert!(calls.transfers.lock().expect("transfer calls").is_empty());
+    assert_eq!(*calls.broadcasts.lock().expect("broadcast calls"), 0);
+    assert!(calls.batches.lock().expect("batch calls").is_empty());
+}
+
 fn scope() -> IndexScope {
     IndexScope {
         chain: ChainId("bitcoin".to_owned()),
@@ -527,11 +1044,19 @@ fn ethereum_scope() -> IndexScope {
     }
 }
 
+fn solana_scope() -> IndexScope {
+    IndexScope {
+        chain: ChainId("solana".to_owned()),
+        network: "localnet".to_owned(),
+    }
+}
+
 fn block(height: u64) -> BlockRef {
     BlockRef {
+        position: BlockPosition(height),
         height: BlockHeight(height),
         hash: BlockHash(vec![height as u8; 32]),
-        parent_hash: None,
+        parent: None,
         timestamp: Some(height),
     }
 }
@@ -548,6 +1073,18 @@ async fn request(
     body: Option<Value>,
     authorized: bool,
 ) -> Response {
+    let body = body.map(|value| value.to_string());
+    raw_request(app, method, path, body.as_deref(), authorized, &[]).await
+}
+
+async fn raw_request(
+    app: &Router,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    authorized: bool,
+    headers: &[(&str, &str)],
+) -> Response {
     let mut request = Request::builder().method(method).uri(path);
     if authorized {
         request = request.header("authorization", format!("Bearer {TOKEN}"));
@@ -555,13 +1092,14 @@ async fn request(
     if body.is_some() {
         request = request.header("content-type", "application/json");
     }
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
     let response = app
         .clone()
         .oneshot(
             request
-                .body(Body::from(
-                    body.map_or_else(String::new, |value| value.to_string()),
-                ))
+                .body(Body::from(body.unwrap_or_default().to_owned()))
                 .expect("fixture request"),
         )
         .await

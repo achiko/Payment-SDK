@@ -1,10 +1,13 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use futures_executor::block_on;
 use indexing::{
-    AddressFilter, BlockHash, BlockHeight, BlockRef, BoxFuture, CanonicalAddress, ChainId,
-    Checkpoint, Composer, FilterSource, History, HistoryQuery, IndexError, IndexErrorKind,
-    IndexScope, Indexer, SyncPhase, SyncStatus, TransactionPage,
+    AddressFilter, BlockHash, BlockHeight, BlockParent, BlockPosition, BlockRef, BoxFuture,
+    CanonicalAddress, ChainId, Checkpoint, Composer, FilterSource, History, HistoryQuery,
+    IndexError, IndexErrorKind, IndexScope, Indexer, SyncPhase, SyncStatus, TransactionPage,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,11 +114,13 @@ fn address(scope: &IndexScope, value: &str) -> CanonicalAddress {
 
 fn block(height: u64) -> BlockRef {
     BlockRef {
+        position: BlockPosition(height),
         height: BlockHeight(height),
         hash: BlockHash(vec![height as u8]),
-        parent_hash: height
-            .checked_sub(1)
-            .map(|value| BlockHash(vec![value as u8])),
+        parent: height.checked_sub(1).map(|value| BlockParent {
+            position: BlockPosition(value),
+            hash: BlockHash(vec![value as u8]),
+        }),
         timestamp: None,
     }
 }
@@ -130,7 +135,7 @@ fn exercise_indexer(indexer: &dyn Indexer, scope: &IndexScope, height: u64) {
     let owner = address(scope, "owner");
     let filter = AddressFilter {
         address: owner.clone(),
-        start_height: BlockHeight(height),
+        start_position: BlockPosition(height),
     };
     let page = block_on(indexer.history(HistoryQuery {
         scope: scope.clone(),
@@ -231,7 +236,7 @@ fn rejects_operations_for_an_unconfigured_scope() {
     .expect_err("missing history");
     let sync_error = block_on(composer.sync(&vec![AddressFilter {
         address: address(&missing, "owner"),
-        start_height: BlockHeight(0),
+        start_position: BlockPosition(0),
     }]))
     .expect_err("missing sync scope");
 
@@ -257,11 +262,11 @@ fn partitions_filters_and_combines_statuses_from_every_indexer() {
 
     let first_filter = AddressFilter {
         address: address(&first_scope, "first-owner"),
-        start_height: BlockHeight(2),
+        start_position: BlockPosition(2),
     };
     let second_filter = AddressFilter {
         address: address(&second_scope, "second-owner"),
-        start_height: BlockHeight(5),
+        start_position: BlockPosition(5),
     };
     let statuses = block_on(composer.sync(&vec![second_filter.clone(), first_filter.clone()]))
         .expect("composed sync");
@@ -276,4 +281,63 @@ fn partitions_filters_and_combines_statuses_from_every_indexer() {
     assert_eq!(first.calls(), vec![Call::Sync(vec![first_filter])]);
     assert_eq!(second.calls(), vec![Call::Sync(vec![second_filter])]);
     assert_eq!(idle.calls(), vec![Call::Sync(Vec::new())]);
+}
+
+#[test]
+fn validates_the_complete_selection_when_polled_before_any_child_sync() {
+    struct Selection {
+        filters: Vec<AddressFilter>,
+        reads: AtomicUsize,
+    }
+
+    impl FilterSource for Selection {
+        fn filters(&self) -> Result<Vec<AddressFilter>, IndexError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(self.filters.clone())
+        }
+    }
+
+    let configured = scope("configured");
+    let first = Arc::new(Probe::new(configured.clone(), 1));
+    let second = Arc::new(Probe::new(scope("second"), 2));
+    let composer = Composer::new(vec![first.clone(), second.clone()]).unwrap();
+    let valid = AddressFilter {
+        address: address(&configured, "owner"),
+        start_position: BlockPosition(0),
+    };
+    for (invalid, kind, message) in [
+        (
+            address(&configured, ""),
+            IndexErrorKind::InvalidRequest,
+            "address filters must be non-empty and unique",
+        ),
+        (
+            valid.address.clone(),
+            IndexErrorKind::InvalidRequest,
+            "address filters must be non-empty and unique",
+        ),
+        (
+            address(&scope("unknown"), ""),
+            IndexErrorKind::ScopeMismatch,
+            "index scope is not configured",
+        ),
+    ] {
+        let selection = Selection {
+            filters: vec![
+                valid.clone(),
+                AddressFilter {
+                    address: invalid,
+                    start_position: BlockPosition(0),
+                },
+            ],
+            reads: AtomicUsize::new(0),
+        };
+        let pending = composer.sync(&selection);
+        assert_eq!(selection.reads.load(Ordering::Relaxed), 0);
+        let error = block_on(pending).expect_err("complete selection must be valid first");
+        assert_eq!(error, IndexError::new(kind, message, false));
+        assert_eq!(selection.reads.load(Ordering::Relaxed), 1);
+        assert!(first.calls().is_empty());
+        assert!(second.calls().is_empty());
+    }
 }

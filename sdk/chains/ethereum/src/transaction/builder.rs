@@ -1,6 +1,6 @@
 use base::{Decimal, DecimalError, TransactionFuture};
 
-use crate::{Address, Wei, erc20};
+use crate::{Address, Wei};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TransferRequest(Transfer);
@@ -98,15 +98,6 @@ impl TransferRequest {
         }
     }
 
-    pub(crate) fn input(&self) -> Vec<u8> {
-        match &self.0 {
-            Transfer::Native { .. } => Vec::new(),
-            Transfer::Erc20 {
-                recipient, amount, ..
-            } => erc20::transfer(recipient, amount),
-        }
-    }
-
     pub(crate) fn erc20_transfer(&self) -> Option<(&Address, &Wei)> {
         match &self.0 {
             Transfer::Native { .. } => None,
@@ -139,9 +130,7 @@ impl Builder {
     pub fn build<'a>(
         &'a self,
     ) -> TransactionFuture<'a, Result<super::UnsignedTransaction, crate::ChainError>> {
-        Box::pin(
-            async move { super::operations::build(self.request.clone(), self.context.clone()) },
-        )
+        Box::pin(async move { super::UnsignedTransaction::new(&self.request, &self.context) })
     }
 
     pub fn sign<'a>(
@@ -149,8 +138,8 @@ impl Builder {
         signer: &'a dyn base::Signer,
     ) -> TransactionFuture<'a, Result<super::SignedTransaction, crate::ChainError>> {
         Box::pin(async move {
-            let unsigned = super::operations::build(self.request.clone(), self.context.clone())?;
-            super::operations::sign(unsigned, signer).await
+            let unsigned = super::UnsignedTransaction::new(&self.request, &self.context)?;
+            unsigned.sign(signer).await
         })
     }
 }

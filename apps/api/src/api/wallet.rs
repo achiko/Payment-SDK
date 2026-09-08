@@ -25,6 +25,7 @@ pub struct CreateWallet {
     pub asset: WalletAsset,
 }
 
+// design-lint: allow unclassified-free-function -- Axum owns the extractor signature; this handler assigns the public wallet ID, delegates one wallet generation call, and maps the HTTP response
 #[utoipa::path(
     post,
     path = "/v1/wallets",
@@ -48,17 +49,16 @@ async fn create(
         .wallets
         .generate(id, &request.asset)
         .await
-        .map_err(create_error)?;
+        .map_err(|error| {
+            if error.kind == wallets::ErrorKind::Unsupported {
+                return ApiError::not_found("wallet asset is not configured");
+            }
+            error.into()
+        })?;
     Ok((StatusCode::CREATED, Json(wallet.into())))
 }
 
-fn create_error(error: wallets::Error) -> ApiError {
-    if error.kind == wallets::ErrorKind::Unsupported {
-        return ApiError::not_found("wallet asset is not configured");
-    }
-    error.into()
-}
-
+// design-lint: allow unclassified-free-function -- Axum owns the state and path extractor signature; this handler delegates one wallet lookup and encodes its public metadata
 #[utoipa::path(
     get,
     path = "/v1/wallets/{id}",
@@ -82,6 +82,7 @@ pub struct Balance {
     pub observed_height: Option<u64>,
 }
 
+// design-lint: allow unclassified-free-function -- Axum owns the extractor signature; this handler delegates one wallet balance read and encodes the HTTP response
 #[utoipa::path(
     get,
     path = "/v1/wallets/{id}/balance",

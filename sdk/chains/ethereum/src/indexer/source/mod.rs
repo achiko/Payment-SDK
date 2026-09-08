@@ -1,6 +1,10 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use indexing::{BlockHash, BlockHeight, BlockRef, BlockSource, BoxFuture, IndexScope, SourceError};
+use alloy_primitives::hex;
+use indexing::{
+    BlockHash, BlockHeight, BlockPosition, BlockRef, BlockSource, BoxFuture, IndexScope,
+    SourceError,
+};
 use json_rpc::{Client as JsonClient, Error, Failure, RawJson};
 use serde_json::{Value, value::RawValue};
 
@@ -8,7 +12,7 @@ use crate::rpc::client::{CallError, Client};
 
 use super::{
     Block,
-    model::{ParsedBlock, ParsedReceipt, encode_hex, parse_quantity},
+    model::{ParsedBlock, ParsedReceipt, parse_quantity},
 };
 
 const RECEIPTS_UNKNOWN: u8 = 0;
@@ -100,7 +104,11 @@ where
         let raw_genesis = self
             .request_result("eth_getBlockByNumber", serde_json::json!(["0x0", false]))
             .await?;
-        if is_json_null(&raw_genesis)? {
+        if raw_genesis
+            .deserialize::<Value>()
+            .map_err(map_json_rpc_error)?
+            .is_null()
+        {
             return Err(source_error(
                 "Ethereum RPC does not expose the genesis block",
                 false,
@@ -129,7 +137,11 @@ where
                 serde_json::json!([tag, full_transactions]),
             )
             .await?;
-        if is_json_null(&raw)? {
+        if raw
+            .deserialize::<Value>()
+            .map_err(map_json_rpc_error)?
+            .is_null()
+        {
             return Err(source_error(
                 "Ethereum RPC does not currently expose the requested block",
                 true,
@@ -138,6 +150,19 @@ where
         let parsed = ParsedBlock::parse(raw.as_bytes(), expected_height, full_transactions)
             .map_err(|error| source_error(error.to_string(), true))?;
         Ok((raw, parsed))
+    }
+
+    async fn fetch_complete_block(&self, height: BlockHeight) -> Result<Block, SourceError> {
+        let tag = format!("0x{:x}", height.0);
+        let (raw_block, parsed) = self.fetch_block(tag, Some(height), true).await?;
+        let raw_receipts = self.fetch_receipts(&parsed).await?;
+        ParsedReceipt::parse_all(&raw_receipts, &parsed)
+            .map_err(|error| source_error(error.to_string(), true))?;
+        Ok(Block {
+            reference: parsed.reference,
+            raw_block: raw_block.into_bytes(),
+            raw_receipts,
+        })
     }
 
     async fn fetch_receipts(
@@ -174,7 +199,7 @@ where
         &self,
         block: &super::model::ParsedBlock,
     ) -> Result<Vec<Vec<u8>>, CallFailure> {
-        let hash = encode_hex(&block.reference.hash.0);
+        let hash = hex::encode_prefixed(&block.reference.hash.0);
         let raw = self
             .request_result_detailed("eth_getBlockReceipts", serde_json::json!([hash]))
             .await?;
@@ -194,7 +219,7 @@ where
     ) -> Result<Vec<Vec<u8>>, SourceError> {
         let mut requests = Vec::with_capacity(block.transactions.len());
         for transaction in &block.transactions {
-            let hash = encode_hex(&transaction.hash);
+            let hash = hex::encode_prefixed(transaction.hash);
             requests.push(("eth_getTransactionReceipt", serde_json::json!([hash])));
         }
         self.client
@@ -204,9 +229,13 @@ where
             .map(|result| {
                 let raw = match result {
                     Ok(raw) => raw,
-                    Err(failure) => return Err(map_remote_failure(failure)),
+                    Err(failure) => return Err(CallFailure::remote(failure).error),
                 };
-                if is_json_null(&raw)? {
+                if raw
+                    .deserialize::<Value>()
+                    .map_err(map_json_rpc_error)?
+                    .is_null()
+                {
                     return Err(source_error(
                         "Ethereum transaction receipt is temporarily unavailable",
                         true,
@@ -235,10 +264,7 @@ where
         match self.client.call(method, params).await {
             Ok(result) => Ok(result),
             Err(CallError::Local(error)) => Err(CallFailure::local(error)),
-            Err(CallError::Remote(failure)) => Err(CallFailure {
-                remote_code: Some(failure.code),
-                error: map_remote_failure(failure),
-            }),
+            Err(CallError::Remote(failure)) => Err(CallFailure::remote(failure)),
         }
     }
 }
@@ -256,39 +282,53 @@ where
         })
     }
 
-    fn block_at<'a>(
+    fn blocks<'a>(
         &'a self,
-        height: BlockHeight,
-    ) -> BoxFuture<'a, Result<Self::Block, SourceError>> {
+        start: BlockPosition,
+        end: BlockPosition,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<Self::Block>, SourceError>> {
         Box::pin(async move {
-            let tag = format!("0x{:x}", height.0);
-            let (raw_block, parsed) = self.fetch_block(tag, Some(height), true).await?;
-            let raw_receipts = self.fetch_receipts(&parsed).await?;
-            ParsedReceipt::parse_all(&raw_receipts, &parsed)
-                .map_err(|error| source_error(error.to_string(), true))?;
-            Ok(Block {
-                reference: parsed.reference,
-                raw_block: raw_block.into_bytes(),
-                raw_receipts,
-            })
+            if limit == 0 || start > end {
+                return Err(source_error(
+                    "Ethereum block range requires ordered positions and a positive limit",
+                    false,
+                ));
+            }
+            let mut position = start.0;
+            let mut blocks = Vec::with_capacity(limit.min(64));
+            while position <= end.0 && blocks.len() < limit {
+                let height = BlockHeight(position);
+                blocks.push(self.fetch_complete_block(height).await?);
+                let Some(next) = position.checked_add(1) else {
+                    break;
+                };
+                position = next;
+            }
+            Ok(blocks)
         })
     }
 
-    fn canonical_hash<'a>(
+    fn canonical_at<'a>(
         &'a self,
-        height: BlockHeight,
-    ) -> BoxFuture<'a, Result<Option<BlockHash>, SourceError>> {
+        position: BlockPosition,
+    ) -> BoxFuture<'a, Result<Option<BlockRef>, SourceError>> {
         Box::pin(async move {
-            let tag = format!("0x{:x}", height.0);
+            let height = BlockHeight(position.0);
+            let tag = format!("0x{:x}", position.0);
             let raw = self
                 .request_result("eth_getBlockByNumber", serde_json::json!([tag, false]))
                 .await?;
-            if is_json_null(&raw)? {
+            if raw
+                .deserialize::<Value>()
+                .map_err(map_json_rpc_error)?
+                .is_null()
+            {
                 return Ok(None);
             }
             let block = ParsedBlock::parse(raw.as_bytes(), Some(height), false)
                 .map_err(|error| source_error(error.to_string(), true))?;
-            Ok(Some(block.reference.hash))
+            Ok(Some(block.reference))
         })
     }
 }
@@ -300,6 +340,19 @@ struct CallFailure {
 }
 
 impl CallFailure {
+    fn remote(failure: Failure) -> Self {
+        Self {
+            remote_code: Some(failure.code),
+            error: source_error(
+                format!(
+                    "Ethereum JSON-RPC request failed with code {}",
+                    failure.code
+                ),
+                failure.is_server_error(),
+            ),
+        }
+    }
+
     fn local(error: SourceError) -> Self {
         Self {
             remote_code: None,
@@ -308,26 +361,12 @@ impl CallFailure {
     }
 }
 
+// design-lint: allow unclassified-free-function -- Ethereum indexing RPC translation between foreign JSON-RPC and SourceError types preserves transport retryability and display context at the chain boundary
 fn map_json_rpc_error(error: Error) -> SourceError {
     source_error(error.to_string(), error.is_retryable())
 }
 
-fn map_remote_failure(failure: Failure) -> SourceError {
-    source_error(
-        format!(
-            "Ethereum JSON-RPC request failed with code {}",
-            failure.code
-        ),
-        failure.is_server_error(),
-    )
-}
-
-fn is_json_null(raw: &RawJson) -> Result<bool, SourceError> {
-    raw.deserialize::<Value>()
-        .map(|value| value.is_null())
-        .map_err(map_json_rpc_error)
-}
-
+// design-lint: allow unclassified-free-function -- Ethereum indexing boundary constructs foreign SourceError values while each validation and RPC call site retains its explicit message and retryability policy
 fn source_error(message: impl Into<String>, retryable: bool) -> SourceError {
     SourceError {
         message: message.into(),

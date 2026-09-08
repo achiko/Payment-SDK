@@ -14,20 +14,25 @@
 //!   BENCH_ADDRESSES   distinct watched addresses             default 16
 //!   BENCH_CREATED     outputs created per block              default 40
 //!   BENCH_SPENT       outputs spent per block                default 30
-//!   BENCH_RESET       truncate before running (1/0)          default 1
+//!   BENCH_SCOPE       network label for an intentional rerun default unique
+//!   BENCH_RESET       clear only the exact run scope (1/0)    default 1
 
-use std::{env, time::Instant};
+#[path = "bench/cleanup.rs"]
+mod cleanup;
+
+use std::{
+    env,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 use indexing::{
-    AssetId, BlockAddition, BlockHash, BlockHeight, BlockRef, Blocks, CanonicalAddress, ChainId,
-    Decimal, HistoryQuery, IndexScope, IndexedOutput, InterpretedBlock, MovementId,
-    ObservationDraft, ObservationDraftStatus, OutputChanges, OutputId, OutputKey, OutputRequest,
-    Outputs, TransactionRef, Transactions, ValueMovement,
+    AssetId, BlockAddition, BlockHash, BlockHeight, BlockParent, BlockPosition, BlockRef, Blocks,
+    CanonicalAddress, ChainId, Decimal, HistoryQuery, IndexScope, IndexedOutput, InterpretedBlock,
+    MovementId, ObservationDraft, ObservationDraftStatus, OutputChanges, OutputId, OutputKey,
+    OutputRequest, Outputs, TransactionRef, Transactions, ValueMovement,
 };
 
 const RETENTION: u64 = 100;
-const CHAIN: &str = "primary";
-const NETWORK: &str = "testing";
 
 struct Profile {
     blocks: u64,
@@ -38,15 +43,14 @@ struct Profile {
     spent: usize,
 }
 
-fn number(key: &str, fallback: usize) -> usize {
-    env::var(key)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(fallback)
-}
-
 impl Profile {
     fn from_env() -> Self {
+        let number = |key: &str, fallback: usize| {
+            env::var(key)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(fallback)
+        };
         Self {
             blocks: number("BENCH_BLOCKS", 200) as u64,
             txs: number("BENCH_TXS", 40),
@@ -65,74 +69,76 @@ impl Profile {
         let movements = history * self.movements;
         history + movements + self.created + self.spent * 2
     }
+
+    fn address(&self, scope: &IndexScope, index: usize) -> CanonicalAddress {
+        let index = index % self.addresses;
+        CanonicalAddress {
+            scope: scope.clone(),
+            value: format!("addr-{index:04}"),
+        }
+    }
 }
 
 fn scope() -> IndexScope {
+    let network = env::var("BENCH_SCOPE").unwrap_or_else(|_| {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        format!("run-{}-{stamp}", std::process::id())
+    });
     IndexScope {
-        chain: ChainId(CHAIN.into()),
-        network: NETWORK.into(),
+        chain: ChainId("benchmark".into()),
+        network,
     }
 }
 
-fn address(index: usize) -> CanonicalAddress {
-    CanonicalAddress {
-        scope: scope(),
-        value: format!("addr-{index:04}"),
-    }
-}
-
-fn transaction(height: u64, index: usize) -> TransactionRef {
+fn transaction(scope: &IndexScope, height: u64, index: usize) -> TransactionRef {
     TransactionRef {
-        scope: scope(),
+        scope: scope.clone(),
         value: format!("{height:010}-{index:05}"),
-    }
-}
-
-fn asset() -> AssetId {
-    AssetId {
-        chain: ChainId(CHAIN.into()),
-        asset: "native".into(),
-    }
-}
-
-fn amount(units: u64) -> Decimal {
-    units.to_string().parse().expect("amount parses")
-}
-
-fn block_ref(height: u64, parent: Option<&BlockRef>) -> BlockRef {
-    BlockRef {
-        height: BlockHeight(height),
-        hash: BlockHash(format!("hash-{height:010}").into_bytes()),
-        parent_hash: parent.map(|block| block.hash.clone()),
-        timestamp: Some(1_700_000_000 + height),
     }
 }
 
 /// One block's worth of interpreted facts, spending outputs handed in from the
 /// previous block so the spend path is exercised the way a real chain does.
 fn interpret(
+    scope: &IndexScope,
     profile: &Profile,
     height: u64,
     parent: Option<&BlockRef>,
     spend: Vec<OutputKey>,
 ) -> (InterpretedBlock, Vec<OutputKey>) {
-    let block = block_ref(height, parent);
+    let block = BlockRef {
+        position: BlockPosition(height),
+        height: BlockHeight(height),
+        hash: BlockHash(format!("hash-{height:010}").into_bytes()),
+        parent: parent.map(|block| BlockParent {
+            position: block.position,
+            hash: block.hash.clone(),
+        }),
+        timestamp: Some(1_700_000_000 + height),
+    };
+    let asset = AssetId {
+        chain: scope.chain.clone(),
+        asset: "native".into(),
+    };
     let mut transactions = Vec::with_capacity(profile.txs);
     for index in 0..profile.txs {
-        let from = address(index % profile.addresses);
-        let to = address((index + 1) % profile.addresses);
+        let from = profile.address(scope, index);
+        let to = profile.address(scope, index + 1);
         let movements = (0..profile.movements)
             .map(|ordinal| ValueMovement::Transfer {
                 id: MovementId(format!("{height}-{index}-{ordinal}")),
-                asset: asset(),
-                amount: amount(1_000 + ordinal as u64),
+                asset: asset.clone(),
+                amount: Decimal::from(1_000 + ordinal as u64),
                 from: from.clone(),
                 to: to.clone(),
             })
             .collect();
         transactions.push(ObservationDraft {
-            scope: scope(),
-            transaction_id: transaction(height, index),
+            scope: scope.clone(),
+            transaction_id: transaction(scope, height, index),
             status: ObservationDraftStatus::Included,
             movements,
             fee: None,
@@ -141,15 +147,15 @@ fn interpret(
 
     let mut created = Vec::with_capacity(profile.created);
     for index in 0..profile.created {
-        let owner = address(index % profile.addresses);
+        let owner = profile.address(scope, index);
         created.push(IndexedOutput {
             id: OutputId {
-                transaction: transaction(height, index),
+                transaction: transaction(scope, height, index),
                 index: index as u32,
             },
             address: owner,
-            asset: asset(),
-            amount: amount(50_000 + index as u64),
+            asset: asset.clone(),
+            amount: Decimal::from(50_000 + index as u64),
             // A P2WPKH script is 22 bytes; a P2WSH witness script is larger.
             evidence: vec![0x51; 22],
             created_at: BlockHeight(height),
@@ -176,28 +182,24 @@ fn interpret(
     )
 }
 
-fn rate(count: f64, seconds: f64) -> f64 {
-    if seconds <= 0.0 { 0.0 } else { count / seconds }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let rate = |count: f64, seconds: f64| {
+        if seconds <= 0.0 { 0.0 } else { count / seconds }
+    };
     let url = env::args()
         .nth(1)
         .unwrap_or_else(|| "postgres://prop@127.0.0.1:5433/integration-test".to_owned());
     let profile = Profile::from_env();
+    let scope = scope();
     let pool = indexing_postgres::pool(&url, 8)?;
 
     if env::var("BENCH_RESET").unwrap_or_else(|_| "1".into()) != "0" {
-        let client = pool.get().await?;
-        client
-            .batch_execute(
-                "TRUNCATE movement, history, journal_output, journal, output, checkpoint",
-            )
-            .await?;
+        let mut client = pool.get().await?;
+        cleanup::clear_scope(&mut client, &scope).await?;
     }
 
-    let repository = indexing_postgres::Repository::new(pool, scope())?;
+    let repository = indexing_postgres::Repository::new(pool, scope.clone())?;
 
     println!(
         "commit: {} blocks x {} tx x {} movements + {} created / {} spent  (~{} rows/block)",
@@ -215,9 +217,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut worst = 0.0_f64;
     let started = Instant::now();
     for height in 1..=profile.blocks {
-        let (interpreted, next_spend) = interpret(&profile, height, parent.as_ref(), spend);
+        let (interpreted, next_spend) = interpret(&scope, &profile, height, parent.as_ref(), spend);
         let block = interpreted.block.clone();
-        let addition = BlockAddition::new(scope(), parent.clone(), RETENTION, interpreted)?;
+        let addition = BlockAddition::new(scope.clone(), parent.clone(), RETENTION, interpreted)?;
         let one = Instant::now();
         repository.add(addition).await?;
         worst = worst.max(one.elapsed().as_secs_f64());
@@ -240,8 +242,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let page = Transactions::list(
             &repository,
             HistoryQuery {
-                scope: scope(),
-                address: address(index % profile.addresses),
+                scope: scope.clone(),
+                address: profile.address(&scope, index),
                 after: None,
                 limit: 100,
             },
@@ -262,8 +264,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let page = Outputs::list(
             &repository,
             OutputRequest {
-                scope: scope(),
-                address: address(index % profile.addresses),
+                scope: scope.clone(),
+                address: profile.address(&scope, index),
                 after: None,
                 limit: 100,
             },

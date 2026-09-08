@@ -1,5 +1,7 @@
 use std::{error, fmt};
 
+use base::TransactionId;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
     Unsupported,
@@ -7,10 +9,12 @@ pub enum ErrorKind {
     NotFound,
     Conflict,
     Unavailable,
+    SourceBusy,
     Generation,
     InvalidSecret,
     InvalidAddress,
     InvalidAmount,
+    InvalidBatch,
     AddressMismatch,
     Balance,
     History,
@@ -21,6 +25,8 @@ pub enum ErrorKind {
 pub struct Error {
     pub kind: ErrorKind,
     pub message: String,
+    /// Canonical local ID preserved from a concrete transaction-layer ambiguity.
+    pub ambiguous_transaction_id: Option<TransactionId>,
 }
 
 impl Error {
@@ -29,6 +35,7 @@ impl Error {
         Self {
             kind,
             message: message.into(),
+            ambiguous_transaction_id: None,
         }
     }
 }
@@ -43,7 +50,12 @@ impl error::Error for Error {}
 
 impl From<base::TransactionError> for Error {
     fn from(error: base::TransactionError) -> Self {
-        let kind = match error.kind {
+        let base::TransactionError {
+            kind,
+            message,
+            ambiguous_transaction_id,
+        } = error;
+        let kind = match kind {
             base::TransactionErrorKind::InvalidAddress => ErrorKind::InvalidAddress,
             base::TransactionErrorKind::InvalidAmount => ErrorKind::InvalidAmount,
             base::TransactionErrorKind::Unavailable
@@ -58,7 +70,11 @@ impl From<base::TransactionError> for Error {
             | base::TransactionErrorKind::Divergent
             | base::TransactionErrorKind::Rejected => ErrorKind::Transaction,
         };
-        Self::new(kind, error.message)
+        Self {
+            kind,
+            message,
+            ambiguous_transaction_id,
+        }
     }
 }
 
@@ -76,5 +92,49 @@ impl From<indexing::IndexError> for Error {
             | indexing::IndexErrorKind::ReorgTooDeep => ErrorKind::Unavailable,
         };
         Self::new(kind, error.message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_wallet_error_has_no_ambiguous_transaction_id() {
+        let error = Error::new(
+            ErrorKind::Unavailable,
+            "provider claimed transaction canonical-id",
+        );
+
+        assert_eq!(error.ambiguous_transaction_id, None);
+    }
+
+    #[test]
+    fn ordinary_transaction_conversion_does_not_synthesize_ambiguity() {
+        let error = Error::from(base::TransactionError::new(
+            base::TransactionErrorKind::Unknown,
+            "provider claimed transaction canonical-id",
+        ));
+
+        assert_eq!(error.kind, ErrorKind::Unavailable);
+        assert_eq!(error.message, "provider claimed transaction canonical-id");
+        assert_eq!(error.ambiguous_transaction_id, None);
+    }
+
+    #[test]
+    fn transaction_error_conversion_preserves_ambiguous_transaction_id() {
+        let id = base::TransactionId::new("canonical-id");
+        let error = Error::from(
+            base::TransactionError::new(
+                base::TransactionErrorKind::Timeout,
+                "submission outcome is unknown",
+            )
+            .with_ambiguous_transaction_id(id.clone()),
+        );
+
+        assert_eq!(error.kind, ErrorKind::Unavailable);
+        assert_eq!(error.message, "submission outcome is unknown");
+        assert_eq!(error.to_string(), "submission outcome is unknown");
+        assert_eq!(error.ambiguous_transaction_id, Some(id));
     }
 }

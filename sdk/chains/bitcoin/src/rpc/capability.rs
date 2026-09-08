@@ -96,11 +96,16 @@ pub trait Transactions: Send + Sync {
         max_fee_rate: FeeRate,
     ) -> BoxFuture<'a, Result<Preflight, SourceError>>;
 
+    /// Submits one exact signed envelope using one visible transport execution.
+    ///
+    /// Definite local or provider rejection remains ID-free. If execution may
+    /// have reached the node without a reliable acknowledgement, the concrete
+    /// transaction adapter attaches only the ID derived from `transaction`.
     fn broadcast<'a>(
         &'a self,
         transaction: SignedTransaction,
         max_fee_rate: FeeRate,
-    ) -> BoxFuture<'a, Result<TransactionId, SourceError>>;
+    ) -> BoxFuture<'a, Result<TransactionId, base::TransactionError>>;
 }
 
 impl<C> Fees for Client<C>
@@ -137,7 +142,7 @@ where
         &'a self,
         transaction: SignedTransaction,
         max_fee_rate: FeeRate,
-    ) -> BoxFuture<'a, Result<TransactionId, SourceError>> {
+    ) -> BoxFuture<'a, Result<TransactionId, base::TransactionError>> {
         Box::pin(async move { self.broadcast(transaction, max_fee_rate).await })
     }
 }
@@ -158,7 +163,7 @@ where
         &'a self,
         transaction: SignedTransaction,
         max_fee_rate: FeeRate,
-    ) -> BoxFuture<'a, Result<TransactionId, SourceError>> {
+    ) -> BoxFuture<'a, Result<TransactionId, base::TransactionError>> {
         Box::pin(async move { self.client.broadcast(transaction, max_fee_rate).await })
     }
 }

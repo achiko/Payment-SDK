@@ -2,6 +2,105 @@ use super::*;
 use crate::{Satoshi, indexer::model::PreviousOutput};
 
 #[test]
+fn block_consensus_decoding_rejects_invalid_rpc_claims_before_projection() {
+    let valid = block_result();
+    let trailing = format!("{}00", valid["tx"][0]["hex"].as_str().expect("fixture hex"));
+    for (field, value, message) in [
+        (
+            "hex",
+            Value::Null,
+            "Bitcoin raw transaction is missing or invalid",
+        ),
+        (
+            "hex",
+            json!(""),
+            "Bitcoin raw transaction is missing or invalid",
+        ),
+        (
+            "hex",
+            json!("not-hex"),
+            "Bitcoin transaction hex is invalid",
+        ),
+        (
+            "hex",
+            json!("ff"),
+            "Bitcoin transaction consensus bytes are invalid",
+        ),
+        (
+            "hex",
+            json!(trailing),
+            "Bitcoin transaction consensus bytes are invalid",
+        ),
+        (
+            "txid",
+            json!(TransactionId([0; 32]).to_string()),
+            "Bitcoin transaction ID does not match its consensus bytes",
+        ),
+    ] {
+        let mut block = valid.clone();
+        block["tx"][0][field] = value;
+        let mut replies = connect_replies();
+        replies.extend([
+            reply("getblockhash", Value::String(hash(2))),
+            reply_for("getblock", json!([hash(2), 2]), block),
+        ]);
+        let client = ScriptedClient::new(replies);
+        let calls = client.clone();
+        let source = block_on(Blocks::connect(client, config())).expect("valid source setup");
+        let error = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 1))
+            .expect_err("invalid consensus claim must stop ingestion");
+        assert_eq!(error.message, message);
+        assert!(error.retryable);
+        calls.assert_exhausted();
+    }
+}
+
+#[test]
+fn input_claim_validation_precedes_prevout_requests() {
+    let (valid, _, _, _) = external_prevout_block();
+    let mut wrong_outpoint = valid["tx"][0]["vin"].clone();
+    wrong_outpoint[0]["vout"] = json!(1);
+    let mut invalid_id = valid["tx"][0]["vin"].clone();
+    invalid_id[0]["txid"] = json!("invalid");
+    invalid_id[0]["vout"] = Value::Null;
+    for (inputs, message) in [
+        (Value::Null, "Bitcoin transaction inputs must be an array"),
+        (
+            json!([]),
+            "Bitcoin transaction input count does not match its consensus bytes",
+        ),
+        (
+            json!([null, null, null]),
+            "Bitcoin transaction input must be an object",
+        ),
+        (
+            invalid_id,
+            "Bitcoin input previous transaction ID is invalid",
+        ),
+        (
+            wrong_outpoint,
+            "Bitcoin input 0 outpoint does not match its consensus bytes",
+        ),
+    ] {
+        let mut block = valid.clone();
+        block["tx"][0]["vin"] = inputs;
+        let mut replies = connect_replies();
+        replies.extend([
+            reply("getblockhash", Value::String(hash(2))),
+            reply_for("getblock", json!([hash(2), 2]), block),
+        ]);
+        let client = ScriptedClient::new(replies);
+        let calls = client.clone();
+        let source = block_on(Blocks::connect(client, config())).unwrap();
+        let error = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 1))
+            .expect_err("input claims must be verified before any previous transaction request");
+        assert_eq!(error.message, message);
+        assert!(error.retryable);
+        calls.assert_exhausted();
+    }
+}
+
+#[test]
 fn numbered_block_fetch_parses_transactions_and_rechecks_canonical_hash() {
     let mut replies = connect_replies();
     replies.extend([
@@ -12,14 +111,27 @@ fn numbered_block_fetch_parses_transactions_and_rechecks_canonical_hash() {
     let source = block_on(Blocks::connect(ScriptedClient::new(replies), config()))
         .expect("valid scripted source must connect");
 
-    let block =
-        block_on(source.block_at(BlockHeight(10))).expect("canonical verbosity-2 block must load");
+    let block = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 1))
+        .expect("canonical verbosity-2 block must load")
+        .pop()
+        .expect("dense range contains its block");
 
     assert_eq!(block.reference.height, BlockHeight(10));
+    assert_eq!(block.reference.position, BlockPosition(10));
     assert_eq!(
         parse_bitcoin_block_hash(&hash(2)).expect("test hash must parse"),
         block.reference.hash
     );
+    assert_eq!(
+        block.reference.parent,
+        Some(indexing::BlockParent {
+            position: BlockPosition(9),
+            hash: parse_bitcoin_block_hash(&hash(3)).expect("test parent hash must parse"),
+        })
+    );
+    let zero_limit = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 0))
+        .expect_err("zero returned-block limit must fail before RPC");
+    assert!(!zero_limit.retryable);
     let transactions = block.transactions();
     assert_eq!(transactions.len(), 1);
     assert!(transactions[0].coinbase);
@@ -54,8 +166,10 @@ fn external_prevouts_are_resolved_once_into_bounded_parsed_facts() {
     let source =
         block_on(Blocks::connect(client, config())).expect("valid scripted source must connect");
 
-    let block = block_on(source.block_at(BlockHeight(10)))
-        .expect("external previous outputs must be enriched");
+    let block = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 1))
+        .expect("external previous outputs must be enriched")
+        .pop()
+        .expect("dense range contains its block");
     calls.assert_exhausted();
 
     let transactions = block.transactions();
@@ -88,7 +202,10 @@ fn external_prevouts_are_resolved_once_into_bounded_parsed_facts() {
                         output_index: u32::try_from(index).expect("test index must fit u32"),
                     },
                     value: Satoshi(output.value.to_sat()),
-                    address: address_for_script(&output.script_pubkey, Network::Regtest),
+                    address: crate::Address::from_script_for_network(
+                        &output.script_pubkey,
+                        Network::Regtest,
+                    ),
                 })
             })
             .collect::<Vec<_>>()
@@ -98,7 +215,10 @@ fn external_prevouts_are_resolved_once_into_bounded_parsed_facts() {
     for output in &previous.output {
         let compact = ResolvedOutput {
             value_satoshis: output.value.to_sat(),
-            address: address_for_script(&output.script_pubkey, Network::Regtest),
+            address: crate::Address::from_script_for_network(
+                &output.script_pubkey,
+                Network::Regtest,
+            ),
         }
         .compact_json()
         .expect("resolved output must fit its compact boundary");
@@ -131,6 +251,65 @@ fn external_prevouts_are_resolved_once_into_bounded_parsed_facts() {
 }
 
 #[test]
+fn in_block_forward_reference_fails_before_external_prevout_requests() {
+    let (mut block, _, _, _) = external_prevout_block();
+    block["tx"].as_array_mut().unwrap().swap(0, 1);
+    let mut replies = connect_replies();
+    replies.extend([
+        reply("getblockhash", Value::String(hash(2))),
+        reply_for("getblock", json!([hash(2), 2]), block),
+    ]);
+    let client = ScriptedClient::new(replies);
+    let calls = client.clone();
+    let source = block_on(Blocks::connect(client, config())).expect("valid source setup");
+
+    let error = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 1))
+        .expect_err("a child cannot spend a later transaction's output");
+
+    assert_eq!(
+        error.message,
+        "Bitcoin block transaction spends an output that was not created earlier in the block"
+    );
+    assert!(error.retryable);
+    calls.assert_exhausted();
+}
+
+#[test]
+fn enrichment_replaces_external_prevouts_and_removes_in_block_claims() {
+    let (mut block, previous, _, _) = external_prevout_block();
+    block["tx"][0]["vin"][0]["prevout"] = json!({"untrusted": true});
+    block["tx"][1]["vin"][0]["prevout"] = json!({"untrusted": true});
+    let mut replies = connect_replies();
+    replies.push(reply_for(
+        "getrawtransaction",
+        json!([previous.compute_txid().to_string(), true]),
+        json!({
+            "txid": previous.compute_txid().to_string(),
+            "hex": consensus::serialize(&previous).to_lower_hex_string(),
+            "blockhash": hash(5),
+        }),
+    ));
+    let client = ScriptedClient::new(replies);
+    let calls = client.clone();
+    let source = block_on(Blocks::connect(client, config())).expect("valid source setup");
+
+    let enriched = block_on(source.enrich_prevouts(serde_json::to_vec(&block).unwrap()))
+        .expect("validated external outputs must replace raw RPC claims");
+    let enriched: Value = serde_json::from_slice(&enriched).unwrap();
+    let address = crate::Address::from_script_for_network(
+        &previous.output[0].script_pubkey,
+        Network::Regtest,
+    )
+    .unwrap();
+    assert_eq!(
+        enriched["tx"][0]["vin"][0]["prevout"],
+        json!({"value_satoshis": 123_456_789, "address": address.encoded()})
+    );
+    assert!(enriched["tx"][1]["vin"][0].get("prevout").is_none());
+    calls.assert_exhausted();
+}
+
+#[test]
 fn external_prevout_lookup_must_return_confirmed_transaction_data() {
     let (block_result, previous, _, _) = external_prevout_block();
     let mut replies = connect_replies();
@@ -151,7 +330,7 @@ fn external_prevout_lookup_must_return_confirmed_transaction_data() {
     let source =
         block_on(Blocks::connect(client, config())).expect("valid scripted source must connect");
 
-    let error = block_on(source.block_at(BlockHeight(10)))
+    let error = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 1))
         .expect_err("mempool-only previous-output data must retry");
     calls.assert_exhausted();
     assert!(error.retryable);
@@ -169,26 +348,33 @@ fn external_prevout_bound_is_above_consensus_maximum_and_fails_before_growth() {
     assert_eq!(MAX_COMPACT_PREVOUT_TOTAL_BYTES, 4_800_000);
 
     let transaction_id = TransactionId([0x33; 32]);
-    let mut outputs = BTreeMap::new();
-    let mut count = 0;
+    let mut outputs = RequiredPrevouts::default();
     for output_index in 0..MAX_EXTERNAL_PREVOUTS_PER_BLOCK {
-        record_external_prevout(
-            &mut outputs,
-            &mut count,
-            transaction_id,
-            u32::try_from(output_index).expect("test output index must fit u32"),
-        )
-        .expect("consensus-complete safety window must remain accepted");
+        outputs
+            .record(
+                transaction_id,
+                u32::try_from(output_index).expect("test output index must fit u32"),
+            )
+            .expect("consensus-complete safety window must remain accepted");
     }
-    let error = record_external_prevout(
-        &mut outputs,
-        &mut count,
-        transaction_id,
-        u32::try_from(MAX_EXTERNAL_PREVOUTS_PER_BLOCK).expect("test output index must fit u32"),
-    )
-    .expect_err("the first out-of-bound prevout must fail before insertion");
+    let duplicate = outputs
+        .record(transaction_id, 0)
+        .expect_err("duplicate validation must precede the full-capacity check");
+    assert_eq!(
+        duplicate.message,
+        "Bitcoin block spends the same external outpoint more than once"
+    );
+    assert!(!duplicate.retryable);
+    assert_eq!(outputs.len(), MAX_EXTERNAL_PREVOUTS_PER_BLOCK);
+    let error = outputs
+        .record(
+            transaction_id,
+            u32::try_from(MAX_EXTERNAL_PREVOUTS_PER_BLOCK).expect("test output index must fit u32"),
+        )
+        .expect_err("the first out-of-bound prevout must fail before insertion");
     assert!(!error.retryable);
-    assert_eq!(count, MAX_EXTERNAL_PREVOUTS_PER_BLOCK);
+    assert_eq!(outputs.len(), MAX_EXTERNAL_PREVOUTS_PER_BLOCK);
+    let outputs = outputs.into_iter().collect::<BTreeMap<_, _>>();
     assert_eq!(
         outputs
             .get(&transaction_id)
@@ -196,6 +382,28 @@ fn external_prevout_bound_is_above_consensus_maximum_and_fails_before_growth() {
             .len(),
         MAX_EXTERNAL_PREVOUTS_PER_BLOCK
     );
+}
+
+#[test]
+fn missing_block_fails_before_the_canonical_hash_recheck() {
+    let mut replies = connect_replies();
+    replies.extend([
+        reply_for("getblockhash", json!([10]), Value::String(hash(2))),
+        failure("getblock", -5),
+    ]);
+    let client = ScriptedClient::new(replies);
+    let calls = client.clone();
+    let source = block_on(Blocks::connect(client, config())).expect("valid source setup");
+
+    let error = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 1))
+        .expect_err("a disappeared block must stop ingestion before rechecking its hash");
+
+    assert_eq!(
+        error.message,
+        "Bitcoin Core no longer exposes the requested block"
+    );
+    assert!(error.retryable);
+    calls.assert_exhausted();
 }
 
 #[test]
@@ -209,7 +417,7 @@ fn numbered_block_fetch_rejects_same_height_reorg_race() {
     let source = block_on(Blocks::connect(ScriptedClient::new(replies), config()))
         .expect("valid scripted source must connect");
 
-    let error = block_on(source.block_at(BlockHeight(10)))
+    let error = block_on(source.blocks(BlockPosition(10), BlockPosition(10), 1))
         .expect_err("same-height canonical replacement must retry");
 
     assert!(error.retryable);
@@ -217,7 +425,7 @@ fn numbered_block_fetch_rejects_same_height_reorg_race() {
 }
 
 #[test]
-fn disappearing_height_is_optional_for_canonical_hash_and_retryable_for_tip() {
+fn disappearing_position_is_optional_for_canonical_reference_and_retryable_for_tip() {
     let mut canonical_replies = connect_replies();
     canonical_replies.extend([
         reply("getblockcount", json!(10)),
@@ -229,7 +437,7 @@ fn disappearing_height_is_optional_for_canonical_hash_and_retryable_for_tip() {
     ))
     .expect("valid scripted source must connect");
     assert_eq!(
-        block_on(canonical.canonical_hash(BlockHeight(10)))
+        block_on(canonical.canonical_at(BlockPosition(10)))
             .expect("a vanished reorg height is not a fatal source error"),
         None
     );
@@ -243,4 +451,86 @@ fn disappearing_height_is_optional_for_canonical_hash_and_retryable_for_tip() {
         .expect("valid scripted source must connect");
     let error = block_on(tip.tip()).expect_err("tip height race must retry");
     assert!(error.retryable);
+}
+
+#[test]
+fn canonical_header_keeps_request_identity_and_complete_coordinates() {
+    for height in [0, 10] {
+        let mut replies = connect_replies();
+        replies.extend([
+            reply_for("getblockcount", json!([]), json!(10)),
+            reply_for("getblockhash", json!([height]), json!(hash(2))),
+            reply_for(
+                "getblockheader",
+                json!([hash(2), true]),
+                json!({"height": height, "hash": hash(2).to_uppercase(), "previousblockhash": hash(3), "time": 100}),
+            ),
+        ]);
+        let client = ScriptedClient::new(replies);
+        let calls = client.clone();
+        let source = block_on(Blocks::connect(client, config())).unwrap();
+        let header = block_on(source.canonical_at(BlockPosition(height)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(header.position, BlockPosition(height));
+        assert_eq!(header.height, BlockHeight(height));
+        assert_eq!(header.hash, parse_bitcoin_block_hash(&hash(2)).unwrap());
+        assert_eq!(header.timestamp, Some(100));
+        if height == 0 {
+            assert_eq!(header.parent, None);
+        } else {
+            let parent = header.parent.unwrap();
+            assert_eq!(parent.position, BlockPosition(height - 1));
+            assert_eq!(parent.hash, parse_bitcoin_block_hash(&hash(3)).unwrap());
+        }
+        calls.assert_exhausted();
+    }
+}
+
+#[test]
+fn header_validation_preserves_error_order_and_retryability() {
+    for (header, message) in [
+        (
+            Value::Null,
+            "Bitcoin getblockheader result must be an object",
+        ),
+        (
+            json!({}),
+            "Bitcoin block-header height is missing or invalid",
+        ),
+        (
+            json!({"height": 9}),
+            "Bitcoin block header does not match the requested height",
+        ),
+        (
+            json!({"height": 10, "hash": "invalid"}),
+            "Bitcoin RPC returned an invalid block hash",
+        ),
+        (
+            json!({"height": 10, "hash": hash(2)}),
+            "Bitcoin previous block hash is missing or invalid",
+        ),
+        (
+            json!({"height": 10, "hash": hash(4), "previousblockhash": hash(3)}),
+            "Bitcoin block-header timestamp is missing or invalid",
+        ),
+        (
+            json!({"height": 10, "hash": hash(4), "previousblockhash": hash(3), "time": 100}),
+            "Bitcoin header lookup returned a different block hash",
+        ),
+    ] {
+        let mut replies = connect_replies();
+        replies.extend([
+            reply_for("getblockcount", json!([]), json!(10)),
+            reply_for("getblockhash", json!([10]), json!(hash(2))),
+            reply_for("getblockheader", json!([hash(2), true]), header),
+        ]);
+        let client = ScriptedClient::new(replies);
+        let calls = client.clone();
+        let source = block_on(Blocks::connect(client, config())).unwrap();
+        let error = block_on(source.tip()).unwrap_err();
+        assert_eq!(error.message, message);
+        assert!(error.retryable);
+        calls.assert_exhausted();
+    }
 }

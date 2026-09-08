@@ -24,7 +24,7 @@ impl HistoryReader for Wallet {
                 .await
                 .map_err(WalletError::from)?;
             let history = History::from_index(transactions, &self.config.scope, |asset| {
-                ethereum_asset(&self.config, asset)
+                self.config.history_asset(asset)
             })?;
             self.config.selected_history(&address, history)
         })
@@ -37,11 +37,12 @@ impl super::WalletConfig {
         wallet: &CanonicalAddress,
         mut history: History,
     ) -> Result<History, WalletError> {
-        if history.transactions.iter().any(|transaction| {
+        let non_native_fee = history.transactions.iter().any(|transaction| {
             transaction.fee.as_ref().is_some_and(|fee| {
                 fee.asset.id.chain != self.scope.chain || fee.asset.id.asset != "native"
             })
-        }) {
+        });
+        if non_native_fee {
             return Err(WalletError::new(
                 WalletErrorKind::History,
                 "Ethereum history contains a non-native network fee",
@@ -58,6 +59,47 @@ impl super::WalletConfig {
         Ok(history)
     }
 
+    fn history_asset(&self, asset: &indexing::AssetId) -> Result<HistoryAsset, WalletError> {
+        if asset.chain.0 != "ethereum" {
+            return Err(WalletError::new(
+                WalletErrorKind::History,
+                "Ethereum history contains a foreign-chain asset",
+            ));
+        }
+        if asset.asset == "native" {
+            return Ok(HistoryAsset {
+                id: asset.clone(),
+                name: Some(crate::ETH.name.to_owned()),
+                ticker: Some(crate::ETH.ticker.to_owned()),
+                decimals: crate::ETH.decimals,
+            });
+        }
+        let token = asset.asset.parse::<crate::Address>().map_err(|_| {
+            WalletError::new(
+                WalletErrorKind::History,
+                "Ethereum history contains an invalid ERC-20 asset identity",
+            )
+        })?;
+        if token.is_zero() {
+            return Err(WalletError::new(
+                WalletErrorKind::History,
+                "Ethereum history contains a zero ERC-20 asset identity",
+            ));
+        }
+        let decimals = match &self.asset {
+            AssetKind::Erc20(token) if asset.asset.eq_ignore_ascii_case(&token.to_string()) => {
+                self.decimals
+            }
+            _ => 0,
+        };
+        Ok(HistoryAsset {
+            id: asset.clone(),
+            name: None,
+            ticker: None,
+            decimals,
+        })
+    }
+
     fn selects(&self, asset: &indexing::AssetId) -> bool {
         if asset.chain != self.scope.chain {
             return false;
@@ -69,53 +111,9 @@ impl super::WalletConfig {
     }
 }
 
-fn ethereum_asset(
-    config: &super::WalletConfig,
-    asset: &indexing::AssetId,
-) -> Result<HistoryAsset, WalletError> {
-    if asset.chain.0 != "ethereum" {
-        return Err(WalletError::new(
-            WalletErrorKind::History,
-            "Ethereum history contains a foreign-chain asset",
-        ));
-    }
-    if asset.asset == "native" {
-        return Ok(HistoryAsset {
-            id: asset.clone(),
-            name: Some(crate::ETH.name.to_owned()),
-            ticker: Some(crate::ETH.ticker.to_owned()),
-            decimals: crate::ETH.decimals,
-        });
-    }
-    let token = asset.asset.parse::<crate::Address>().map_err(|_| {
-        WalletError::new(
-            WalletErrorKind::History,
-            "Ethereum history contains an invalid ERC-20 asset identity",
-        )
-    })?;
-    if token.is_zero() {
-        return Err(WalletError::new(
-            WalletErrorKind::History,
-            "Ethereum history contains a zero ERC-20 asset identity",
-        ));
-    }
-    let decimals = match &config.asset {
-        AssetKind::Erc20(token) if asset.asset.eq_ignore_ascii_case(&token.to_string()) => {
-            config.decimals
-        }
-        _ => 0,
-    };
-    Ok(HistoryAsset {
-        id: asset.clone(),
-        name: None,
-        ticker: None,
-        decimals,
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use base::{BlockHash, BlockHeight, BlockRef, Decimal};
+    use base::{BlockHash, BlockHeight, BlockPosition, BlockRef, Decimal};
     use indexing::{
         AssetId, ChainId, HistoryCursor, HistoryPosition, IndexScope, MovementId, NetworkFee,
         ObservedTransaction, TransactionPage, TransactionRef, TransactionStatus, ValueMovement,
@@ -156,9 +154,10 @@ mod tests {
 
     fn block(height: u64) -> BlockRef {
         BlockRef {
+            position: BlockPosition(height),
             height: BlockHeight(height),
             hash: BlockHash(vec![height as u8; 32]),
-            parent_hash: None,
+            parent: None,
             timestamp: None,
         }
     }
@@ -201,30 +200,64 @@ mod tests {
         page: TransactionPage,
     ) -> Result<History, WalletError> {
         let history =
-            History::from_index(page, &config.scope, |value| ethereum_asset(config, value))?;
+            History::from_index(page, &config.scope, |value| config.history_asset(value))?;
         config.selected_history(wallet, history)
+    }
+
+    #[test]
+    fn configured_asset_resolution_preserves_identity_validation() {
+        let config = config(AssetKind::Erc20(Address([0xab; 20])), 6);
+        for (asset, message) in [
+            (
+                AssetId {
+                    chain: ChainId("bitcoin".to_owned()),
+                    asset: "native".to_owned(),
+                },
+                "Ethereum history contains a foreign-chain asset",
+            ),
+            (
+                asset("invalid"),
+                "Ethereum history contains an invalid ERC-20 asset identity",
+            ),
+            (
+                asset(Address([0; 20]).to_string()),
+                "Ethereum history contains a zero ERC-20 asset identity",
+            ),
+        ] {
+            let error = config
+                .history_asset(&asset)
+                .expect_err("invalid identity must fail");
+            assert_eq!(error.kind, WalletErrorKind::History);
+            assert_eq!(error.message, message);
+        }
+        let mixed_case = asset(format!("0x{}", "AB".repeat(20)));
+        let selected = config.history_asset(&mixed_case).unwrap();
+        assert_eq!(selected.id, mixed_case);
+        assert_eq!(selected.decimals, 6);
+        let unrelated = config
+            .history_asset(&asset(Address([0xcd; 20]).to_string()))
+            .unwrap();
+        assert_eq!(unrelated.decimals, 0);
+        assert_eq!(unrelated.name, None);
+        assert_eq!(unrelated.ticker, None);
     }
 
     #[test]
     fn native_fees_and_token_movements_use_distinct_precision() {
         let token = Address([7; 20]);
         let config = config(AssetKind::Erc20(token.clone()), 6);
-        let native = ethereum_asset(
-            &config,
-            &AssetId {
+        let native = config
+            .history_asset(&AssetId {
                 chain: ChainId(crate::CHAIN.to_owned()),
                 asset: "native".to_owned(),
-            },
-        )
-        .expect("native fee asset");
-        let token = ethereum_asset(
-            &config,
-            &AssetId {
+            })
+            .expect("native fee asset");
+        let token = config
+            .history_asset(&AssetId {
                 chain: ChainId(crate::CHAIN.to_owned()),
                 asset: token.to_string(),
-            },
-        )
-        .expect("configured token asset");
+            })
+            .expect("configured token asset");
 
         assert_eq!(native.decimals, 18);
         assert_eq!(native.ticker.as_deref(), Some("ETH"));

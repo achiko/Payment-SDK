@@ -24,6 +24,7 @@ impl AddressText {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddressEncoding {
+    Base58,
     Base58Check,
     Bech32,
     Bech32m,
@@ -35,4 +36,17 @@ pub trait AddressFormat: Send + Sync {
     fn address_text(&self, address: &Address) -> Result<AddressText, Error>;
 
     fn parse_address(&self, address: &AddressText) -> Result<Address, Error>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_base58_is_distinct_from_base58check() {
+        assert_ne!(AddressEncoding::Base58, AddressEncoding::Base58Check);
+
+        let address = AddressText::new(AddressEncoding::Base58, "plain-base58");
+        assert_eq!(address.encoding, AddressEncoding::Base58);
+    }
 }

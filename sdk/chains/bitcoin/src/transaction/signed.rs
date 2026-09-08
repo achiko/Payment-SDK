@@ -1,4 +1,4 @@
-use crate::{ChainError, ChainErrorKind};
+use crate::ChainError;
 use bitcoin::{Transaction, Txid, consensus, hashes::Hash};
 use std::{fmt, str::FromStr};
 
@@ -88,13 +88,13 @@ impl SignedTransaction {
     ) -> Result<Self, ChainError> {
         let transaction: Transaction =
             consensus::deserialize(&consensus_bytes).map_err(|error| {
-                invalid_transaction(format!(
+                ChainError::invalid_transaction(format!(
                     "could not decode signed Bitcoin consensus bytes: {error}"
                 ))
             })?;
         let computed_id = Id::from(transaction.compute_txid());
         if computed_id != expected_id {
-            return Err(invalid_transaction(format!(
+            return Err(ChainError::invalid_transaction(format!(
                 "signed Bitcoin transaction ID mismatch: expected {expected_id}, computed {computed_id}"
             )));
         }
@@ -126,9 +126,9 @@ impl SignedTransaction {
 
     /// Decodes the retained consensus bytes and returns BIP141 virtual bytes.
     pub fn virtual_size(&self) -> Result<u64, ChainError> {
-        let transaction = decode_signed_transaction(&self.consensus_bytes)?;
+        let transaction = self.decode()?;
         u64::try_from(transaction.vsize())
-            .map_err(|_| invalid_transaction("signed Bitcoin virtual size exceeds u64"))
+            .map_err(|_| ChainError::invalid_transaction("signed Bitcoin virtual size exceeds u64"))
     }
 
     /// Decodes the retained exact consensus bytes into reviewable transaction
@@ -140,16 +140,17 @@ impl SignedTransaction {
     /// decode, their txid differs from the verified boundary value, or a
     /// platform-sized count cannot be represented by the public integer types.
     pub fn inspect(&self) -> Result<Inspection, ChainError> {
-        let transaction = decode_signed_transaction(&self.consensus_bytes)?;
+        let transaction = self.decode()?;
         let transaction_id = Id::from(transaction.compute_txid());
         if transaction_id != self.id {
-            return Err(invalid_transaction(format!(
+            return Err(ChainError::invalid_transaction(format!(
                 "signed Bitcoin transaction ID mismatch: expected {}, computed {transaction_id}",
                 self.id
             )));
         }
-        let virtual_size = u64::try_from(transaction.vsize())
-            .map_err(|_| invalid_transaction("signed Bitcoin virtual size exceeds u64"))?;
+        let virtual_size = u64::try_from(transaction.vsize()).map_err(|_| {
+            ChainError::invalid_transaction("signed Bitcoin virtual size exceeds u64")
+        })?;
         let inputs = transaction
             .input
             .iter()
@@ -168,7 +169,7 @@ impl SignedTransaction {
             .map(|(output_index, output)| {
                 Ok(OutputInspection {
                     output_index: u32::try_from(output_index).map_err(|_| {
-                        invalid_transaction("signed Bitcoin output index exceeds u32")
+                        ChainError::invalid_transaction("signed Bitcoin output index exceeds u32")
                     })?,
                     value: Satoshi(output.value.to_sat()),
                     script_pubkey: output.script_pubkey.as_bytes().to_vec(),
@@ -182,6 +183,14 @@ impl SignedTransaction {
             virtual_size,
             inputs,
             outputs,
+        })
+    }
+
+    fn decode(&self) -> Result<Transaction, ChainError> {
+        consensus::deserialize(&self.consensus_bytes).map_err(|error| {
+            ChainError::invalid_transaction(format!(
+                "could not decode signed Bitcoin consensus bytes: {error}"
+            ))
         })
     }
 }
@@ -207,24 +216,10 @@ impl fmt::Debug for RedactedBytes {
     }
 }
 
-fn invalid_transaction(message: impl Into<String>) -> ChainError {
-    ChainError {
-        kind: ChainErrorKind::InvalidTransaction,
-        message: message.into(),
-    }
-}
-
-fn decode_signed_transaction(consensus_bytes: &[u8]) -> Result<Transaction, ChainError> {
-    consensus::deserialize(consensus_bytes).map_err(|error| {
-        invalid_transaction(format!(
-            "could not decode signed Bitcoin consensus bytes: {error}"
-        ))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ChainErrorKind;
     use bitcoin::{
         Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness, absolute, transaction::Version,
     };
@@ -338,6 +333,42 @@ mod tests {
         assert_eq!(
             signed.virtual_size().expect("valid bytes have a vsize"),
             u64::try_from(transaction.vsize()).expect("test vsize fits u64")
+        );
+    }
+
+    #[test]
+    fn retained_byte_readers_preserve_consensus_decode_errors() {
+        let mut trailing = consensus::serialize(&transaction());
+        trailing.push(0);
+        for bytes in [vec![0xff], trailing] {
+            let expected = SignedTransaction::from_consensus_bytes(Id([0; 32]), bytes.clone())
+                .expect_err("invalid bytes fail at construction");
+            let signed = SignedTransaction {
+                id: Id([0; 32]),
+                consensus_bytes: bytes.clone(),
+            };
+            assert_eq!(signed.virtual_size(), Err(expected.clone()));
+            assert_eq!(signed.inspect(), Err(expected));
+            assert_eq!(signed.consensus_bytes(), bytes);
+        }
+    }
+
+    #[test]
+    fn inspection_rechecks_retained_transaction_id() {
+        let transaction = transaction();
+        let computed = Id::from(transaction.compute_txid());
+        let signed = SignedTransaction {
+            id: Id([0; 32]),
+            consensus_bytes: consensus::serialize(&transaction),
+        };
+        let error = signed.inspect().expect_err("mismatched retained ID");
+        assert_eq!(error.kind, ChainErrorKind::InvalidTransaction);
+        assert_eq!(
+            error.message,
+            format!(
+                "signed Bitcoin transaction ID mismatch: expected {}, computed {computed}",
+                signed.id
+            )
         );
     }
 

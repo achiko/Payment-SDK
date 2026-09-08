@@ -7,6 +7,7 @@ pub enum ErrorKind {
     Timeout,
     Unavailable,
     HttpStatus(u16),
+    ResponseTooLarge,
     InvalidResponse,
 }
 

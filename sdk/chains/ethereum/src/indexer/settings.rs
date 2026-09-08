@@ -115,14 +115,19 @@ impl IndexerSettings {
         Ok(RpcClient::new(self.transport()?))
     }
 
-    /// Builds an indexer on an existing client, verifying that the node really
-    /// serves the configured chain ID and genesis block before returning.
+    /// Verifies the configured chain ID and genesis and returns the exact
+    /// source that later enters indexing composition.
+    pub async fn source(&self, client: RpcClient<Http>) -> Result<Source<Http>, IndexError> {
+        Ok(Source::from_rpc(client, self.source_config()?).await?)
+    }
+
+    /// Builds an indexer from a source that was verified before storage opened.
     ///
     /// `observer`, when supplied, is called after each block this indexer
     /// commits. Pass `None` to index without notification.
-    pub async fn build<R>(
+    pub fn build<R>(
         &self,
-        client: RpcClient<Http>,
+        source: Source<Http>,
         repository: R,
         observer: Option<Arc<dyn Observer>>,
     ) -> Result<Indexer<Http, R>, IndexError>
@@ -130,15 +135,13 @@ impl IndexerSettings {
         R: Clone,
     {
         let scope = self.scope();
-        let source = Source::from_rpc(
-            client,
-            SourceConfig {
-                scope: scope.clone(),
-                expected_chain_id: self.network.chain_id,
-                expected_genesis_hash: self.genesis()?,
-            },
-        )
-        .await?;
+        if source.config() != &self.source_config()? {
+            return Err(IndexError::new(
+                IndexErrorKind::InvalidRequest,
+                "Ethereum source belongs to different indexer settings",
+                false,
+            ));
+        }
         let mut indexer = Indexer::new(
             source,
             BlockInterpreter::new(scope.clone())?,
@@ -154,6 +157,14 @@ impl IndexerSettings {
             indexer.observe(observer);
         }
         Ok(indexer)
+    }
+
+    fn source_config(&self) -> Result<SourceConfig, IndexError> {
+        Ok(SourceConfig {
+            scope: self.scope(),
+            expected_chain_id: self.network.chain_id,
+            expected_genesis_hash: self.genesis()?,
+        })
     }
 
     fn genesis(&self) -> Result<BlockHash, IndexError> {
@@ -195,11 +206,47 @@ impl IndexerSettings {
             self.retry_initial_backoff,
             self.retry_max_backoff,
         )
-        .map_err(transport_error)?;
-        Http::new(config).map_err(transport_error)
+        .map_err(|error| IndexError::new(IndexErrorKind::Source, error.to_string(), false))?;
+        Http::new(config)
+            .map_err(|error| IndexError::new(IndexErrorKind::Source, error.to_string(), false))
     }
 }
 
-fn transport_error(error: json_rpc::Error) -> IndexError {
-    IndexError::new(IndexErrorKind::Source, error.to_string(), false)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_configuration_failures_preserve_classification_context_and_order() {
+        let mut settings = IndexerSettings::new(
+            "http://127.0.0.1:1",
+            Network::new(1, "mainnet"),
+            "00".repeat(32),
+        );
+        settings.retry_initial_backoff = Duration::from_secs(3);
+        settings.retry_max_backoff = Duration::from_secs(2);
+        settings.headers = vec![("invalid header".to_owned(), "hidden value".to_owned())];
+        let error = settings.client().err().expect("invalid settings must fail");
+        assert_eq!(error.kind, IndexErrorKind::Source);
+        assert_eq!(
+            error.message,
+            "initial retry backoff must not exceed its maximum"
+        );
+        assert!(!error.retryable);
+
+        settings.retry_initial_backoff = Duration::ZERO;
+        let error = settings.client().err().expect("invalid settings must fail");
+        assert_eq!(error.kind, IndexErrorKind::Source);
+        assert_eq!(error.message, "JSON-RPC header name is invalid");
+        assert!(!error.retryable);
+
+        settings.endpoints.clear();
+        let error = settings.client().err().expect("invalid settings must fail");
+        assert_eq!(error.kind, IndexErrorKind::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "at least one Ethereum RPC endpoint is required"
+        );
+        assert!(!error.retryable);
+    }
 }

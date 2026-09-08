@@ -3,10 +3,11 @@ use std::path::Path;
 use base::Decimal;
 use futures_executor::block_on;
 use indexing::{
-    AssetId, BlockAddition, BlockHash, BlockHeight, BlockOutcome, BlockRef, BlockSelector, Blocks,
-    CanonicalAddress, ChainId, HistoryQuery, IndexErrorKind, IndexScope, IndexedOutput,
-    InterpretedBlock, MovementId, ObservationDraft, ObservationDraftStatus, OutputChanges,
-    OutputId, OutputKey, OutputRequest, Outputs, TransactionRef, Transactions, ValueMovement,
+    AssetId, BlockAddition, BlockHash, BlockHeight, BlockOutcome, BlockParent, BlockPosition,
+    BlockRef, BlockSelector, Blocks, CanonicalAddress, ChainId, HistoryQuery, IndexErrorKind,
+    IndexScope, IndexedOutput, InterpretedBlock, MovementId, ObservationDraft,
+    ObservationDraftStatus, OutputChanges, OutputId, OutputKey, OutputRequest, Outputs,
+    TransactionRef, Transactions, ValueMovement,
 };
 use indexing_redb::Repository;
 use tempfile::TempDir;
@@ -25,10 +26,33 @@ fn open(path: &Path) -> Repository {
 
 fn block(height: u64, hash: u8, parent: u8) -> BlockRef {
     BlockRef {
+        position: BlockPosition(height),
         height: BlockHeight(height),
         hash: BlockHash(vec![hash]),
-        parent_hash: Some(BlockHash(vec![parent])),
+        parent: Some(BlockParent {
+            position: BlockPosition(height - 1),
+            hash: BlockHash(vec![parent]),
+        }),
         timestamp: Some(1_000 + height),
+    }
+}
+
+fn sparse_block(
+    position: u64,
+    height: u64,
+    hash: u8,
+    parent_position: u64,
+    parent_hash: u8,
+) -> BlockRef {
+    BlockRef {
+        position: BlockPosition(position),
+        height: BlockHeight(height),
+        hash: BlockHash(vec![hash]),
+        parent: Some(BlockParent {
+            position: BlockPosition(parent_position),
+            hash: BlockHash(vec![parent_hash]),
+        }),
+        timestamp: Some(1_000 + position),
     }
 }
 
@@ -138,6 +162,118 @@ fn outputs(repository: &Repository) -> Vec<IndexedOutput> {
 }
 
 #[test]
+fn duplicate_output_identity_is_rejected_before_repository_add() {
+    let directory = TempDir::new().expect("temporary directory");
+    let database = directory.path().join("index.redb");
+    let repository = open(&database);
+    let first = output("duplicate");
+    let mut second = first.clone();
+    second.address = address("another-receiver");
+
+    let error = BlockAddition::new(
+        scope(),
+        None,
+        4,
+        InterpretedBlock {
+            block: block(1, 1, 0),
+            transactions: vec![draft("duplicate")],
+            outputs: OutputChanges {
+                created: vec![first, second],
+                ..OutputChanges::default()
+            },
+        },
+    )
+    .expect_err("duplicate output identity");
+
+    assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+    assert_eq!(tip(&repository), None);
+}
+
+#[test]
+fn history_and_output_pages_preserve_order_and_reject_stale_cursors() {
+    let directory = TempDir::new().expect("temporary directory");
+    let repository = open(&directory.path().join("index.redb"));
+    let first = block(1, 1, 0);
+    let second = block(2, 2, 1);
+    let first_output = output("one");
+    let mut second_output = output("two");
+    second_output.created_at = second.height;
+    for (block, expected, id, output) in [
+        (first.clone(), None, "one", first_output.clone()),
+        (second.clone(), Some(first), "two", second_output.clone()),
+    ] {
+        block_on(repository.add(addition(
+            block,
+            expected,
+            id,
+            OutputChanges {
+                created: vec![output],
+                ..OutputChanges::default()
+            },
+        )))
+        .expect("seed block");
+    }
+    let history_page = |after| {
+        block_on(Transactions::list(
+            &repository,
+            HistoryQuery {
+                scope: scope(),
+                address: address("receiver"),
+                after,
+                limit: 1,
+            },
+        ))
+    };
+    let output_page = |after| {
+        block_on(Outputs::list(
+            &repository,
+            OutputRequest {
+                scope: scope(),
+                address: address("receiver"),
+                after,
+                limit: 1,
+            },
+        ))
+    };
+
+    let page = history_page(None).expect("first history page");
+    assert_eq!(page.checkpoint, Some(second.clone()));
+    assert_eq!(page.transactions.len(), 1);
+    assert_eq!(page.transactions[0].transaction_id, transaction("one"));
+    let history_cursor = page.next.expect("history continuation");
+    let page = history_page(Some(history_cursor.clone())).expect("final history page");
+    assert_eq!(page.checkpoint, Some(second.clone()));
+    assert_eq!(page.transactions.len(), 1);
+    assert_eq!(page.transactions[0].transaction_id, transaction("two"));
+    assert_eq!(page.next, None);
+
+    let page = output_page(None).expect("first output page");
+    assert_eq!(page.checkpoint, Some(second.clone()));
+    assert_eq!(page.outputs, vec![first_output]);
+    let output_cursor = page.next.expect("output continuation");
+    let page = output_page(Some(output_cursor.clone())).expect("final output page");
+    assert_eq!(page.checkpoint, Some(second.clone()));
+    assert_eq!(page.outputs, vec![second_output]);
+    assert_eq!(page.next, None);
+
+    block_on(repository.add(addition(
+        block(3, 3, 2),
+        Some(second),
+        "three",
+        OutputChanges::default(),
+    )))
+    .expect("advance checkpoint");
+    let error = history_page(Some(history_cursor)).expect_err("stale history cursor");
+    assert_eq!(error.kind, IndexErrorKind::Conflict);
+    assert!(error.retryable);
+    assert_eq!(error.message, "history changed during pagination");
+    let error = output_page(Some(output_cursor)).expect_err("stale output cursor");
+    assert_eq!(error.kind, IndexErrorKind::Conflict);
+    assert!(error.retryable);
+    assert_eq!(error.message, "outputs changed during pagination");
+}
+
+#[test]
 fn restart_and_reorg_preserve_atomic_canonical_state() {
     let directory = TempDir::new().expect("temporary directory");
     let database = directory.path().join("index.redb");
@@ -230,4 +366,72 @@ fn restart_and_reorg_preserve_atomic_canonical_state() {
     let repository = open(&database);
     assert_eq!(history(&repository), vec!["funding"]);
     assert_eq!(outputs(&repository), vec![funding]);
+}
+
+#[test]
+fn sparse_coordinates_round_trip_through_restart_and_rollback() {
+    let directory = TempDir::new().expect("temporary directory");
+    let database = directory.path().join("sparse-index.redb");
+    let repository = open(&database);
+    let first = sparse_block(100, 50, 1, 97, 0);
+    let second = sparse_block(103, 51, 2, 100, 1);
+
+    block_on(repository.add(addition(
+        first.clone(),
+        None,
+        "sparse-first",
+        OutputChanges::default(),
+    )))
+    .expect("first sparse block");
+    block_on(repository.add(addition(
+        second.clone(),
+        Some(first.clone()),
+        "sparse-second",
+        OutputChanges::default(),
+    )))
+    .expect("second sparse block");
+
+    drop(repository);
+    let repository = open(&database);
+    assert_eq!(tip(&repository), Some(second.clone()));
+    assert_eq!(
+        block_on(repository.get(BlockSelector::Height {
+            scope: scope(),
+            height: BlockHeight(50),
+        }))
+        .expect("first retained block"),
+        Some(first.clone())
+    );
+    assert_eq!(
+        block_on(repository.get(BlockSelector::Height {
+            scope: scope(),
+            height: BlockHeight(51),
+        }))
+        .expect("second retained block"),
+        Some(second.clone())
+    );
+
+    let page = block_on(Transactions::list(
+        &repository,
+        HistoryQuery {
+            scope: scope(),
+            address: address("receiver"),
+            after: None,
+            limit: 10,
+        },
+    ))
+    .expect("sparse history");
+    let blocks: Vec<BlockRef> = page
+        .transactions
+        .into_iter()
+        .map(|transaction| transaction.block().clone())
+        .collect();
+    assert_eq!(blocks, [first.clone(), second.clone()]);
+
+    assert_eq!(
+        block_on(repository.remove(scope(), second)).expect("sparse rollback"),
+        Some(first.clone())
+    );
+    drop(repository);
+    assert_eq!(tip(&open(&database)), Some(first));
 }

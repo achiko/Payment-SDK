@@ -39,6 +39,22 @@ impl SecretBytes {
             }
         }
     }
+
+    /// Generates a 32-byte Ed25519 seed from the operating system CSPRNG.
+    ///
+    /// The opaque result can be handed directly to an SDK wallet provider or
+    /// durable wallet registry without exposing it through formatting or
+    /// serialization traits.
+    pub fn generate_ed25519() -> Result<Self, crate::Error> {
+        let mut bytes = [0_u8; 32];
+        getrandom::fill(&mut bytes).map_err(|_| {
+            crate::Error::new(
+                crate::ErrorKind::KeyGeneration,
+                "operating system random source is unavailable",
+            )
+        })?;
+        Ok(Self::new(bytes))
+    }
 }
 
 impl Drop for SecretBytes {
@@ -65,6 +81,16 @@ mod tests {
         let second = SecretBytes::generate_secp256k1().expect("OS randomness must be available");
 
         assert!(k256::SecretKey::from_slice(first.as_bytes()).is_ok());
+        assert_ne!(first.as_bytes(), second.as_bytes());
+    }
+
+    #[test]
+    fn generates_distinct_ed25519_seeds() {
+        let first = SecretBytes::generate_ed25519().expect("OS randomness must be available");
+        let second = SecretBytes::generate_ed25519().expect("OS randomness must be available");
+
+        assert_eq!(first.as_bytes().len(), 32);
+        assert_eq!(second.as_bytes().len(), 32);
         assert_ne!(first.as_bytes(), second.as_bytes());
     }
 }

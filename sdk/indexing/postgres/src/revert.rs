@@ -2,14 +2,13 @@
 
 use indexing::{BlockRef, IndexError, IndexErrorKind, IndexScope};
 
-use crate::{
-    Repository, prepare_in, row,
-    write::{locked_checkpoint, move_checkpoint, optional_block},
-};
+use crate::{Repository, row, write::move_checkpoint};
 
 const JOURNAL_ENTRY: &str = "\
-SELECT block_hash, previous_checkpoint_height AS previous_height,
+SELECT block_hash, previous_checkpoint_position AS previous_position,
+       previous_checkpoint_height AS previous_height,
        previous_checkpoint_hash AS previous_hash,
+       previous_checkpoint_parent_position AS previous_parent_position,
        previous_checkpoint_parent AS previous_parent,
        previous_checkpoint_time AS previous_timestamp
 FROM payments_journal WHERE chain = $1 AND network = $2 AND height = $3";
@@ -48,7 +47,8 @@ impl Repository {
         let mut client = self.client().await?;
         let transaction = client.transaction().await.map_err(crate::store)?;
 
-        let current = locked_checkpoint(&transaction, scope).await?;
+        self.lock_scope(&transaction).await?;
+        let current = self.locked_checkpoint(&transaction).await?;
         if current.as_ref() != Some(expected_tip) {
             return Err(IndexError::new(
                 IndexErrorKind::Conflict,
@@ -57,7 +57,10 @@ impl Repository {
             ));
         }
         let height = row::as_i64(expected_tip.height.0, "block height")?;
-        let statement = prepare_in(&transaction, JOURNAL_ENTRY).await?;
+        let statement = transaction
+            .prepare_cached(JOURNAL_ENTRY)
+            .await
+            .map_err(crate::store)?;
         let entry = transaction
             .query_opt(&statement, &[&scope.chain.0, &scope.network, &height])
             .await
@@ -80,24 +83,38 @@ impl Repository {
         // block's height, so it is deleted by predicate rather than recorded in
         // the journal. Movements go first: nothing cascades them any more.
         for sql in [DELETE_MOVEMENT, DELETE_HISTORY, DELETE_CREATED] {
-            let statement = prepare_in(&transaction, sql).await?;
+            let statement = transaction
+                .prepare_cached(sql)
+                .await
+                .map_err(crate::store)?;
             transaction
                 .execute(&statement, &[&scope.chain.0, &scope.network, &height])
                 .await
                 .map_err(crate::store)?;
         }
         // Spent outputs are not recoverable, so they come back from the journal.
-        let statement = prepare_in(&transaction, RESTORE_SPENT).await?;
+        let statement = transaction
+            .prepare_cached(RESTORE_SPENT)
+            .await
+            .map_err(crate::store)?;
         transaction
             .execute(&statement, &[&scope.chain.0, &scope.network, &height])
             .await
             .map_err(crate::store)?;
 
-        let previous = optional_block(&entry, "previous_")?;
+        let previous_height: Option<i64> =
+            entry.try_get("previous_height").map_err(crate::store)?;
+        let previous = match previous_height {
+            None => None,
+            Some(_) => Some(row::block(&entry, "previous_")?),
+        };
         match &previous {
             Some(block) => move_checkpoint(&transaction, scope, block).await?,
             None => {
-                let statement = prepare_in(&transaction, DROP_CHECKPOINT).await?;
+                let statement = transaction
+                    .prepare_cached(DROP_CHECKPOINT)
+                    .await
+                    .map_err(crate::store)?;
                 transaction
                     .execute(&statement, &[&scope.chain.0, &scope.network])
                     .await
@@ -105,7 +122,10 @@ impl Repository {
             }
         }
         // journal_output cascades with the journal row.
-        let statement = prepare_in(&transaction, DROP_JOURNAL).await?;
+        let statement = transaction
+            .prepare_cached(DROP_JOURNAL)
+            .await
+            .map_err(crate::store)?;
         transaction
             .execute(&statement, &[&scope.chain.0, &scope.network, &height])
             .await

@@ -14,7 +14,7 @@ pub mod transaction;
 
 pub use address::{Address, AddressError, AddressErrorKind, AddressValidator, Addresser};
 pub use asset::{Asset, Asseter};
-pub use block::{BlockHash, BlockHeight, BlockRef};
+pub use block::{BlockHash, BlockHeight, BlockParent, BlockPosition, BlockRef};
 pub use chain::{Chain, ChainCollection, TestnetMap};
 pub use crypto::{
     Curve, PublicKey, PublicKeyFormat, ScalarTweak as KeyTweak, Signature, SignatureEncoding,

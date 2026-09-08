@@ -70,7 +70,7 @@ impl Redb {
         command_queue_capacity: usize,
     ) -> Result<Self, Error> {
         if command_queue_capacity == 0 {
-            return Err(invalid_request(
+            return Err(Error::invalid_request(
                 "redb command queue capacity must be greater than zero",
             ));
         }
@@ -80,14 +80,16 @@ impl Redb {
         let (startup_tx, startup_rx) = std_mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("storage-redb-owner".to_owned())
-            .spawn(move || match Backend::open(&path) {
-                Ok(backend) => {
-                    if startup_tx.send(Ok(())).is_ok() {
-                        backend.run(command_rx);
+            .spawn(move || {
+                let backend = match Backend::open(&path) {
+                    Ok(backend) => backend,
+                    Err(error) => {
+                        drop(startup_tx.send(Err(error)));
+                        return;
                     }
-                }
-                Err(error) => {
-                    drop(startup_tx.send(Err(error)));
+                };
+                if startup_tx.send(Ok(())).is_ok() {
+                    backend.run(command_rx);
                 }
             })
             .map_err(|error| unavailable(format!("failed to spawn redb owner thread: {error}")))?;
@@ -299,7 +301,7 @@ struct Backend {
 
 impl Backend {
     fn open(path: &Path) -> Result<Self, Error> {
-        let database_path = validated_database_path(path)?;
+        let database_path = DatabasePath::validate(path)?;
         let db = open_database(&database_path.path, database_path.initialize)?;
         let mut backend = Self {
             db: Some(db),
@@ -398,6 +400,7 @@ impl Backend {
     }
 }
 
+// design-lint: allow unclassified-free-function -- shared native redb factory preserves cache and error policy for initial create-or-open and recovery open-only without constructing a backend state wrapper
 fn open_database(path: &Path, initialize: bool) -> Result<Database, Error> {
     let mut builder = Database::builder();
     builder.set_cache_size(DATABASE_CACHE_BYTES);

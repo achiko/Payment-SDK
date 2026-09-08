@@ -1,5 +1,5 @@
+use super::transport::Client as Transport;
 use super::*;
-use super::{transport::Client as Transport, wire::fee_rate_json};
 use crate::{FeeRate, Network, Satoshi, SignedTransaction, TransactionId};
 use bitcoin::{
     Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, absolute,
@@ -24,13 +24,38 @@ struct ScriptedClient {
 
 struct ExpectedReply {
     method: &'static str,
-    result: Result<Value, i64>,
+    result: ExpectedResult,
+}
+
+enum ExpectedResult {
+    Response(Result<Value, i64>),
+    Transport(Error),
 }
 
 impl ScriptedClient {
     fn new(replies: Vec<ExpectedReply>) -> Self {
         Self {
             replies: Arc::new(Mutex::new(replies.into())),
+        }
+    }
+
+    fn respond(&self, method: &str) -> Result<Result<RawJson, Failure>, Error> {
+        let expected = self
+            .replies
+            .lock()
+            .expect("script lock must be healthy")
+            .pop_front()
+            .expect("Core client made more calls than scripted");
+        assert_eq!(method, expected.method);
+        match expected.result {
+            ExpectedResult::Response(result) => Ok(result
+                .map(|value| RawJson::from_serializable(&value).expect("reply JSON must encode"))
+                .map_err(|code| Failure {
+                    code,
+                    message: "scripted failure".to_owned(),
+                    data: None,
+                })),
+            ExpectedResult::Transport(error) => Err(error),
         }
     }
 }
@@ -41,30 +66,21 @@ impl Transport for ScriptedClient {
         method: &'a str,
         _params: Value,
     ) -> BoxFuture<'a, Result<Result<RawJson, Failure>, Error>> {
-        let expected = self
-            .replies
-            .lock()
-            .expect("script lock must be healthy")
-            .pop_front()
-            .expect("Core client made more calls than scripted");
-        assert_eq!(method, expected.method);
-        let result = expected
-            .result
-            .map(|value| RawJson::from_serializable(&value).expect("reply JSON must encode"))
-            .map_err(|code| Failure {
-                code,
-                message: "scripted failure".to_owned(),
-                data: None,
-            });
-        Box::pin(async move { Ok(result) })
+        assert_ne!(
+            method, "sendrawtransaction",
+            "Bitcoin submission must use one transport execution"
+        );
+        let result = self.respond(method);
+        Box::pin(async move { result })
     }
 
     fn request_once<'a>(
         &'a self,
         method: &'a str,
-        params: Value,
+        _params: Value,
     ) -> BoxFuture<'a, Result<Result<RawJson, Failure>, Error>> {
-        self.request(method, params)
+        let result = self.respond(method);
+        Box::pin(async move { result })
     }
 
     fn batch<'a>(
@@ -78,7 +94,24 @@ impl Transport for ScriptedClient {
 fn success(method: &'static str, result: Value) -> ExpectedReply {
     ExpectedReply {
         method,
-        result: Ok(result),
+        result: ExpectedResult::Response(Ok(result)),
+    }
+}
+
+fn remote_failure(method: &'static str, code: i64) -> ExpectedReply {
+    ExpectedReply {
+        method,
+        result: ExpectedResult::Response(Err(code)),
+    }
+}
+
+fn transport_failure(method: &'static str, kind: json_rpc::ErrorKind) -> ExpectedReply {
+    ExpectedReply {
+        method,
+        result: ExpectedResult::Transport(Error {
+            kind,
+            message: "scripted transport failure".to_owned(),
+        }),
     }
 }
 
@@ -170,10 +203,7 @@ fn connect_rejects_pruned_node() {
 #[test]
 fn core_warmup_failure_is_retryable() {
     let error = block_on(Client::connect(
-        ScriptedClient::new(vec![ExpectedReply {
-            method: "getnetworkinfo",
-            result: Err(-28),
-        }]),
+        ScriptedClient::new(vec![remote_failure("getnetworkinfo", -28)]),
         config(),
     ))
     .err()
@@ -225,8 +255,13 @@ fn preflight_preserves_rejection_reason_and_exact_fee() {
 
 #[test]
 fn core_max_fee_rate_boundary_is_enforced_before_rpc() {
-    assert!(fee_rate_json(FeeRate::new(BITCOIN_CORE_MAX_FEE_RATE_SATOSHIS_PER_KVB,)).is_ok());
-    let error = fee_rate_json(FeeRate::new(BITCOIN_CORE_MAX_FEE_RATE_SATOSHIS_PER_KVB + 1))
+    assert!(
+        FeeRate::new(BITCOIN_CORE_MAX_FEE_RATE_SATOSHIS_PER_KVB)
+            .core_maximum_json()
+            .is_ok()
+    );
+    let error = FeeRate::new(BITCOIN_CORE_MAX_FEE_RATE_SATOSHIS_PER_KVB + 1)
+        .core_maximum_json()
         .expect_err("fee rates above Core's limit must fail locally");
     assert!(!error.retryable);
 }
@@ -234,6 +269,7 @@ fn core_max_fee_rate_boundary_is_enforced_before_rpc() {
 #[test]
 fn broadcast_rejects_a_mismatched_returned_txid() {
     let signed = signed_transaction();
+    let local_id = signed.id();
     let mut replies = readiness_replies();
     replies.push(success(
         "sendrawtransaction",
@@ -245,5 +281,226 @@ fn broadcast_rejects_a_mismatched_returned_txid() {
     let error = block_on(core.transactions().broadcast(signed, FeeRate::new(10_000)))
         .expect_err("mismatched broadcast ID must fail");
 
+    assert_eq!(error.kind, base::TransactionErrorKind::Unavailable);
     assert!(error.message.contains("different transaction ID"));
+    assert_eq!(
+        error.ambiguous_transaction_id,
+        Some(base::TransactionId::new(local_id.to_string()))
+    );
+}
+
+#[test]
+fn broadcast_remote_rejection_is_definite_and_has_no_ambiguity() {
+    let signed = signed_transaction();
+    let mut replies = readiness_replies();
+    replies.push(remote_failure("sendrawtransaction", -26));
+    let core = block_on(Client::connect(ScriptedClient::new(replies), config()))
+        .expect("valid scripted Core node must connect");
+
+    let error = block_on(core.transactions().broadcast(signed, FeeRate::new(10_000)))
+        .expect_err("a remote Bitcoin rejection must fail definitively");
+
+    assert_eq!(error.kind, base::TransactionErrorKind::Rejected);
+    assert_eq!(
+        error.message,
+        "Bitcoin JSON-RPC request failed with code -26"
+    );
+    assert_eq!(error.ambiguous_transaction_id, None);
+}
+
+#[test]
+fn malformed_broadcast_response_keeps_the_exact_local_id_as_ambiguous() {
+    let signed = signed_transaction();
+    let local_id = signed.id();
+    let mut replies = readiness_replies();
+    replies.push(success("sendrawtransaction", Value::Bool(true)));
+    let core = block_on(Client::connect(ScriptedClient::new(replies), config()))
+        .expect("valid scripted Core node must connect");
+
+    let error = block_on(core.transactions().broadcast(signed, FeeRate::new(10_000)))
+        .expect_err("a malformed Bitcoin acknowledgement must remain ambiguous");
+
+    assert_eq!(error.kind, base::TransactionErrorKind::Unavailable);
+    assert_eq!(
+        error.ambiguous_transaction_id,
+        Some(base::TransactionId::new(local_id.to_string()))
+    );
+}
+
+#[test]
+fn broadcast_transport_failure_keeps_the_exact_local_id_as_ambiguous() {
+    let signed = signed_transaction();
+    let local_id = signed.id();
+    let mut replies = readiness_replies();
+    replies.push(transport_failure(
+        "sendrawtransaction",
+        json_rpc::ErrorKind::Timeout,
+    ));
+    let core = block_on(Client::connect(ScriptedClient::new(replies), config()))
+        .expect("valid scripted Core node must connect");
+
+    let error = block_on(core.transactions().broadcast(signed, FeeRate::new(10_000)))
+        .expect_err("a Bitcoin transport failure may follow submission");
+
+    assert_eq!(error.kind, base::TransactionErrorKind::Unavailable);
+    assert_eq!(
+        error.ambiguous_transaction_id,
+        Some(base::TransactionId::new(local_id.to_string()))
+    );
+}
+
+#[test]
+fn broadcast_fee_rejection_happens_before_wire_and_has_no_ambiguity() {
+    let signed = signed_transaction();
+    let core = block_on(Client::connect(
+        ScriptedClient::new(readiness_replies()),
+        config(),
+    ))
+    .expect("valid scripted Core node must connect");
+
+    let error = block_on(core.transactions().broadcast(
+        signed,
+        FeeRate::new(BITCOIN_CORE_MAX_FEE_RATE_SATOSHIS_PER_KVB + 1),
+    ))
+    .expect_err("an invalid Bitcoin fee ceiling must fail before submission");
+
+    assert_eq!(error.kind, base::TransactionErrorKind::Fee);
+    assert_eq!(error.ambiguous_transaction_id, None);
+}
+
+#[test]
+fn core_maximum_fee_json_preserves_exact_satoshis_and_validation() {
+    for (satoshis, expected) in [
+        (1, "0.00000001"),
+        (1_000, "0.00001"),
+        (1_001, "0.00001001"),
+        (99_999_999, "0.99999999"),
+        (100_000_000, "1"),
+    ] {
+        let encoded = FeeRate::new(satoshis).core_maximum_json().unwrap();
+        assert_eq!(encoded.to_string(), expected);
+        assert_eq!(
+            Satoshi::from_rpc_json(&Value::Number(encoded), "maximum fee")
+                .unwrap()
+                .0,
+            satoshis
+        );
+    }
+    for (satoshis, message) in [
+        (0, "Bitcoin maximum fee rate must be greater than zero"),
+        (
+            100_000_001,
+            "Bitcoin maximum fee rate exceeds Bitcoin Core's 1 BTC/kvB limit",
+        ),
+        (
+            u64::MAX,
+            "Bitcoin maximum fee rate exceeds Bitcoin Core's 1 BTC/kvB limit",
+        ),
+    ] {
+        let error = FeeRate::new(satoshis).core_maximum_json().unwrap_err();
+        assert_eq!(error.message, message);
+        assert!(!error.retryable);
+    }
+}
+
+#[test]
+fn block_hash_format_uses_bitcoin_display_byte_order() {
+    let internal = indexing::BlockHash((0_u8..32).collect());
+    let displayed = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100";
+    assert_eq!(format_bitcoin_block_hash(&internal).unwrap(), displayed);
+    assert_eq!(parse_bitcoin_block_hash(displayed).unwrap(), internal);
+    assert_eq!(
+        parse_bitcoin_block_hash(&displayed.to_uppercase()).unwrap(),
+        internal
+    );
+}
+
+#[test]
+fn block_hash_format_rejects_non_native_lengths() {
+    for length in [0, 1, 31, 33, 64] {
+        let error = format_bitcoin_block_hash(&indexing::BlockHash(vec![0; length])).unwrap_err();
+        assert_eq!(error.message, "Bitcoin block hash must be 32 bytes");
+        assert!(!error.retryable);
+    }
+}
+
+#[test]
+fn rpc_amount_json_keeps_exact_precision_and_range() {
+    for (json, expected) in [
+        ("0", 0),
+        ("0.00000001", 1),
+        ("1.23000000", 123_000_000),
+        ("184467440737.09551615", u64::MAX),
+    ] {
+        let value = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            Satoshi::from_rpc_json(&value, "amount").unwrap(),
+            Satoshi(expected)
+        );
+    }
+}
+
+#[test]
+fn rpc_amount_json_keeps_rejection_context_and_retryability() {
+    for (json, suffix) in [
+        ("null", "must be a JSON number"),
+        ("\"1\"", "must be a JSON number"),
+        ("true", "must be a JSON number"),
+        ("{}", "must be a JSON number"),
+        ("[]", "must be a JSON number"),
+        ("-1", "must be a non-negative fixed-point decimal"),
+        ("1e0", "must be a non-negative fixed-point decimal"),
+        ("1E2", "must be a non-negative fixed-point decimal"),
+        ("0.000000001", "is not an exact Bitcoin amount"),
+        ("1.000000000", "is not an exact Bitcoin amount"),
+        ("184467440737.09551616", "exceeds u64 satoshis"),
+        ("184467440738", "exceeds u64 satoshis"),
+        ("18446744073709551616", "exceeds u64 satoshis"),
+    ] {
+        let value = serde_json::from_str(json).unwrap();
+        let error = Satoshi::from_rpc_json(&value, "amount").unwrap_err();
+        assert_eq!(error.to_string(), format!("amount {suffix}"), "{json}");
+        assert!(error.retryable);
+    }
+}
+
+#[test]
+fn block_hash_parse_rejects_invalid_text_as_retryable_rpc_data() {
+    for value in [
+        String::new(),
+        "00".repeat(31),
+        "00".repeat(33),
+        "gg".repeat(32),
+        format!("0x{}", "00".repeat(32)),
+        format!(" {}", "00".repeat(32)),
+    ] {
+        let error = parse_bitcoin_block_hash(&value).unwrap_err();
+        assert_eq!(error.message, "Bitcoin RPC returned an invalid block hash");
+        assert!(error.retryable);
+    }
+}
+
+#[test]
+fn object_parser_keeps_json_values_and_contextual_shape_errors() {
+    let value: Value = serde_json::from_str(
+        r#"{"exact":18446744073709551616,"nested":{"values":[null,true,"text"]}}"#,
+    )
+    .unwrap();
+    let raw = RawJson::from_serializable(&value).unwrap();
+    assert_eq!(
+        wire::parse_object(&raw, "result").unwrap(),
+        *value.as_object().unwrap()
+    );
+    for value in [
+        Value::Null,
+        serde_json::json!(false),
+        serde_json::json!(1),
+        serde_json::json!("text"),
+        serde_json::json!([]),
+    ] {
+        let raw = RawJson::from_serializable(&value).unwrap();
+        let error = wire::parse_object(&raw, "Bitcoin boundary result").unwrap_err();
+        assert_eq!(error.message, "Bitcoin boundary result must be an object");
+        assert!(error.retryable);
+    }
 }

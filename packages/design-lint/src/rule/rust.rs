@@ -4,31 +4,33 @@ use syn::{
     TraitItem, Type, visit::Visit,
 };
 
-use super::{CheckFn, finding, production::test_only};
+use super::{finding, production::test_only};
 use crate::{
     Finding, Policy, Result,
     source::{SourceFile, Workspace},
 };
 
-pub(super) fn checks() -> [(&'static str, CheckFn); 4] {
-    [
-        ("trait-method-count", traits),
-        ("empty-struct", empty_structs),
-        ("struct-word-count", struct_names),
-        ("self-constructor-static", constructors),
-    ]
+pub(super) fn traits(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
+    let mut findings = check(workspace, policy, ApiRule::Traits)?;
+    for evidence in super::adopted::contract::check(workspace, policy)? {
+        if let Some(finding) = findings.iter_mut().find(|finding| {
+            finding.subject == evidence.subject
+                && finding.location.path == evidence.location.path
+                && finding.location.line == evidence.location.line
+        }) {
+            finding.related = evidence.related;
+            finding.review = evidence.review;
+        }
+    }
+    Ok(findings)
 }
-
-fn traits(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
-    check(workspace, policy, ApiRule::Traits)
-}
-fn empty_structs(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
+pub(super) fn empty_structs(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
     check(workspace, policy, ApiRule::EmptyStructs)
 }
-fn struct_names(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
+pub(super) fn struct_names(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
     check(workspace, policy, ApiRule::StructNames)
 }
-fn constructors(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
+pub(super) fn constructors(workspace: &Workspace, policy: &Policy) -> Result<Vec<Finding>> {
     check(workspace, policy, ApiRule::Constructors)
 }
 
@@ -42,7 +44,7 @@ enum ApiRule {
 
 fn check(workspace: &Workspace, _policy: &Policy, rule: ApiRule) -> Result<Vec<Finding>> {
     let mut output = Vec::new();
-    for source in &workspace.sources {
+    for source in workspace.production() {
         ApiVisitor {
             source,
             output: &mut output,
@@ -85,7 +87,7 @@ impl<'ast> Visit<'ast> for ApiVisitor<'_> {
         let count = item
             .items
             .iter()
-            .filter(|item| matches!(item, TraitItem::Fn(_)))
+            .filter(|item| matches!(item, TraitItem::Fn(method) if !test_only(&method.attrs)))
             .count();
         if self.rule == ApiRule::Traits && count > 3 {
             self.push(
@@ -139,6 +141,9 @@ impl<'ast> Visit<'ast> for ApiVisitor<'_> {
         self.inherent = previous;
     }
     fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        if test_only(&item.attrs) {
+            return;
+        }
         let constructor = ["new", "parse", "from", "try_from"].iter().any(|prefix| {
             item.sig.ident == *prefix
                 || item

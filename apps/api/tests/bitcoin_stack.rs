@@ -259,7 +259,7 @@ impl RpcFixture {
 
     fn header(&self, hash: &str) -> Value {
         let (height, parent) = block_identity(hash);
-        let mut header = json!({"hash": hash, "height": height, "time": 99 + height});
+        let mut header = json!({"hash": hash, "height": height, "time": 100});
         if let Some(parent) = parent {
             header["previousblockhash"] = json!(parent);
         }
@@ -312,15 +312,16 @@ impl RpcFixture {
             (&self.previous, self.fixture.genesis_hash.clone())
         } else if id == self.funding.compute_txid().to_string() {
             (&self.funding, self.fixture.block_hash.clone())
-        } else if let Some((position, transaction)) = self
-            .submitted
-            .iter()
-            .enumerate()
-            .find(|(_, transaction)| transaction.compute_txid().to_string() == id)
-        {
-            (transaction, format!("{:064x}", 5 + position * 2))
         } else {
-            panic!("unknown fixture transaction {id}");
+            let Some((position, transaction)) = self
+                .submitted
+                .iter()
+                .enumerate()
+                .find(|(_, transaction)| transaction.compute_txid().to_string() == id)
+            else {
+                panic!("unknown fixture transaction {id}");
+            };
+            (transaction, format!("{:064x}", 5 + position * 2))
         };
         json!({
             "txid": transaction.compute_txid().to_string(),

@@ -77,7 +77,12 @@ impl SecretKey {
     }
 
     pub fn sign_ecdsa(&self, digest: &[u8], encoding: SignatureEncoding) -> Result<Vec<u8>, Error> {
-        let digest = digest_array(digest)?;
+        let digest: [u8; 32] = digest.try_into().map_err(|_| {
+            Error::new(
+                ErrorKind::InvalidDigest,
+                "digest must contain exactly 32 bytes",
+            )
+        })?;
         let (signature, recovery_id) = self
             .ecdsa_key()?
             .sign_prehash_recoverable(&digest)
@@ -107,7 +112,12 @@ impl SecretKey {
                 "Schnorr signatures require raw encoding",
             ));
         }
-        let digest = digest_array(digest)?;
+        let digest: [u8; 32] = digest.try_into().map_err(|_| {
+            Error::new(
+                ErrorKind::InvalidDigest,
+                "digest must contain exactly 32 bytes",
+            )
+        })?;
         let mut key = SchnorrSigningKey::from_bytes(&self.bytes)
             .map_err(|_| Error::new(ErrorKind::InvalidKey, "invalid Schnorr key"))?;
         if let Some(tweak) = tweak {
@@ -161,18 +171,59 @@ impl ScalarTweak {
     }
 }
 
-fn digest_array(digest: &[u8]) -> Result<[u8; 32], Error> {
-    digest.try_into().map_err(|_| {
-        Error::new(
-            ErrorKind::InvalidDigest,
-            "digest must contain exactly 32 bytes",
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signing_rejects_every_non_32_byte_digest_at_the_boundary() {
+        let key = SecretKey::new([1_u8; 32]).expect("test key must be valid");
+        let expected = Error::new(
+            ErrorKind::InvalidDigest,
+            "digest must contain exactly 32 bytes",
+        );
+        for length in [0, 1, 31, 33, 64] {
+            let digest = vec![2; length];
+            assert_eq!(
+                key.sign_ecdsa(&digest, SignatureEncoding::Recoverable),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                key.sign_schnorr(&digest, SignatureEncoding::Raw, None),
+                Err(expected.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn schnorr_validates_encoding_then_digest_then_tweak() {
+        let key = SecretKey::new([1_u8; 32]).expect("test key must be valid");
+        let tweak = ScalarTweak::Add([255; 32]);
+        for encoding in [
+            SignatureEncoding::Der,
+            SignatureEncoding::Compact,
+            SignatureEncoding::Recoverable,
+        ] {
+            assert_eq!(
+                key.sign_schnorr(&[], encoding, Some(&tweak)),
+                Err(Error::new(
+                    ErrorKind::UnsupportedEncoding,
+                    "Schnorr signatures require raw encoding",
+                ))
+            );
+        }
+        assert_eq!(
+            key.sign_schnorr(&[], SignatureEncoding::Raw, Some(&tweak)),
+            Err(Error::new(
+                ErrorKind::InvalidDigest,
+                "digest must contain exactly 32 bytes",
+            ))
+        );
+        assert_eq!(
+            key.sign_schnorr(&[2; 32], SignatureEncoding::Raw, Some(&tweak)),
+            Err(Error::new(ErrorKind::InvalidTweak, "invalid scalar tweak"))
+        );
+    }
 
     #[test]
     fn signs_ecdsa_and_schnorr_digests() {

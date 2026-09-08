@@ -152,6 +152,62 @@ fn indexed_address(address: &Address) -> CanonicalAddress {
 }
 
 #[test]
+fn rejects_non_object_values_at_each_block_parsing_boundary() {
+    let transaction = coinbase(TxOut {
+        value: Amount::from_sat(10_000),
+        script_pubkey: p2wpkh_address(0x02).script_pubkey(),
+    });
+    let native_hash = bitcoin::BlockHash::from_byte_array([0xaa; 32]);
+    let expected_hash = BlockHash(native_hash.to_byte_array().to_vec());
+    let valid = json!({
+        "hash": native_hash.to_string(),
+        "height": 10,
+        "previousblockhash": bitcoin::BlockHash::from_byte_array([0xbb; 32]).to_string(),
+        "time": 100,
+        "nTx": 1,
+        "tx": [transaction_json(&transaction, &[None])]
+    });
+    Block::parse(
+        &serde_json::to_vec(&valid).expect("test block JSON must encode"),
+        Some(BlockHeight(10)),
+        Some(&expected_hash),
+        Network::Regtest,
+    )
+    .expect("unmodified block must parse");
+
+    for (path, message) in [
+        ("", "Bitcoin block result must be an object"),
+        ("/tx/0", "Bitcoin transaction must be an object"),
+        ("/tx/0/vin/0", "Bitcoin transaction input must be an object"),
+        (
+            "/tx/0/vout/0",
+            "Bitcoin transaction output must be an object",
+        ),
+    ] {
+        for invalid in [
+            Value::Null,
+            json!(false),
+            json!(1),
+            json!("invalid"),
+            json!([]),
+        ] {
+            let mut value = valid.clone();
+            *value.pointer_mut(path).expect("test path must exist") = invalid;
+            let error = Block::parse(
+                &serde_json::to_vec(&value).expect("test block JSON must encode"),
+                Some(BlockHeight(10)),
+                Some(&expected_hash),
+                Network::Regtest,
+            )
+            .expect_err("non-object value must fail while parsing the block");
+
+            assert_eq!(error.kind, crate::ChainErrorKind::InvalidTransaction);
+            assert_eq!(error.message, message, "object boundary {path}");
+        }
+    }
+}
+
+#[test]
 fn ignores_transactions_unrelated_to_the_address_filter() {
     let destination = p2wpkh_address(0x02);
     let unrelated = p2tr_address();
@@ -302,6 +358,53 @@ fn indexed_address_spend_is_recorded_directly() {
 }
 
 #[test]
+fn duplicate_spends_keep_the_global_error_even_for_unselected_addresses() {
+    let source = p2wpkh_address(0x02);
+    let transactions = [1_000, 900]
+        .into_iter()
+        .map(|value| {
+            let transaction = Transaction {
+                version: Version::TWO,
+                lock_time: absolute::LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::new(Txid::from_byte_array([9; 32]), 1),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(value),
+                    script_pubkey: source.script_pubkey(),
+                }],
+            };
+            transaction_json(
+                &transaction,
+                &[Some(PreviousEvidence {
+                    value: 2_000,
+                    script: source.script_pubkey(),
+                    height: 4,
+                    coinbase: false,
+                })],
+            )
+        })
+        .collect();
+    let block = block(transactions);
+    let interpreter = BlockInterpreter::new(scope(), Network::Regtest).unwrap();
+    for addresses in [Vec::new(), vec![indexed_address(&source)]] {
+        let error = interpreter
+            .inspect(&block, &addresses)
+            .expect_err("duplicate inputs must fail before output aggregation");
+
+        assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+        assert_eq!(
+            error.message,
+            "Bitcoin block spends the same outpoint more than once"
+        );
+        assert!(!error.retryable);
+    }
+}
+
+#[test]
 fn missing_resolved_prevout_fails_before_commit() {
     let destination = p2wpkh_address(0x02);
     let transaction = Transaction {
@@ -353,4 +456,183 @@ fn missing_resolved_prevout_fails_before_commit() {
 
     assert_eq!(error.kind, crate::ChainErrorKind::InvalidTransaction);
     assert!(error.message.contains("resolved previous output"));
+}
+
+#[test]
+fn invalid_address_filters_keep_nonretryable_request_errors() {
+    let canonical = p2wpkh_address(0x02).to_string();
+    for (value, message) in [
+        (
+            "not-an-address".to_owned(),
+            "Bitcoin indexed address is invalid or wrong-network",
+        ),
+        (
+            "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn".to_owned(),
+            "Bitcoin indexing supports P2WPKH and P2TR addresses only",
+        ),
+        (
+            canonical.to_uppercase(),
+            "Bitcoin indexed address is not canonical",
+        ),
+    ] {
+        let error = BlockInterpreter::new(scope(), Network::Regtest)
+            .unwrap()
+            .inspect(
+                &block(Vec::new()),
+                &[CanonicalAddress {
+                    scope: scope(),
+                    value,
+                }],
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, IndexErrorKind::InvalidRequest);
+        assert_eq!(error.message, message);
+        assert!(!error.retryable);
+    }
+}
+
+#[test]
+fn outputs_exceeding_resolved_inputs_remain_nonretryable_invalid_blocks() {
+    let address = p2wpkh_address(0x02);
+    let transaction = Transaction {
+        version: Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(Txid::from_byte_array([3; 32]), 0),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(2_000),
+            script_pubkey: address.script_pubkey(),
+        }],
+    };
+    let block = block(vec![transaction_json(
+        &transaction,
+        &[Some(PreviousEvidence {
+            value: 1_000,
+            script: address.script_pubkey(),
+            height: 9,
+            coinbase: false,
+        })],
+    )]);
+    let error = BlockInterpreter::new(scope(), Network::Regtest)
+        .unwrap()
+        .inspect(&block, &[indexed_address(&address)])
+        .unwrap_err();
+    assert_eq!(error.kind, IndexErrorKind::InvalidBlock);
+    assert_eq!(
+        error.message,
+        "Bitcoin transaction outputs exceed its resolved inputs"
+    );
+    assert!(!error.retryable);
+}
+
+#[test]
+fn transaction_ids_and_scripts_keep_native_parsing_and_boundary_errors() {
+    let transaction = Transaction {
+        version: Version::ONE,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(
+                Txid::from_byte_array(std::array::from_fn(|i| i as u8)),
+                0,
+            ),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x6a]),
+        }],
+    };
+    let mut tx = transaction_json(
+        &transaction,
+        &[Some(PreviousEvidence {
+            value: 1_000,
+            script: ScriptBuf::from_bytes(vec![0x6a]),
+            height: 1,
+            coinbase: false,
+        })],
+    );
+    for path in [
+        "/txid",
+        "/vin/0/txid",
+        "/vout/0/scriptPubKey/hex",
+        "/vin/0/prevout/scriptPubKey/hex",
+    ] {
+        let text = tx.pointer(path).unwrap().as_str().unwrap().to_uppercase();
+        *tx.pointer_mut(path).unwrap() = json!(text);
+    }
+    let _parsed = block(vec![tx.clone()]);
+    let valid = json!({
+        "hash": "aa".repeat(32), "height": 10, "previousblockhash": "bb".repeat(32),
+        "time": 100, "nTx": 1, "tx": [tx],
+    });
+    for (path, invalid, message) in [
+        (
+            "/tx/0/txid",
+            json!("ff"),
+            "Bitcoin transaction ID is invalid",
+        ),
+        (
+            "/tx/0/vin/0/txid",
+            json!("ff"),
+            "Bitcoin transaction ID is invalid",
+        ),
+        (
+            "/tx/0/txid",
+            Value::Null,
+            "Bitcoin transaction ID is missing or invalid",
+        ),
+        (
+            "/tx/0/vin/0/txid",
+            Value::Null,
+            "Bitcoin input previous transaction ID is missing or invalid",
+        ),
+        (
+            "/tx/0/vout/0/scriptPubKey/hex",
+            Value::Null,
+            "Bitcoin scriptPubKey hex is missing or invalid",
+        ),
+        (
+            "/tx/0/vin/0/prevout/scriptPubKey/hex",
+            Value::Null,
+            "Bitcoin scriptPubKey hex is missing or invalid",
+        ),
+        (
+            "/tx/0/vout/0/scriptPubKey/hex",
+            json!("6"),
+            "Bitcoin scriptPubKey hex is invalid",
+        ),
+        (
+            "/tx/0/vin/0/prevout/scriptPubKey/hex",
+            json!("zz"),
+            "Bitcoin scriptPubKey hex is invalid",
+        ),
+        (
+            "/tx/0/vout/0/scriptPubKey",
+            Value::Null,
+            "Bitcoin output scriptPubKey is missing",
+        ),
+        (
+            "/tx/0/vin/0/prevout/scriptPubKey",
+            Value::Null,
+            "Bitcoin prevout scriptPubKey is missing",
+        ),
+    ] {
+        let mut value = valid.clone();
+        *value.pointer_mut(path).unwrap() = invalid;
+        let error = Block::parse(
+            &serde_json::to_vec(&value).unwrap(),
+            None,
+            None,
+            Network::Regtest,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, crate::ChainErrorKind::InvalidTransaction);
+        assert_eq!(error.message, message, "{path}");
+    }
 }

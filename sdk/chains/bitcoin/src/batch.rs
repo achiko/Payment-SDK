@@ -3,7 +3,7 @@ use std::sync::Arc;
 use base::{
     SignedTransaction as Prepared, TransactionEnvelope as Envelope, TransactionId as BaseId,
 };
-use wallets::{Error, ErrorKind, SendError, SendFuture, Sender, Transfer, Wallet};
+use wallets::{Error, ErrorKind, MAX_TRANSFERS, SendError, SendFuture, Sender, Transfer, Wallet};
 
 use crate::transaction::{BatchBuilder, Funding};
 use crate::wallet::PREPARED_KIND;
@@ -19,6 +19,7 @@ pub(crate) struct Batch {
     network: Network,
     utxos: Arc<IndexUtxos>,
     fees: Arc<dyn Fees>,
+    transactions: Arc<dyn crate::Transactions>,
     fee_target_blocks: u16,
     max_fee_rate: FeeRate,
 }
@@ -28,6 +29,7 @@ impl Batch {
         network: Network,
         utxos: Arc<IndexUtxos>,
         fees: Arc<dyn Fees>,
+        transactions: Arc<dyn crate::Transactions>,
         fee_target_blocks: u16,
         max_fee_rate: FeeRate,
     ) -> Self {
@@ -35,16 +37,18 @@ impl Batch {
             network,
             utxos,
             fees,
+            transactions,
             fee_target_blocks,
             max_fee_rate,
         }
     }
 
     fn parse(&self, transfer: Transfer) -> Result<(Arc<dyn Wallet>, Address, Output), Error> {
-        let source = native_address(&transfer.wallet.address(), self.network)?;
+        let source = Address::from_wallet_address(&transfer.wallet.address(), self.network)?;
         let destination = transfer.wallet.parse_address(&transfer.to)?;
-        let destination = native_address(&destination, self.network)?;
-        let output = Output::new(destination, transfer.amount).map_err(transaction_error)?;
+        let destination = Address::from_wallet_address(&destination, self.network)?;
+        let output = Output::new(destination, transfer.amount)
+            .map_err(|error| Error::new(ErrorKind::Transaction, error.to_string()))?;
         Ok((transfer.wallet, source, output))
     }
 
@@ -53,8 +57,9 @@ impl Batch {
         for (index, transfer) in transfers.into_iter().enumerate() {
             let (wallet, address, output) = self
                 .parse(transfer)
-                .map_err(|error| SendError::at(index, Vec::new(), error))?;
-            if let Some(source) = sources.iter_mut().find(|source| source.address == address) {
+                .map_err(|error| SendError::item(index, Vec::new(), error))?;
+            let existing = sources.iter_mut().find(|source| source.address == address);
+            if let Some(source) = existing {
                 source.recipients.push(output);
             } else {
                 sources.push(Source {
@@ -66,99 +71,475 @@ impl Batch {
         }
         Ok(sources)
     }
+
+    async fn execute(&self, transfers: Vec<Transfer>) -> Result<Vec<BaseId>, SendError> {
+        if transfers.is_empty() {
+            return Err(SendError::collection(
+                ErrorKind::InvalidBatch,
+                "at least one transfer is required",
+            ));
+        }
+        if transfers.len() > MAX_TRANSFERS {
+            return Err(SendError::collection(
+                ErrorKind::InvalidBatch,
+                "at most 50 transfers are allowed",
+            ));
+        }
+        let sources = self.sources(transfers)?;
+        let fee_rate = self
+            .fees
+            .estimate(self.fee_target_blocks)
+            .await
+            .map_err(|error| SendError::operation(ErrorKind::Transaction, error.to_string()))?;
+        if fee_rate > self.max_fee_rate {
+            return Err(SendError::operation(
+                ErrorKind::Transaction,
+                "estimated fee rate exceeds the configured maximum",
+            ));
+        }
+
+        let mut funding = Vec::with_capacity(sources.len());
+        let mut owners = Vec::new();
+        let mut checkpoint = None;
+        for source in &sources {
+            let set = self
+                .utxos
+                .utxos(vec![source.address.clone()])
+                .await
+                .map_err(|error| SendError::operation(ErrorKind::Transaction, error.to_string()))?;
+            let checkpoint_changed = checkpoint
+                .as_ref()
+                .is_some_and(|expected| expected != &set.checkpoint);
+            if checkpoint_changed {
+                return Err(SendError::operation(
+                    ErrorKind::Transaction,
+                    "indexed output snapshot changed while building the transaction",
+                ));
+            }
+            checkpoint.get_or_insert(set.checkpoint);
+            let available = set
+                .outputs
+                .into_iter()
+                .map(|output| {
+                    SpendSource::from_exact_selection(
+                        self.network,
+                        &source.address,
+                        TransactionId(output.transaction_id),
+                        output.output_index,
+                        output.value,
+                        output.script_pubkey,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| SendError::operation(ErrorKind::Transaction, error.to_string()))?;
+            owners.extend(std::iter::repeat_n(source.wallet.as_ref(), available.len()));
+            funding.push(Funding {
+                available,
+                recipients: source.recipients.clone(),
+                change_address: source.address.clone(),
+            });
+        }
+
+        let signed = BatchBuilder::new(self.network, funding, fee_rate)
+            .sign_each(&owners)
+            .await
+            .map_err(|error| SendError::operation(ErrorKind::Transaction, error.to_string()))?;
+        let prepared = Prepared::new(
+            PREPARED_KIND,
+            BaseId::new(signed.id().to_string()),
+            Envelope::new(signed.consensus_bytes().to_vec()),
+        );
+        let submitted = crate::wallet::broadcast_prepared(
+            self.transactions.as_ref(),
+            self.max_fee_rate,
+            &prepared,
+        )
+        .await
+        .map_err(|error| SendError::grouped(Vec::new(), error.into()))?;
+        Ok(vec![submitted.id])
+    }
 }
 
 impl Sender for Batch {
     fn send<'a>(&'a self, transfers: Vec<Transfer>) -> SendFuture<'a> {
-        Box::pin(async move {
-            if transfers.is_empty() {
-                return Err(failure("transaction batch is empty"));
-            }
-            let sources = self.sources(transfers)?;
-            let fee_rate = self
-                .fees
-                .estimate(self.fee_target_blocks)
-                .await
-                .map_err(failure_with)?;
-            if fee_rate > self.max_fee_rate {
-                return Err(failure("estimated fee rate exceeds the configured maximum"));
-            }
-
-            let mut funding = Vec::with_capacity(sources.len());
-            let mut owners = Vec::new();
-            let mut checkpoint = None;
-            for source in &sources {
-                let set = self
-                    .utxos
-                    .utxos(vec![source.address.clone()])
-                    .await
-                    .map_err(failure_with)?;
-                if checkpoint
-                    .as_ref()
-                    .is_some_and(|expected| expected != &set.checkpoint)
-                {
-                    return Err(failure(
-                        "indexed output snapshot changed while building the transaction",
-                    ));
-                }
-                checkpoint.get_or_insert(set.checkpoint);
-                let available = set
-                    .outputs
-                    .into_iter()
-                    .map(|output| {
-                        SpendSource::from_exact_selection(
-                            self.network,
-                            &source.address,
-                            TransactionId(output.transaction_id),
-                            output.output_index,
-                            output.value,
-                            output.script_pubkey,
-                        )
-                        .map_err(failure_with)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                owners.extend(std::iter::repeat_n(source.wallet.as_ref(), available.len()));
-                funding.push(Funding {
-                    available,
-                    recipients: source.recipients.clone(),
-                    change_address: source.address.clone(),
-                });
-            }
-
-            let signed = BatchBuilder::new(self.network, funding, fee_rate)
-                .sign_each(&owners)
-                .await
-                .map_err(failure_with)?;
-            let prepared = Prepared::new(
-                PREPARED_KIND,
-                BaseId::new(signed.id().to_string()),
-                Envelope::new(signed.consensus_bytes().to_vec()),
-            );
-            let submitted = sources[0]
-                .wallet
-                .broadcaster()
-                .broadcast(&prepared)
-                .await
-                .map_err(failure_with)?;
-            Ok(vec![submitted.id])
-        })
+        Box::pin(self.execute(transfers))
     }
 }
 
-fn native_address(address: &base::Address, network: Network) -> Result<Address, Error> {
-    let value = std::str::from_utf8(address.as_bytes())
-        .map_err(|_| transaction_error("Bitcoin address is not UTF-8"))?;
-    Address::parse_for_network(value, network).map_err(transaction_error)
+impl Address {
+    fn from_wallet_address(address: &base::Address, network: Network) -> Result<Self, Error> {
+        let value = std::str::from_utf8(address.as_bytes())
+            .map_err(|_| Error::new(ErrorKind::Transaction, "Bitcoin address is not UTF-8"))?;
+        Self::parse_for_network(value, network)
+            .map_err(|error| Error::new(ErrorKind::Transaction, error.to_string()))
+    }
 }
 
-fn failure(message: &'static str) -> SendError {
-    SendError::at(0, Vec::new(), Error::new(ErrorKind::Transaction, message))
-}
+#[cfg(test)]
+mod tests {
+    use bitcoin::{
+        Amount, OutPoint, ScriptBuf, Sequence, Transaction as NativeTransaction, TxIn, TxOut, Txid,
+        Witness, absolute, consensus, hashes::Hash, transaction::Version,
+    };
+    use futures_executor::block_on;
+    use indexing::{
+        BoxFuture, ChainId, History, HistoryQuery, IndexError, IndexScope, OutputPage,
+        OutputRequest, Outputs, SourceError, TransactionPage,
+    };
+    use wallets::{AddressText, Provider, SecretBytes};
 
-fn failure_with(error: impl std::fmt::Display) -> SendError {
-    SendError::at(0, Vec::new(), transaction_error(error))
-}
+    use super::*;
+    use crate::{AddressType, Transactions, WalletConfig, WalletProvider};
 
-fn transaction_error(error: impl std::fmt::Display) -> Error {
-    Error::new(ErrorKind::Transaction, error.to_string())
+    struct InactiveDependencies;
+
+    impl Outputs for InactiveDependencies {
+        fn list<'a>(
+            &'a self,
+            _request: OutputRequest,
+        ) -> BoxFuture<'a, Result<OutputPage, IndexError>> {
+            Box::pin(async { unreachable!("invalid batch must not read indexed outputs") })
+        }
+    }
+
+    impl Fees for InactiveDependencies {
+        fn estimate<'a>(
+            &'a self,
+            _target_blocks: u16,
+        ) -> BoxFuture<'a, Result<FeeRate, SourceError>> {
+            Box::pin(async { unreachable!("invalid batch must not estimate fees") })
+        }
+    }
+
+    impl Transactions for InactiveDependencies {
+        fn preflight<'a>(
+            &'a self,
+            _transaction: &'a crate::SignedTransaction,
+            _max_fee_rate: FeeRate,
+        ) -> BoxFuture<'a, Result<crate::Preflight, SourceError>> {
+            Box::pin(async { unreachable!("invalid batch must not preflight a transaction") })
+        }
+
+        fn broadcast<'a>(
+            &'a self,
+            _transaction: crate::SignedTransaction,
+            _max_fee_rate: FeeRate,
+        ) -> BoxFuture<'a, Result<TransactionId, base::TransactionError>> {
+            Box::pin(async { unreachable!("invalid batch must not broadcast a transaction") })
+        }
+    }
+
+    impl History for InactiveDependencies {
+        fn history<'a>(
+            &'a self,
+            _request: HistoryQuery,
+        ) -> BoxFuture<'a, Result<TransactionPage, IndexError>> {
+            Box::pin(async { unreachable!("invalid batch must not read indexed history") })
+        }
+    }
+
+    fn direct_sender() -> (Arc<dyn Sender>, Arc<dyn Wallet>) {
+        direct_sender_with_fees(Arc::new(InactiveDependencies))
+    }
+
+    fn direct_sender_with_fees(fees: Arc<dyn Fees>) -> (Arc<dyn Sender>, Arc<dyn Wallet>) {
+        let provider = provider(fees, Arc::new(InactiveDependencies));
+        let wallet = block_on(provider.create(SecretBytes::new([1_u8; 32])))
+            .expect("fixed valid secret must create a Bitcoin wallet");
+        (provider.transactions(), wallet)
+    }
+
+    fn provider(fees: Arc<dyn Fees>, outputs: Arc<dyn Outputs>) -> WalletProvider {
+        let network = Network::Regtest;
+        let scope = IndexScope {
+            chain: ChainId(crate::CHAIN.to_owned()),
+            network: network.canonical_name().to_owned(),
+        };
+        let dependencies = Arc::new(InactiveDependencies);
+        let transactions: Arc<dyn Transactions> = dependencies.clone();
+        let history: Arc<dyn History> = dependencies;
+        let utxos = Arc::new(
+            IndexUtxos::new(scope.clone(), network, outputs)
+                .expect("fixture scope must match the Bitcoin network"),
+        );
+        WalletProvider::new(
+            WalletConfig {
+                scope,
+                network,
+                address_type: AddressType::SegwitV0,
+                fee_target_blocks: 6,
+                max_fee_rate: FeeRate::new(1_000),
+            },
+            utxos,
+            fees,
+            transactions,
+            history,
+        )
+    }
+
+    fn assert_invalid_batch(failure: SendError, message: &str) {
+        assert!(failure.accepted.is_empty());
+        assert_eq!(failure.failed_index, None);
+        assert_eq!(failure.ambiguous_transaction_id, None);
+        assert_eq!(failure.source.kind, ErrorKind::InvalidBatch);
+        assert_eq!(failure.source.message, message);
+        assert_eq!(failure.source.ambiguous_transaction_id, None);
+        assert_eq!(failure.to_string(), message);
+    }
+
+    fn exact_envelope_id() -> BaseId {
+        let transaction = NativeTransaction {
+            version: Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([3; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let native_id = TransactionId::from(transaction.compute_txid());
+        let signed = crate::SignedTransaction::from_consensus_bytes(
+            native_id,
+            consensus::serialize(&transaction),
+        )
+        .expect("fixture envelope and transaction ID must agree");
+        BaseId::new(signed.id().to_string())
+    }
+
+    #[test]
+    fn direct_sender_rejects_an_empty_batch_before_chain_io() {
+        let (sender, _) = direct_sender();
+
+        let failure = block_on(sender.send(Vec::new()))
+            .expect_err("the concrete Bitcoin sender must reject an empty batch");
+
+        assert_invalid_batch(failure, "at least one transfer is required");
+    }
+
+    #[test]
+    fn direct_sender_rejects_51_items_before_chain_io() {
+        let (sender, wallet) = direct_sender();
+        let destination = wallet
+            .address_text(&wallet.address())
+            .expect("fixture wallet address must format");
+        let amount: base::Decimal = "0.00000001"
+            .parse()
+            .expect("one satoshi must be a valid decimal");
+        let transfers = (0..=MAX_TRANSFERS)
+            .map(|_| Transfer {
+                wallet: wallet.clone(),
+                to: AddressText::new(destination.encoding, destination.text.clone()),
+                amount: amount.clone(),
+            })
+            .collect();
+
+        let failure = block_on(sender.send(transfers))
+            .expect_err("the concrete Bitcoin sender must reject 51 items");
+
+        assert_invalid_batch(failure, "at most 50 transfers are allowed");
+    }
+
+    #[test]
+    fn fee_preparation_failures_are_index_free_before_output_reads() {
+        struct FeeReply(Result<FeeRate, SourceError>);
+
+        impl Fees for FeeReply {
+            fn estimate<'a>(
+                &'a self,
+                target_blocks: u16,
+            ) -> BoxFuture<'a, Result<FeeRate, SourceError>> {
+                assert_eq!(target_blocks, 6);
+                Box::pin(async { self.0.clone() })
+            }
+        }
+
+        for (reply, message) in [
+            (
+                Err(SourceError {
+                    message: "fee provider unavailable\nretry later".to_owned(),
+                    retryable: true,
+                }),
+                "fee provider unavailable\nretry later",
+            ),
+            (
+                Ok(FeeRate::new(1_001)),
+                "estimated fee rate exceeds the configured maximum",
+            ),
+        ] {
+            let (sender, wallet) = direct_sender_with_fees(Arc::new(FeeReply(reply)));
+            let destination = wallet.address_text(&wallet.address()).unwrap();
+            let failure = block_on(sender.send(vec![Transfer {
+                wallet,
+                to: destination,
+                amount: "0.00000001".parse().unwrap(),
+            }]))
+            .unwrap_err();
+
+            assert!(failure.accepted.is_empty());
+            assert_eq!(failure.failed_index, None);
+            assert_eq!(failure.ambiguous_transaction_id, None);
+            assert_eq!(failure.source.ambiguous_transaction_id, None);
+            assert_eq!(failure.source.kind, ErrorKind::Transaction);
+            assert_eq!(failure.source.message, message);
+            assert_eq!(failure.to_string(), message);
+        }
+    }
+
+    #[test]
+    fn grouped_sources_read_fees_then_first_seen_addresses_at_one_checkpoint() {
+        struct Reads {
+            events: std::sync::Mutex<Vec<String>>,
+            change_checkpoint: bool,
+        }
+
+        impl Fees for Reads {
+            fn estimate<'a>(
+                &'a self,
+                target_blocks: u16,
+            ) -> BoxFuture<'a, Result<FeeRate, SourceError>> {
+                Box::pin(async move {
+                    assert_eq!(target_blocks, 6);
+                    self.events.lock().unwrap().push("fees".to_owned());
+                    Ok(FeeRate::new(1_000))
+                })
+            }
+        }
+
+        impl Outputs for Reads {
+            fn list<'a>(
+                &'a self,
+                request: OutputRequest,
+            ) -> BoxFuture<'a, Result<OutputPage, IndexError>> {
+                Box::pin(async move {
+                    assert!(request.after.is_none());
+                    let mut events = self.events.lock().unwrap();
+                    events.push(request.address.value);
+                    let height = if self.change_checkpoint {
+                        u64::try_from(events.len()).unwrap()
+                    } else {
+                        1
+                    };
+                    Ok(OutputPage {
+                        checkpoint: Some(base::BlockRef {
+                            position: base::BlockPosition(height),
+                            height: base::BlockHeight(height),
+                            hash: base::BlockHash(vec![height as u8; 32]),
+                            parent: None,
+                            timestamp: None,
+                        }),
+                        outputs: Vec::new(),
+                        next: None,
+                    })
+                })
+            }
+        }
+
+        for (change_checkpoint, expected_error) in [
+            (
+                true,
+                "indexed output snapshot changed while building the transaction",
+            ),
+            (
+                false,
+                "each Bitcoin grouped source needs inputs and recipients",
+            ),
+        ] {
+            let reads = Arc::new(Reads {
+                events: std::sync::Mutex::new(Vec::new()),
+                change_checkpoint,
+            });
+            let provider = provider(reads.clone(), reads.clone());
+            let first = block_on(provider.create(SecretBytes::new([1_u8; 32]))).unwrap();
+            let second = block_on(provider.create(SecretBytes::new([2_u8; 32]))).unwrap();
+            let first_address = first.address_text(&first.address()).unwrap();
+            let second_address = second.address_text(&second.address()).unwrap();
+            let transfers = [first.clone(), second, first]
+                .into_iter()
+                .map(|wallet| Transfer {
+                    wallet,
+                    to: first_address.clone(),
+                    amount: "0.00001000".parse().unwrap(),
+                })
+                .collect();
+            let sender = provider.transactions();
+            let submission = sender.send(transfers);
+            assert!(reads.events.lock().unwrap().is_empty());
+            let failure = block_on(submission).unwrap_err();
+
+            assert_eq!(
+                reads.events.lock().unwrap().as_slice(),
+                ["fees", &first_address.text, &second_address.text]
+            );
+            assert!(failure.accepted.is_empty());
+            assert_eq!(failure.failed_index, None);
+            assert_eq!(failure.ambiguous_transaction_id, None);
+            assert_eq!(failure.source.ambiguous_transaction_id, None);
+            assert_eq!(failure.source.kind, ErrorKind::Transaction);
+            assert_eq!(failure.source.message, expected_error);
+        }
+    }
+
+    #[test]
+    fn grouped_broadcast_failure_preserves_exact_ambiguity_without_an_index() {
+        let ambiguous = exact_envelope_id();
+        let failure = SendError::grouped(
+            Vec::new(),
+            base::TransactionError::new(
+                base::TransactionErrorKind::Timeout,
+                "grouped submission outcome is unknown",
+            )
+            .with_ambiguous_transaction_id(ambiguous.clone())
+            .into(),
+        );
+
+        assert!(failure.accepted.is_empty());
+        assert_eq!(failure.failed_index, None);
+        assert_eq!(failure.ambiguous_transaction_id, Some(ambiguous));
+        assert_eq!(failure.source.ambiguous_transaction_id, None);
+    }
+
+    #[test]
+    fn grouped_broadcast_failure_does_not_parse_provider_prose_as_ambiguity() {
+        let failure = SendError::grouped(
+            Vec::new(),
+            base::TransactionError::new(
+                base::TransactionErrorKind::Unavailable,
+                format!("provider claimed transaction {:064x}", 9),
+            )
+            .into(),
+        );
+
+        assert!(failure.accepted.is_empty());
+        assert_eq!(failure.failed_index, None);
+        assert_eq!(failure.ambiguous_transaction_id, None);
+        assert_eq!(failure.source.ambiguous_transaction_id, None);
+    }
+
+    #[test]
+    fn batch_address_conversion_keeps_utf8_and_network_errors() {
+        let invalid_utf8 = base::Address::new([0xff]);
+        let error = Address::from_wallet_address(&invalid_utf8, Network::Regtest).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Transaction);
+        assert_eq!(error.message, "Bitcoin address is not UTF-8");
+        assert_eq!(error.ambiguous_transaction_id, None);
+
+        let value = "1BitcoinEaterAddressDontSendf59kuE";
+        let encoded = base::Address::new(value.as_bytes());
+        let expected = Address::parse_for_network(value, Network::Regtest).unwrap_err();
+        let error = Address::from_wallet_address(&encoded, Network::Regtest).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Transaction);
+        assert_eq!(error.message, expected.to_string());
+        assert_eq!(error.ambiguous_transaction_id, None);
+        assert_eq!(
+            Address::from_wallet_address(&encoded, Network::Mainnet)
+                .unwrap()
+                .encoded(),
+            value
+        );
+    }
 }

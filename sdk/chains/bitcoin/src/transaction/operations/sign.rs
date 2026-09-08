@@ -3,21 +3,17 @@ use base::{
     SignatureScheme, Signer,
 };
 use bitcoin::{
-    Address as NativeAddress, Amount, CompressedPublicKey, OutPoint, ScriptBuf, Sequence,
-    Transaction, TxIn, TxOut, Txid, Witness, absolute, consensus,
+    Address as NativeAddress, Amount, CompressedPublicKey, ScriptBuf, Transaction, TxOut, Witness,
+    consensus,
     hashes::Hash,
     key::{TapTweak, XOnlyPublicKey},
     secp256k1::{Message, Secp256k1, ecdsa, schnorr},
     sighash::{Prevouts, SighashCache},
-    transaction::Version,
 };
 
 use crate::{ChainError, Network};
 
-use super::{
-    Input, SighashType, SignedTransaction, TransactionId, UnsignedTransaction, ecdsa_sighash_type,
-    invalid_transaction, native_network, signer_error, signer_error_message, taproot_sighash_type,
-};
+use super::{Input, SighashType, SignedTransaction, TransactionId, UnsignedTransaction};
 
 struct InputSigner<'a, S: ?Sized> {
     transaction: &'a Transaction,
@@ -46,11 +42,11 @@ pub(in crate::transaction) async fn sign_each<S: Signer + ?Sized>(
     signers: &[&S],
 ) -> Result<SignedTransaction, ChainError> {
     if transaction.inputs.len() != signers.len() {
-        return Err(invalid_transaction(
+        return Err(ChainError::invalid_transaction(
             "Bitcoin transaction needs exactly one signer per input",
         ));
     }
-    let mut native = native_transaction(network, &transaction)?;
+    let mut native = transaction.native(network)?;
     let prevouts = transaction
         .inputs
         .iter()
@@ -76,7 +72,7 @@ pub(in crate::transaction) async fn sign_each<S: Signer + ?Sized>(
         } else if script.is_p2tr() {
             signing.sign_p2tr_input(input_index).await?
         } else {
-            return Err(invalid_transaction(format!(
+            return Err(ChainError::invalid_transaction(format!(
                 "Bitcoin input {input_index} is neither P2WPKH nor P2TR"
             )));
         };
@@ -87,41 +83,6 @@ pub(in crate::transaction) async fn sign_each<S: Signer + ?Sized>(
     SignedTransaction::from_consensus_bytes(id, consensus::serialize(&native))
 }
 
-fn native_transaction(
-    network: Network,
-    transaction: &UnsignedTransaction,
-) -> Result<Transaction, ChainError> {
-    let input = transaction
-        .inputs
-        .iter()
-        .map(|input| TxIn {
-            previous_output: OutPoint::new(
-                Txid::from_byte_array(input.utxo.transaction_id),
-                input.utxo.output_index,
-            ),
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence(input.sequence),
-            witness: Witness::new(),
-        })
-        .collect();
-    let output = transaction
-        .outputs
-        .iter()
-        .map(|output| {
-            Ok(TxOut {
-                value: Amount::from_sat(output.value.0),
-                script_pubkey: super::checked_address(network, &output.address)?.script_pubkey(),
-            })
-        })
-        .collect::<Result<Vec<_>, ChainError>>()?;
-    Ok(Transaction {
-        version: Version(transaction.version),
-        lock_time: absolute::LockTime::from_consensus(transaction.lock_time),
-        input,
-        output,
-    })
-}
-
 impl<S: Signer + ?Sized> InputSigner<'_, S> {
     async fn sign_p2wpkh_input(
         &self,
@@ -129,7 +90,7 @@ impl<S: Signer + ?Sized> InputSigner<'_, S> {
         input: &Input,
     ) -> Result<Witness, ChainError> {
         let script = &self.prevouts[input_index].script_pubkey;
-        let sighash_type = ecdsa_sighash_type(self.sighash_type)?;
+        let sighash_type = self.sighash_type.ecdsa()?;
         let sighash = SighashCache::new(self.transaction)
             .p2wpkh_signature_hash(
                 input_index,
@@ -138,7 +99,9 @@ impl<S: Signer + ?Sized> InputSigner<'_, S> {
                 sighash_type,
             )
             .map_err(|error| {
-                invalid_transaction(format!("could not compute Bitcoin input sighash: {error}"))
+                ChainError::invalid_transaction(format!(
+                    "could not compute Bitcoin input sighash: {error}"
+                ))
             })?;
         let signed = self
             .signer
@@ -152,15 +115,13 @@ impl<S: Signer + ?Sized> InputSigner<'_, S> {
                 key_tweak: None,
             })
             .await
-            .map_err(signer_error)?;
+            .map_err(|error| ChainError::signing(format!("Bitcoin signing failed: {error}")))?;
         let public_key =
             CompressedPublicKey::from_slice(&signed.public_key.bytes).map_err(|error| {
-                signer_error_message(format!("invalid compressed Bitcoin public key: {error}"))
+                ChainError::signing(format!("invalid compressed Bitcoin public key: {error}"))
             })?;
-        if NativeAddress::p2wpkh(&public_key, native_network(self.network)).script_pubkey()
-            != *script
-        {
-            return Err(signer_error_message(format!(
+        if NativeAddress::p2wpkh(&public_key, self.network.native()).script_pubkey() != *script {
+            return Err(ChainError::signing(format!(
                 "Bitcoin input {input_index} does not belong to its signing key"
             )));
         }
@@ -168,18 +129,18 @@ impl<S: Signer + ?Sized> InputSigner<'_, S> {
         if signature.scheme != SignatureScheme::EcdsaSecp256k1
             || signature.encoding != SignatureEncoding::Der
         {
-            return Err(signer_error_message(
+            return Err(ChainError::signing(
                 "Bitcoin signer returned an incompatible ECDSA signature",
             ));
         }
         let signature = ecdsa::Signature::from_der(&signature.bytes).map_err(|error| {
-            signer_error_message(format!("invalid DER Bitcoin signature: {error}"))
+            ChainError::signing(format!("invalid DER Bitcoin signature: {error}"))
         })?;
         let message = Message::from_digest(sighash.to_byte_array());
         Secp256k1::verification_only()
             .verify_ecdsa(&message, &signature, &public_key.0)
             .map_err(|_| {
-                signer_error_message(format!(
+                ChainError::signing(format!(
                     "Bitcoin signer returned an ECDSA signature that failed cryptographic verification for input {input_index}"
                 ))
             })?;
@@ -197,7 +158,7 @@ impl<S: Signer + ?Sized> InputSigner<'_, S> {
     }
 
     async fn sign_p2tr_input(&self, input_index: usize) -> Result<Witness, ChainError> {
-        let sighash_type = taproot_sighash_type(self.sighash_type)?;
+        let sighash_type = self.sighash_type.taproot();
         let sighash = SighashCache::new(self.transaction)
             .taproot_key_spend_signature_hash(
                 input_index,
@@ -205,7 +166,9 @@ impl<S: Signer + ?Sized> InputSigner<'_, S> {
                 sighash_type,
             )
             .map_err(|error| {
-                invalid_transaction(format!("could not compute Taproot input sighash: {error}"))
+                ChainError::invalid_transaction(format!(
+                    "could not compute Taproot input sighash: {error}"
+                ))
             })?;
         let signed = self
             .signer
@@ -222,34 +185,34 @@ impl<S: Signer + ?Sized> InputSigner<'_, S> {
                 }),
             })
             .await
-            .map_err(signer_error)?;
+            .map_err(|error| ChainError::signing(format!("Bitcoin signing failed: {error}")))?;
         let signature = signed.signature;
         let public_key = XOnlyPublicKey::from_slice(&signed.public_key.bytes).map_err(|error| {
-            signer_error_message(format!("invalid x-only Bitcoin public key: {error}"))
+            ChainError::signing(format!("invalid x-only Bitcoin public key: {error}"))
         })?;
         let secp = Secp256k1::verification_only();
-        let expected = NativeAddress::p2tr(&secp, public_key, None, native_network(self.network))
-            .script_pubkey();
+        let expected =
+            NativeAddress::p2tr(&secp, public_key, None, self.network.native()).script_pubkey();
         if expected != self.prevouts[input_index].script_pubkey {
-            return Err(signer_error_message(format!(
+            return Err(ChainError::signing(format!(
                 "Bitcoin Taproot input {input_index} does not belong to its signing key"
             )));
         }
         if signature.scheme != SignatureScheme::SchnorrSecp256k1
             || signature.encoding != SignatureEncoding::Raw
         {
-            return Err(signer_error_message(
+            return Err(ChainError::signing(
                 "Bitcoin signer returned an incompatible Schnorr signature",
             ));
         }
         let signature = schnorr::Signature::from_slice(&signature.bytes).map_err(|error| {
-            signer_error_message(format!("invalid raw Bitcoin Schnorr signature: {error}"))
+            ChainError::signing(format!("invalid raw Bitcoin Schnorr signature: {error}"))
         })?;
         let (output_key, _) = public_key.tap_tweak(&secp, None);
         let message = Message::from_digest(sighash.to_byte_array());
         secp.verify_schnorr(&signature, &message, output_key.as_x_only_public_key())
             .map_err(|_| {
-                signer_error_message(format!(
+                ChainError::signing(format!(
                     "Bitcoin signer returned a Schnorr signature that failed cryptographic verification for input {input_index}"
                 ))
             })?;
@@ -258,5 +221,90 @@ impl<S: Signer + ?Sized> InputSigner<'_, S> {
             sighash_type,
         };
         Ok(Witness::from_slice(&[signature.to_vec()]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use base::{SignFuture, SignerError, SignerErrorKind};
+    use futures_executor::block_on;
+
+    use super::*;
+    use crate::{ChainErrorKind, Satoshi, SpendSource};
+
+    struct FailingSigner {
+        requests: Mutex<Vec<SignRequest>>,
+        error: SignerError,
+    }
+
+    impl Signer for FailingSigner {
+        fn sign<'a>(&'a self, request: SignRequest) -> SignFuture<'a> {
+            self.requests.lock().unwrap().push(request);
+            Box::pin(async { Err(self.error.clone()) })
+        }
+    }
+
+    #[test]
+    fn both_input_kinds_preserve_signer_failure_context_and_signing_request() {
+        for (script, scheme, encoding, public_key_format, key_tweak) in [
+            (
+                ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([7; 20])),
+                SignatureScheme::EcdsaSecp256k1,
+                SignatureEncoding::Der,
+                PublicKeyFormat::Compressed,
+                None,
+            ),
+            (
+                ScriptBuf::from_bytes([vec![0x51, 0x20], vec![7; 32]].concat()),
+                SignatureScheme::SchnorrSecp256k1,
+                SignatureEncoding::Raw,
+                PublicKeyFormat::XOnly,
+                Some(KeyTweak::TaggedHashAdd {
+                    tag: b"TapTweak".to_vec(),
+                    suffix: Vec::new(),
+                }),
+            ),
+        ] {
+            let signer = FailingSigner {
+                requests: Mutex::new(Vec::new()),
+                error: SignerError {
+                    kind: SignerErrorKind::UnsupportedOperation,
+                    message: " signer unavailable\nrequest context ".to_owned(),
+                },
+            };
+            let unsigned = UnsignedTransaction {
+                version: 2,
+                lock_time: 0,
+                inputs: vec![Input {
+                    utxo: SpendSource {
+                        transaction_id: [3; 32],
+                        output_index: 0,
+                        value: Satoshi(10_000),
+                        script_pubkey: script.into_bytes(),
+                        satisfaction_weight: 0,
+                    },
+                    sequence: 0,
+                }],
+                outputs: Vec::new(),
+                sighash_type: SighashType::All,
+            };
+            let error = block_on(sign(Network::Regtest, unsigned, &signer)).unwrap_err();
+            assert_eq!(error.kind, ChainErrorKind::Signer);
+            assert_eq!(
+                error.message,
+                "Bitcoin signing failed:  signer unavailable\nrequest context "
+            );
+            let requests = signer.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].scheme, scheme);
+            assert_eq!(requests[0].encoding, encoding);
+            assert_eq!(requests[0].public_key_format, public_key_format);
+            assert_eq!(requests[0].key_tweak, key_tweak);
+            assert!(
+                matches!(&requests[0].payload, SignablePayload::Digest(digest) if digest.bytes.len() == 32)
+            );
+        }
     }
 }

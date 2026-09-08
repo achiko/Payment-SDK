@@ -9,6 +9,7 @@ pub fn routes() -> OpenApiRouter<HttpState> {
         .routes(routes!(ready))
 }
 
+// design-lint: allow single-use-free-function -- named Utoipa liveness endpoint binds its GET route and OpenAPI response contract through routes!(live)
 #[utoipa::path(
     get,
     path = "/health/live",
@@ -19,6 +20,7 @@ async fn live() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+// design-lint: allow unclassified-free-function -- Axum owns the state extractor signature; this health handler maps an open ready channel to 204 and unavailable or closed state to 503
 #[utoipa::path(
     get,
     path = "/health/ready",

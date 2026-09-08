@@ -93,6 +93,7 @@ impl OutputChanges {
         scope: &IndexScope,
         block_height: BlockHeight,
     ) -> Result<(), IndexError> {
+        let mut created_ids = BTreeSet::new();
         let mut created = BTreeSet::new();
         for output in &self.created {
             if !output.address.belongs_to(scope)
@@ -100,6 +101,7 @@ impl OutputChanges {
                 || output.asset.chain != scope.chain
                 || output.amount.validate_amount().is_err()
                 || output.created_at != block_height
+                || !created_ids.insert(output.id.clone())
                 || !created.insert(output.key())
             {
                 return Err(IndexError::new(

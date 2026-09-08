@@ -15,8 +15,6 @@ pub use transactions::{HttpAccounts, HttpTransactions, TransactionClient, Transa
 
 use blocks::Methods;
 
-const BASIS_POINTS_DENOMINATOR: u64 = 10_000;
-
 impl HttpConfig {
     /// Builds focused account and transaction adapters over shared endpoints.
     pub fn connect(self) -> Result<(HttpAccounts, HttpTransactions), BuildError> {
@@ -37,14 +35,13 @@ mod tests {
         time::Duration,
     };
 
-    use alloy_primitives::keccak256;
+    use alloy_primitives::{hex, keccak256};
     use futures_executor::block_on;
-    use indexing::{BlockHash, BlockHeight, BlockRef};
+    use indexing::{BlockHash, BlockHeight, BlockPosition, BlockRef};
     use json_rpc::Retry;
     use serde_json::{Value, json};
 
     use super::transport::{Call, Client as JsonClient, Error, Failure, RawJson};
-    use super::wire::{data_hex, transaction_id_hex};
     use super::*;
     use crate::{
         Address, AssetKind, ChainErrorKind, SignedTransaction, TransactionId, TransferRequest, Wei,
@@ -222,36 +219,47 @@ mod tests {
     }
 
     #[test]
-    fn reads_native_and_erc20_balances_with_exact_block_behavior() {
+    fn reads_balances_and_nonce_with_canonical_addresses_and_exact_blocks() {
         let client = ScriptedClient::new(vec![
             success("eth_getBalance", json!("0x2a")),
             success("eth_call", json!(format!("0x{}", "00".repeat(31) + "2b"))),
+            success("eth_getTransactionCount", json!("0x3")),
         ]);
         let rpc = account_rpc(client.clone());
         let block = BlockRef {
+            position: BlockPosition(9),
             height: BlockHeight(9),
             hash: BlockHash(vec![0xaa; 32]),
-            parent_hash: None,
+            parent: None,
             timestamp: None,
         };
 
         assert_eq!(
-            block_on(rpc.balance(Address([0x11; 20]), &AssetKind::Native, None))
+            block_on(rpc.balance(Address([0x0a; 20]), &AssetKind::Native, None))
                 .expect("native balance must parse"),
             Wei::from_u128(42)
         );
         assert_eq!(
             block_on(rpc.balance(
-                Address([0x11; 20]),
-                &AssetKind::Erc20(Address([0x33; 20])),
+                Address([0x0a; 20]),
+                &AssetKind::Erc20(Address([0x0b; 20])),
                 Some(block),
             ))
             .expect("token balance must parse"),
             Wei::from_u128(43)
         );
+        assert_eq!(
+            block_on(rpc.nonce(Address([0x0a; 20]))).expect("nonce must parse"),
+            3
+        );
 
         let requests = client.requests();
+        assert_eq!(requests[0].1[0], json!(format!("0x{}", "0a".repeat(20))));
         assert_eq!(requests[0].1[1], json!("pending"));
+        assert_eq!(
+            requests[1].1[0]["to"],
+            json!(format!("0x{}", "0b".repeat(20)))
+        );
         assert_eq!(
             requests[1].1[1],
             json!({
@@ -261,8 +269,41 @@ mod tests {
         );
         assert_eq!(
             requests[1].1[0]["data"],
-            json!(format!("0x70a08231{}{}", "00".repeat(12), "11".repeat(20)))
+            json!(format!("0x70a08231{}{}", "00".repeat(12), "0a".repeat(20)))
         );
+        assert_eq!(
+            requests[2].1,
+            json!([format!("0x{}", "0a".repeat(20)), "pending"])
+        );
+    }
+
+    #[test]
+    fn balance_rejects_invalid_block_hash_before_token_validation_or_rpc() {
+        for (length, asset) in [
+            (31, AssetKind::Native),
+            (33, AssetKind::Native),
+            (31, AssetKind::Erc20(Address([0; 20]))),
+            (33, AssetKind::Erc20(Address([0; 20]))),
+        ] {
+            let client = ScriptedClient::new(Vec::new());
+            let rpc = account_rpc(client.clone());
+            let block = BlockRef {
+                position: BlockPosition(9),
+                height: BlockHeight(9),
+                hash: BlockHash(vec![0xaa; length]),
+                parent: None,
+                timestamp: None,
+            };
+            let error = block_on(rpc.balance(Address([0x11; 20]), &asset, Some(block)))
+                .expect_err("invalid block hash must fail before any token check or RPC");
+
+            assert_eq!(
+                error.message,
+                "Ethereum balance block hash must contain exactly 32 bytes"
+            );
+            assert!(!error.retryable);
+            assert!(client.requests().is_empty());
+        }
     }
 
     #[test]
@@ -278,7 +319,7 @@ mod tests {
             success("eth_call", abi_word(0)),
         ]);
         let rpc = account_rpc(client.clone());
-        let token = Address([0x33; 20]);
+        let token = Address([0x0b; 20]);
 
         block_on(rpc.validate_token(&token, 6)).expect("canonical ERC-20 probes must pass");
 
@@ -287,6 +328,10 @@ mod tests {
             "requireCanonical": true,
         });
         let requests = client.requests();
+        let encoded_token = json!(format!("0x{}", "0b".repeat(20)));
+        assert_eq!(requests[2].1[0], encoded_token);
+        assert_eq!(requests[3].1[0]["to"], encoded_token);
+        assert_eq!(requests[4].1[0]["to"], encoded_token);
         assert_eq!(requests[2].1[1], expected_block);
         assert_eq!(requests[3].1[1], expected_block);
         assert_eq!(requests[4].1[1], expected_block);
@@ -361,8 +406,13 @@ mod tests {
         ]);
         let rpc = rpc(client.clone());
 
-        let context = block_on(rpc.build_context(&native_transfer(), 4))
-            .expect("bounded build context must succeed");
+        let request = TransferRequest::native_atomic(
+            Address([0x0a; 20]),
+            Address([0x0b; 20]),
+            Wei::from_u128(7),
+        );
+        let context =
+            block_on(rpc.build_context(&request, 4)).expect("bounded build context must succeed");
 
         assert_eq!(context.chain_id, 31_337);
         assert_eq!(context.nonce, 4);
@@ -373,6 +423,14 @@ mod tests {
         );
         assert_eq!(context.max_fee_per_gas, Wei::from_u128(5_000_000_000));
         let requests = client.requests();
+        assert_eq!(
+            requests[1].1[0]["from"],
+            json!(format!("0x{}", "0a".repeat(20)))
+        );
+        assert_eq!(
+            requests[1].1[0]["to"],
+            json!(format!("0x{}", "0b".repeat(20)))
+        );
         assert_eq!(requests[1].1[0]["data"], json!("0x"));
         assert_eq!(requests[1].1[0]["value"], json!("0x7"));
     }
@@ -571,9 +629,11 @@ mod tests {
     fn exact_envelope_broadcast_rejects_a_mismatched_provider_hash() {
         let envelope = vec![0x02, 0x01, 0x02, 0x03];
         let id = TransactionId(keccak256(&envelope).0);
+        let local_id = base::TransactionId::new(id.to_string());
+        let provider_candidate = format!("0x{}", "dd".repeat(32));
         let client = ScriptedClient::new(vec![success(
             "eth_sendRawTransaction",
-            json!(format!("0x{}", "dd".repeat(32))),
+            json!(provider_candidate.clone()),
         )]);
         let rpc = rpc(client.clone());
 
@@ -583,14 +643,43 @@ mod tests {
         }))
         .expect_err("provider hash mismatch must fail");
 
-        assert!(error.retryable);
-        assert_eq!(client.requests()[0].1, json!([data_hex(&envelope)]));
+        assert_eq!(error.kind, base::TransactionErrorKind::Unavailable);
+        assert_eq!(error.ambiguous_transaction_id, Some(local_id));
+        assert_ne!(
+            error
+                .ambiguous_transaction_id
+                .as_ref()
+                .map(base::TransactionId::as_str),
+            Some(provider_candidate.as_str())
+        );
+        assert_eq!(
+            client.requests()[0].1,
+            json!([hex::encode_prefixed(&envelope)])
+        );
+    }
+
+    #[test]
+    fn mismatched_local_id_is_rejected_before_submission_without_ambiguity() {
+        let envelope = vec![0x02, 0x10, 0x20, 0x30];
+        let client = ScriptedClient::new(Vec::new());
+        let rpc = rpc(client.clone());
+
+        let error = block_on(rpc.broadcast(SignedTransaction {
+            id: TransactionId([0x99; 32]),
+            envelope,
+        }))
+        .expect_err("a local ID that does not match the envelope must fail before RPC");
+
+        assert_eq!(error.kind, base::TransactionErrorKind::InvalidTransaction);
+        assert_eq!(error.ambiguous_transaction_id, None);
+        assert!(client.requests().is_empty());
     }
 
     #[test]
     fn unknown_remote_submission_failure_remains_ambiguous() {
         let envelope = vec![0x02, 0x04, 0x05, 0x06];
         let id = TransactionId(keccak256(&envelope).0);
+        let local_id = base::TransactionId::new(id.to_string());
         let client = ScriptedClient::new(vec![failure(
             "eth_sendRawTransaction",
             -32_000,
@@ -600,9 +689,29 @@ mod tests {
         let error = block_on(rpc(client).broadcast(SignedTransaction { id, envelope }))
             .expect_err("an unclassified post-attempt remote failure must stay ambiguous");
 
-        assert!(error.retryable);
-        assert!(error.message.contains("outcome is ambiguous"));
+        assert_eq!(error.kind, base::TransactionErrorKind::Unavailable);
+        assert_eq!(error.ambiguous_transaction_id, Some(local_id));
+        assert_eq!(
+            error.message,
+            "Ethereum submission outcome is ambiguous: Ethereum JSON-RPC eth_sendRawTransaction failed with code -32000"
+        );
         assert!(!error.message.contains("Bearer secret"));
+    }
+
+    #[test]
+    fn missing_and_malformed_submission_results_keep_the_exact_local_id() {
+        for result in [Value::Null, json!(7)] {
+            let envelope = vec![0x02, 0x07, 0x08, 0x09];
+            let id = TransactionId(keccak256(&envelope).0);
+            let local_id = base::TransactionId::new(id.to_string());
+            let client = ScriptedClient::new(vec![success("eth_sendRawTransaction", result)]);
+
+            let error = block_on(rpc(client).broadcast(SignedTransaction { id, envelope }))
+                .expect_err("a missing or malformed result must remain ambiguous");
+
+            assert_eq!(error.kind, base::TransactionErrorKind::Unavailable);
+            assert_eq!(error.ambiguous_transaction_id, Some(local_id));
+        }
     }
 
     #[tokio::test]
@@ -636,19 +745,17 @@ mod tests {
             .await
             .expect("transaction must prepare");
 
-        assert!(
-            coordinator
-                .broadcast(signed.clone())
-                .await
-                .expect_err("unclassified remote failure must be ambiguous")
-                .retryable
+        let error = coordinator
+            .broadcast(signed.clone())
+            .await
+            .expect_err("unclassified remote failure must be ambiguous");
+        assert_eq!(
+            error.ambiguous_transaction_id,
+            Some(base::TransactionId::new(signed.id.to_string()))
         );
         client.push_replies([
             success("eth_getTransactionByHash", Value::Null),
-            success(
-                "eth_sendRawTransaction",
-                json!(transaction_id_hex(&signed.id)),
-            ),
+            success("eth_sendRawTransaction", json!(signed.id.to_string())),
         ]);
 
         assert_eq!(
@@ -667,8 +774,8 @@ mod tests {
         assert_eq!(
             submissions,
             [
-                json!([data_hex(&signed.envelope)]),
-                json!([data_hex(&signed.envelope)])
+                json!([hex::encode_prefixed(&signed.envelope)]),
+                json!([hex::encode_prefixed(&signed.envelope)])
             ]
         );
     }
@@ -679,10 +786,7 @@ mod tests {
         let id = TransactionId(keccak256(&envelope).0);
         let matching = ScriptedClient::new(vec![
             failure("eth_sendRawTransaction", -32_000, "already known"),
-            success(
-                "eth_getTransactionByHash",
-                json!({"hash": transaction_id_hex(&id)}),
-            ),
+            success("eth_getTransactionByHash", json!({"hash": id.to_string()})),
         ]);
         let matching_rpc = rpc(matching);
 
@@ -703,9 +807,50 @@ mod tests {
             ),
         ]);
         let mismatched_rpc = rpc(mismatched);
+        let local_id = base::TransactionId::new(id.to_string());
         let error = block_on(mismatched_rpc.broadcast(SignedTransaction { id, envelope }))
             .expect_err("different known hash must not be accepted");
-        assert!(error.retryable);
+        assert_eq!(error.kind, base::TransactionErrorKind::Unavailable);
+        assert_eq!(error.ambiguous_transaction_id, Some(local_id));
+    }
+
+    #[test]
+    fn already_known_without_visible_transaction_remains_ambiguous() {
+        let envelope = vec![0x02, 0xaa, 0xbb];
+        let id = TransactionId(keccak256(&envelope).0);
+        let client = ScriptedClient::new(vec![
+            failure("eth_sendRawTransaction", -32_000, "already known"),
+            success("eth_getTransactionByHash", Value::Null),
+        ]);
+
+        let error = block_on(rpc(client.clone()).broadcast(SignedTransaction {
+            id: id.clone(),
+            envelope: envelope.clone(),
+        }))
+        .expect_err("already-known without a matching lookup must remain ambiguous");
+
+        assert_eq!(error.kind, base::TransactionErrorKind::Unavailable);
+        assert_eq!(
+            error.ambiguous_transaction_id,
+            Some(base::TransactionId::new(id.to_string()))
+        );
+        assert_eq!(
+            error.message,
+            "Ethereum submission outcome is ambiguous: Ethereum RPC reported an already-known transaction but did not expose the matching hash"
+        );
+        assert_eq!(
+            client.requests(),
+            [
+                (
+                    "eth_sendRawTransaction".to_owned(),
+                    json!([hex::encode_prefixed(&envelope)]),
+                ),
+                (
+                    "eth_getTransactionByHash".to_owned(),
+                    json!([id.to_string()])
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -716,7 +861,7 @@ mod tests {
 
         let matching = ScriptedClient::new(vec![success(
             "eth_getTransactionByHash",
-            json!({"hash": transaction_id_hex(&id)}),
+            json!({"hash": id.to_string()}),
         )]);
         assert!(block_on(rpc(matching).known(&id)).expect("matching hash must be known"));
 

@@ -5,34 +5,10 @@
 //! the SDK can reuse it rather than reimplementing the readiness and
 //! shutdown semantics.
 
-use std::{error::Error, io, marker::PhantomData, sync::Arc, time::Duration};
+use std::{error::Error, io, sync::Arc, time::Duration};
 
-use indexing::{AddressFilter, FilterSource, IndexError, IndexErrorKind, Indexer, SyncPhase};
+use indexing::{FilterSource, Indexer, SyncPhase, SyncStatus};
 use tokio::sync::watch;
-
-/// Adapts the caller's filter closure to the selection synchronization reads.
-///
-/// The closure is handed down rather than called here, because reading it
-/// before `sync` observes the source tip is exactly the ordering that loses a
-/// newly registered address. See [`indexing::FilterSource`].
-struct Selection<F, E> {
-    filters: F,
-    marker: PhantomData<fn() -> E>,
-}
-
-impl<F, E> FilterSource for Selection<F, E>
-where
-    F: Fn() -> Result<Vec<AddressFilter>, E> + Send + Sync,
-    E: Error + Send + Sync + 'static,
-{
-    fn filters(&self) -> Result<Vec<AddressFilter>, IndexError> {
-        // A selection that cannot be read is a caller fault, not a transient
-        // one, so it stops the loop instead of retrying forever.
-        (self.filters)().map_err(|error| {
-            IndexError::new(IndexErrorKind::InvalidRequest, error.to_string(), false)
-        })
-    }
-}
 
 pub type TaskError = Box<dyn Error + Send + Sync>;
 
@@ -51,29 +27,50 @@ pub enum SyncState {
     Retrying { error: String },
 }
 
+impl SyncState {
+    fn from_statuses(indexer: &dyn Indexer, statuses: &[SyncStatus]) -> Option<Self> {
+        let complete = !indexer.scopes().is_empty()
+            && statuses.len() == indexer.scopes().len()
+            && indexer.scopes().iter().all(|scope| {
+                statuses
+                    .iter()
+                    .filter(|status| status.scope == *scope)
+                    .count()
+                    == 1
+            });
+        if !complete
+            || statuses
+                .iter()
+                .any(|status| status.phase == SyncPhase::Ready && status.checkpoint.is_none())
+        {
+            return None;
+        }
+        if statuses
+            .iter()
+            .all(|status| status.phase == SyncPhase::Ready)
+        {
+            Some(Self::Ready)
+        } else {
+            Some(Self::CatchingUp)
+        }
+    }
+}
+
 /// Keeps the composed index current until shutdown or a terminal failure.
-pub async fn run<F, E>(
+pub async fn run(
     indexer: Arc<dyn Indexer>,
-    filters: F,
+    selection: Arc<dyn FilterSource>,
     interval: Duration,
     mut shutdown: watch::Receiver<bool>,
     state: watch::Sender<SyncState>,
-) -> Result<(), TaskError>
-where
-    F: Fn() -> Result<Vec<AddressFilter>, E> + Send + Sync + 'static,
-    E: Error + Send + Sync + 'static,
-{
-    let selection = Selection {
-        filters,
-        marker: PhantomData,
-    };
+) -> Result<(), TaskError> {
     loop {
         if *shutdown.borrow() {
             return Ok(());
         }
 
         let result = tokio::select! {
-            result = indexer.sync(&selection) => result,
+            result = indexer.sync(selection.as_ref()) => result,
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     return Ok(());
@@ -82,57 +79,24 @@ where
             }
         };
 
-        let wait = match result {
-            Ok(statuses) => {
-                let complete = !indexer.scopes().is_empty()
-                    && statuses.len() == indexer.scopes().len()
-                    && indexer.scopes().iter().all(|scope| {
-                        statuses
-                            .iter()
-                            .filter(|status| status.scope == *scope)
-                            .count()
-                            == 1
-                    });
-                if !complete
-                    || statuses.iter().any(|status| {
-                        status.phase == SyncPhase::Ready && status.checkpoint.is_none()
-                    })
-                {
-                    state.send_replace(SyncState::Retrying {
-                        error: "incomplete synchronization status".to_owned(),
-                    });
-                    return Err(io::Error::other(
-                        "indexer returned incomplete or inconsistent synchronization status",
-                    )
-                    .into());
-                }
-                let caught_up = statuses
-                    .iter()
-                    .all(|status| status.phase == SyncPhase::Ready);
-                let next = if caught_up {
-                    SyncState::Ready
-                } else {
-                    SyncState::CatchingUp
-                };
-                state.send_if_modified(|current| {
-                    let changed = *current != next;
-                    *current = next;
-                    changed
+        let result = result.map(|statuses| SyncState::from_statuses(indexer.as_ref(), &statuses));
+        let next = match result {
+            Ok(Some(next)) => next,
+            Ok(None) => {
+                state.send_replace(SyncState::Retrying {
+                    error: "incomplete synchronization status".to_owned(),
                 });
-                caught_up
+                return Err(io::Error::other(
+                    "indexer returned incomplete or inconsistent synchronization status",
+                )
+                .into());
             }
             Err(error) if error.retryable => {
                 // The reason must reach the caller: this loop will keep going
                 // forever, and silence here is indistinguishable from health.
-                let next = SyncState::Retrying {
+                SyncState::Retrying {
                     error: error.message.clone(),
-                };
-                state.send_if_modified(|current| {
-                    let changed = *current != next;
-                    *current = next;
-                    changed
-                });
-                true
+                }
             }
             Err(error) => {
                 state.send_replace(SyncState::Retrying {
@@ -141,6 +105,12 @@ where
                 return Err(error.into());
             }
         };
+        let wait = next != SyncState::CatchingUp;
+        state.send_if_modified(|current| {
+            let changed = *current != next;
+            *current = next;
+            changed
+        });
 
         if wait {
             tokio::select! {
@@ -151,6 +121,341 @@ where
                 }
                 () = tokio::time::sleep(interval) => {}
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        future,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use indexing::{
+        BlockHash, BlockHeight, BlockPosition, BlockRef, BoxFuture, ChainId, Checkpoint, History,
+        HistoryQuery, IndexError, IndexErrorKind, IndexScope, SyncStatus, TransactionPage,
+    };
+
+    use super::*;
+
+    struct Index {
+        scope: IndexScope,
+        results: Mutex<VecDeque<Result<Vec<SyncStatus>, IndexError>>>,
+        pending: bool,
+        calls: AtomicUsize,
+        continue_after_first: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    impl Checkpoint for Index {
+        fn checkpoint<'a>(
+            &'a self,
+            _scope: &'a IndexScope,
+        ) -> BoxFuture<'a, Result<Option<BlockRef>, IndexError>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    impl History for Index {
+        fn history<'a>(
+            &'a self,
+            _request: HistoryQuery,
+        ) -> BoxFuture<'a, Result<TransactionPage, IndexError>> {
+            Box::pin(async {
+                Ok(TransactionPage {
+                    checkpoint: None,
+                    transactions: Vec::new(),
+                    next: None,
+                })
+            })
+        }
+    }
+
+    impl Indexer for Index {
+        fn scopes(&self) -> &[IndexScope] {
+            std::slice::from_ref(&self.scope)
+        }
+
+        fn sync<'a>(
+            &'a self,
+            _selection: &'a dyn FilterSource,
+        ) -> BoxFuture<'a, Result<Vec<SyncStatus>, IndexError>> {
+            Box::pin(async move {
+                if self.pending {
+                    return future::pending().await;
+                }
+                let call = self.calls.fetch_add(1, Ordering::Relaxed);
+                if call == 1
+                    && let Some(gate) = &self.continue_after_first
+                {
+                    gate.notified().await;
+                }
+                self.results
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pop_front()
+                    .unwrap_or_else(|| Ok(vec![status(&self.scope, SyncPhase::Ready)]))
+            })
+        }
+    }
+
+    fn scope() -> IndexScope {
+        IndexScope {
+            chain: ChainId("fixture".to_owned()),
+            network: "owned".to_owned(),
+        }
+    }
+
+    fn block() -> BlockRef {
+        BlockRef {
+            position: BlockPosition(4),
+            height: BlockHeight(4),
+            hash: BlockHash(vec![4; 32]),
+            parent: None,
+            timestamp: None,
+        }
+    }
+
+    fn status(scope: &IndexScope, phase: SyncPhase) -> SyncStatus {
+        SyncStatus {
+            scope: scope.clone(),
+            checkpoint: Some(block()),
+            observed_tip: Some(block()),
+            phase,
+        }
+    }
+
+    fn index(results: impl IntoIterator<Item = Result<Vec<SyncStatus>, IndexError>>) -> Arc<Index> {
+        Arc::new(Index {
+            scope: scope(),
+            results: Mutex::new(results.into_iter().collect()),
+            pending: false,
+            calls: AtomicUsize::new(0),
+            continue_after_first: None,
+        })
+    }
+
+    async fn next(state: &mut watch::Receiver<SyncState>) -> SyncState {
+        state.changed().await.expect("runtime state");
+        state.borrow_and_update().clone()
+    }
+
+    #[tokio::test]
+    async fn publishes_catch_up_then_ready_with_a_persisted_checkpoint() {
+        let scope = scope();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut index = index([
+            Ok(vec![status(&scope, SyncPhase::CatchingUp)]),
+            Ok(vec![status(&scope, SyncPhase::Ready)]),
+        ]);
+        Arc::get_mut(&mut index)
+            .expect("unshared fixture")
+            .continue_after_first = Some(Arc::clone(&gate));
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (state, mut state_rx) = watch::channel(SyncState::Retrying {
+            error: "initial".to_owned(),
+        });
+        let task = tokio::spawn(run(
+            index,
+            Arc::new(Vec::new()),
+            Duration::from_millis(1),
+            shutdown_rx,
+            state,
+        ));
+
+        assert_eq!(next(&mut state_rx).await, SyncState::CatchingUp);
+        gate.notify_one();
+        assert_eq!(next(&mut state_rx).await, SyncState::Ready);
+        shutdown.send_replace(true);
+        task.await.expect("runtime task").expect("clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn retryable_failure_recovers_without_terminating() {
+        let scope = scope();
+        let index = index([
+            Err(IndexError::new(IndexErrorKind::Source, "offline", true)),
+            Ok(vec![status(&scope, SyncPhase::Ready)]),
+        ]);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (state, mut state_rx) = watch::channel(SyncState::CatchingUp);
+        let task = tokio::spawn(run(
+            index,
+            Arc::new(Vec::new()),
+            Duration::from_millis(1),
+            shutdown_rx,
+            state,
+        ));
+
+        assert_eq!(
+            next(&mut state_rx).await,
+            SyncState::Retrying {
+                error: "offline".to_owned()
+            }
+        );
+        assert_eq!(next(&mut state_rx).await, SyncState::Ready);
+        shutdown.send_replace(true);
+        task.await.expect("runtime task").expect("clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn fatal_failure_is_returned_and_published_not_ready() {
+        let index = index([Err(IndexError::new(
+            IndexErrorKind::InvalidBlock,
+            "fatal",
+            false,
+        ))]);
+        let (_shutdown, shutdown_rx) = watch::channel(false);
+        let (state, mut state_rx) = watch::channel(SyncState::Ready);
+
+        let error = run(
+            index,
+            Arc::new(Vec::new()),
+            Duration::from_millis(1),
+            shutdown_rx,
+            state,
+        )
+        .await
+        .expect_err("fatal result");
+        assert_eq!(error.to_string(), "fatal");
+        assert_eq!(
+            state_rx.borrow_and_update().clone(),
+            SyncState::Retrying {
+                error: "fatal".to_owned()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_an_inflight_sync() {
+        let index = Arc::new(Index {
+            scope: scope(),
+            results: Mutex::new(VecDeque::new()),
+            pending: true,
+            calls: AtomicUsize::new(0),
+            continue_after_first: None,
+        });
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (state, _state_rx) = watch::channel(SyncState::CatchingUp);
+        let task = tokio::spawn(run(
+            index,
+            Arc::new(Vec::new()),
+            Duration::from_secs(1),
+            shutdown_rx,
+            state,
+        ));
+        tokio::task::yield_now().await;
+
+        shutdown.send_replace(true);
+        task.await.expect("runtime task").expect("clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn ready_without_a_checkpoint_is_a_fatal_contract_violation() {
+        let scope = scope();
+        let index = index([Ok(vec![SyncStatus {
+            scope,
+            checkpoint: None,
+            observed_tip: Some(block()),
+            phase: SyncPhase::Ready,
+        }])]);
+        let (_shutdown, shutdown_rx) = watch::channel(false);
+        let (state, _state_rx) = watch::channel(SyncState::CatchingUp);
+
+        let error = run(
+            index,
+            Arc::new(Vec::new()),
+            Duration::from_millis(1),
+            shutdown_rx,
+            state,
+        )
+        .await
+        .expect_err("missing persisted checkpoint");
+        assert!(error.to_string().contains("incomplete or inconsistent"));
+    }
+
+    #[tokio::test]
+    async fn invalid_status_sets_always_publish_before_returning_the_contract_error() {
+        let scope = scope();
+        let ready = status(&scope, SyncPhase::Ready);
+        let foreign = IndexScope {
+            network: "unconfigured".to_owned(),
+            ..scope.clone()
+        };
+        for statuses in [
+            Vec::new(),
+            vec![status(&foreign, SyncPhase::Ready)],
+            vec![ready.clone(), ready.clone()],
+            vec![SyncStatus {
+                checkpoint: None,
+                ..ready
+            }],
+        ] {
+            let index = index([Ok(statuses)]);
+            let (_shutdown, shutdown_rx) = watch::channel(false);
+            let expected = SyncState::Retrying {
+                error: "incomplete synchronization status".to_owned(),
+            };
+            let (state, state_rx) = watch::channel(expected.clone());
+            let error = run(
+                index,
+                Arc::new(Vec::new()),
+                Duration::from_secs(60),
+                shutdown_rx,
+                state.clone(),
+            )
+            .await
+            .expect_err("invalid status must terminate the runtime");
+
+            assert_eq!(
+                error.to_string(),
+                "indexer returned incomplete or inconsistent synchronization status"
+            );
+            assert_eq!(*state_rx.borrow(), expected);
+            assert!(state_rx.has_changed().expect("sender remains open"));
+        }
+    }
+
+    #[tokio::test]
+    async fn unchanged_states_do_not_notify_and_shutdown_interrupts_the_retry_interval() {
+        for (result, expected) in [
+            (
+                Ok(vec![status(&scope(), SyncPhase::Ready)]),
+                SyncState::Ready,
+            ),
+            (
+                Err(IndexError::new(IndexErrorKind::Source, "offline", true)),
+                SyncState::Retrying {
+                    error: "offline".to_owned(),
+                },
+            ),
+        ] {
+            let index = index([result]);
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let (state, state_rx) = watch::channel(expected.clone());
+            let mut task = std::pin::pin!(run(
+                index.clone(),
+                Arc::new(Vec::new()),
+                Duration::from_secs(60),
+                shutdown_rx,
+                state,
+            ));
+            future::poll_fn(|context| {
+                assert!(std::future::Future::poll(task.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+
+            assert_eq!(index.calls.load(Ordering::Relaxed), 1);
+            assert_eq!(*state_rx.borrow(), expected);
+            assert!(!state_rx.has_changed().expect("runtime still owns sender"));
+            shutdown.send_replace(true);
+            task.await.expect("shutdown interrupts the interval");
+            assert_eq!(index.calls.load(Ordering::Relaxed), 1);
         }
     }
 }

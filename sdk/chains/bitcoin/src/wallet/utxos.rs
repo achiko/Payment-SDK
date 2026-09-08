@@ -4,7 +4,7 @@ use std::{
 };
 
 use indexing::{
-    AssetId, BlockRef, CanonicalAddress, ChainId, IndexError, IndexScope, OutputCursor,
+    AssetId, BlockRef, CanonicalAddress, ChainId, IndexScope, IndexedOutput, OutputCursor,
     OutputRequest, Outputs, SourceError,
 };
 
@@ -70,64 +70,24 @@ impl IndexUtxos {
                     limit: PAGE_SIZE,
                 })
                 .await
-                .map_err(index_error)?;
+                .map_err(|error| source_error(error.message, error.retryable))?;
             let checkpoint = page.checkpoint.as_ref().ok_or_else(|| {
                 source_error("indexed outputs have no canonical checkpoint", true)
             })?;
-            validate_checkpoint(expected_checkpoint, checkpoint)?;
+            let expected = expected_checkpoint.get_or_insert_with(|| checkpoint.clone());
+            if expected != checkpoint {
+                return Err(source_error(
+                    "indexed output checkpoint changed while loading Bitcoin outputs",
+                    true,
+                ));
+            }
             for output in page.outputs {
-                if output.address != canonical
-                    || output.asset != *NATIVE_ASSET
-                    || !output.id.transaction.belongs_to(&self.scope)
-                {
-                    return Err(source_error(
-                        "indexed output does not belong to the requested Bitcoin address and asset",
-                        false,
-                    ));
-                }
-                if output.evidence != expected_script {
-                    return Err(source_error(
-                        "indexed output locking script does not match its Bitcoin address",
-                        false,
-                    ));
-                }
-                let transaction_id = output
-                    .id
-                    .transaction
-                    .value
-                    .parse::<TransactionId>()
-                    .map_err(|_| {
-                        source_error(
-                            "indexed output has an invalid Bitcoin transaction ID",
-                            false,
-                        )
-                    })?;
-                let value = indexed_satoshis(&output.amount)?;
-                let confirmations = checkpoint
-                    .height
-                    .0
-                    .checked_sub(output.created_at.0)
-                    .and_then(|depth| depth.checked_add(1))
-                    .ok_or_else(|| {
-                        source_error(
-                            "indexed output was created after the canonical checkpoint",
-                            false,
-                        )
-                    })?;
-                if output.coinbase && confirmations < COINBASE_MATURITY {
+                let Some(output) =
+                    self.unspent(output, &canonical, &expected_script, checkpoint, seen)?
+                else {
                     continue;
-                }
-                if !seen.insert((transaction_id.0, output.id.index)) {
-                    return Err(source_error("indexed output is duplicated", false));
-                }
-                outputs.push(UnspentOutput {
-                    transaction_id: transaction_id.0,
-                    output_index: output.id.index,
-                    value,
-                    script_pubkey: output.evidence,
-                    confirmations,
-                    coinbase: output.coinbase,
-                });
+                };
+                outputs.push(output);
             }
             let Some(next) = page.next else {
                 break;
@@ -136,6 +96,68 @@ impl IndexUtxos {
             after = Some(next);
         }
         Ok(outputs)
+    }
+
+    fn unspent(
+        &self,
+        output: IndexedOutput,
+        canonical: &CanonicalAddress,
+        expected_script: &[u8],
+        checkpoint: &BlockRef,
+        seen: &mut BTreeSet<([u8; 32], u32)>,
+    ) -> Result<Option<UnspentOutput>, SourceError> {
+        if output.address != *canonical
+            || output.asset != *NATIVE_ASSET
+            || !output.id.transaction.belongs_to(&self.scope)
+        {
+            return Err(source_error(
+                "indexed output does not belong to the requested Bitcoin address and asset",
+                false,
+            ));
+        }
+        if output.evidence != expected_script {
+            return Err(source_error(
+                "indexed output locking script does not match its Bitcoin address",
+                false,
+            ));
+        }
+        let transaction_id = output
+            .id
+            .transaction
+            .value
+            .parse::<TransactionId>()
+            .map_err(|_| {
+                source_error(
+                    "indexed output has an invalid Bitcoin transaction ID",
+                    false,
+                )
+            })?;
+        let value = Satoshi::from_indexed_amount(&output.amount)?;
+        let confirmations = checkpoint
+            .height
+            .0
+            .checked_sub(output.created_at.0)
+            .and_then(|depth| depth.checked_add(1))
+            .ok_or_else(|| {
+                source_error(
+                    "indexed output was created after the canonical checkpoint",
+                    false,
+                )
+            })?;
+        if output.coinbase && confirmations < COINBASE_MATURITY {
+            return Ok(None);
+        }
+        if !seen.insert((transaction_id.0, output.id.index)) {
+            return Err(source_error("indexed output is duplicated", false));
+        }
+        Ok(Some(UnspentOutput {
+            transaction_id: transaction_id.0,
+            output_index: output.id.index,
+            value,
+            script_pubkey: output.evidence,
+            confirmations,
+            coinbase: output.coinbase,
+        }))
     }
 }
 
@@ -162,23 +184,6 @@ impl IndexUtxos {
     }
 }
 
-fn validate_checkpoint(
-    expected: &mut Option<BlockRef>,
-    actual: &BlockRef,
-) -> Result<(), SourceError> {
-    match expected {
-        Some(expected) if expected != actual => Err(source_error(
-            "indexed output checkpoint changed while loading Bitcoin outputs",
-            true,
-        )),
-        Some(_) => Ok(()),
-        None => {
-            *expected = Some(actual.clone());
-            Ok(())
-        }
-    }
-}
-
 fn validate_cursor(
     previous: Option<&OutputCursor>,
     next: &OutputCursor,
@@ -193,20 +198,19 @@ fn validate_cursor(
     Ok(())
 }
 
-fn index_error(error: IndexError) -> SourceError {
-    source_error(error.message, error.retryable)
+impl Satoshi {
+    /// Indexing persists Bitcoin amounts in chain-native atomic units. Unlike the
+    /// public wallet API, this boundary must not interpret the decimal as BTC and
+    /// multiply it by `10^8` a second time.
+    fn from_indexed_amount(amount: &base::Decimal) -> Result<Self, SourceError> {
+        amount
+            .to_atomic_u64(0)
+            .map(Self)
+            .map_err(|error| source_error(error.to_string(), false))
+    }
 }
 
-/// Indexing persists Bitcoin amounts in chain-native atomic units. Unlike the
-/// public wallet API, this boundary must not interpret the decimal as BTC and
-/// multiply it by `10^8` a second time.
-fn indexed_satoshis(amount: &base::Decimal) -> Result<Satoshi, SourceError> {
-    amount
-        .to_atomic_u64(0)
-        .map(Satoshi)
-        .map_err(|error| source_error(error.to_string(), false))
-}
-
+// design-lint: allow unclassified-free-function -- indexed Bitcoin output boundary constructs foreign SourceError with caller-selected retryability across amount, checkpoint and pagination validation without coupling wallet reads to RPC plumbing
 fn source_error(message: impl Into<String>, retryable: bool) -> SourceError {
     SourceError {
         message: message.into(),
@@ -216,32 +220,212 @@ fn source_error(message: impl Into<String>, retryable: bool) -> SourceError {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::VecDeque, sync::Mutex};
+
     use base::{Decimal, DecimalErrorKind};
+    use futures_executor::block_on;
+    use indexing::{BoxFuture, IndexError, IndexErrorKind, OutputPage};
 
     use super::*;
 
-    fn checkpoint(height: u64) -> BlockRef {
-        BlockRef {
-            height: indexing::BlockHeight(height),
-            hash: indexing::BlockHash(vec![height as u8]),
-            parent_hash: None,
-            timestamp: None,
+    struct FailingOutputs(IndexError);
+
+    impl Outputs for FailingOutputs {
+        fn list<'a>(
+            &'a self,
+            _request: OutputRequest,
+        ) -> BoxFuture<'a, Result<OutputPage, IndexError>> {
+            Box::pin(async { Err(self.0.clone()) })
         }
     }
 
     #[test]
-    fn output_pages_must_keep_one_checkpoint() {
+    fn indexed_output_errors_preserve_message_and_retryability() {
+        for retryable in [false, true] {
+            let expected = IndexError::new(
+                IndexErrorKind::Store,
+                " indexing store failed: request 7\nretained context ",
+                retryable,
+            );
+            let outputs = IndexUtxos::new(
+                IndexScope {
+                    chain: ChainId(crate::CHAIN.to_owned()),
+                    network: "mainnet".to_owned(),
+                },
+                Network::Mainnet,
+                Arc::new(FailingOutputs(expected.clone())),
+            )
+            .expect("matching scope");
+            let address = Address::from_encoded("1BitcoinEaterAddressDontSendf59kuE");
+
+            let error = block_on(outputs.utxos(vec![address]))
+                .expect_err("indexed output failure must reach the wallet caller");
+
+            assert_eq!(error.message, expected.message);
+            assert_eq!(error.retryable, retryable);
+        }
+    }
+
+    fn checkpoint(height: u64) -> BlockRef {
+        BlockRef {
+            position: indexing::BlockPosition(height),
+            height: indexing::BlockHeight(height),
+            hash: indexing::BlockHash(vec![height as u8]),
+            parent: None,
+            timestamp: None,
+        }
+    }
+
+    struct ScriptedOutputs(Mutex<VecDeque<(Option<OutputCursor>, OutputPage)>>);
+
+    impl Outputs for ScriptedOutputs {
+        fn list<'a>(
+            &'a self,
+            request: OutputRequest,
+        ) -> BoxFuture<'a, Result<OutputPage, IndexError>> {
+            let (after, page) = self
+                .0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("expected output read");
+            assert_eq!(request.after, after);
+            Box::pin(async { Ok(page) })
+        }
+    }
+
+    #[test]
+    fn output_pages_and_addresses_must_keep_one_checkpoint() {
         let first = checkpoint(10);
-        let mut expected = None;
+        let mut reorg = first.clone();
+        reorg.hash = indexing::BlockHash(vec![99]);
+        for last in [first.clone(), checkpoint(11), reorg] {
+            let cursor = OutputCursor {
+                checkpoint: Some(first.clone()),
+                position: vec![1],
+            };
+            let pages = Arc::new(ScriptedOutputs(Mutex::new(VecDeque::from([
+                (
+                    None,
+                    OutputPage {
+                        checkpoint: Some(first.clone()),
+                        outputs: Vec::new(),
+                        next: Some(cursor.clone()),
+                    },
+                ),
+                (
+                    Some(cursor),
+                    OutputPage {
+                        checkpoint: Some(first.clone()),
+                        outputs: Vec::new(),
+                        next: None,
+                    },
+                ),
+                (
+                    None,
+                    OutputPage {
+                        checkpoint: Some(last.clone()),
+                        outputs: Vec::new(),
+                        next: None,
+                    },
+                ),
+            ]))));
+            let outputs = IndexUtxos::new(
+                IndexScope {
+                    chain: ChainId(crate::CHAIN.to_owned()),
+                    network: "mainnet".to_owned(),
+                },
+                Network::Mainnet,
+                pages.clone(),
+            )
+            .unwrap();
+            let addresses = vec![
+                Address::from_encoded("1BitcoinEaterAddressDontSendf59kuE"),
+                Address::from_encoded("1BoatSLRHtKNngkdXEeobR76b53LETtpyT"),
+            ];
+            let result = block_on(outputs.utxos(addresses));
+            assert!(pages.0.lock().unwrap().is_empty());
+            if last == first {
+                assert_eq!(result.unwrap().checkpoint, first);
+                continue;
+            }
+            let error = result.expect_err("checkpoint changes must restart the entire read");
+            assert!(error.retryable);
+            assert_eq!(
+                error.message,
+                "indexed output checkpoint changed while loading Bitcoin outputs"
+            );
+        }
+    }
 
-        validate_checkpoint(&mut expected, &first).expect("first page establishes checkpoint");
-        validate_checkpoint(&mut expected, &first).expect("same checkpoint remains valid");
-        let error = validate_checkpoint(&mut expected, &checkpoint(11))
-            .expect_err("changed checkpoint must restart the output read");
+    #[test]
+    fn indexed_coinbase_maturity_precedes_duplicate_tracking() {
+        let scope = IndexScope {
+            chain: ChainId(crate::CHAIN.to_owned()),
+            network: "mainnet".to_owned(),
+        };
+        let address = Address::from_encoded("1BitcoinEaterAddressDontSendf59kuE");
+        let script = address
+            .script_pubkey_for_network(Network::Mainnet)
+            .unwrap()
+            .into_bytes();
+        let mature = IndexedOutput {
+            id: indexing::OutputId {
+                transaction: indexing::TransactionRef {
+                    scope: scope.clone(),
+                    value: TransactionId([7; 32]).to_string(),
+                },
+                index: 3,
+            },
+            address: CanonicalAddress {
+                scope: scope.clone(),
+                value: address.encoded().to_owned(),
+            },
+            asset: (*NATIVE_ASSET).clone(),
+            amount: Decimal::from(100_000_u64),
+            evidence: script.clone(),
+            created_at: indexing::BlockHeight(1),
+            coinbase: true,
+        };
+        let mut immature = mature.clone();
+        immature.created_at = indexing::BlockHeight(2);
 
-        assert_eq!(expected, Some(first));
-        assert!(error.retryable);
-        assert!(error.message.contains("checkpoint changed"));
+        for duplicate_mature in [false, true] {
+            let mut page_outputs = vec![immature.clone(), immature.clone(), mature.clone()];
+            if duplicate_mature {
+                page_outputs.push(mature.clone());
+            }
+            let pages = Arc::new(ScriptedOutputs(Mutex::new(VecDeque::from([(
+                None,
+                OutputPage {
+                    checkpoint: Some(checkpoint(100)),
+                    outputs: page_outputs,
+                    next: None,
+                },
+            )]))));
+            let outputs = IndexUtxos::new(scope.clone(), Network::Mainnet, pages.clone()).unwrap();
+            let result = block_on(outputs.utxos(vec![address.clone()]));
+            assert!(pages.0.lock().unwrap().is_empty());
+            if duplicate_mature {
+                let error = result.unwrap_err();
+                assert_eq!(error.message, "indexed output is duplicated");
+                assert!(!error.retryable);
+                continue;
+            }
+            let result = result.unwrap();
+            assert_eq!(result.checkpoint, checkpoint(100));
+            assert_eq!(
+                result.outputs,
+                vec![UnspentOutput {
+                    transaction_id: [7; 32],
+                    output_index: 3,
+                    value: Satoshi(100_000),
+                    script_pubkey: script.clone(),
+                    confirmations: 100,
+                    coinbase: true,
+                }]
+            );
+        }
     }
 
     #[test]
@@ -271,7 +455,7 @@ mod tests {
         let amount = Decimal::from(100_000_u64);
 
         assert_eq!(
-            indexed_satoshis(&amount).expect("atomic indexed amount must convert"),
+            Satoshi::from_indexed_amount(&amount).expect("atomic indexed amount must convert"),
             Satoshi(100_000)
         );
     }
@@ -287,12 +471,33 @@ mod tests {
             .expect_err("fractional satoshis must be rejected");
 
         assert_eq!(error.kind, DecimalErrorKind::ExcessPrecision);
-        let boundary_error =
-            indexed_satoshis(&amount).expect_err("index adapter must reject fractional satoshis");
+        let boundary_error = Satoshi::from_indexed_amount(&amount)
+            .expect_err("index adapter must reject fractional satoshis");
         assert_eq!(
             boundary_error.message,
             "amount has more than 0 fractional digits"
         );
         assert!(!boundary_error.retryable);
+    }
+
+    #[test]
+    fn indexed_amount_preserves_zero_maximum_and_rejects_invalid_integers() {
+        for amount in [0, u64::MAX] {
+            assert_eq!(
+                Satoshi::from_indexed_amount(&Decimal::from(amount)).unwrap(),
+                Satoshi(amount)
+            );
+        }
+        for (amount, message) in [
+            ("-1", "currency amount must not be negative"),
+            (
+                "18446744073709551616",
+                "atomic amount exceeds the u64 range",
+            ),
+        ] {
+            let error = Satoshi::from_indexed_amount(&amount.parse().unwrap()).unwrap_err();
+            assert_eq!(error.message, message);
+            assert!(!error.retryable);
+        }
     }
 }

@@ -11,6 +11,7 @@ pub fn routes() -> OpenApiRouter<State> {
     OpenApiRouter::new().routes(routes!(read))
 }
 
+// design-lint: allow unclassified-free-function -- Axum owns the extension extractor signature; this handler serializes the injected OpenAPI contract and maps encoding errors to HTTP
 #[utoipa::path(
     get,
     path = "/openapi.json",

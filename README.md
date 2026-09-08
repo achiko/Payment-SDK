@@ -1,9 +1,15 @@
 # Payment SDK
 
-Payment-SDK is a design-stage Rust workspace for one Bitcoin/Ethereum wallet
-API process. It composes native chain clients, wallet implementations, embedded
-indexers, and redb persistence in one process. There are no internal HTTP hops
-or separately deployed wallet/indexer services.
+Payment-SDK is a design-stage Rust workspace whose current implementation is one
+Bitcoin/Ethereum/Solana wallet API process. It composes native chain clients,
+wallet implementations, embedded indexers, and one central PostgreSQL
+database/schema/pool in one process. There are no internal HTTP hops or
+separately deployed wallet/indexer services.
+
+Native SOL submission and runtime composition are implemented through the same
+chain-neutral wallet and indexing contracts. The checksum-pinned owned Agave
+system target is explicit but remains manual evidence; see
+`docs/FEATURE_VALIDATION.md` for the tested and unavailable boundary.
 
 The current scope is deliberately small:
 
@@ -19,15 +25,18 @@ Deposit accounting, ledgers, collections/sweeps, payment workflows, custody
 services, hardware wallets, raw-block archives, and indexing command APIs are
 not part of the workspace.
 
-## Workspace
+## Current workspace
 
 ```text
 apps/api                 explicit composition root and public HTTP process
 sdk/chains/base          approved chain-neutral values and capabilities
 sdk/chains/bitcoin       Bitcoin RPC, transactions, wallets, and interpretation
 sdk/chains/ethereum      Ethereum RPC, transactions, wallets, and interpretation
+sdk/chains/solana        Solana RPC, transactions, wallets, and interpretation
 sdk/wallets              wallet families, instances, birthdays, and sending
-sdk/indexing             Indexer, Composer, synchronization, and collections
+sdk/indexing             Indexer, Composer, synchronization contracts, and collections
+sdk/indexing/runtime     reusable async synchronization and readiness loop
+sdk/indexing/postgres    scope-bound PostgreSQL indexing repository
 sdk/indexing/redb        indexing Blocks/Transactions/Outputs persistence
 packages/*               generic HTTP, JSON-RPC, crypto, and storage mechanics
 ```
@@ -48,7 +57,7 @@ filters remain caller-owned.
 Dependencies point toward generic contracts. Packages import no SDK/application
 crate; indexing imports no concrete chain or redb record; chain-native
 transaction and RPC semantics stay in each chain crate. After composition,
-business and endpoint code do not branch on Bitcoin or Ethereum.
+business and endpoint code do not branch on a concrete chain.
 
 ## Documentation
 
@@ -57,11 +66,18 @@ business and endpoint code do not branch on Bitcoin or Ethereum.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) defines ownership and dependency
   direction.
 - [`docs/CONTRACTS.md`](docs/CONTRACTS.md) describes reusable Rust boundaries.
+- [`docs/FEATURE_VALIDATION.md`](docs/FEATURE_VALIDATION.md) separates current
+  evidence from accepted implementation gaps.
 - [`docs/INDEXING.md`](docs/INDEXING.md) defines synchronization and persistence
   semantics.
 - [`docs/refactoring.md`](docs/refactoring.md) shows the target API, composition,
   business usage, and refactoring acceptance evidence.
 - [`docs/API.md`](docs/API.md) documents the public HTTP surface.
+- [`docs/INDEXING_CENTRAL_DATABASE_PLAN.md`](docs/INDEXING_CENTRAL_DATABASE_PLAN.md)
+  is the flat execution plan for shared PostgreSQL and generic indexing work.
+- [`packages/design-lint/README.md`](packages/design-lint/README.md) describes SDK and adopted design checks, policy, and review commands.
+- [`docs/SOLANA_IMPLEMENTATION_PLAN.md`](docs/SOLANA_IMPLEMENTATION_PLAN.md) is
+  the flat, maximum-small implementation plan for native Solana support.
 
 ## Validation
 

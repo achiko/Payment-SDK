@@ -1,17 +1,18 @@
 use std::sync::Arc;
 
-use crate::{BlockHeight, BlockRef, CanonicalAddress, IndexScope, Observer};
+use crate::{BlockPosition, BlockRef, CanonicalAddress, IndexScope, Observer};
 
 use crate::{
     BlockInterpreter, BlockSource, Blocks, Checkpoint, History, HistoryQuery, IndexError, Indexer,
-    SyncConfig, TransactionPage, Transactions, indexer::Index, synchronizer::Synchronizer,
+    SyncConfig, SyncPlan, TransactionPage, Transactions, indexer::Index,
+    synchronizer::Synchronizer,
 };
 
 /// Caller-owned selection of one address and the first block worth inspecting.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AddressFilter {
     pub address: CanonicalAddress,
-    pub start_height: BlockHeight,
+    pub start_position: BlockPosition,
 }
 
 /// The complete address selection, read on demand rather than handed over in
@@ -30,6 +31,15 @@ pub struct AddressFilter {
 /// taken as a snapshot argument.
 pub trait FilterSource: Send + Sync {
     fn filters(&self) -> Result<Vec<AddressFilter>, IndexError>;
+
+    fn plan(
+        &self,
+        _scope: &IndexScope,
+        checkpoint: Option<BlockRef>,
+    ) -> Result<SyncPlan, IndexError> {
+        self.filters()
+            .map(|filters| SyncPlan::detached(filters, checkpoint))
+    }
 }
 
 /// A selection that cannot change while a pass runs, such as a fixed

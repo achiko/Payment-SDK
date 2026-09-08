@@ -1,3 +1,4 @@
+use base::TransactionError;
 use chain_ethereum::{
     Address, BuildContext, ChainError, SignedTransaction, TransactionId, Transactions,
     TransferIntent, TransferRequest, Wei,
@@ -46,7 +47,7 @@ impl Transactions for InspectingAdapter {
     fn broadcast<'a>(
         &'a self,
         _transaction: SignedTransaction,
-    ) -> BoxFuture<'a, Result<TransactionId, SourceError>> {
+    ) -> BoxFuture<'a, Result<TransactionId, TransactionError>> {
         Box::pin(async { panic!("the inspection boundary test does not broadcast") })
     }
 

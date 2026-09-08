@@ -8,6 +8,7 @@ use utoipa::IntoParams;
 pub enum Chain {
     Bitcoin,
     Ethereum,
+    Solana,
 }
 
 impl Chain {
@@ -16,6 +17,7 @@ impl Chain {
         match self {
             Self::Bitcoin => "bitcoin",
             Self::Ethereum => "ethereum",
+            Self::Solana => "solana",
         }
     }
 }
@@ -28,6 +30,7 @@ pub enum WalletAsset {
     Btc,
     Eth,
     Usdc,
+    Sol,
 }
 
 impl WalletAsset {
@@ -36,6 +39,7 @@ impl WalletAsset {
         match self {
             Self::Btc => Chain::Bitcoin,
             Self::Eth | Self::Usdc => Chain::Ethereum,
+            Self::Sol => Chain::Solana,
         }
     }
 }
@@ -80,6 +84,7 @@ pub struct AddressInput {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AddressEncoding {
+    Base58,
     Base58Check,
     Bech32,
     Bech32m,
@@ -89,6 +94,7 @@ pub enum AddressEncoding {
 impl From<AddressInput> for wallets::AddressText {
     fn from(address: AddressInput) -> Self {
         let encoding = match address.encoding {
+            AddressEncoding::Base58 => wallets::AddressEncoding::Base58,
             AddressEncoding::Base58Check => wallets::AddressEncoding::Base58Check,
             AddressEncoding::Bech32 => wallets::AddressEncoding::Bech32,
             AddressEncoding::Bech32m => wallets::AddressEncoding::Bech32m,

@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use bitcoin::{Transaction, consensus, hex::FromHex};
+use bitcoin::{Transaction, TxIn, consensus, hex::FromHex};
 use indexing::SourceError;
 use serde_json::{Map, Value};
 
-use crate::TransactionId;
 use crate::rpc::source_error;
+use crate::{Address, TransactionId, indexer::Outpoint};
 
 use super::{
     MAX_COMPACT_ADDRESS_BYTES, MAX_COMPACT_PREVOUT_JSON_BYTES, MAX_EXTERNAL_PREVOUTS_PER_BLOCK,
@@ -19,7 +19,10 @@ pub(super) struct ResolvedOutput {
 
 impl ResolvedOutput {
     pub(super) fn compact_json(&self) -> Result<Value, SourceError> {
-        validate_compact_address(self.address.as_ref())?;
+        self.address
+            .as_ref()
+            .map(Address::validate_compact_prevout)
+            .transpose()?;
         let prevout = serde_json::json!({
             "value_satoshis": self.value_satoshis,
             "address": self.address.as_ref().map(|address| address.encoded()),
@@ -37,6 +40,7 @@ impl ResolvedOutput {
     }
 }
 
+// design-lint: allow unclassified-free-function -- shared Bitcoin RPC-to-consensus conversion verifies JSON bytes against an independent expected txid and preserves source retryability without RPC policy on transaction IDs
 pub(super) fn decode_consensus_transaction(
     object: &Map<String, Value>,
     expected_id: TransactionId,
@@ -54,6 +58,7 @@ pub(super) fn decode_consensus_transaction(
     Ok(transaction)
 }
 
+// design-lint: allow unclassified-free-function -- Bitcoin RPC boundary compares independent foreign JSON and consensus input claims before prevout acquisition, preserving coinbase and outpoint validation order and source retryability
 pub(super) fn validate_input_claims(
     value: &Value,
     transaction: &Transaction,
@@ -73,15 +78,17 @@ pub(super) fn validate_input_claims(
         let object = input
             .as_object()
             .ok_or_else(|| source_error("Bitcoin transaction input must be an object", true))?;
-        if native_input.previous_output.is_null() {
-            if !transaction.is_coinbase()
-                || object.get("coinbase").and_then(Value::as_str).is_none()
-            {
-                return Err(source_error(
-                    "Bitcoin null input is not a valid coinbase input",
-                    true,
-                ));
-            }
+        let null_outpoint = native_input.previous_output.is_null();
+        if null_outpoint
+            && (!transaction.is_coinbase()
+                || object.get("coinbase").and_then(Value::as_str).is_none())
+        {
+            return Err(source_error(
+                "Bitcoin null input is not a valid coinbase input",
+                true,
+            ));
+        }
+        if null_outpoint {
             continue;
         }
         let previous_id = required_string(object, "txid", "Bitcoin input previous transaction ID")?
@@ -100,57 +107,156 @@ pub(super) fn validate_input_claims(
     Ok(())
 }
 
-pub(super) fn record_external_prevout(
-    outputs: &mut BTreeMap<TransactionId, BTreeSet<u32>>,
-    count: &mut usize,
-    transaction_id: TransactionId,
-    output_index: u32,
-) -> Result<(), SourceError> {
-    if outputs
-        .get(&transaction_id)
-        .is_some_and(|indexes| indexes.contains(&output_index))
-    {
-        return Err(source_error(
-            "Bitcoin block spends the same external outpoint more than once",
-            false,
-        ));
-    }
-    if *count >= MAX_EXTERNAL_PREVOUTS_PER_BLOCK {
-        return Err(source_error(
-            format!(
-                "Bitcoin block exceeds the {MAX_EXTERNAL_PREVOUTS_PER_BLOCK} external-prevout safety bound"
-            ),
-            false,
-        ));
-    }
-    outputs
-        .entry(transaction_id)
-        .or_default()
-        .insert(output_index);
-    *count = count
-        .checked_add(1)
-        .ok_or_else(|| source_error("Bitcoin external prevout count overflowed", false))?;
-    Ok(())
+#[derive(Debug, Default)]
+pub(super) struct RequiredPrevouts {
+    by_transaction: BTreeMap<TransactionId, BTreeSet<u32>>,
+    count: usize,
 }
 
-pub(super) fn validate_compact_address(
-    address: Option<&crate::Address>,
-) -> Result<(), SourceError> {
-    let Some(address) = address else {
-        return Ok(());
-    };
-    if address.encoded().len() > MAX_COMPACT_ADDRESS_BYTES
-        || !address
-            .encoded()
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric())
-    {
-        return Err(source_error(
-            "Bitcoin canonical prevout address exceeds the compact data bound",
-            false,
-        ));
+impl RequiredPrevouts {
+    pub(super) fn len(&self) -> usize {
+        self.count
     }
-    Ok(())
+
+    pub(super) fn observe(
+        &mut self,
+        input: &TxIn,
+        earlier_outputs: &BTreeSet<Outpoint>,
+        transaction_ids: &BTreeSet<TransactionId>,
+    ) -> Result<(), SourceError> {
+        if input.previous_output.is_null() {
+            return Ok(());
+        }
+        let previous_id = TransactionId::from(input.previous_output.txid);
+        let outpoint = Outpoint {
+            transaction_id: previous_id,
+            output_index: input.previous_output.vout,
+        };
+        if earlier_outputs.contains(&outpoint) {
+            return Ok(());
+        }
+        if transaction_ids.contains(&previous_id) {
+            return Err(source_error(
+                "Bitcoin block transaction spends an output that was not created earlier in the block",
+                true,
+            ));
+        }
+        self.record(previous_id, input.previous_output.vout)
+    }
+
+    pub(super) fn record(
+        &mut self,
+        transaction_id: TransactionId,
+        output_index: u32,
+    ) -> Result<(), SourceError> {
+        if self
+            .by_transaction
+            .get(&transaction_id)
+            .is_some_and(|indexes| indexes.contains(&output_index))
+        {
+            return Err(source_error(
+                "Bitcoin block spends the same external outpoint more than once",
+                false,
+            ));
+        }
+        if self.count >= MAX_EXTERNAL_PREVOUTS_PER_BLOCK {
+            return Err(source_error(
+                format!(
+                    "Bitcoin block exceeds the {MAX_EXTERNAL_PREVOUTS_PER_BLOCK} external-prevout safety bound"
+                ),
+                false,
+            ));
+        }
+        self.by_transaction
+            .entry(transaction_id)
+            .or_default()
+            .insert(output_index);
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or_else(|| source_error("Bitcoin external prevout count overflowed", false))?;
+        Ok(())
+    }
+}
+
+impl IntoIterator for RequiredPrevouts {
+    type Item = (TransactionId, BTreeSet<u32>);
+    type IntoIter = std::collections::btree_map::IntoIter<TransactionId, BTreeSet<u32>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.by_transaction.into_iter()
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct ResolvedPrevouts {
+    values: BTreeMap<TransactionId, BTreeMap<u32, ResolvedOutput>>,
+}
+
+impl ResolvedPrevouts {
+    pub(super) fn insert(
+        &mut self,
+        transaction_id: TransactionId,
+        outputs: BTreeMap<u32, ResolvedOutput>,
+    ) {
+        self.values.insert(transaction_id, outputs);
+    }
+
+    pub(super) fn enrich_input(
+        &self,
+        input: &mut Value,
+        native_input: &TxIn,
+        earlier_outputs: &BTreeSet<Outpoint>,
+    ) -> Result<(), SourceError> {
+        if native_input.previous_output.is_null() {
+            return Ok(());
+        }
+        let input = input
+            .as_object_mut()
+            .ok_or_else(|| source_error("Bitcoin transaction input must be an object", true))?;
+        // Verbosity 2 does not include this field. Removing any unexpected
+        // value ensures parsing sees only the compact, source-owned shape.
+        input.remove("prevout");
+        let previous_id = TransactionId::from(native_input.previous_output.txid);
+        let outpoint = Outpoint {
+            transaction_id: previous_id,
+            output_index: native_input.previous_output.vout,
+        };
+        if earlier_outputs.contains(&outpoint) {
+            return Ok(());
+        }
+        let previous_transaction = self.values.get(&previous_id).ok_or_else(|| {
+            source_error(
+                "Bitcoin external previous transaction was not resolved",
+                true,
+            )
+        })?;
+        let output = previous_transaction
+            .get(&native_input.previous_output.vout)
+            .ok_or_else(|| {
+                source_error("Bitcoin external previous output was not resolved", true)
+            })?;
+        let prevout = output.compact_json()?;
+        input.insert("prevout".to_owned(), prevout);
+        Ok(())
+    }
+}
+
+impl Address {
+    pub(super) fn validate_compact_prevout(&self) -> Result<(), SourceError> {
+        if self.encoded().len() > MAX_COMPACT_ADDRESS_BYTES
+            || !self
+                .encoded()
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return Err(source_error(
+                "Bitcoin canonical prevout address exceeds the compact data bound",
+                false,
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub(super) fn required_string<'a>(
@@ -177,4 +283,98 @@ pub(super) fn required_u32(
         .and_then(|value| {
             u32::try_from(value).map_err(|_| source_error(format!("{context} exceeds u32"), true))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coinbase_claims_keep_the_null_outpoint_exemption_and_error_precedence() {
+        let mut transaction = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                ..TxIn::default()
+            }],
+            output: Vec::new(),
+        };
+        for marker in ["", "01"] {
+            let value = serde_json::json!({
+                "vin": [{"coinbase": marker, "txid": false, "vout": null}]
+            });
+            validate_input_claims(&value, &transaction)
+                .expect("coinbase inputs do not require regular outpoint claims");
+        }
+        for input in [
+            serde_json::json!({}),
+            serde_json::json!({"coinbase": null}),
+            serde_json::json!({"coinbase": false}),
+            serde_json::json!({"coinbase": 1}),
+        ] {
+            let error = validate_input_claims(&serde_json::json!({"vin": [input]}), &transaction)
+                .unwrap_err();
+            assert_eq!(
+                error.message,
+                "Bitcoin null input is not a valid coinbase input"
+            );
+            assert!(error.retryable);
+        }
+        let error =
+            validate_input_claims(&serde_json::json!({"vin": [null]}), &transaction).unwrap_err();
+        assert_eq!(error.message, "Bitcoin transaction input must be an object");
+        assert!(error.retryable);
+
+        transaction.input.push(TxIn::default());
+        let error = validate_input_claims(
+            &serde_json::json!({"vin": [{"coinbase": "01"}, null]}),
+            &transaction,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.message,
+            "Bitcoin null input is not a valid coinbase input"
+        );
+        assert!(error.retryable);
+    }
+
+    #[test]
+    fn compact_prevout_preserves_optional_address_and_exact_satoshis() {
+        for address in [None, Some(String::new()), Some("A1".repeat(64))] {
+            let output = ResolvedOutput {
+                value_satoshis: u64::MAX,
+                address: address.as_ref().map(Address::from_encoded),
+            };
+            assert_eq!(
+                output.compact_json().unwrap(),
+                serde_json::json!({
+                    "value_satoshis": u64::MAX,
+                    "address": address,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn compact_prevout_rejects_oversized_and_non_alphanumeric_addresses() {
+        for address in [
+            "a".repeat(129),
+            "a b".to_owned(),
+            "a\"b".to_owned(),
+            "é".to_owned(),
+        ] {
+            let error = ResolvedOutput {
+                value_satoshis: 1,
+                address: Some(Address::from_encoded(address)),
+            }
+            .compact_json()
+            .unwrap_err();
+            assert_eq!(
+                error.message,
+                "Bitcoin canonical prevout address exceeds the compact data bound"
+            );
+            assert!(!error.retryable);
+        }
+    }
 }

@@ -1,5 +1,6 @@
 use std::fmt;
 
+use alloy_primitives::hex;
 use indexing::SourceError;
 use json_rpc::{Config as TransportConfig, Http as HttpClient};
 use serde_json::{Value, json};
@@ -134,8 +135,7 @@ where
     ) -> Result<Wei, SourceError> {
         let raw = self.request_result(method, params).await?;
         let value: String = raw.deserialize().map_err(map_json_rpc_error)?;
-        super::wire::parse_quantity_wei(&value)
-            .map_err(|message| invalid_rpc_response(method, message))
+        Wei::from_quantity(&value).map_err(|message| invalid_rpc_response(method, message))
     }
 
     pub(super) async fn latest_canonical_parameter(&self) -> Result<Value, SourceError> {
@@ -149,7 +149,7 @@ where
         let hash = super::wire::parse_fixed_data::<32>(hash, "block hash")
             .map_err(|message| invalid_rpc_response("eth_getBlockByNumber", message))?;
         Ok(json!({
-            "blockHash": super::wire::data_hex(&hash),
+            "blockHash": hex::encode_prefixed(hash),
             "requireCanonical": true,
         }))
     }
@@ -185,10 +185,7 @@ where
         expected: &TransactionId,
     ) -> Result<bool, SourceError> {
         let raw = self
-            .request_result(
-                "eth_getTransactionByHash",
-                json!([super::wire::transaction_id_hex(expected)]),
-            )
+            .request_result("eth_getTransactionByHash", json!([expected.to_string()]))
             .await?;
         let value: Value = raw.deserialize().map_err(map_json_rpc_error)?;
         if value.is_null() {
@@ -197,7 +194,7 @@ where
         let returned = value.get("hash").and_then(Value::as_str).ok_or_else(|| {
             invalid_rpc_response("eth_getTransactionByHash", "transaction object has no hash")
         })?;
-        let returned = super::wire::parse_transaction_id(returned, "eth_getTransactionByHash")?;
+        let returned = TransactionId::from_rpc(returned, "eth_getTransactionByHash")?;
         if &returned != expected {
             return Err(invalid_rpc_response(
                 "eth_getTransactionByHash",

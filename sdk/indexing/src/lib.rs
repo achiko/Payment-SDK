@@ -1,5 +1,6 @@
 //! Reorg-safe, chain-independent block synchronization contracts.
 
+mod admission;
 mod block;
 mod composer;
 mod error;
@@ -15,7 +16,7 @@ mod synchronizer;
 mod synchronizer_test;
 mod value;
 
-pub use base::{BlockHash, BlockHeight, BlockRef, Decimal};
+pub use base::{BlockHash, BlockHeight, BlockParent, BlockPosition, BlockRef, Decimal};
 pub use block::{BlockAddition, BlockOutcome, BlockSelector, Blocks, InterpretedBlock};
 pub use composer::Composer;
 pub use error::{IndexError, IndexErrorKind, SourceError};
@@ -41,3 +42,4 @@ pub use value::{AssetId, CanonicalAddress, ChainId, IndexScope, TransactionRef};
 use std::{future::Future, pin::Pin};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub use admission::{CommitPermit, PublicationPermit, ScopeAdmission, SyncPlan};

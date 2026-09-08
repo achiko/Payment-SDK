@@ -1,6 +1,5 @@
 use crate::{
-    BlockHash, BlockHeight, BlockRef, BoxFuture, CanonicalAddress, IndexError, InterpretedBlock,
-    SourceError,
+    BlockPosition, BlockRef, BoxFuture, CanonicalAddress, IndexError, InterpretedBlock, SourceError,
 };
 
 /// Gives generic synchronization access to a chain-native block identity.
@@ -14,16 +13,19 @@ pub trait BlockSource: Send + Sync {
 
     fn tip<'a>(&'a self) -> BoxFuture<'a, Result<BlockRef, SourceError>>;
 
-    fn block_at<'a>(
+    /// Returns at most `limit` actual produced blocks in the inclusive range.
+    fn blocks<'a>(
         &'a self,
-        height: BlockHeight,
-    ) -> BoxFuture<'a, Result<Self::Block, SourceError>>;
+        start: BlockPosition,
+        end: BlockPosition,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<Self::Block>, SourceError>>;
 
-    /// Used to compare a persisted checkpoint with the current canonical chain.
-    fn canonical_hash<'a>(
+    /// Returns the complete canonical reference at one native position.
+    fn canonical_at<'a>(
         &'a self,
-        height: BlockHeight,
-    ) -> BoxFuture<'a, Result<Option<BlockHash>, SourceError>>;
+        position: BlockPosition,
+    ) -> BoxFuture<'a, Result<Option<BlockRef>, SourceError>>;
 }
 
 /// Converts a chain-native block into relevant canonical changes.
