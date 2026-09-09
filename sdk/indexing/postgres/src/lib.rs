@@ -42,12 +42,12 @@ use tokio_postgres::NoTls;
 /// row decodes through one function.
 const CHECKPOINT: &str = "SELECT position, height, hash, parent_position, \
                           parent_hash AS parent, block_timestamp AS timestamp \
-                          FROM checkpoint WHERE chain = $1 AND network = $2";
+                          FROM payments_checkpoint WHERE chain = $1 AND network = $2";
 
 /// A retained block, which is the only place a non-tip height is recorded.
 const RETAINED_BLOCK: &str = "SELECT block_position AS position, height, block_hash AS hash, \
                               block_parent_position AS parent_position, block_parent AS parent, \
-                              block_timestamp AS timestamp FROM journal \
+                              block_timestamp AS timestamp FROM payments_journal \
                               WHERE chain = $1 AND network = $2 AND height = $3";
 
 // design-lint: allow unclassified-free-function -- public PostgreSQL factory validates connection configuration and constructs a foreign pool for process-wide injection without making scope-bound repositories own connection creation

@@ -14,8 +14,8 @@ SELECT STRING_AGG(
 FROM information_schema.columns
 WHERE table_schema = current_schema()
   AND table_name IN (
-      'checkpoint', 'history', 'journal', 'journal_output',
-      'movement', 'output', 'payment_wallets'
+      'payments_checkpoint', 'payments_history', 'payments_journal', 'payments_journal_output',
+      'payments_movement', 'payments_output', 'payments_wallet'
   )"#;
 
 const CONSTRAINTS: &str = r#"
@@ -32,8 +32,8 @@ FROM (
     JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
     WHERE namespace.nspname = current_schema()
       AND relation.relname IN (
-          'checkpoint', 'history', 'journal', 'journal_output',
-          'movement', 'output', 'payment_wallets'
+          'payments_checkpoint', 'payments_history', 'payments_journal', 'payments_journal_output',
+          'payments_movement', 'payments_output', 'payments_wallet'
       )
       AND constraint_record.contype IN ('p', 'u', 'f', 'c')
     GROUP BY relation.relname, constraint_record.contype
@@ -58,126 +58,126 @@ JOIN pg_class index_relation ON index_relation.oid = definition.indexrelid
 JOIN pg_namespace namespace ON namespace.oid = table_relation.relnamespace
 WHERE namespace.nspname = current_schema()
   AND table_relation.relname IN (
-      'checkpoint', 'history', 'journal', 'journal_output',
-      'movement', 'output', 'payment_wallets'
+      'payments_checkpoint', 'payments_history', 'payments_journal', 'payments_journal_output',
+      'payments_movement', 'payments_output', 'payments_wallet'
   )"#;
 
 const JOURNAL_CASCADE: &str = r#"
 SELECT confdeltype = 'c'
 FROM pg_constraint
-WHERE conrelid = 'journal_output'::regclass AND contype = 'f'"#;
+WHERE conrelid = 'payments_journal_output'::regclass AND contype = 'f'"#;
 
 const EXPECTED_COLUMNS: &str = "\
-checkpoint.chain:text:NO
-checkpoint.network:text:NO
-checkpoint.height:int8:NO
-checkpoint.hash:bytea:NO
-checkpoint.parent_hash:bytea:YES
-checkpoint.block_timestamp:int8:YES
-checkpoint.position:int8:NO
-checkpoint.parent_position:int8:YES
-history.chain:text:NO
-history.network:text:NO
-history.address:text:NO
-history.height:int8:NO
-history.transaction_id:text:NO
-history.status:text:NO
-history.failure_reason:text:YES
-history.block_hash:bytea:NO
-history.block_parent:bytea:YES
-history.block_timestamp:int8:YES
-history.fee_asset:text:YES
-history.fee_amount:numeric:YES
-history.fee_payer:text:YES
-history.block_position:int8:NO
-history.block_parent_position:int8:YES
-journal.chain:text:NO
-journal.network:text:NO
-journal.height:int8:NO
-journal.block_hash:bytea:NO
-journal.block_parent:bytea:YES
-journal.block_timestamp:int8:YES
-journal.previous_checkpoint_height:int8:YES
-journal.previous_checkpoint_hash:bytea:YES
-journal.previous_checkpoint_parent:bytea:YES
-journal.previous_checkpoint_time:int8:YES
-journal.block_position:int8:NO
-journal.block_parent_position:int8:YES
-journal.previous_checkpoint_position:int8:YES
-journal.previous_checkpoint_parent_position:int8:YES
-journal_output.chain:text:NO
-journal_output.network:text:NO
-journal_output.height:int8:NO
-journal_output.transaction_id:text:NO
-journal_output.output_index:int4:NO
-journal_output.address:text:NO
-journal_output.asset_chain:text:NO
-journal_output.asset:text:NO
-journal_output.amount:numeric:NO
-journal_output.evidence:bytea:NO
-journal_output.created_at:int8:NO
-journal_output.coinbase:bool:NO
-movement.chain:text:NO
-movement.network:text:NO
-movement.address:text:NO
-movement.height:int8:NO
-movement.transaction_id:text:NO
-movement.ordinal:int4:NO
-movement.kind:text:NO
-movement.movement_id:text:NO
-movement.asset_chain:text:NO
-movement.asset:text:NO
-movement.amount:numeric:NO
-movement.from_address:text:YES
-movement.to_address:text:YES
-output.chain:text:NO
-output.network:text:NO
-output.transaction_id:text:NO
-output.output_index:int4:NO
-output.address:text:NO
-output.asset_chain:text:NO
-output.asset:text:NO
-output.amount:numeric:NO
-output.evidence:bytea:NO
-output.created_at:int8:NO
-output.coinbase:bool:NO
-payment_wallets.id:text:NO
-payment_wallets.chain:text:NO
-payment_wallets.network:text:NO
-payment_wallets.address:text:NO
-payment_wallets.start_height:int8:NO
-payment_wallets.secret:bytea:NO
-payment_wallets.created_at:timestamptz:NO";
+payments_checkpoint.chain:text:NO
+payments_checkpoint.network:text:NO
+payments_checkpoint.height:int8:NO
+payments_checkpoint.hash:bytea:NO
+payments_checkpoint.parent_hash:bytea:YES
+payments_checkpoint.block_timestamp:int8:YES
+payments_checkpoint.position:int8:NO
+payments_checkpoint.parent_position:int8:YES
+payments_history.chain:text:NO
+payments_history.network:text:NO
+payments_history.address:text:NO
+payments_history.height:int8:NO
+payments_history.transaction_id:text:NO
+payments_history.status:text:NO
+payments_history.failure_reason:text:YES
+payments_history.block_hash:bytea:NO
+payments_history.block_parent:bytea:YES
+payments_history.block_timestamp:int8:YES
+payments_history.fee_asset:text:YES
+payments_history.fee_amount:numeric:YES
+payments_history.fee_payer:text:YES
+payments_history.block_position:int8:NO
+payments_history.block_parent_position:int8:YES
+payments_journal.chain:text:NO
+payments_journal.network:text:NO
+payments_journal.height:int8:NO
+payments_journal.block_hash:bytea:NO
+payments_journal.block_parent:bytea:YES
+payments_journal.block_timestamp:int8:YES
+payments_journal.previous_checkpoint_height:int8:YES
+payments_journal.previous_checkpoint_hash:bytea:YES
+payments_journal.previous_checkpoint_parent:bytea:YES
+payments_journal.previous_checkpoint_time:int8:YES
+payments_journal.block_position:int8:NO
+payments_journal.block_parent_position:int8:YES
+payments_journal.previous_checkpoint_position:int8:YES
+payments_journal.previous_checkpoint_parent_position:int8:YES
+payments_journal_output.chain:text:NO
+payments_journal_output.network:text:NO
+payments_journal_output.height:int8:NO
+payments_journal_output.transaction_id:text:NO
+payments_journal_output.output_index:int4:NO
+payments_journal_output.address:text:NO
+payments_journal_output.asset_chain:text:NO
+payments_journal_output.asset:text:NO
+payments_journal_output.amount:numeric:NO
+payments_journal_output.evidence:bytea:NO
+payments_journal_output.created_at:int8:NO
+payments_journal_output.coinbase:bool:NO
+payments_movement.chain:text:NO
+payments_movement.network:text:NO
+payments_movement.address:text:NO
+payments_movement.height:int8:NO
+payments_movement.transaction_id:text:NO
+payments_movement.ordinal:int4:NO
+payments_movement.kind:text:NO
+payments_movement.movement_id:text:NO
+payments_movement.asset_chain:text:NO
+payments_movement.asset:text:NO
+payments_movement.amount:numeric:NO
+payments_movement.from_address:text:YES
+payments_movement.to_address:text:YES
+payments_output.chain:text:NO
+payments_output.network:text:NO
+payments_output.transaction_id:text:NO
+payments_output.output_index:int4:NO
+payments_output.address:text:NO
+payments_output.asset_chain:text:NO
+payments_output.asset:text:NO
+payments_output.amount:numeric:NO
+payments_output.evidence:bytea:NO
+payments_output.created_at:int8:NO
+payments_output.coinbase:bool:NO
+payments_wallet.id:text:NO
+payments_wallet.chain:text:NO
+payments_wallet.network:text:NO
+payments_wallet.address:text:NO
+payments_wallet.start_height:int8:NO
+payments_wallet.secret:bytea:NO
+payments_wallet.created_at:timestamptz:NO";
 
 const EXPECTED_CONSTRAINTS: &str = "\
-checkpoint:c:2
-checkpoint:p:1
-history:c:3
-history:p:1
-journal:c:3
-journal:p:1
-journal_output:f:1
-journal_output:p:1
-movement:c:1
-movement:p:1
-output:p:1
-payment_wallets:p:1
-payment_wallets:u:1";
+payments_checkpoint:c:2
+payments_checkpoint:p:1
+payments_history:c:3
+payments_history:p:1
+payments_journal:c:3
+payments_journal:p:1
+payments_journal_output:f:1
+payments_journal_output:p:1
+payments_movement:c:1
+payments_movement:p:1
+payments_output:p:1
+payments_wallet:p:1
+payments_wallet:u:1";
 
 const EXPECTED_INDEXES: &str = "\
-checkpoint.checkpoint_pkey:true:true:chain,network
-history.history_by_height:false:false:chain,network,height
-history.history_pkey:true:true:chain,network,address,height,transaction_id
-journal.journal_pkey:true:true:chain,network,height
-journal_output.journal_output_pkey:true:true:chain,network,height,transaction_id,output_index
-movement.movement_by_height:false:false:chain,network,height
-movement.movement_pkey:true:true:chain,network,address,height,transaction_id,ordinal
-output.output_by_address_identity:false:false:chain,network,address,transaction_id,output_index
-output.output_by_height:false:false:chain,network,created_at
-output.output_pkey:true:true:chain,network,transaction_id,output_index
-payment_wallets.payment_wallets_by_scope:false:false:chain,network
-payment_wallets.payment_wallets_chain_network_address_key:false:true:chain,network,address
-payment_wallets.payment_wallets_pkey:true:true:id";
+payments_checkpoint.payments_checkpoint_pkey:true:true:chain,network
+payments_history.payments_history_by_height:false:false:chain,network,height
+payments_history.payments_history_pkey:true:true:chain,network,address,height,transaction_id
+payments_journal.payments_journal_pkey:true:true:chain,network,height
+payments_journal_output.payments_journal_output_pkey:true:true:chain,network,height,transaction_id,output_index
+payments_movement.payments_movement_by_height:false:false:chain,network,height
+payments_movement.payments_movement_pkey:true:true:chain,network,address,height,transaction_id,ordinal
+payments_output.payments_output_by_address_identity:false:false:chain,network,address,transaction_id,output_index
+payments_output.payments_output_by_height:false:false:chain,network,created_at
+payments_output.payments_output_pkey:true:true:chain,network,transaction_id,output_index
+payments_wallet.payments_wallet_by_scope:false:false:chain,network
+payments_wallet.payments_wallet_chain_network_address_key:false:true:chain,network,address
+payments_wallet.payments_wallet_pkey:true:true:id";
 
 // design-lint: allow unclassified-free-function -- public startup algorithm validates the deployment-owned shared schema through one read-only repeatable-read transaction on an injected foreign pool independently of scope-bound repositories
 /// Checks that a pool resolves to the configured compatible schema.

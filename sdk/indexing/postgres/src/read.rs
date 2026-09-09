@@ -23,7 +23,7 @@ const HISTORY_PAGE: &str = "\
 SELECT height, transaction_id, status, failure_reason, block_position AS position,
        block_hash AS hash, block_parent_position AS parent_position, block_parent AS parent,
        block_timestamp AS timestamp, fee_asset, fee_amount::text AS fee_amount, fee_payer
-FROM history WHERE chain = $1 AND network = $2 AND address = $3
+FROM payments_history WHERE chain = $1 AND network = $2 AND address = $3
   AND (height, transaction_id) > ($4, $5)
 ORDER BY height, transaction_id LIMIT $6";
 
@@ -36,7 +36,7 @@ ORDER BY height, transaction_id LIMIT $6";
 const PAGE_MOVEMENTS: &str = "\
 SELECT height, transaction_id, kind, movement_id, asset_chain, asset, amount::text AS amount,
        from_address, to_address
-FROM movement WHERE chain = $1 AND network = $2 AND address = $3
+FROM payments_movement WHERE chain = $1 AND network = $2 AND address = $3
   AND (height, transaction_id) >= ($4, $5)
   AND (height, transaction_id) <= ($6, $7)
 ORDER BY height, transaction_id, ordinal";
@@ -46,7 +46,7 @@ ORDER BY height, transaction_id, ordinal";
 const OUTPUT_PAGE: &str = "\
 SELECT transaction_id, output_index, address, asset_chain, asset, amount::text AS amount,
        evidence, created_at, coinbase
-FROM output WHERE chain = $1 AND network = $2 AND address = $3
+FROM payments_output WHERE chain = $1 AND network = $2 AND address = $3
   AND (transaction_id, output_index) > ($4, $5)
 ORDER BY transaction_id, output_index LIMIT $6";
 

@@ -1,4 +1,4 @@
-//! Durable address selection, stored in `payment_wallets`.
+//! Durable address selection, stored in `payments_wallet`.
 
 use indexing::{
     AddressFilter, BlockPosition, BoxFuture, CanonicalAddress, IndexError, IndexErrorKind,
@@ -8,11 +8,11 @@ use indexing::{
 use crate::{Repository, row};
 
 const REGISTER: &str = "\
-INSERT INTO payment_wallets (id, chain, network, address, start_height, secret)
+INSERT INTO payments_wallet (id, chain, network, address, start_height, secret)
 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING";
 
 const REGISTERED: &str = "\
-SELECT id, address, start_height, secret FROM payment_wallets
+SELECT id, address, start_height, secret FROM payments_wallet
 WHERE chain = $1 AND network = $2 ORDER BY created_at, id";
 
 impl Repository {

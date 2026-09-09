@@ -10,7 +10,7 @@ use crate::{
 };
 
 const WRITE_HISTORY: &str = "\
-INSERT INTO history (chain, network, address, height, transaction_id, status, failure_reason,
+INSERT INTO payments_history (chain, network, address, height, transaction_id, status, failure_reason,
                      block_position, block_hash, block_parent_position, block_parent,
                      block_timestamp, fee_asset, fee_amount, fee_payer)
 SELECT $1, $2, entry.address, $3, entry.transaction_id, entry.status, entry.failure_reason,
@@ -20,7 +20,7 @@ FROM UNNEST($9::text[], $10::text[], $11::text[], $12::text[], $13::text[], $14:
      AS entry(address, transaction_id, status, failure_reason, fee_asset, fee_amount, fee_payer)";
 
 const WRITE_MOVEMENT: &str = "\
-INSERT INTO movement (chain, network, address, height, transaction_id, ordinal, kind, movement_id,
+INSERT INTO payments_movement (chain, network, address, height, transaction_id, ordinal, kind, movement_id,
                       asset_chain, asset, amount, from_address, to_address)
 SELECT $1, $2, entry.address, $3, entry.transaction_id, entry.ordinal, entry.kind,
        entry.movement_id, entry.asset_chain, entry.asset, entry.amount::numeric,
@@ -31,7 +31,7 @@ FROM UNNEST($4::text[], $5::text[], $6::int4[], $7::text[], $8::text[], $9::text
               from_address, to_address)";
 
 const WRITE_CREATED: &str = "\
-INSERT INTO output (chain, network, transaction_id, output_index, address, asset_chain, asset,
+INSERT INTO payments_output (chain, network, transaction_id, output_index, address, asset_chain, asset,
                     amount, evidence, created_at, coinbase)
 SELECT $1, $2, entry.transaction_id, entry.output_index, entry.address, entry.asset_chain,
        entry.asset, entry.amount::numeric, entry.evidence, $3, entry.coinbase
@@ -46,14 +46,14 @@ WITH target AS (
     SELECT * FROM UNNEST($3::text[], $4::text[], $5::int4[])
         AS t(address, transaction_id, output_index)
 ), removed AS (
-    DELETE FROM output USING target
+    DELETE FROM payments_output USING target
     WHERE output.chain = $1 AND output.network = $2
       AND output.address = target.address
       AND output.transaction_id = target.transaction_id
       AND output.output_index = target.output_index
     RETURNING output.*
 )
-INSERT INTO journal_output (chain, network, height, transaction_id, output_index, address,
+INSERT INTO payments_journal_output (chain, network, height, transaction_id, output_index, address,
                             asset_chain, asset, amount, evidence, created_at, coinbase)
 SELECT chain, network, $6, transaction_id, output_index, address, asset_chain, asset, amount,
        evidence, created_at, coinbase
